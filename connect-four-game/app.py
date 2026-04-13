@@ -1,14 +1,6 @@
 import streamlit as st
-import numpy as np
+import streamlit.components.v1 as components
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-ROWS, COLS = 6, 7
-EMPTY, RED, YELLOW = 0, 1, 2
-PLAYER_COLORS = {RED: "🔴", YELLOW: "🟡"}
-PLAYER_NAMES = {RED: "Red", YELLOW: "Yellow"}
-WINNING_LENGTH = 4
-
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Connect Four",
     page_icon="🔴",
@@ -16,379 +8,535 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# Strip all Streamlit chrome so only the component is visible
 st.markdown(
     """
 <style>
-/* ── Global ── */
-@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&display=swap');
-
-html, body, [data-testid="stAppViewContainer"] {
-    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-    min-height: 100vh;
-}
-
-[data-testid="stAppViewContainer"] > .main { padding-top: 1rem; }
-
-h1 {
-    font-family: 'Nunito', sans-serif !important;
-    font-weight: 900 !important;
-    font-size: 3rem !important;
-    text-align: center;
-    background: linear-gradient(90deg, #ff6b6b, #ffd93d, #ff6b6b);
-    background-size: 200%;
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin-bottom: 0 !important;
-    letter-spacing: -1px;
-    animation: shimmer 3s linear infinite;
-}
-@keyframes shimmer { 0%{background-position:0%} 100%{background-position:200%} }
-
-/* ── Turn indicator ── */
-.turn-box {
-    background: rgba(255,255,255,0.08);
-    border: 2px solid rgba(255,255,255,0.15);
-    backdrop-filter: blur(12px);
-    border-radius: 16px;
-    padding: 12px 24px;
-    text-align: center;
-    font-family: 'Nunito', sans-serif;
-    font-size: 1.25rem;
-    font-weight: 800;
-    color: white;
-    margin: 8px auto 16px auto;
-    max-width: 340px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-}
-.turn-red  { border-color: #ff4757 !important; box-shadow: 0 0 20px rgba(255,71,87,0.4) !important; }
-.turn-yellow { border-color: #ffd93d !important; box-shadow: 0 0 20px rgba(255,217,61,0.4) !important; }
-
-/* ── Win banner ── */
-.win-banner {
-    background: linear-gradient(135deg, rgba(255,215,0,0.2), rgba(255,107,107,0.2));
-    border: 2px solid gold;
-    border-radius: 20px;
-    padding: 16px 32px;
-    text-align: center;
-    font-family: 'Nunito', sans-serif;
-    font-size: 1.6rem;
-    font-weight: 900;
-    color: gold;
-    margin: 8px auto 16px auto;
-    max-width: 400px;
-    box-shadow: 0 0 40px rgba(255,215,0,0.3);
-    animation: pulse 1.5s ease-in-out infinite;
-}
-@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.03)} }
-
-.draw-banner {
-    background: rgba(255,255,255,0.08);
-    border: 2px solid rgba(255,255,255,0.4);
-    border-radius: 20px;
-    padding: 16px 32px;
-    text-align: center;
-    font-family: 'Nunito', sans-serif;
-    font-size: 1.6rem;
-    font-weight: 900;
-    color: white;
-    margin: 8px auto 16px auto;
-    max-width: 400px;
-}
-
-/* ── Board frame ── */
-.board-frame {
-    background: linear-gradient(145deg, #1565C0, #0D47A1);
-    border-radius: 20px;
-    padding: 16px;
-    box-shadow:
-        0 20px 60px rgba(0,0,0,0.5),
-        0 0 0 4px rgba(255,255,255,0.08),
-        inset 0 2px 4px rgba(255,255,255,0.15);
-    margin: 0 auto;
-    max-width: 560px;
-}
-
-/* ── Column buttons (arrow row) ── */
-.stButton > button {
-    background: rgba(255,255,255,0.12) !important;
-    border: 2px solid rgba(255,255,255,0.2) !important;
-    border-radius: 12px !important;
-    color: white !important;
-    font-size: 1.3rem !important;
-    font-weight: 800 !important;
-    width: 100% !important;
-    padding: 4px 0 !important;
-    transition: all 0.15s ease !important;
-    cursor: pointer !important;
-    box-shadow: none !important;
-}
-.stButton > button:hover {
-    background: rgba(255,255,255,0.25) !important;
-    border-color: rgba(255,255,255,0.5) !important;
-    transform: translateY(-2px) !important;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.3) !important;
-}
-.stButton > button:active { transform: translateY(0) !important; }
-
-/* ── Cell SVG circles ── */
-.board-row {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 6px;
-    justify-content: center;
-}
-.cell {
-    width: 66px;
-    height: 66px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: inset 0 4px 8px rgba(0,0,0,0.4);
-}
-.cell-empty {
-    background: radial-gradient(circle at 35% 35%, #1a237e, #0d1547);
-    box-shadow: inset 0 4px 12px rgba(0,0,0,0.6), inset 0 -2px 4px rgba(255,255,255,0.05);
-}
-.cell-red {
-    background: radial-gradient(circle at 35% 35%, #ff6b6b, #c62828);
-    box-shadow:
-        inset 0 4px 8px rgba(0,0,0,0.3),
-        inset 0 -2px 4px rgba(255,255,255,0.3),
-        0 0 16px rgba(255,71,87,0.5);
-}
-.cell-yellow {
-    background: radial-gradient(circle at 35% 35%, #fff176, #f9a825);
-    box-shadow:
-        inset 0 4px 8px rgba(0,0,0,0.2),
-        inset 0 -2px 4px rgba(255,255,255,0.4),
-        0 0 16px rgba(255,217,61,0.5);
-}
-.cell-win {
-    animation: winPulse 0.7s ease-in-out infinite alternate;
-}
-@keyframes winPulse {
-    from { filter: brightness(1); }
-    to   { filter: brightness(1.5) drop-shadow(0 0 10px white); }
-}
-
-/* ── Score cards ── */
-.score-area {
-    display: flex;
-    gap: 16px;
-    justify-content: center;
-    margin: 12px auto 4px auto;
-    max-width: 400px;
-}
-.score-card {
-    flex: 1;
-    background: rgba(255,255,255,0.07);
-    border-radius: 14px;
-    padding: 10px 16px;
-    text-align: center;
-    border: 2px solid rgba(255,255,255,0.1);
-    font-family: 'Nunito', sans-serif;
-}
-.score-card .label { font-size: 0.8rem; color: rgba(255,255,255,0.6); font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
-.score-card .number { font-size: 2rem; font-weight: 900; color: white; line-height: 1.1; }
-.score-card-red   { border-color: rgba(255,71,87,0.5) !important; }
-.score-card-yellow{ border-color: rgba(255,217,61,0.5) !important; }
-
-/* ── Restart button ── */
-.restart-btn .stButton > button {
-    background: linear-gradient(135deg, #667eea, #764ba2) !important;
-    border: none !important;
-    border-radius: 14px !important;
-    font-size: 1rem !important;
-    font-weight: 800 !important;
-    padding: 10px 0 !important;
-    letter-spacing: 0.5px;
-    box-shadow: 0 4px 20px rgba(102,126,234,0.4) !important;
-    transition: all 0.2s ease !important;
-}
-.restart-btn .stButton > button:hover {
-    transform: translateY(-3px) !important;
-    box-shadow: 0 8px 30px rgba(102,126,234,0.6) !important;
-}
-
-/* ── Subtitle ── */
-.subtitle {
-    text-align: center;
-    color: rgba(255,255,255,0.45);
-    font-size: 0.85rem;
-    font-family: 'Nunito', sans-serif;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    margin-top: -4px;
-    margin-bottom: 4px;
-}
-
-/* Hide default streamlit chrome */
 #MainMenu, footer, header { visibility: hidden; }
-[data-testid="stToolbar"] { display: none; }
+[data-testid="stToolbar"]  { display: none; }
+[data-testid="stAppViewContainer"] {
+    background: linear-gradient(160deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+}
+section.main > div.block-container {
+    padding: 0 !important;
+    max-width: 100% !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ── Session state init ─────────────────────────────────────────────────────────
-def init_state():
-    st.session_state.board = np.zeros((ROWS, COLS), dtype=int)
-    st.session_state.current_player = RED
-    st.session_state.winner = None
-    st.session_state.winning_cells = set()
-    st.session_state.game_over = False
-    st.session_state.draw = False
+# ── Entire game lives in a single self-contained HTML/JS/CSS component ─────────
+# The component handles hover, animation, win detection, and score tracking
+# entirely in the browser — no Streamlit round-trips needed.
+GAME_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&display=swap');
 
-if "board" not in st.session_state:
-    init_state()
-    st.session_state.score = {RED: 0, YELLOW: 0}
+/* ── Layout tokens (must match JS constants CS/GAP/BP/PREV_H) ── */
+:root {
+  --cs:   66px;   /* cell size          */
+  --gap:  7px;    /* gap between cells  */
+  --bp:   13px;   /* board padding      */
+}
 
-# ── Game logic ─────────────────────────────────────────────────────────────────
-def drop_piece(board, col, player):
-    for row in range(ROWS - 1, -1, -1):
-        if board[row][col] == EMPTY:
-            board[row][col] = player
-            return row
-    return -1
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-def get_winning_cells(board, row, col, player):
-    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
-    for dr, dc in directions:
-        cells = [(row, col)]
-        for sign in (1, -1):
-            r, c = row + sign * dr, col + sign * dc
-            while 0 <= r < ROWS and 0 <= c < COLS and board[r][c] == player:
-                cells.append((r, c))
-                r += sign * dr
-                c += sign * dc
-        if len(cells) >= WINNING_LENGTH:
-            return set(cells)
-    return set()
+html {
+  background: linear-gradient(160deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+}
+body {
+  background: transparent;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-family: 'Nunito', sans-serif;
+  padding: 22px 16px 18px;
+}
 
-def check_winner(board, row, col, player):
-    cells = get_winning_cells(board, row, col, player)
-    return cells if cells else None
+/* ── Title ── */
+#title {
+  font-size: 2.8rem;
+  font-weight: 900;
+  background: linear-gradient(90deg, #ff6b6b 0%, #ffd93d 50%, #ff6b6b 100%);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: shimmer 3s linear infinite;
+  margin-bottom: 2px;
+  letter-spacing: -1px;
+}
+@keyframes shimmer { to { background-position: 200% center; } }
 
-def is_draw(board):
-    return all(board[0][c] != EMPTY for c in range(COLS))
+.subtitle {
+  color: rgba(255,255,255,0.3);
+  font-size: 0.68rem;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
 
-def handle_column_click(col):
-    if st.session_state.game_over:
-        return
-    board = st.session_state.board
-    if board[0][col] != EMPTY:
-        return
-    player = st.session_state.current_player
-    row = drop_piece(board, col, player)
-    if row == -1:
-        return
-    winning_cells = check_winner(board, row, col, player)
-    if winning_cells:
-        st.session_state.winner = player
-        st.session_state.winning_cells = winning_cells
-        st.session_state.game_over = True
-        st.session_state.score[player] += 1
-    elif is_draw(board):
-        st.session_state.game_over = True
-        st.session_state.draw = True
-    else:
-        st.session_state.current_player = YELLOW if player == RED else RED
+/* ── Score cards ── */
+#scores {
+  display: flex;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.sc {
+  background: rgba(255,255,255,0.06);
+  border-radius: 14px;
+  padding: 8px 28px;
+  text-align: center;
+  border: 2px solid rgba(255,255,255,0.08);
+  color: white;
+  min-width: 110px;
+  transition: border-color 0.35s ease, box-shadow 0.35s ease;
+}
+.sc .lbl {
+  font-size: 0.7rem; font-weight: 800;
+  letter-spacing: 1px; text-transform: uppercase;
+  opacity: 0.5; margin-bottom: 2px;
+}
+.sc .num { font-size: 2rem; font-weight: 900; line-height: 1; }
+#sc-red            { border-color: rgba(255,71,87,0.25); }
+#sc-yellow         { border-color: rgba(255,217,61,0.25); }
+#sc-red.active     { border-color: rgba(255,71,87,0.8);  box-shadow: 0 0 18px rgba(255,71,87,0.3); }
+#sc-yellow.active  { border-color: rgba(255,217,61,0.8); box-shadow: 0 0 18px rgba(255,217,61,0.3); }
 
-# ── Render helpers ─────────────────────────────────────────────────────────────
-def cell_class(value, r, c):
-    if value == RED:
-        base = "cell cell-red"
-    elif value == YELLOW:
-        base = "cell cell-yellow"
-    else:
-        base = "cell cell-empty"
-    if (r, c) in st.session_state.winning_cells:
-        base += " cell-win"
-    return base
+/* ── Turn indicator ── */
+#turn {
+  background: rgba(255,255,255,0.07);
+  border: 2px solid rgba(255,255,255,0.1);
+  border-radius: 16px;
+  padding: 10px 32px;
+  color: white;
+  font-size: 1.1rem;
+  font-weight: 800;
+  margin-bottom: 16px;
+  min-width: 210px;
+  text-align: center;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease, color 0.3s ease;
+}
+#turn.t-red    { border-color: rgba(255,71,87,0.75);  box-shadow: 0 0 24px rgba(255,71,87,0.3); }
+#turn.t-yellow { border-color: rgba(255,217,61,0.75); box-shadow: 0 0 24px rgba(255,217,61,0.3); }
+#turn.t-win    {
+  border-color: gold; box-shadow: 0 0 32px rgba(255,215,0,0.45);
+  color: gold; animation: turnPulse 1.2s ease-in-out infinite;
+}
+#turn.t-draw { border-color: rgba(255,255,255,0.35); }
+@keyframes turnPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.03)} }
 
-def render_board():
-    board = st.session_state.board
-    html_rows = []
-    for r in range(ROWS):
-        cells_html = []
-        for c in range(COLS):
-            cls = cell_class(board[r][c], r, c)
-            cells_html.append(f'<div class="{cls}"></div>')
-        html_rows.append(f'<div class="board-row">{"".join(cells_html)}</div>')
-    st.markdown(f'<div class="board-frame">{"".join(html_rows)}</div>', unsafe_allow_html=True)
+/* ── Game area ── */
+#game-area { position: relative; user-select: none; }
 
-# ── UI Layout ──────────────────────────────────────────────────────────────────
-st.markdown("<h1>Connect Four</h1>", unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Classic Strategy Game</p>', unsafe_allow_html=True)
+/* ── Preview row ──
+   Height = --cs + 14px so the bouncing ghost piece has room to travel
+   without clipping into the board. JS uses PREV_H = 80 (must match). */
+#prev-row {
+  display: flex;
+  gap: var(--gap);
+  padding: 0 var(--bp);
+  height: calc(var(--cs) + 14px);   /* = 80px */
+  align-items: flex-end;
+}
 
-# Score display
-s = st.session_state.score
-st.markdown(
-    f"""
-<div class="score-area">
-  <div class="score-card score-card-red">
-    <div class="label">🔴 Red</div>
-    <div class="number">{s[RED]}</div>
+.prev-cell {
+  width: var(--cs);
+  height: var(--cs);
+  border-radius: 50%;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+  position: relative;
+}
+.prev-cell.on {
+  opacity: 0.82;
+  animation: prevBounce 0.75s ease-in-out infinite alternate;
+}
+/* Small downward arrow below the ghost piece */
+.prev-cell.on::after {
+  content: '';
+  position: absolute;
+  bottom: -9px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left:  7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top:   8px solid rgba(255,255,255,0.35);
+}
+@keyframes prevBounce {
+  from { transform: translateY(0); }
+  to   { transform: translateY(10px); }
+}
+.prev-cell.c-red {
+  background: radial-gradient(circle at 35% 35%, #ff6b6b, #c62828);
+  box-shadow: 0 0 24px rgba(255,71,87,0.7),
+              inset 0 -4px 8px rgba(255,255,255,0.2),
+              inset 0  4px 8px rgba(0,0,0,0.25);
+}
+.prev-cell.c-yellow {
+  background: radial-gradient(circle at 35% 35%, #fff176, #f9a825);
+  box-shadow: 0 0 24px rgba(255,217,61,0.7),
+              inset 0 -4px 8px rgba(255,255,255,0.28),
+              inset 0  4px 8px rgba(0,0,0,0.18);
+}
+
+/* ── Board ── */
+#board {
+  background: linear-gradient(150deg, #1a6ed8 0%, #1155b0 55%, #0c3f8a 100%);
+  border-radius: 20px;
+  padding: var(--bp);
+  display: flex;
+  gap: var(--gap);
+  position: relative;
+  box-shadow:
+    0 28px 72px rgba(0,0,0,0.65),
+    0 0 0 3px rgba(255,255,255,0.07),
+    inset 0 2px 6px rgba(255,255,255,0.14),
+    inset 0 -2px 5px rgba(0,0,0,0.3);
+}
+
+/* ── Column ── */
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  padding: 3px;
+  border-radius: 11px;
+  cursor: pointer;
+  transition: background 0.11s ease;
+  position: relative;
+}
+/* Hover highlight + inset glow ring */
+.col:not(.full):hover { background: rgba(255,255,255,0.115); }
+.col:not(.full):hover::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 11px;
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,0.28);
+  pointer-events: none;
+}
+.col.full { cursor: not-allowed; }
+
+/* ── Cells ── */
+.cell {
+  width: var(--cs);
+  height: var(--cs);
+  border-radius: 50%;
+  flex-shrink: 0;
+  will-change: transform;  /* GPU compositing hint */
+}
+.cell.empty {
+  background: radial-gradient(circle at 35% 35%, #1e2b8a, #0d1547);
+  box-shadow: inset 0 5px 14px rgba(0,0,0,0.72),
+              inset 0 -2px 4px rgba(255,255,255,0.04);
+}
+.cell.red {
+  background: radial-gradient(circle at 35% 35%, #ff6b6b, #c62828);
+  box-shadow: inset 0 4px 8px rgba(0,0,0,0.32),
+              inset 0 -3px 8px rgba(255,255,255,0.24),
+              0 0 20px rgba(255,71,87,0.42);
+}
+.cell.yellow {
+  background: radial-gradient(circle at 35% 35%, #fff176, #f9a825);
+  box-shadow: inset 0 4px 8px rgba(0,0,0,0.22),
+              inset 0 -3px 8px rgba(255,255,255,0.34),
+              0 0 20px rgba(255,217,61,0.42);
+}
+
+/* ── Drop animation ──
+   Per-keyframe timing-functions simulate gravity + elastic bounce:
+   0→78%  : heavy ease-in  (accelerating fall like gravity)
+   78→88% : quick overshoot (piece compresses at landing)
+   88→95% : spring rebound
+   95→100%: gentle settle
+   Duration is computed in JS and stored in --dur.
+   Starting offset is computed in JS and stored in --from.            */
+.cell.dropping {
+  animation: drop var(--dur, 0.45s) linear both;
+}
+@keyframes drop {
+  0%   {
+    transform: translateY(var(--from, -350px));
+    animation-timing-function: cubic-bezier(0.45, 0, 0.95, 1);
+  }
+  78%  {
+    transform: translateY(0);
+    animation-timing-function: cubic-bezier(0.12, 0, 0.08, 1);
+  }
+  88%  {
+    transform: translateY(8px);
+    animation-timing-function: cubic-bezier(0.38, 0, 0.18, 1);
+  }
+  95%  {
+    transform: translateY(-4px);
+    animation-timing-function: cubic-bezier(0.08, 0, 0.25, 1);
+  }
+  100% { transform: translateY(0); }
+}
+
+/* ── Winning cells ── */
+.cell.win-cell {
+  animation: winGlow 0.65s ease-in-out infinite alternate;
+}
+@keyframes winGlow {
+  from { filter: brightness(1); transform: scale(1); }
+  to   { filter: brightness(1.8) drop-shadow(0 0 14px white); transform: scale(1.1); }
+}
+
+/* ── Restart button ── */
+#btn-new {
+  margin-top: 20px;
+  padding: 12px 52px;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  border: none;
+  border-radius: 14px;
+  color: white;
+  font-family: 'Nunito', sans-serif;
+  font-size: 1rem;
+  font-weight: 800;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  box-shadow: 0 6px 28px rgba(102,126,234,0.45);
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+#btn-new:hover  { transform: translateY(-3px); box-shadow: 0 10px 38px rgba(102,126,234,0.65); }
+#btn-new:active { transform: translateY(0); }
+
+.hint {
+  margin-top: 10px;
+  color: rgba(255,255,255,0.18);
+  font-size: 0.7rem;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+</style>
+</head>
+<body>
+
+<div id="title">Connect Four</div>
+<div class="subtitle">Classic Strategy Game</div>
+
+<div id="scores">
+  <div class="sc active" id="sc-red">
+    <div class="lbl">🔴 Red</div>
+    <div class="num" id="n-red">0</div>
   </div>
-  <div class="score-card score-card-yellow">
-    <div class="label">🟡 Yellow</div>
-    <div class="number">{s[YELLOW]}</div>
+  <div class="sc" id="sc-yellow">
+    <div class="lbl">🟡 Yellow</div>
+    <div class="num" id="n-yellow">0</div>
   </div>
 </div>
-""",
-    unsafe_allow_html=True,
-)
 
-# Turn / result banner
-if st.session_state.game_over:
-    if st.session_state.draw:
-        st.markdown('<div class="draw-banner">🤝 It\'s a Draw!</div>', unsafe_allow_html=True)
-    else:
-        w = st.session_state.winner
-        emoji = PLAYER_COLORS[w]
-        name = PLAYER_NAMES[w]
-        st.markdown(f'<div class="win-banner">🏆 {emoji} {name} Wins!</div>', unsafe_allow_html=True)
-else:
-    p = st.session_state.current_player
-    css_class = "turn-red" if p == RED else "turn-yellow"
-    st.markdown(
-        f'<div class="turn-box {css_class}">{PLAYER_COLORS[p]} {PLAYER_NAMES[p]}\'s Turn</div>',
-        unsafe_allow_html=True,
-    )
+<div id="turn" class="t-red">🔴 Red's Turn</div>
 
-# Column drop buttons
-if not st.session_state.game_over:
-    cols_ui = st.columns(COLS)
-    for c, col_ui in enumerate(cols_ui):
-        with col_ui:
-            board = st.session_state.board
-            col_full = board[0][c] != EMPTY
-            label = "▼" if not col_full else "✕"
-            if st.button(label, key=f"col_{c}", disabled=col_full):
-                handle_column_click(c)
-                st.rerun()
+<div id="game-area">
+  <div id="prev-row"></div>
+  <div id="board"></div>
+</div>
 
-# Board
-render_board()
+<button id="btn-new">↺  New Game</button>
+<div class="hint">Hover a column to preview · Click to drop</div>
 
-# Restart button
-st.markdown("")
-restart_col = st.columns([1, 2, 1])[1]
-with restart_col:
-    st.markdown('<div class="restart-btn">', unsafe_allow_html=True)
-    if st.button("↺  New Game", key="restart", use_container_width=True):
-        score_backup = st.session_state.score
-        init_state()
-        st.session_state.score = score_backup
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+<script>
+// ── Constants (pixel values must match CSS :root variables and PREV_H above) ──
+const ROWS=6, COLS=7, EMPTY=0, RED=1, YEL=2;
+const CS=66, GAP=7, BP=13;
+const PREV_H = 80; // height of #prev-row (CS + 14 from CSS)
 
-# Footer hint
-st.markdown(
-    '<p style="text-align:center;color:rgba(255,255,255,0.2);font-size:0.75rem;'
-    'font-family:Nunito,sans-serif;margin-top:12px;">Click ▼ above a column to drop your piece</p>',
-    unsafe_allow_html=True,
-)
+// ── State ──────────────────────────────────────────────────────────────────────
+let board, cur, over, busy;
+const scores = {[RED]: 0, [YEL]: 0};
+
+// ── Initialise / reset game ────────────────────────────────────────────────────
+function init() {
+  board = Array.from({length: ROWS}, () => Array(COLS).fill(EMPTY));
+  cur = RED;
+  over = false;
+  busy = false;
+  buildGrid();
+  setTurn();
+  setScoreHighlight();
+}
+
+// ── Build DOM ──────────────────────────────────────────────────────────────────
+function buildGrid() {
+  // Preview ghost pieces (one per column)
+  const pr = document.getElementById('prev-row');
+  pr.innerHTML = '';
+  for (let c = 0; c < COLS; c++) {
+    const d = document.createElement('div');
+    d.className = 'prev-cell';
+    d.id = 'pv' + c;
+    pr.appendChild(d);
+  }
+
+  // Board columns
+  const bd = document.getElementById('board');
+  bd.innerHTML = '';
+  for (let c = 0; c < COLS; c++) {
+    const col = document.createElement('div');
+    col.className = 'col';
+    col.dataset.c = c;
+    for (let r = 0; r < ROWS; r++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell empty';
+      cell.id = `cl${r}_${c}`;
+      col.appendChild(cell);
+    }
+    // Hover → show ghost piece above column
+    col.addEventListener('mouseenter', () => onEnter(c));
+    col.addEventListener('mouseleave', () => onLeave(c));
+    // Click → drop piece
+    col.addEventListener('click',      () => onDrop(c));
+    bd.appendChild(col);
+  }
+}
+
+// ── Hover events ──────────────────────────────────────────────────────────────
+function onEnter(c) {
+  if (over || busy || board[0][c] !== EMPTY) return;
+  for (let i = 0; i < COLS; i++) {
+    const pv = document.getElementById('pv' + i);
+    pv.className = 'prev-cell' + (i === c ? ' on ' + (cur === RED ? 'c-red' : 'c-yellow') : '');
+  }
+}
+
+function onLeave(c) {
+  document.getElementById('pv' + c).className = 'prev-cell';
+}
+
+function clearPrev() {
+  for (let i = 0; i < COLS; i++)
+    document.getElementById('pv' + i).className = 'prev-cell';
+}
+
+// ── Drop a piece ───────────────────────────────────────────────────────────────
+function lowestEmpty(c) {
+  for (let r = ROWS - 1; r >= 0; r--)
+    if (board[r][c] === EMPTY) return r;
+  return -1;
+}
+
+function onDrop(c) {
+  if (over || busy) return;
+  const row = lowestEmpty(c);
+  if (row < 0) return;
+
+  board[row][c] = cur;
+  busy = true;
+  clearPrev();
+
+  // ── Animate the falling piece ──
+  // translateY(--from) moves the cell from the ghost-piece position
+  // (centre of preview row) down to its natural DOM position (translateY 0).
+  //
+  // fromY = distance upward from cell centre to preview-row centre:
+  //   cell centre relative to board top = BP + row*(CS+GAP) + CS/2
+  //   preview-row centre above board top = PREV_H/2
+  //   total = BP + row*(CS+GAP) + CS/2 + PREV_H/2
+  const fromY = -(BP + row * (CS + GAP) + CS / 2 + PREV_H / 2);
+
+  // Duration scales with √distance so deeper drops feel heavier (gravity)
+  const maxFromY = BP + 5 * (CS + GAP) + CS / 2 + PREV_H / 2; // row 5
+  const dur = (0.22 + 0.30 * Math.sqrt(Math.abs(fromY) / maxFromY)).toFixed(3);
+
+  const cell = document.getElementById(`cl${row}_${c}`);
+  cell.className = `cell ${cur === RED ? 'red' : 'yellow'}`;
+  cell.style.setProperty('--from', `${fromY}px`);
+  cell.style.setProperty('--dur',  `${dur}s`);
+  cell.classList.add('dropping');
+
+  cell.addEventListener('animationend', () => {
+    cell.classList.remove('dropping');
+    busy = false;
+    afterDrop(row, c);
+  }, {once: true});
+}
+
+// ── Post-drop: check win/draw, switch player ───────────────────────────────────
+function afterDrop(row, c) {
+  const wc = findWinCells(row, c, cur);
+  if (wc) {
+    over = true;
+    scores[cur]++;
+    updateScores();
+    wc.forEach(([r, cc]) =>
+      document.getElementById(`cl${r}_${cc}`).classList.add('win-cell')
+    );
+    setTurn('win');
+    return;
+  }
+  if (board[0].every(v => v !== EMPTY)) {
+    over = true;
+    setTurn('draw');
+    return;
+  }
+  cur = cur === RED ? YEL : RED;
+  setTurn();
+  setScoreHighlight();
+  // Disable full columns
+  if (board[0][c] !== EMPTY)
+    document.querySelector(`.col[data-c="${c}"]`).classList.add('full');
+}
+
+// ── Win detection ──────────────────────────────────────────────────────────────
+function findWinCells(row, col, p) {
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  for (const [dr, dc] of dirs) {
+    const cells = [[row, col]];
+    for (const s of [1, -1]) {
+      let [r, c] = [row + s*dr, col + s*dc];
+      while (r >= 0 && r < ROWS && c >= 0 && c < COLS && board[r][c] === p) {
+        cells.push([r, c]);
+        r += s*dr; c += s*dc;
+      }
+    }
+    if (cells.length >= 4) return cells;
+  }
+  return null;
+}
+
+// ── UI updates ─────────────────────────────────────────────────────────────────
+function setTurn(state) {
+  const el = document.getElementById('turn');
+  if (state === 'win') {
+    el.className = 't-win';
+    el.textContent = `🏆 ${cur === RED ? '🔴 Red' : '🟡 Yellow'} Wins!`;
+  } else if (state === 'draw') {
+    el.className = 't-draw';
+    el.textContent = "🤝 It's a Draw!";
+  } else {
+    el.className = cur === RED ? 't-red' : 't-yellow';
+    el.textContent = cur === RED ? "🔴 Red's Turn" : "🟡 Yellow's Turn";
+  }
+}
+
+function updateScores() {
+  document.getElementById('n-red').textContent    = scores[RED];
+  document.getElementById('n-yellow').textContent = scores[YEL];
+}
+
+function setScoreHighlight() {
+  document.getElementById('sc-red').classList.toggle('active',    cur === RED);
+  document.getElementById('sc-yellow').classList.toggle('active', cur === YEL);
+}
+
+// ── New Game ───────────────────────────────────────────────────────────────────
+document.getElementById('btn-new').addEventListener('click', init);
+
+// ── Start ──────────────────────────────────────────────────────────────────────
+init();
+</script>
+</body>
+</html>
+"""
+
+components.html(GAME_HTML, height=900, scrolling=False)
