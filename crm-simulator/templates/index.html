@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Time-to-CRM Simulator</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>Time-to-CRM Simulator</h1>
+  <p class="subtitle">Monte Carlo sales-pipeline simulator — tune parameters, run the simulation, explore results.</p>
+</header>
+
+<main>
+  <!-- ── LEFT PANEL: inputs ──────────────────────────────────────────── -->
+  <aside id="inputs-panel">
+
+    <section class="input-section">
+      <h2>Volume</h2>
+
+      <div class="field">
+        <label for="num_leads">Leads to simulate <span class="val" id="num_leads_val">500</span></label>
+        <input type="range" id="num_leads" name="num_leads"
+               min="50" max="5000" step="50" value="500" />
+      </div>
+    </section>
+
+    <section class="input-section">
+      <h2>Conversion Rates</h2>
+
+      <div class="field">
+        <label for="lead_to_mql_rate">Lead → MQL <span class="val" id="lead_to_mql_rate_val">40%</span></label>
+        <input type="range" id="lead_to_mql_rate" name="lead_to_mql_rate"
+               min="1" max="100" step="1" value="40" />
+      </div>
+
+      <div class="field">
+        <label for="mql_to_sql_rate">MQL → SQL <span class="val" id="mql_to_sql_rate_val">35%</span></label>
+        <input type="range" id="mql_to_sql_rate" name="mql_to_sql_rate"
+               min="1" max="100" step="1" value="35" />
+      </div>
+
+      <div class="field">
+        <label for="sql_to_opp_rate">SQL → Opportunity <span class="val" id="sql_to_opp_rate_val">60%</span></label>
+        <input type="range" id="sql_to_opp_rate" name="sql_to_opp_rate"
+               min="1" max="100" step="1" value="60" />
+      </div>
+
+      <div class="field">
+        <label for="opp_win_rate">Opportunity → Won <span class="val" id="opp_win_rate_val">25%</span></label>
+        <input type="range" id="opp_win_rate" name="opp_win_rate"
+               min="1" max="100" step="1" value="25" />
+      </div>
+    </section>
+
+    <section class="input-section">
+      <h2>Stage Durations — Mean (days)</h2>
+
+      <div class="field">
+        <label for="days_lead_to_mql_mean">Lead → MQL mean <span class="val" id="days_lead_to_mql_mean_val">7 d</span></label>
+        <input type="range" id="days_lead_to_mql_mean" name="days_lead_to_mql_mean"
+               min="1" max="60" step="1" value="7" />
+      </div>
+
+      <div class="field">
+        <label for="days_mql_to_sql_mean">MQL → SQL mean <span class="val" id="days_mql_to_sql_mean_val">14 d</span></label>
+        <input type="range" id="days_mql_to_sql_mean" name="days_mql_to_sql_mean"
+               min="1" max="90" step="1" value="14" />
+      </div>
+
+      <div class="field">
+        <label for="days_sql_to_opp_mean">SQL → Opp mean <span class="val" id="days_sql_to_opp_mean_val">10 d</span></label>
+        <input type="range" id="days_sql_to_opp_mean" name="days_sql_to_opp_mean"
+               min="1" max="60" step="1" value="10" />
+      </div>
+
+      <div class="field">
+        <label for="days_opp_to_close_mean">Opp → Close mean <span class="val" id="days_opp_to_close_mean_val">45 d</span></label>
+        <input type="range" id="days_opp_to_close_mean" name="days_opp_to_close_mean"
+               min="1" max="365" step="1" value="45" />
+      </div>
+    </section>
+
+    <section class="input-section">
+      <h2>Stage Durations — Std Dev (days)</h2>
+
+      <div class="field">
+        <label for="days_lead_to_mql_std">Lead → MQL σ <span class="val" id="days_lead_to_mql_std_val">3 d</span></label>
+        <input type="range" id="days_lead_to_mql_std" name="days_lead_to_mql_std"
+               min="0" max="30" step="1" value="3" />
+      </div>
+
+      <div class="field">
+        <label for="days_mql_to_sql_std">MQL → SQL σ <span class="val" id="days_mql_to_sql_std_val">7 d</span></label>
+        <input type="range" id="days_mql_to_sql_std" name="days_mql_to_sql_std"
+               min="0" max="60" step="1" value="7" />
+      </div>
+
+      <div class="field">
+        <label for="days_sql_to_opp_std">SQL → Opp σ <span class="val" id="days_sql_to_opp_std_val">5 d</span></label>
+        <input type="range" id="days_sql_to_opp_std" name="days_sql_to_opp_std"
+               min="0" max="30" step="1" value="5" />
+      </div>
+
+      <div class="field">
+        <label for="days_opp_to_close_std">Opp → Close σ <span class="val" id="days_opp_to_close_std_val">20 d</span></label>
+        <input type="range" id="days_opp_to_close_std" name="days_opp_to_close_std"
+               min="0" max="120" step="1" value="20" />
+      </div>
+    </section>
+
+    <div class="run-row">
+      <button id="run-btn" onclick="runSimulation()">&#9654; Run Simulation</button>
+      <button class="secondary" onclick="resetDefaults()">Reset</button>
+    </div>
+
+  </aside>
+
+  <!-- ── RIGHT PANEL: results ────────────────────────────────────────── -->
+  <section id="results-panel">
+
+    <div id="placeholder">
+      <div class="placeholder-icon">&#128200;</div>
+      <p>Set your parameters and click <strong>Run Simulation</strong> to see results.</p>
+    </div>
+
+    <div id="results-content" style="display:none">
+
+      <!-- KPI strip -->
+      <div id="kpi-strip">
+        <div class="kpi" id="kpi-total-leads">
+          <span class="kpi-value">—</span>
+          <span class="kpi-label">Leads simulated</span>
+        </div>
+        <div class="kpi" id="kpi-won">
+          <span class="kpi-value">—</span>
+          <span class="kpi-label">Deals won</span>
+        </div>
+        <div class="kpi" id="kpi-overall-rate">
+          <span class="kpi-value">—</span>
+          <span class="kpi-label">Overall conversion</span>
+        </div>
+        <div class="kpi" id="kpi-median-crm">
+          <span class="kpi-value">—</span>
+          <span class="kpi-label">Median time-to-CRM</span>
+        </div>
+        <div class="kpi" id="kpi-median-close">
+          <span class="kpi-value">—</span>
+          <span class="kpi-label">Median time-to-close</span>
+        </div>
+      </div>
+
+      <!-- Funnel chart -->
+      <div class="chart-card">
+        <h3>Pipeline Funnel</h3>
+        <div class="chart-wrap chart-wrap-funnel">
+          <canvas id="chart-funnel"></canvas>
+        </div>
+      </div>
+
+      <!-- Time-to-CRM distribution -->
+      <div class="chart-card">
+        <h3>Time-to-CRM Distribution <span class="chart-note">(days until Opportunity stage)</span></h3>
+        <div class="chart-wrap">
+          <canvas id="chart-crm-hist"></canvas>
+        </div>
+        <div class="stats-table-wrap">
+          <table class="stats-table" id="stats-crm"></table>
+        </div>
+      </div>
+
+      <!-- Time-to-Close distribution -->
+      <div class="chart-card">
+        <h3>Time-to-Close Distribution <span class="chart-note">(days until Won)</span></h3>
+        <div class="chart-wrap">
+          <canvas id="chart-close-hist"></canvas>
+        </div>
+        <div class="stats-table-wrap">
+          <table class="stats-table" id="stats-close"></table>
+        </div>
+      </div>
+
+      <!-- CDF -->
+      <div class="chart-card">
+        <h3>Cumulative Distribution — Time-to-CRM</h3>
+        <div class="chart-wrap">
+          <canvas id="chart-cdf"></canvas>
+        </div>
+      </div>
+
+      <!-- Stage duration breakdown -->
+      <div class="chart-card">
+        <h3>Stage Duration Breakdown <span class="chart-note">(P5–P95 range, median line)</span></h3>
+        <div class="chart-wrap chart-wrap-stages">
+          <canvas id="chart-stages"></canvas>
+        </div>
+      </div>
+
+      <!-- Conversion rates table -->
+      <div class="chart-card">
+        <h3>Conversion Rates</h3>
+        <table class="conv-table" id="conv-table"></table>
+      </div>
+
+    </div><!-- /results-content -->
+  </section>
+</main>
+
+<footer>
+  Time-to-CRM Simulator &mdash; Flask + Chart.js &mdash; runs fully offline at localhost:5000
+</footer>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
