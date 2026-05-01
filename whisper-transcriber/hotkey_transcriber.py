@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push-to-toggle local Whisper transcription on Windows.
+"""Push-to-toggle local Dutch transcription with faster-whisper.
 
 Default hotkey: Windows+Shift
 - First press: start microphone recording
@@ -18,34 +18,25 @@ import keyboard
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import whisper
+from faster_whisper import WhisperModel
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Record with a global hotkey and type Whisper transcript at cursor."
+        description="Record with a global hotkey and type Dutch transcript at cursor."
     )
-    parser.add_argument("--model", default="base", help="Whisper model: tiny/base/small/medium/large")
+    parser.add_argument("--model", default="small", help="faster-whisper model size/path")
     parser.add_argument("--samplerate", type=int, default=16000, help="Recording sample rate")
     parser.add_argument("--channels", type=int, default=1, help="Audio channels (1 = mono)")
-    parser.add_argument("--language", default=None, help="Optional language code, e.g. nl or en")
     parser.add_argument("--hotkey", default="windows+shift", help="Global hotkey to toggle recording")
-    parser.add_argument(
-        "--task",
-        choices=["transcribe", "translate"],
-        default="transcribe",
-        help="Transcribe original language or translate to English",
-    )
     return parser.parse_args()
 
 
 class HotkeyTranscriber:
-    def __init__(self, model_name: str, samplerate: int, channels: int, language: str | None, task: str):
-        self.model = whisper.load_model(model_name)
+    def __init__(self, model_name: str, samplerate: int, channels: int):
+        self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
         self.samplerate = samplerate
         self.channels = channels
-        self.language = language
-        self.task = task
 
         self._is_recording = False
         self._frames: list[np.ndarray] = []
@@ -62,7 +53,6 @@ class HotkeyTranscriber:
     def toggle(self) -> None:
         with self._lock:
             should_start = not self._is_recording
-
         if should_start:
             self.start_recording()
         else:
@@ -70,7 +60,7 @@ class HotkeyTranscriber:
 
     def start_recording(self) -> None:
         with self._lock:
-            self._frames = []
+            self._frames.clear()
             self._is_recording = True
 
         self._stream = sd.InputStream(
@@ -97,26 +87,33 @@ class HotkeyTranscriber:
                 return
             audio = np.concatenate(self._frames, axis=0)
 
+        if audio.size == 0:
+            print("No audio captured.")
+            return
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
         sf.write(tmp_path, audio, self.samplerate)
-        print("🟡 Transcribing...")
 
         try:
-            result = self.model.transcribe(
+            print("Processing...")
+            segments, _ = self.model.transcribe(
                 str(tmp_path),
-                language=self.language,
-                task=self.task,
-                fp16=False,
+                language="nl",
+                vad_filter=True,
+                beam_size=1,
+                condition_on_previous_text=False,
+                without_timestamps=True,
             )
-            text = result["text"].strip()
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+
             if not text:
-                print("Transcript empty.")
+                print("Done (empty transcript).")
                 return
 
             keyboard.write(text)
-            print(f"✅ Typed {len(text)} characters at cursor.")
+            print("Done")
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -124,13 +121,11 @@ class HotkeyTranscriber:
 def main() -> None:
     args = parse_args()
 
-    print(f"Loading Whisper model '{args.model}'...")
+    print(f"Loading faster-whisper model '{args.model}' (CPU int8)...")
     transcriber = HotkeyTranscriber(
         model_name=args.model,
         samplerate=args.samplerate,
         channels=args.channels,
-        language=args.language,
-        task=args.task,
     )
 
     keyboard.add_hotkey(args.hotkey, transcriber.toggle)
