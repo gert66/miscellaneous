@@ -248,6 +248,32 @@ with st.sidebar:
 
     mhd_is_causal = survival_scenario in (SCEN_B, SCEN_C)
 
+    # baseline survival
+    st.subheader("Baseline overleving")
+    baseline_survival = st.slider(
+        "Baseline 2-jaars overleving", 0.20, 0.90, 0.494, step=0.01,
+        help=(
+            "Sets the average 2-year survival level in the synthetic dataset before "
+            "individual risk differences from GTV and MHD are applied. "
+            "The article reports approximately 49.4% 2-year survival, equivalent to "
+            "50.6% 24-month mortality. "
+            "Used as intercept in scenarios A and B; optionally applied to scenario C."
+        ),
+    )
+    if survival_scenario == SCEN_C:
+        calibrate_article = st.checkbox(
+            "Kalibreer artikel-model op geselecteerde baseline",
+            value=False,
+            help=(
+                "If enabled, adjust only the intercept of the article formula so that "
+                "the average simulated 24-month mortality approximately matches the "
+                "selected baseline mortality. "
+                "The GTV (0.0590) and MHD (0.2635) coefficients remain unchanged."
+            ),
+        )
+    else:
+        calibrate_article = False
+
     # model settings
     st.subheader("Modelinstellingen")
     use_sqrt = st.checkbox(
@@ -311,17 +337,25 @@ else:
 
 # ── survival generation (store true_mort_logit for proton counterfactual) ─────
 
+_baseline_mort = 1.0 - baseline_survival
+
 if survival_scenario == SCEN_C:
-    true_mort_logit = (-1.3409
-                       + 0.0590 * np.sqrt(tumor_volume)
-                       + 0.2635 * np.sqrt(mean_heart_dose))
-    p_mortality = 1.0 / (1.0 + np.exp(-true_mort_logit))
-    survival    = rng.binomial(1, 1.0 - p_mortality).astype(int)
+    article_slopes = 0.0590 * np.sqrt(tumor_volume) + 0.2635 * np.sqrt(mean_heart_dose)
+    if calibrate_article:
+        # Shift intercept so E[p_mortality] ≈ baseline_mortality
+        _article_int = np.log(_baseline_mort / (1.0 - _baseline_mort)) - article_slopes.mean()
+    else:
+        _article_int = -1.3409
+    true_mort_logit = _article_int + article_slopes
+    p_mortality     = 1.0 / (1.0 + np.exp(-true_mort_logit))
+    survival        = rng.binomial(1, 1.0 - p_mortality).astype(int)
 else:
-    tv_norm  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
-    mhd_norm = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
-    surv_logit      = b1 * tv_norm + b2_val * mhd_norm + surv_noise * rng.standard_normal(n_patients)
-    true_mort_logit = -surv_logit   # logit of mortality = -logit of survival
+    tv_norm    = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
+    mhd_norm   = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
+    # Intercept derived from baseline survival: logit(baseline_survival)
+    _surv_int       = np.log(baseline_survival / _baseline_mort)
+    surv_logit      = _surv_int + b1 * tv_norm + b2_val * mhd_norm + surv_noise * rng.standard_normal(n_patients)
+    true_mort_logit = -surv_logit
     survival        = rng.binomial(1, 1.0 / (1.0 + np.exp(-surv_logit))).astype(int)
 
 # ── dataframe ─────────────────────────────────────────────────────────────────
@@ -346,14 +380,32 @@ with st.expander("Validatietabel — beschrijvende statistieken", expanded=True)
                           "MHD (Gy)": describe_arr(mean_heart_dose)}),
             use_container_width=True,
         )
-    with vc2:
-        st.metric("Pearson r (GTV ↔ MHD)", f"{pearson_r:.3f}")
-        st.metric("p-waarde correlatie",    fmt_pval(pearson_p))
-        st.metric("24-maands mortaliteit",  f"{mortality_rate*100:.1f}%")
         if dist_mode == DIST_ARTICLE:
             st.caption(
                 "Referentie (artikel): GTV gem.≈110 cc, med.≈69 cc, SD≈130 cc; "
-                "MHD gem.≈12 Gy, med.≈11 Gy, SD≈8.2 Gy; mortaliteit ≈50.6 %."
+                "MHD gem.≈12 Gy, med.≈11 Gy, SD≈8.2 Gy."
+            )
+    with vc2:
+        st.metric("Pearson r (GTV ↔ MHD)", f"{pearson_r:.3f}")
+        st.metric("p-waarde correlatie",    fmt_pval(pearson_p))
+        st.markdown("**Baseline vs gesimuleerd**")
+        bv_df = pd.DataFrame({
+            "": ["Geselecteerd (baseline)", "Gesimuleerd"],
+            "2-jaars overleving":      [
+                f"{baseline_survival * 100:.1f} %",
+                f"{survival.mean() * 100:.1f} %",
+            ],
+            "24-maands mortaliteit":   [
+                f"{_baseline_mort * 100:.1f} %",
+                f"{mortality_rate * 100:.1f} %",
+            ],
+        })
+        st.dataframe(bv_df, use_container_width=True, hide_index=True)
+        if survival_scenario == SCEN_C and not calibrate_article:
+            st.caption(
+                "Scenario C gebruikt de vaste artikel-intercept (−1.3409). "
+                "Schakel 'Kalibreer artikel-model' in om de gesimuleerde mortaliteit "
+                "op de geselecteerde baseline af te stemmen."
             )
 
 # ── raw data ──────────────────────────────────────────────────────────────────
