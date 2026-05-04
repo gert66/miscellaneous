@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_curve, auc
@@ -199,6 +200,52 @@ y_pred_test = model.predict(X_test)
 fpr, tpr, _ = roc_curve(y_test, y_prob_test)
 roc_auc_val = auc(fpr, tpr)
 
+# ── three comparison models (raw split → Pipeline scales internally) ──────────
+
+# Raw (unscaled) split with the same random_state → identical train/test rows
+X_raw_train, X_raw_test, _, _ = train_test_split(
+    X, y, test_size=test_size, random_state=int(seed)
+)
+
+_lr = lambda: LogisticRegression(max_iter=1000)
+
+pipe_A = Pipeline([("sc", StandardScaler()), ("lr", _lr())])
+pipe_B = Pipeline([("sc", StandardScaler()), ("lr", _lr())])
+pipe_C = Pipeline([("sc", StandardScaler()), ("lr", _lr())])
+
+pipe_A.fit(X_raw_train[:, [0]], y_train)   # TV only
+pipe_B.fit(X_raw_train[:, [1]], y_train)   # MHD only
+pipe_C.fit(X_raw_train,         y_train)   # TV + MHD
+
+def _roc(pipe, Xte, col=None):
+    Xte_in = Xte[:, col] if col is not None else Xte
+    prob = pipe.predict_proba(Xte_in)[:, 1]
+    f, t, _ = roc_curve(y_test, prob)
+    return f, t, auc(f, t)
+
+fpr_A, tpr_A, auc_A = _roc(pipe_A, X_raw_test, col=[0])
+fpr_B, tpr_B, auc_B = _roc(pipe_B, X_raw_test, col=[1])
+fpr_C, tpr_C, auc_C = _roc(pipe_C, X_raw_test)
+
+_coef = lambda pipe: pipe.named_steps["lr"].coef_[0]
+
+roc_summary = pd.DataFrame(
+    {
+        "Model": ["A", "B", "C"],
+        "Predictoren": [
+            "tumor_volume",
+            "mean_heart_dose",
+            "tumor_volume + mean_heart_dose",
+        ],
+        "AUC (testset)": [f"{auc_A:.3f}", f"{auc_B:.3f}", f"{auc_C:.3f}"],
+        "Coëfficiënten (std.)": [
+            f"TV: {_coef(pipe_A)[0]:.3f}",
+            f"MHD: {_coef(pipe_B)[0]:.3f}",
+            f"TV: {_coef(pipe_C)[0]:.3f},  MHD: {_coef(pipe_C)[1]:.3f}",
+        ],
+    }
+)
+
 st.subheader("Logistische regressie — resultaten")
 
 res_col1, res_col2 = st.columns([3, 1])
@@ -235,8 +282,8 @@ elif causal_mhd:
 # ── visualisations ────────────────────────────────────────────────────────────
 
 st.subheader("Visualisaties")
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Histogrammen", "Scatter TV ↔ MHD", "Correlatiemat.", "ROC-curve", "Verwarringsmatrix"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Histogrammen", "Scatter TV ↔ MHD", "Correlatiemat.", "ROC-curve", "Verwarringsmatrix", "ROC vergelijking"]
 )
 
 COLORS = {0: "#e74c3c", 1: "#2ecc71"}
@@ -354,6 +401,58 @@ with tab5:
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+with tab6:
+    MODEL_PALETTE = {
+        "A": ("#2980b9", "solid"),
+        "B": ("#e67e22", "dashed"),
+        "C": ("#27ae60", "dashdot"),
+    }
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for (label, f, t, a_val) in [
+        ("A — tumor_volume only",               fpr_A, tpr_A, auc_A),
+        ("B — mean_heart_dose only",            fpr_B, tpr_B, auc_B),
+        ("C — tumor_volume + mean_heart_dose",  fpr_C, tpr_C, auc_C),
+    ]:
+        key = label[0]
+        color, ls = MODEL_PALETTE[key]
+        ax.plot(f, t, color=color, lw=2, linestyle=ls,
+                label=f"Model {label}  (AUC = {a_val:.3f})")
+    ax.plot([0, 1], [0, 1], color="gray", linestyle=":", lw=1, label="Toeval (AUC = 0.500)")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC-vergelijking — drie logistische regressiemodellen (testset)")
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.markdown("**Samenvatting per model**")
+    st.dataframe(roc_summary, use_container_width=True, hide_index=True)
+
+    # Context-aware interpretation
+    mhd_predictive = auc_B > 0.55
+    if not causal_mhd and mhd_predictive:
+        st.warning(
+            f"**Confounding zichtbaar:** Model B (_alleen MHD_, AUC = {auc_B:.3f}) "
+            f"presteert beter dan toeval, ook al heeft MHD **geen causale werking**. "
+            f"Dit werkt alleen doordat MHD correleert met TV (r = {pearson_r:.2f}). "
+            f"Model A (alleen TV) heeft AUC = {auc_A:.3f}; het verschil met C is klein "
+            f"omdat MHD geen extra informatie toevoegt na correctie voor TV."
+        )
+    elif not causal_mhd and not mhd_predictive:
+        st.info(
+            f"Model B (MHD alleen, AUC = {auc_B:.3f}) presteert nauwelijks beter dan toeval. "
+            f"Vergroot de correlatie (a) of de steekproef om confounding-predictie zichtbaar te maken."
+        )
+    elif causal_mhd:
+        st.success(
+            f"Causale modus actief. Model B (AUC = {auc_B:.3f}) profiteert nu van "
+            f"zowel het causale als het confounding-pad. "
+            f"Model C combineert beide predictoren (AUC = {auc_C:.3f})."
+        )
 
 # ── footer ────────────────────────────────────────────────────────────────────
 
