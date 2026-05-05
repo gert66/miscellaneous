@@ -47,6 +47,37 @@ _BLABELS = ["0–2 %", "2–5 %", "5–10 %", "10–20 %", "20–30 %", "30–40
 
 _NOISE_LEVELS = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0]
 
+# ── article calibration target ────────────────────────────────────────────────
+# Van Loon et al.: GTV med ≈ 69 cc, mean ≈ 110 cc; MHD mean ≈ 12 Gy, SD ≈ 8.2 Gy
+# Pearson r(GTV, MHD) ≈ 0.45 (reported in article)
+_ARTICLE_TARGET_R = 0.45
+
+
+@st.cache_data(show_spinner=False)
+def _calibrate_correlation(
+    target_pearson_r: float = _ARTICLE_TARGET_R,
+    n: int = 5000,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """
+    Grid-search the Gaussian copula rho that best reproduces
+    the article's observed Pearson r(GTV, MHD).
+    Returns (best_rho, achieved_r).  Result is cached after first run.
+    """
+    rng0 = np.random.default_rng(seed)
+    best_rho, best_err, best_r = 0.45, 1.0, 0.45
+    for rho in np.linspace(0.0, 0.95, 96):
+        Z  = rng0.multivariate_normal([0.0, 0.0], [[1.0, rho], [rho, 1.0]], size=n)
+        U1 = np.clip(sp_norm.cdf(Z[:, 0]), 1e-9, 1 - 1e-9)
+        U2 = np.clip(sp_norm.cdf(Z[:, 1]), 1e-9, 1 - 1e-9)
+        gtv = lognorm.ppf(U1, s=_GTV_SIGMA, scale=np.exp(_GTV_MU)).clip(0.0, 1800.0)
+        mhd = sp_gamma.ppf(U2, a=_MHD_K, scale=_MHD_THETA).clip(0.0, 45.0)
+        r, _ = stats.pearsonr(gtv, mhd)
+        err  = abs(r - target_pearson_r)
+        if err < best_err:
+            best_err, best_rho, best_r = err, float(rho), float(r)
+    return best_rho, best_r
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -175,6 +206,8 @@ with st.sidebar:
         help="Startnummer voor de pseudo-random generator.",
     )
 
+    use_calibrated = False   # will be overridden in DIST_ARTICLE branch
+
     if dist_mode == DIST_SIMPLE:
         st.subheader("Tumorvolume (GTV)")
         tv_mu    = st.slider("Gemiddelde GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
@@ -184,10 +217,31 @@ with st.sidebar:
         mhd_noise_sd = st.slider("Ruisniveau MHD (Gy)", 0.1, 10.0, 3.0, step=0.1)
     else:
         st.subheader("Correlatie (Gaussian copula)")
-        target_corr = st.slider(
-            "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
-            help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
+        use_calibrated = st.toggle(
+            "Gebruik gekalibreerde artikel-parameters",
+            value=False,
+            help=(
+                "Zoekt automatisch de copula-correlatie die de Pearson r uit Van Loon et al. "
+                f"het best reproduceert (doel r ≈ {_ARTICLE_TARGET_R}). "
+                "Kalibratie wordt eenmalig berekend en gecached — eerste run duurt ~1 s."
+            ),
         )
+        if use_calibrated:
+            with st.spinner("Kalibratie berekenen…"):
+                _cal_rho, _cal_r = _calibrate_correlation()
+            target_corr = _cal_rho
+            st.caption(
+                f"✅ **Beste parametersets toegepast** — "
+                f"copula ρ = **{_cal_rho:.3f}** → Pearson r ≈ {_cal_r:.3f} "
+                f"(doel {_ARTICLE_TARGET_R}, Van Loon et al.)\n\n"
+                f"GTV: log-normaal (med. ≈ 69 cc, gem. ≈ 110 cc, SD ≈ 130 cc)\n\n"
+                f"MHD: gamma (gem. ≈ 12 Gy, SD ≈ 8.2 Gy)"
+            )
+        else:
+            target_corr = st.slider(
+                "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
+                help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
+            )
 
     st.subheader("Mortaliteitsscenario")
     survival_scenario = st.selectbox(
@@ -238,7 +292,7 @@ with st.sidebar:
     if survival_scenario == SCEN_C:
         calibrate_article = st.checkbox(
             "Kalibreer artikel-model op geselecteerde baseline",
-            value=False,
+            value=use_calibrated,
             help="Past alleen het intercept aan zodat de gemiddelde gesimuleerde mortaliteit overeenkomt "
                  "met de geselecteerde baseline. De slopes (0.0590 en 0.2635) blijven ongewijzigd.",
         )
