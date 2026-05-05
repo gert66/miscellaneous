@@ -16,6 +16,7 @@ import seaborn as sns
 from matplotlib.patches import Patch
 from scipy import stats
 from scipy.stats import norm as sp_norm, lognorm, gamma as sp_gamma
+from scipy.optimize import brentq
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -218,7 +219,7 @@ with st.sidebar:
     else:
         st.subheader("Correlatie (Gaussian copula)")
         use_calibrated = st.toggle(
-            "Gebruik gekalibreerde artikel-parameters",
+            "Kalibreer GTV-MHD correlatie naar artikelwaarde",
             value=False,
             help=(
                 "Zoekt automatisch de copula-correlatie die de Pearson r uit Van Loon et al. "
@@ -372,7 +373,12 @@ _baseline_mort = 1.0 - baseline_survival
 if survival_scenario == SCEN_C:
     article_slopes = 0.0590 * np.sqrt(tumor_volume) + 0.2635 * np.sqrt(mean_heart_dose)
     if calibrate_article:
-        _art_int = np.log(_baseline_mort / (1.0 - _baseline_mort)) - article_slopes.mean()
+        def _mean_p(intercept):
+            return (1.0 / (1.0 + np.exp(-(intercept + article_slopes)))).mean() - _baseline_mort
+        try:
+            _art_int = brentq(_mean_p, -30.0, 30.0)
+        except ValueError:
+            _art_int = np.log(_baseline_mort / (1.0 - _baseline_mort)) - article_slopes.mean()
     else:
         _art_int = -1.3409
     true_mort_logit = _art_int + article_slopes
@@ -436,6 +442,13 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 
 # ── three pipeline models (predicting mortality) ──────────────────────────────
+
+if len(np.unique(y_train)) < 2:
+    st.warning(
+        "⚠️ De trainingsset bevat slechts één klasse — alle patiënten hebben dezelfde uitkomst. "
+        "Vergroot de steekproef, pas de baseline mortaliteit aan, of verlaag het ruisniveau."
+    )
+    st.stop()
 
 pipe_A, pipe_B, pipe_C = make_pipe(), make_pipe(), make_pipe()
 pipe_A.fit(X_train[:, [0]], y_train)
@@ -569,14 +582,14 @@ with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
             f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
         )
     else:
-        _gtv_t  = "√GTV" if use_sqrt else "GTV (gestand.)"
-        _mhd_t  = "√MHD" if use_sqrt else "MHD (gestand.)"
-        _b2_line    = f" + {b2_val:.2f} · {_mhd_t}" if survival_scenario == SCEN_B else ""
+        _b2_line    = f" + {b2_val:.2f} · z_MHD" if survival_scenario == SCEN_B else ""
         _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
         st.markdown(
             f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
             f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
-            f" + {b1:.2f} · {_gtv_t}{_b2_line}{_noise_line}\n```"
+            f" + {b1:.2f} · z_GTV{_b2_line}{_noise_line}\n```\n\n"
+            f"z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
+            f"*(gestandaardiseerde ruwe waarden; √-transformatie geldt alleen voor het model)*"
         )
     param_rows = [
         ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
