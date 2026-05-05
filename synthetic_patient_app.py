@@ -84,6 +84,96 @@ def _calibrate_correlation(
     return best_rho, best_r
 
 
+_FIT_TARGETS = {
+    "beta_gtv":  0.0590,
+    "beta_mhd":  0.2635,
+    "auc":       0.640,
+    "mortality": 0.506,
+}
+_FIT_WEIGHTS = {"beta_gtv": 1.0, "beta_mhd": 1.0, "auc": 2.0, "mortality": 2.0}
+
+
+@st.cache_data(show_spinner=False)
+def _fit_to_article(
+    n: int = 500,
+    test_size: float = 0.2,
+    seed: int = 42,
+) -> dict:
+    """Grid search over (copula rho, noise) to minimise loss vs article targets.
+    Generates data with SCEN_B causal structure + SCALE_SQRT_RAW, fits an
+    unstandardized logistic model on sqrt(GTV) and sqrt(MHD), and evaluates the
+    four target metrics. Returns the best parameter set and achieved metrics."""
+    from sklearn.linear_model import LogisticRegression as _LR
+    from sklearn.model_selection import train_test_split as _tts
+    from sklearn.metrics import roc_curve as _roc, auc as _auc
+    from scipy.stats import norm as _norm
+
+    rho_grid   = np.arange(0.0, 0.95, 0.05)
+    noise_grid = np.arange(0.0, 2.25, 0.25)
+
+    best_loss   = np.inf
+    best_params = {"rho": 0.45, "noise": 1.0}
+    best_metrics: dict = {}
+
+    for rho in rho_grid:
+        for noise in noise_grid:
+            rng0 = np.random.default_rng(seed)
+            Z  = rng0.multivariate_normal([0.0, 0.0], [[1.0, rho], [rho, 1.0]], size=n)
+            eps = 1e-6
+            U1 = np.clip(_norm.cdf(Z[:, 0]), eps, 1 - eps)
+            U2 = np.clip(_norm.cdf(Z[:, 1]), eps, 1 - eps)
+            gtv = lognorm.ppf(U1, s=_GTV_SIGMA, scale=np.exp(_GTV_MU)).clip(0.0, 1800.0)
+            mhd = sp_gamma.ppf(U2, a=_MHD_K, scale=_MHD_THETA).clip(0.0, 45.0)
+
+            # mortality via SCEN_B / SCALE_SQRT_RAW with b1=0.059, b2=0.2635
+            tv_gen  = np.sqrt(gtv)
+            mhd_gen = np.sqrt(mhd)
+            gen_sl  = _FIT_TARGETS["beta_gtv"] * tv_gen + _FIT_TARGETS["beta_mhd"] * mhd_gen
+            target_mort = _FIT_TARGETS["mortality"]
+            try:
+                def _mp(i): return (1/(1+np.exp(-(i+gen_sl)))).mean() - target_mort
+                intercept = brentq(_mp, -30.0, 30.0)
+            except ValueError:
+                intercept = np.log(target_mort/(1-target_mort)) - gen_sl.mean()
+            logit = intercept + gen_sl + noise * rng0.standard_normal(n)
+            mortality = rng0.binomial(1, 1.0/(1.0+np.exp(-logit))).astype(int)
+
+            if len(np.unique(mortality)) < 2:
+                continue
+
+            Xsq = np.column_stack([tv_gen, mhd_gen])
+            Xtr, Xte, ytr, yte = _tts(Xsq, mortality,
+                                       test_size=test_size, random_state=int(seed))
+            if len(np.unique(ytr)) < 2:
+                continue
+
+            lr = _LR(max_iter=1000, fit_intercept=True)
+            lr.fit(Xtr, ytr)
+            b_gtv, b_mhd = lr.coef_[0]
+            fp, tp, _ = _roc(yte, lr.predict_proba(Xte)[:, 1])
+            achieved_auc  = _auc(fp, tp)
+            achieved_mort = mortality.mean()
+
+            loss = (
+                _FIT_WEIGHTS["beta_gtv"]  * (b_gtv - _FIT_TARGETS["beta_gtv"])**2 +
+                _FIT_WEIGHTS["beta_mhd"]  * (b_mhd - _FIT_TARGETS["beta_mhd"])**2 +
+                _FIT_WEIGHTS["auc"]       * (achieved_auc  - _FIT_TARGETS["auc"])**2 +
+                _FIT_WEIGHTS["mortality"] * (achieved_mort - _FIT_TARGETS["mortality"])**2
+            )
+            if loss < best_loss:
+                best_loss   = loss
+                best_params = {"rho": float(rho), "noise": float(noise)}
+                best_metrics = {
+                    "beta_gtv":  float(b_gtv),
+                    "beta_mhd":  float(b_mhd),
+                    "auc":       float(achieved_auc),
+                    "mortality": float(achieved_mort),
+                    "loss":      float(best_loss),
+                }
+
+    return {**best_params, **best_metrics}
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def wald_pvalues(lr: LogisticRegression, X_scaled: np.ndarray) -> np.ndarray:
@@ -185,6 +275,10 @@ st.set_page_config(page_title="Mortaliteitsmodel — Confounding Demo", layout="
 with st.sidebar:
     st.header("Simulatie-instellingen")
 
+    # Read the fit-to-article toggle state before any widgets so "Overridden"
+    # captions can appear on sliders that are rendered earlier in the sidebar.
+    _fit_preview = st.session_state.get("fit_to_article_toggle", False)
+
     dist_mode = st.selectbox(
         "Distribution mode",
         [DIST_ARTICLE, DIST_SIMPLE],
@@ -241,6 +335,8 @@ with st.sidebar:
                 "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
                 help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
             )
+            if _fit_preview:
+                st.caption("⚙️ *Overschreven door optimalisatie*")
 
     st.subheader("Mortaliteitsscenario")
     survival_scenario = st.selectbox(
@@ -294,6 +390,8 @@ with st.sidebar:
             "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
             help="Willekeurige variatie op de logit-schaal niet verklaard door GTV of MHD.",
         )
+        if _fit_preview:
+            st.caption("⚙️ *Overschreven door optimalisatie*")
     else:
         gen_scale = SCALE_SQRT_RAW  # SCEN_C uses sqrt; gen_scale not used for generation
         b1, b2_val, surv_noise = 0.059, 0.2635, 0.0
@@ -336,6 +434,42 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("Fit to article")
+    _fit_eligible = (
+        dist_mode == DIST_ARTICLE
+        and survival_scenario in (SCEN_A, SCEN_B)
+        and gen_scale == SCALE_SQRT_RAW
+    )
+    if not _fit_eligible:
+        st.caption(
+            "Beschikbaar wanneer: artikel-verdeling + scenario A of B + schaal √GTV/MHD ongestand."
+        )
+        fit_to_article = False
+    else:
+        fit_to_article = st.toggle(
+            "Optimaliseer parameters naar artikel",
+            key="fit_to_article_toggle",
+            value=False,
+            help=(
+                "Zoekt via grid search de combinatie van copula-ρ en ruisniveau die de "
+                "Van Loon artikel-resultaten het best reproduceert: "
+                "β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortaliteit ≈ 50.6 %. "
+                "Resultaat wordt gecached — eerste run ~5 s."
+            ),
+        )
+        if fit_to_article:
+            with st.spinner("Grid search uitvoeren…"):
+                _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
+            st.caption(
+                f"✅ **Optimum gevonden** — "
+                f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
+                f"β_√GTV = {_fit_result['beta_gtv']:.4f} (doel 0.0590)  \n"
+                f"β_√MHD = {_fit_result['beta_mhd']:.4f} (doel 0.2635)  \n"
+                f"AUC = {_fit_result['auc']:.3f} (doel 0.640)  \n"
+                f"Mortaliteit = {_fit_result['mortality']*100:.1f} % (doel 50.6 %)"
+            )
+
+    st.divider()
     st.subheader("Protonentherapie")
     proton_reduction_mode = st.selectbox(
         "Proton MHD reduction mode",
@@ -371,6 +505,14 @@ with st.sidebar:
     else:
         proton_effect_strength = 0.0
 
+
+# ── fit-to-article overrides ──────────────────────────────────────────────────
+
+_fit_overridden = False
+if fit_to_article and _fit_eligible:
+    target_corr = _fit_result["rho"]
+    surv_noise  = _fit_result["noise"]
+    _fit_overridden = True
 
 # ── data generation ───────────────────────────────────────────────────────────
 
@@ -646,6 +788,28 @@ with tab_model:
                 f"terwijl het gefitte model {'√-getransformeerde' if use_sqrt else 'ruwe'} predictoren gebruikt. "
                 "De coëfficiënten b1/b2 kunnen niet direct worden vergeleken met de gefitte coëfficiënten."
             )
+
+    if _fit_overridden:
+        st.info(
+            f"**Fit-to-article actief** — parameters overschreven door grid search:  \n"
+            f"Copula ρ = **{_fit_result['rho']:.2f}** · "
+            f"Ruisniveau σ = **{_fit_result['noise']:.2f}**"
+        )
+        fa1, fa2, fa3, fa4 = st.columns(4)
+        fa1.metric("β_√GTV (gefitst)", f"{_fit_result['beta_gtv']:.4f}",
+                   delta=f"{_fit_result['beta_gtv']-0.059:+.4f} vs 0.059")
+        fa2.metric("β_√MHD (gefitst)", f"{_fit_result['beta_mhd']:.4f}",
+                   delta=f"{_fit_result['beta_mhd']-0.2635:+.4f} vs 0.264")
+        fa3.metric("AUC (gefitst)", f"{_fit_result['auc']:.3f}",
+                   delta=f"{_fit_result['auc']-0.64:+.3f} vs 0.640")
+        fa4.metric("Mortaliteit (gefitst)", f"{_fit_result['mortality']*100:.1f}%",
+                   delta=f"{(_fit_result['mortality']-0.506)*100:+.1f}pp vs 50.6%")
+        st.warning(
+            "**Gelijke coëfficiënten bewijzen geen causaliteit.**  \n"
+            "Verschillende onderliggende data-genererende mechanismen kunnen hetzelfde "
+            "gefitte model produceren. Dezelfde β-waarden als Van Loon et al. betekenen "
+            "niet dat de causale structuur overeenkomt."
+        )
 
     with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
         if survival_scenario == SCEN_C:
