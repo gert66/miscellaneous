@@ -36,6 +36,10 @@ SCEN_C = "C — Artikel-stijl mortaliteitsmodel"
 PROTON_MULT = "A — Multiplicatief"
 PROTON_ABS  = "B — Absoluut"
 
+SCALE_Z_RAW    = "Gestandaardiseerd ruw GTV/MHD"
+SCALE_SQRT_RAW = "√GTV/MHD, ongestandaardiseerd"
+SCALE_SQRT_Z   = "√GTV/MHD, gestandaardiseerd"
+
 _GTV_MU    = np.log(69.0)
 _GTV_SIGMA = np.sqrt(2 * (np.log(110.0) - np.log(69.0)))
 _MHD_K     = (12.0 / 8.2) ** 2
@@ -254,25 +258,50 @@ with st.sidebar:
             "**C:** Artikel-formule met √GTV en √MHD."
         ),
     )
-    if survival_scenario == SCEN_A:
-        b1 = st.slider(
-            "b1 — causaal effect GTV op mortaliteit (logit, gestand.)", 0.0, 5.0, 2.0, step=0.1,
-            help="Werkelijk causaal effect van GTV. Groter = groter GTV → hogere mortaliteit.",
+    if survival_scenario in (SCEN_A, SCEN_B):
+        _default_scale = SCALE_SQRT_RAW if dist_mode == DIST_ARTICLE else SCALE_Z_RAW
+        gen_scale = st.selectbox(
+            "Schaal ware mortaliteitsformule",
+            [SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z],
+            index=[SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z].index(_default_scale),
+            key=f"gen_scale_{dist_mode}_{survival_scenario}",
+            help=(
+                "**Gestand. ruw GTV/MHD:** b1/b2 zijn gestandaardiseerde logit-effecten van ruwe waarden. "
+                "**√GTV/MHD ongestand.:** b1/b2 op dezelfde schaal als het Van Loon artikel. "
+                "**√GTV/MHD gestand.:** b1/b2 zijn gestand. logit-effecten van √-getransf. waarden."
+            ),
         )
-        b2_val     = 0.0
+        if gen_scale == SCALE_SQRT_RAW:
+            _b1_label = "b1 — echt effect van √GTV op 24-maands mortaliteit"
+            _b2_label = "b2 — echt effect van √MHD op 24-maands mortaliteit"
+            _b1_def, _b1_max, _b1_step = 0.0590, 0.5,  0.005
+            _b2_def, _b2_max, _b2_step = 0.2635, 1.0,  0.005
+        elif gen_scale == SCALE_SQRT_Z:
+            _b1_label = "b1 — echt effect van gestand. √GTV op 24-maands mortaliteit"
+            _b2_label = "b2 — echt effect van gestand. √MHD op 24-maands mortaliteit"
+            _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
+            _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
+        else:  # SCALE_Z_RAW
+            _b1_label = "b1 — causaal effect GTV op mortaliteit (logit, gestand.)"
+            _b2_label = "b2 — causaal effect MHD op mortaliteit (logit, gestand.)"
+            _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
+            _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
+        b1 = st.slider(_b1_label, 0.0, _b1_max, _b1_def, step=_b1_step,
+                       key=f"b1_{gen_scale}",
+                       help="Werkelijk causaal effect van GTV op de logit-schaal.")
+        if survival_scenario == SCEN_B:
+            b2_val = st.slider(_b2_label, 0.0, _b2_max, _b2_def, step=_b2_step,
+                               key=f"b2_{gen_scale}")
+        else:
+            b2_val = 0.0
+        if gen_scale == SCALE_SQRT_RAW:
+            st.caption("Deze coëfficiënten zijn op dezelfde schaal als de Van Loon artikel-formule.")
         surv_noise = st.slider(
             "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
             help="Willekeurige variatie op de logit-schaal niet verklaard door GTV of MHD.",
         )
-    elif survival_scenario == SCEN_B:
-        b1 = st.slider(
-            "b1 — causaal effect GTV op mortaliteit (logit, gestand.)", 0.0, 5.0, 2.0, step=0.1,
-        )
-        b2_val = st.slider(
-            "b2 — causaal effect MHD op mortaliteit (logit, gestand.)", 0.0, 3.0, 1.0, step=0.1,
-        )
-        surv_noise = st.slider("Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1)
     else:
+        gen_scale = SCALE_SQRT_RAW  # SCEN_C uses sqrt; gen_scale not used for generation
         b1, b2_val, surv_noise = 0.059, 0.2635, 0.0
         st.info(
             "Mortaliteit via artikel-formule:\n\n"
@@ -384,13 +413,30 @@ if survival_scenario == SCEN_C:
     true_mort_logit = _art_int + article_slopes
     _display_int    = _art_int
 else:
-    tv_norm  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
-    mhd_norm = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
-    _mort_int       = np.log(_baseline_mort / (1.0 - _baseline_mort))
+    if gen_scale == SCALE_SQRT_RAW:
+        tv_gen  = np.sqrt(tumor_volume)
+        mhd_gen = np.sqrt(mean_heart_dose)
+        _gen_slopes = b1 * tv_gen + b2_val * mhd_gen
+        def _mean_p_ab(intercept):
+            return (1.0 / (1.0 + np.exp(-(intercept + _gen_slopes)))).mean() - _baseline_mort
+        try:
+            _mort_int = brentq(_mean_p_ab, -30.0, 30.0)
+        except ValueError:
+            _mort_int = np.log(_baseline_mort / (1.0 - _baseline_mort)) - _gen_slopes.mean()
+    elif gen_scale == SCALE_SQRT_Z:
+        _sq_gtv = np.sqrt(tumor_volume)
+        _sq_mhd = np.sqrt(mean_heart_dose)
+        tv_gen  = (_sq_gtv - _sq_gtv.mean()) / _sq_gtv.std()
+        mhd_gen = (_sq_mhd - _sq_mhd.mean()) / _sq_mhd.std()
+        _mort_int = np.log(_baseline_mort / (1.0 - _baseline_mort))
+    else:  # SCALE_Z_RAW
+        tv_gen  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
+        mhd_gen = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
+        _mort_int = np.log(_baseline_mort / (1.0 - _baseline_mort))
     _display_int    = _mort_int
     true_mort_logit = (_mort_int
-                       + b1 * tv_norm
-                       + b2_val * mhd_norm
+                       + b1 * tv_gen
+                       + b2_val * mhd_gen
                        + surv_noise * rng.standard_normal(n_patients))
 
 p_mortality = 1.0 / (1.0 + np.exp(-true_mort_logit))
@@ -519,8 +565,16 @@ else:
 
 def _noise_auc_row(nl: float) -> dict:
     rng_n = np.random.default_rng(int(seed))
-    tv_n  = (tumor_volume - tumor_volume.mean()) / tumor_volume.std()
-    mh_n  = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
+    if gen_scale == SCALE_SQRT_RAW:
+        tv_n  = np.sqrt(tumor_volume)
+        mh_n  = np.sqrt(mean_heart_dose)
+    elif gen_scale == SCALE_SQRT_Z:
+        _sg = np.sqrt(tumor_volume); _sm = np.sqrt(mean_heart_dose)
+        tv_n  = (_sg - _sg.mean()) / _sg.std()
+        mh_n  = (_sm - _sm.mean()) / _sm.std()
+    else:  # SCALE_Z_RAW
+        tv_n  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
+        mh_n  = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
     logit_n = _display_int + b1 * tv_n + b2_val * mh_n + nl * rng_n.standard_normal(n_patients)
     mort_n  = rng_n.binomial(1, 1.0 / (1.0 + np.exp(-logit_n))).astype(int)
     Xtr, Xte, ytr, yte = train_test_split(X_feat, mort_n,
@@ -572,6 +626,18 @@ else:
     st.success(f"MHD heeft een causaal effect op mortaliteit. "
                f"Coëfficiënt {fl[1]}: {coefs_C[1]:.3f},  p = {fmt_pval(pvals_C[1])}.")
 
+# ── scale mismatch warning ────────────────────────────────────────────────────
+
+if survival_scenario != SCEN_C:
+    _gen_uses_sqrt = gen_scale in (SCALE_SQRT_RAW, SCALE_SQRT_Z)
+    if _gen_uses_sqrt != use_sqrt:
+        st.warning(
+            "⚠️ **Schaalverschil:** De ware mortaliteitsformule gebruikt "
+            f"{'√-getransformeerde' if _gen_uses_sqrt else 'ruwe (niet-√)'} predictoren, "
+            f"terwijl het gefitte model {'√-getransformeerde' if use_sqrt else 'ruwe'} predictoren gebruikt. "
+            "De coëfficiënten b1/b2 kunnen niet direct worden vergeleken met de gefitte coëfficiënten."
+        )
+
 # ── main page: formula expanders ──────────────────────────────────────────────
 
 with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
@@ -582,14 +648,31 @@ with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
             f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
         )
     else:
-        _b2_line    = f" + {b2_val:.2f} · z_MHD" if survival_scenario == SCEN_B else ""
         _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+        if gen_scale == SCALE_SQRT_RAW:
+            _pred_gtv  = "√GTV"
+            _pred_mhd  = "√MHD"
+            _scale_note = "*(ongestandaardiseerde √-waarden — dezelfde schaal als Van Loon artikel)*"
+        elif gen_scale == SCALE_SQRT_Z:
+            _pred_gtv  = "z_√GTV"
+            _pred_mhd  = "z_√MHD"
+            _scale_note = (
+                "z\\_√GTV = (√GTV − gem.) / SD,   z\\_√MHD = (√MHD − gem.) / SD  "
+                "*(gestandaardiseerde √-waarden)*"
+            )
+        else:  # SCALE_Z_RAW
+            _pred_gtv  = "z_GTV"
+            _pred_mhd  = "z_MHD"
+            _scale_note = (
+                "z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
+                "*(gestandaardiseerde ruwe waarden)*"
+            )
+        _b2_line = f" + {b2_val:.4f} · {_pred_mhd}" if survival_scenario == SCEN_B else ""
         st.markdown(
             f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
             f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
-            f" + {b1:.2f} · z_GTV{_b2_line}{_noise_line}\n```\n\n"
-            f"z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
-            f"*(gestandaardiseerde ruwe waarden; √-transformatie geldt alleen voor het model)*"
+            f" + {b1:.4f} · {_pred_gtv}{_b2_line}{_noise_line}\n```\n\n"
+            f"{_scale_note}"
         )
     param_rows = [
         ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
@@ -631,25 +714,38 @@ with st.expander("Toon ware mortaliteitslogitfunctie", expanded=False):
         fig.tight_layout()
         centered(fig)
     else:
-        _b2_str    = f" + {b2_val:.2f} · z_MHD" if survival_scenario == SCEN_B else ""
         _noise_str = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+        if gen_scale == SCALE_SQRT_RAW:
+            _vp_gtv = "√GTV";    _vp_mhd = "√MHD"
+            _xlabel = "Predictor op √-schaal (ongestand.)"
+            _title  = "Logit-bijdragen op √-schaal (ongestandaardiseerd)"
+            x_range = np.linspace(0, 15, 300)
+        elif gen_scale == SCALE_SQRT_Z:
+            _vp_gtv = "z_√GTV";  _vp_mhd = "z_√MHD"
+            _xlabel = "Gestandaardiseerde √-predictor (z-score)"
+            _title  = "Logit-bijdragen op gestandaardiseerde √-schaal"
+            x_range = np.linspace(-3, 3, 300)
+        else:  # SCALE_Z_RAW
+            _vp_gtv = "z_GTV";   _vp_mhd = "z_MHD"
+            _xlabel = "Gestandaardiseerde predictor (z-score)"
+            _title  = "Logit-bijdragen op gestandaardiseerde schaal"
+            x_range = np.linspace(-3, 3, 300)
+        _b2_str = f" + {b2_val:.4f} · {_vp_mhd}" if survival_scenario == SCEN_B else ""
         st.markdown(
-            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'} — "
-            f"gestandaardiseerde logitfunctie:**\n\n"
-            f"```\nlogit(p) = {_display_int:.4f} + {b1:.2f} · z_GTV{_b2_str}{_noise_str}\n```\n\n"
-            f"z_GTV = (GTV − gem.) / SD,   z_MHD = (MHD − gem.) / SD"
+            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}:**\n\n"
+            f"```\nlogit(p) = {_display_int:.4f} + {b1:.4f} · {_vp_gtv}{_b2_str}{_noise_str}\n```"
         )
-        x_range = np.linspace(-3, 3, 300)
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.2f} · z_GTV")
+        ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.4f} · {_vp_gtv}")
         if survival_scenario == SCEN_B:
             ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2, linestyle="--",
-                    label=f"{b2_val:.2f} · z_MHD")
+                    label=f"{b2_val:.4f} · {_vp_mhd}")
         ax.axhline(0, color="gray", lw=0.8, linestyle=":")
-        ax.axvline(0, color="gray", lw=0.8, linestyle=":")
-        ax.set_xlabel("Gestandaardiseerde predictor (z-score)")
+        if gen_scale != SCALE_SQRT_RAW:
+            ax.axvline(0, color="gray", lw=0.8, linestyle=":")
+        ax.set_xlabel(_xlabel)
         ax.set_ylabel("Bijdrage aan logit(p_mortaliteit)")
-        ax.set_title("Logit-bijdragen op gestandaardiseerde schaal")
+        ax.set_title(_title)
         ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
         fig.tight_layout()
         centered(fig)
