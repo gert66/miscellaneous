@@ -179,12 +179,6 @@ def build_nnt_table(delta: np.ndarray, n_total: int) -> pd.DataFrame:
 # ── page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Mortaliteitsmodel — Confounding Demo", layout="wide")
-st.title("24-maands mortaliteit: confounding in klinische data")
-st.markdown(
-    "**Doel:** laat zien dat een variabele zonder causale werking "
-    "(_mean heart dose_) toch statistisch significant kan lijken doordat ze "
-    "correleert met de echte oorzaak (_tumorvolume_)."
-)
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
@@ -598,174 +592,184 @@ MC = {1: "#e74c3c", 0: "#2ecc71"}   # 1=gestorven=red, 0=niet gestorven=green
 ML = {1: "Gestorven", 0: "Niet gestorven"}
 MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "dashdot")}
 
-# ── main page: regression model ───────────────────────────────────────────────
-
-st.subheader("Logistische regressie — gecombineerd mortaliteitsmodel")
-r1, r2 = st.columns([3, 1])
-with r1:
-    st.dataframe(coef_df, use_container_width=True, hide_index=True)
-    st.caption(
-        f"Predictoren: {', '.join(fl)} (StandardScaler). "
-        "Uitkomst: 24-maands mortaliteit (1 = gestorven). "
-        "p-waarden via Wald-test.  *** p<0.001  ** p<0.01  * p<0.05  ns p≥0.05"
-    )
-with r2:
-    st.metric("ROC AUC (testset)", f"{auc_C:.3f}")
-    st.metric("Nauwkeurigheid",    f"{accuracy_C*100:.1f}%")
-
-if not mhd_is_causal and pvals_C[1] < 0.05:
-    st.warning(
-        f"**Confounding waarschuwing:** {fl[1]} is statistisch significant "
-        f"(p = {fmt_pval(pvals_C[1])}) terwijl het **geen causale invloed** heeft op mortaliteit. "
-        f"Dit komt doordat MHD correleert met GTV (r = {pearson_r:.2f})."
-    )
-elif not mhd_is_causal:
-    st.info(f"{fl[1]} is niet significant (p = {fmt_pval(pvals_C[1])}). "
-            f"Vergroot de correlatie of steekproef om confounding zichtbaar te maken.")
-else:
-    st.success(f"MHD heeft een causaal effect op mortaliteit. "
-               f"Coëfficiënt {fl[1]}: {coefs_C[1]:.3f},  p = {fmt_pval(pvals_C[1])}.")
-
-# ── scale mismatch warning ────────────────────────────────────────────────────
-
-if survival_scenario != SCEN_C:
-    _gen_uses_sqrt = gen_scale in (SCALE_SQRT_RAW, SCALE_SQRT_Z)
-    if _gen_uses_sqrt != use_sqrt:
-        st.warning(
-            "⚠️ **Schaalverschil:** De ware mortaliteitsformule gebruikt "
-            f"{'√-getransformeerde' if _gen_uses_sqrt else 'ruwe (niet-√)'} predictoren, "
-            f"terwijl het gefitte model {'√-getransformeerde' if use_sqrt else 'ruwe'} predictoren gebruikt. "
-            "De coëfficiënten b1/b2 kunnen niet direct worden vergeleken met de gefitte coëfficiënten."
-        )
-
-# ── main page: formula expanders ──────────────────────────────────────────────
-
-with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
-    if survival_scenario == SCEN_C:
-        st.markdown(
-            f"**Scenario C — Artikel-formule**\n\n"
-            f"```\nlogit(p_mortaliteit) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```\n\n"
-            f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
-        )
-    else:
-        _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
-        if gen_scale == SCALE_SQRT_RAW:
-            _pred_gtv  = "√GTV"
-            _pred_mhd  = "√MHD"
-            _scale_note = "*(ongestandaardiseerde √-waarden — dezelfde schaal als Van Loon artikel)*"
-        elif gen_scale == SCALE_SQRT_Z:
-            _pred_gtv  = "z_√GTV"
-            _pred_mhd  = "z_√MHD"
-            _scale_note = (
-                "z\\_√GTV = (√GTV − gem.) / SD,   z\\_√MHD = (√MHD − gem.) / SD  "
-                "*(gestandaardiseerde √-waarden)*"
-            )
-        else:  # SCALE_Z_RAW
-            _pred_gtv  = "z_GTV"
-            _pred_mhd  = "z_MHD"
-            _scale_note = (
-                "z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
-                "*(gestandaardiseerde ruwe waarden)*"
-            )
-        _b2_line = f" + {b2_val:.4f} · {_pred_mhd}" if survival_scenario == SCEN_B else ""
-        st.markdown(
-            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
-            f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
-            f" + {b1:.4f} · {_pred_gtv}{_b2_line}{_noise_line}\n```\n\n"
-            f"{_scale_note}"
-        )
-    param_rows = [
-        ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
-         f"= logit({_baseline_mort*100:.1f} %)"),
-        ("b1 — GTV-coëfficiënt", f"{b1:.4f}",
-         "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar"),
-    ]
-    if survival_scenario != SCEN_A:
-        param_rows.append(
-            ("b2 — MHD-coëfficiënt", f"{b2_val:.4f}",
-             "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar")
-        )
-    if survival_scenario in (SCEN_A, SCEN_B):
-        param_rows.append(("Mortaliteitsruisniveau σ", f"{surv_noise:.2f}", "N(0,σ) toegevoegd aan logit"))
-    param_rows += [
-        ("Geselecteerde baseline mortaliteit", f"{_baseline_mort*100:.1f} %", ""),
-        ("Gesimuleerde mortaliteit",           f"{obs_mort_rate*100:.1f} %", ""),
-    ]
-    st.dataframe(
-        pd.DataFrame(param_rows, columns=["Parameter", "Waarde", "Toelichting"]),
-        use_container_width=True, hide_index=True,
-    )
-
-with st.expander("Toon ware mortaliteitslogitfunctie", expanded=False):
-    if survival_scenario == SCEN_C:
-        st.markdown(
-            "**Scenario C — logit-bijdragen op √-schaal (niet gestandaardiseerd)**\n\n"
-            f"```\nlogit(p) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```"
-        )
-        x_range = np.linspace(0, 15, 300)
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x_range, 0.059  * x_range, color=MS["A"][0], lw=2, label="0.0590 · √GTV")
-        ax.plot(x_range, 0.2635 * x_range, color=MS["B"][0], lw=2, linestyle="--",
-                label="0.2635 · √MHD")
-        ax.axhline(0, color="gray", lw=0.8, linestyle=":")
-        ax.set_xlabel("Predictor op √-schaal"); ax.set_ylabel("Logit-bijdrage")
-        ax.set_title("Logit-bijdragen per predictor (Scenario C)")
-        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        centered(fig)
-    else:
-        _noise_str = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
-        if gen_scale == SCALE_SQRT_RAW:
-            _vp_gtv = "√GTV";    _vp_mhd = "√MHD"
-            _xlabel = "Predictor op √-schaal (ongestand.)"
-            _title  = "Logit-bijdragen op √-schaal (ongestandaardiseerd)"
-            x_range = np.linspace(0, 15, 300)
-        elif gen_scale == SCALE_SQRT_Z:
-            _vp_gtv = "z_√GTV";  _vp_mhd = "z_√MHD"
-            _xlabel = "Gestandaardiseerde √-predictor (z-score)"
-            _title  = "Logit-bijdragen op gestandaardiseerde √-schaal"
-            x_range = np.linspace(-3, 3, 300)
-        else:  # SCALE_Z_RAW
-            _vp_gtv = "z_GTV";   _vp_mhd = "z_MHD"
-            _xlabel = "Gestandaardiseerde predictor (z-score)"
-            _title  = "Logit-bijdragen op gestandaardiseerde schaal"
-            x_range = np.linspace(-3, 3, 300)
-        _b2_str = f" + {b2_val:.4f} · {_vp_mhd}" if survival_scenario == SCEN_B else ""
-        st.markdown(
-            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}:**\n\n"
-            f"```\nlogit(p) = {_display_int:.4f} + {b1:.4f} · {_vp_gtv}{_b2_str}{_noise_str}\n```"
-        )
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.4f} · {_vp_gtv}")
-        if survival_scenario == SCEN_B:
-            ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2, linestyle="--",
-                    label=f"{b2_val:.4f} · {_vp_mhd}")
-        ax.axhline(0, color="gray", lw=0.8, linestyle=":")
-        if gen_scale != SCALE_SQRT_RAW:
-            ax.axvline(0, color="gray", lw=0.8, linestyle=":")
-        ax.set_xlabel(_xlabel)
-        ax.set_ylabel("Bijdrage aan logit(p_mortaliteit)")
-        ax.set_title(_title)
-        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        centered(fig)
-    st.caption(
-        "De logit-bijdrage is het lineaire effect van de predictor op de logit-schaal, "
-        "niet de mortaliteitskans direct. "
-        "De kans volgt via p = 1 / (1 + exp(−logit)). "
-        "Een logit-toename van +1 rondom logit = 0 verhoogt de kans van 50 % naar ~73 %."
-    )
-
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
-st.subheader("Visualisaties")
-
-(tab_roc, tab_hist, tab_dose, tab_proton, tab_data, tab_raw,
- tab_scatter, tab_corr, tab_cm, tab_noise) = st.tabs([
-    "ROC vergelijking", "Histogrammen", "Dosis-effect", "Proton benefit",
-    "Data summary", "Ruwe data",
-    "Scatter GTV ↔ MHD", "Correlatiemat.", "Verwarringsmatrix", "Ruis-impact",
+(tab_model, tab_roc, tab_hist, tab_dose, tab_proton, tab_data,
+ tab_noise, tab_scatter, tab_corr, tab_cm, tab_raw) = st.tabs([
+    "Model results", "ROC vergelijking", "Histogrammen", "Dosis-effect",
+    "Proton benefit", "Data summary", "Ruis-impact",
+    "Scatter GTV ↔ MHD", "Correlatiemat.", "Verwarringsmatrix", "Ruwe data",
 ])
+
+# ── tab: Model results ────────────────────────────────────────────────────────
+
+with tab_model:
+    st.title("24-maands mortaliteit: confounding in klinische data")
+    st.markdown(
+        "**Doel:** laat zien dat een variabele zonder causale werking "
+        "(_mean heart dose_) toch statistisch significant kan lijken doordat ze "
+        "correleert met de echte oorzaak (_tumorvolume_)."
+    )
+
+    st.subheader("Logistische regressie — gecombineerd mortaliteitsmodel")
+    r1, r2 = st.columns([3, 1])
+    with r1:
+        st.dataframe(coef_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Predictoren: {', '.join(fl)} (StandardScaler). "
+            "Uitkomst: 24-maands mortaliteit (1 = gestorven). "
+            "p-waarden via Wald-test.  *** p<0.001  ** p<0.01  * p<0.05  ns p≥0.05"
+        )
+    with r2:
+        st.metric("ROC AUC (testset)", f"{auc_C:.3f}")
+        st.metric("Nauwkeurigheid",    f"{accuracy_C*100:.1f}%")
+
+    if not mhd_is_causal and pvals_C[1] < 0.05:
+        st.warning(
+            f"**Confounding waarschuwing:** {fl[1]} is statistisch significant "
+            f"(p = {fmt_pval(pvals_C[1])}) terwijl het **geen causale invloed** heeft op mortaliteit. "
+            f"Dit komt doordat MHD correleert met GTV (r = {pearson_r:.2f})."
+        )
+    elif not mhd_is_causal:
+        st.info(f"{fl[1]} is niet significant (p = {fmt_pval(pvals_C[1])}). "
+                f"Vergroot de correlatie of steekproef om confounding zichtbaar te maken.")
+    else:
+        st.success(f"MHD heeft een causaal effect op mortaliteit. "
+                   f"Coëfficiënt {fl[1]}: {coefs_C[1]:.3f},  p = {fmt_pval(pvals_C[1])}.")
+
+    if survival_scenario != SCEN_C:
+        _gen_uses_sqrt = gen_scale in (SCALE_SQRT_RAW, SCALE_SQRT_Z)
+        if _gen_uses_sqrt != use_sqrt:
+            st.warning(
+                "⚠️ **Schaalverschil:** De ware mortaliteitsformule gebruikt "
+                f"{'√-getransformeerde' if _gen_uses_sqrt else 'ruwe (niet-√)'} predictoren, "
+                f"terwijl het gefitte model {'√-getransformeerde' if use_sqrt else 'ruwe'} predictoren gebruikt. "
+                "De coëfficiënten b1/b2 kunnen niet direct worden vergeleken met de gefitte coëfficiënten."
+            )
+
+    with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
+        if survival_scenario == SCEN_C:
+            st.markdown(
+                f"**Scenario C — Artikel-formule**\n\n"
+                f"```\nlogit(p_mortaliteit) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```\n\n"
+                f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
+            )
+        else:
+            _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+            if gen_scale == SCALE_SQRT_RAW:
+                _pred_gtv  = "√GTV"
+                _pred_mhd  = "√MHD"
+                _scale_note = "*(ongestandaardiseerde √-waarden — dezelfde schaal als Van Loon artikel)*"
+            elif gen_scale == SCALE_SQRT_Z:
+                _pred_gtv  = "z_√GTV"
+                _pred_mhd  = "z_√MHD"
+                _scale_note = (
+                    "z\\_√GTV = (√GTV − gem.) / SD,   z\\_√MHD = (√MHD − gem.) / SD  "
+                    "*(gestandaardiseerde √-waarden)*"
+                )
+            else:  # SCALE_Z_RAW
+                _pred_gtv  = "z_GTV"
+                _pred_mhd  = "z_MHD"
+                _scale_note = (
+                    "z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
+                    "*(gestandaardiseerde ruwe waarden)*"
+                )
+            _b2_line = f" + {b2_val:.4f} · {_pred_mhd}" if survival_scenario == SCEN_B else ""
+            st.markdown(
+                f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
+                f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
+                f" + {b1:.4f} · {_pred_gtv}{_b2_line}{_noise_line}\n```\n\n"
+                f"{_scale_note}"
+            )
+        param_rows = [
+            ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
+             f"= logit({_baseline_mort*100:.1f} %)"),
+            ("b1 — GTV-coëfficiënt", f"{b1:.4f}",
+             "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar"),
+        ]
+        if survival_scenario != SCEN_A:
+            param_rows.append(
+                ("b2 — MHD-coëfficiënt", f"{b2_val:.4f}",
+                 "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar")
+            )
+        if survival_scenario in (SCEN_A, SCEN_B):
+            param_rows.append(("Mortaliteitsruisniveau σ", f"{surv_noise:.2f}", "N(0,σ) toegevoegd aan logit"))
+        param_rows += [
+            ("Geselecteerde baseline mortaliteit", f"{_baseline_mort*100:.1f} %", ""),
+            ("Gesimuleerde mortaliteit",           f"{obs_mort_rate*100:.1f} %", ""),
+        ]
+        st.dataframe(
+            pd.DataFrame(param_rows, columns=["Parameter", "Waarde", "Toelichting"]),
+            use_container_width=True, hide_index=True,
+        )
+
+    with st.expander("Toon ware mortaliteitslogitfunctie", expanded=False):
+        if survival_scenario == SCEN_C:
+            st.markdown(
+                "**Scenario C — logit-bijdragen op √-schaal (niet gestandaardiseerd)**\n\n"
+                f"```\nlogit(p) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```"
+            )
+            x_range = np.linspace(0, 15, 300)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x_range, 0.059  * x_range, color=MS["A"][0], lw=2, label="0.0590 · √GTV")
+            ax.plot(x_range, 0.2635 * x_range, color=MS["B"][0], lw=2, linestyle="--",
+                    label="0.2635 · √MHD")
+            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+            ax.set_xlabel("Predictor op √-schaal"); ax.set_ylabel("Logit-bijdrage")
+            ax.set_title("Logit-bijdragen per predictor (Scenario C)")
+            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            centered(fig)
+        else:
+            _noise_str = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+            if gen_scale == SCALE_SQRT_RAW:
+                _vp_gtv = "√GTV";    _vp_mhd = "√MHD"
+                _xlabel = "Predictor op √-schaal (ongestand.)"
+                _title  = "Logit-bijdragen op √-schaal (ongestandaardiseerd)"
+                x_range = np.linspace(0, 15, 300)
+            elif gen_scale == SCALE_SQRT_Z:
+                _vp_gtv = "z_√GTV";  _vp_mhd = "z_√MHD"
+                _xlabel = "Gestandaardiseerde √-predictor (z-score)"
+                _title  = "Logit-bijdragen op gestandaardiseerde √-schaal"
+                x_range = np.linspace(-3, 3, 300)
+            else:  # SCALE_Z_RAW
+                _vp_gtv = "z_GTV";   _vp_mhd = "z_MHD"
+                _xlabel = "Gestandaardiseerde predictor (z-score)"
+                _title  = "Logit-bijdragen op gestandaardiseerde schaal"
+                x_range = np.linspace(-3, 3, 300)
+            _b2_str = f" + {b2_val:.4f} · {_vp_mhd}" if survival_scenario == SCEN_B else ""
+            st.markdown(
+                f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}:**\n\n"
+                f"```\nlogit(p) = {_display_int:.4f} + {b1:.4f} · {_vp_gtv}{_b2_str}{_noise_str}\n```"
+            )
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.4f} · {_vp_gtv}")
+            if survival_scenario == SCEN_B:
+                ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2, linestyle="--",
+                        label=f"{b2_val:.4f} · {_vp_mhd}")
+            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+            if gen_scale != SCALE_SQRT_RAW:
+                ax.axvline(0, color="gray", lw=0.8, linestyle=":")
+            ax.set_xlabel(_xlabel)
+            ax.set_ylabel("Bijdrage aan logit(p_mortaliteit)")
+            ax.set_title(_title)
+            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            centered(fig)
+        st.caption(
+            "De logit-bijdrage is het lineaire effect van de predictor op de logit-schaal, "
+            "niet de mortaliteitskans direct. "
+            "De kans volgt via p = 1 / (1 + exp(−logit)). "
+            "Een logit-toename van +1 rondom logit = 0 verhoogt de kans van 50 % naar ~73 %."
+        )
+
+    st.divider()
+    st.caption(
+        f"Scenario {survival_scenario[:1]} · "
+        "Causaal diagram (A): **GTV → mortaliteit** en **GTV → MHD**. "
+        "In scenario A heeft MHD geen direct pad naar mortaliteit. "
+        "In scenario B en C heeft MHD ook een causaal effect."
+    )
 
 # ── tab: ROC vergelijking ─────────────────────────────────────────────────────
 
@@ -1190,12 +1194,3 @@ with tab_noise:
         ax.legend(fontsize=8); ax.set_ylim(0.4, 1.0)
         fig.tight_layout(); centered(fig)
 
-# ── footer ────────────────────────────────────────────────────────────────────
-
-st.divider()
-st.caption(
-    f"Scenario {survival_scenario[:1]} · "
-    "Causaal diagram (A): **GTV → mortaliteit** en **GTV → MHD**. "
-    "In scenario A heeft MHD geen direct pad naar mortaliteit. "
-    "In scenario B en C heeft MHD ook een causaal effect."
-)
