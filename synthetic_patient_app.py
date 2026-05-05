@@ -32,6 +32,9 @@ SCEN_A = "A — GTV causaal, MHD niet-causaal"
 SCEN_B = "B — GTV en MHD causaal"
 SCEN_C = "C — Artikel-stijl mortaliteitsmodel"
 
+PROTON_MULT = "A — Multiplicatief"
+PROTON_ABS  = "B — Absoluut"
+
 _GTV_MU    = np.log(69.0)
 _GTV_SIGMA = np.sqrt(2 * (np.log(110.0) - np.log(69.0)))
 _MHD_K     = (12.0 / 8.2) ** 2
@@ -165,8 +168,7 @@ with st.sidebar:
     st.subheader("Steekproef")
     n_patients = st.slider(
         "Steekproefgrootte", 100, 3000, 500, step=50,
-        help="Aantal synthetische patiënten. Grotere steekproeven maken schattingen "
-             "stabieler en maken zwakke confounding-effecten eerder statistisch significant.",
+        help="Aantal synthetische patiënten.",
     )
     seed = st.number_input(
         "Random seed", value=42, step=1,
@@ -175,26 +177,16 @@ with st.sidebar:
 
     if dist_mode == DIST_SIMPLE:
         st.subheader("Tumorvolume (GTV)")
-        tv_mu = st.slider("Gemiddelde GTV (cc)", 10.0, 200.0, 45.0, step=1.0,
-                          help="Gemiddelde van de normale verdeling voor tumorvolume.")
-        tv_sigma = st.slider("Spreiding GTV (cc)", 5.0, 60.0, 15.0, step=1.0,
-                             help="Standaarddeviatie van de GTV-verdeling.")
+        tv_mu    = st.slider("Gemiddelde GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
+        tv_sigma = st.slider("Spreiding GTV (cc)",   5.0,  60.0, 15.0, step=1.0)
         st.subheader("Mean Heart Dose = a·GTV + ruis")
-        corr_a = st.slider(
-            "Correlatiecoëfficiënt a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05,
-            help="Controls how strongly larger tumors also tend to receive higher mean heart dose. "
-                 "This creates confounding when MHD itself has no causal effect.",
-        )
-        mhd_noise_sd = st.slider(
-            "Ruisniveau MHD (Gy)", 0.1, 10.0, 3.0, step=0.1,
-            help="Willekeurige variatie in MHD niet verklaard door GTV. Hogere ruis verzwakt de GTV-MHD correlatie.",
-        )
+        corr_a       = st.slider("Correlatiecoëfficiënt a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05)
+        mhd_noise_sd = st.slider("Ruisniveau MHD (Gy)", 0.1, 10.0, 3.0, step=0.1)
     else:
         st.subheader("Correlatie (Gaussian copula)")
         target_corr = st.slider(
             "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
-            help="Controls how strongly larger tumors also tend to receive higher mean heart dose. "
-                 "This creates confounding when MHD itself has no causal effect.",
+            help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
         )
 
     st.subheader("Mortaliteitsscenario")
@@ -202,39 +194,29 @@ with st.sidebar:
         "Scenario",
         [SCEN_A, SCEN_B, SCEN_C],
         help=(
-            "**A:** Mortaliteit gegenereerd vanuit GTV alleen. MHD kan toch voorspellend zijn "
-            "omdat het correleert met GTV. "
-            "**B:** Mortaliteit gegenereerd vanuit zowel GTV als MHD. "
+            "**A:** Mortaliteit vanuit GTV alleen. MHD correleert met GTV maar heeft geen causaal effect. "
+            "**B:** GTV en MHD zijn beide causaal. "
             "**C:** Artikel-formule met √GTV en √MHD."
         ),
     )
     if survival_scenario == SCEN_A:
         b1 = st.slider(
             "b1 — causaal effect GTV op mortaliteit (logit, gestand.)", 0.0, 5.0, 2.0, step=0.1,
-            help="Werkelijk causaal effect van GTV op mortaliteitskans. Groter = groter GTV → hogere mortaliteit.",
+            help="Werkelijk causaal effect van GTV. Groter = groter GTV → hogere mortaliteit.",
         )
         b2_val     = 0.0
         surv_noise = st.slider(
             "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
-            help="Adds random patient-level variation to the mortality logit that is not explained "
-                 "by GTV or MHD. Higher values make mortality more random, weaken the visible "
-                 "dose-response relationship, and usually reduce model AUC.",
+            help="Willekeurige variatie op de logit-schaal niet verklaard door GTV of MHD.",
         )
     elif survival_scenario == SCEN_B:
         b1 = st.slider(
             "b1 — causaal effect GTV op mortaliteit (logit, gestand.)", 0.0, 5.0, 2.0, step=0.1,
-            help="Werkelijk causaal effect van GTV op mortaliteitskans.",
         )
         b2_val = st.slider(
             "b2 — causaal effect MHD op mortaliteit (logit, gestand.)", 0.0, 3.0, 1.0, step=0.1,
-            help="Werkelijk causaal effect van MHD op mortaliteitskans.",
         )
-        surv_noise = st.slider(
-            "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
-            help="Adds random patient-level variation to the mortality logit that is not explained "
-                 "by GTV or MHD. Higher values make mortality more random, weaken the visible "
-                 "dose-response relationship, and usually reduce model AUC.",
-        )
+        surv_noise = st.slider("Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1)
     else:
         b1, b2_val, surv_noise = 0.059, 0.2635, 0.0
         st.info(
@@ -249,18 +231,16 @@ with st.sidebar:
     baseline_survival = st.slider(
         "Baseline 2-jaars overleving", 0.20, 0.90, 0.494, step=0.01,
         help=(
-            "Sets the average 2-year survival level before individual risk differences from GTV "
-            "and MHD are applied. The article reports approximately 49.4% 2-year survival "
-            "(= 50.6% 24-month mortality). Used as intercept in scenarios A and B."
+            "Gemiddeld 2-jaars overlevingsniveau vóór individuele risicoverschillen. "
+            "Het artikel rapporteert ~49.4 % 2-jaars overleving (= 50.6 % mortaliteit)."
         ),
     )
     if survival_scenario == SCEN_C:
         calibrate_article = st.checkbox(
             "Kalibreer artikel-model op geselecteerde baseline",
             value=False,
-            help="Adjust only the intercept of the article formula so that the average simulated "
-                 "24-month mortality matches the selected baseline. "
-                 "GTV (0.0590) and MHD (0.2635) coefficients remain unchanged.",
+            help="Past alleen het intercept aan zodat de gemiddelde gesimuleerde mortaliteit overeenkomt "
+                 "met de geselecteerde baseline. De slopes (0.0590 en 0.2635) blijven ongewijzigd.",
         )
     else:
         calibrate_article = False
@@ -270,38 +250,49 @@ with st.sidebar:
         "Gebruik √-getransformeerde predictoren",
         value=(dist_mode == DIST_ARTICLE),
         key=f"use_sqrt_{dist_mode}",
-        help="Als ingeschakeld: modellen gefit op √GTV en √MHD. "
-             "Beïnvloedt alleen het model, niet de datagen.",
+        help="Modellen gefit op √GTV en √MHD. Beïnvloedt alleen het model, niet de datagen.",
     )
     test_size = st.slider(
         "Testset aandeel", 0.1, 0.5, 0.2, step=0.05,
-        help="Fraction of patients held out for testing the model. A larger test set gives a more "
-             "stable validation estimate but leaves fewer patients for model fitting.",
+        help="Aandeel patiënten gereserveerd voor modelvalidatie.",
     )
 
     st.divider()
     st.subheader("Protonentherapie")
-    mhd_reduction_factor = st.slider(
-        "MHD reductiefactor met protonentherapie", 0.0, 1.0, 0.6, step=0.05,
-        help="0.6 = protonentherapie brengt MHD terug tot 60 % van de fotonwaarde.",
+    proton_reduction_mode = st.selectbox(
+        "Proton MHD reduction mode",
+        [PROTON_MULT, PROTON_ABS],
+        help=(
+            "**A — Multiplicatief:** mhd_proton = mhd_photon × factor. "
+            "**B — Absoluut:** mhd_proton = mhd_photon − reductie (Gy), minimaal 0."
+        ),
     )
+    if proton_reduction_mode == PROTON_MULT:
+        mhd_reduction_factor = st.slider(
+            "MHD reduction factor", 0.0, 1.0, 0.6, step=0.05,
+            help="0.6 means proton therapy reduces MHD to 60% of the photon value.",
+        )
+        mhd_absolute_reduction = 0.0
+    else:
+        mhd_absolute_reduction = st.slider(
+            "Absolute MHD reduction (Gy)", 0.0, 30.0, 5.0, step=0.5,
+            help="Subtracts a fixed number of Gy from each patient's photon MHD.",
+        )
+        mhd_reduction_factor = 1.0
+
     apply_true_proton = st.toggle(
         "Echte mortaliteitswinst van MHD-reductie",
         value=False,
-        help="Uit: protonreductie beïnvloedt alleen het model, niet de werkelijke uitkomst. "
+        help="Uit: protonreductie beïnvloedt alleen het model. "
              "Aan: verlaagde MHD vermindert ook de werkelijke gesimuleerde mortaliteit.",
     )
     if apply_true_proton:
         proton_effect_strength = st.slider(
             "Sterkte echt MHD-reductieffect", 0.0, 1.0, 0.1, step=0.01,
-            help="Controls whether lowering MHD truly reduces mortality in the simulated data.",
         )
     else:
         proton_effect_strength = 0.0
 
-    st.divider()
-    show_raw = st.checkbox("Toon ruwe data", value=False,
-                           help="Toon de eerste 50 rijen van de gegenereerde dataset.")
 
 # ── data generation ───────────────────────────────────────────────────────────
 
@@ -335,9 +326,8 @@ if survival_scenario == SCEN_C:
 else:
     tv_norm  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
     mhd_norm = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
-    _mort_int       = np.log(_baseline_mort / (1.0 - _baseline_mort))   # logit(baseline_mort)
+    _mort_int       = np.log(_baseline_mort / (1.0 - _baseline_mort))
     _display_int    = _mort_int
-    # positive b1/b2 → higher GTV/MHD → higher mortality
     true_mort_logit = (_mort_int
                        + b1 * tv_norm
                        + b2_val * mhd_norm
@@ -345,7 +335,7 @@ else:
 
 p_mortality = 1.0 / (1.0 + np.exp(-true_mort_logit))
 mortality   = rng.binomial(1, p_mortality).astype(int)   # 1 = died, 0 = survived
-survival    = 1 - mortality                               # kept for coloring only
+survival    = 1 - mortality
 
 # ── dataframe ─────────────────────────────────────────────────────────────────
 
@@ -356,97 +346,19 @@ df = pd.DataFrame({
 })
 y = df["mortality"].values   # 1 = died; models predict P(mortality=1)
 
-# ── validation table ──────────────────────────────────────────────────────────
+# ── proton MHD reduction ──────────────────────────────────────────────────────
+
+if proton_reduction_mode == PROTON_MULT:
+    mhd_proton    = (mean_heart_dose * mhd_reduction_factor).clip(0.0)
+    _proton_label = f"factor × {mhd_reduction_factor:.2f}"
+else:
+    mhd_proton    = (mean_heart_dose - mhd_absolute_reduction).clip(0.0)
+    _proton_label = f"− {mhd_absolute_reduction:.1f} Gy"
+
+# ── statistics ────────────────────────────────────────────────────────────────
 
 pearson_r, pearson_p = stats.pearsonr(tumor_volume, mean_heart_dose)
 obs_mort_rate = mortality.mean()
-
-with st.expander("Validatietabel — beschrijvende statistieken", expanded=True):
-    vc1, vc2 = st.columns(2)
-    with vc1:
-        st.dataframe(
-            pd.DataFrame({"GTV (cc)": describe_arr(tumor_volume),
-                          "MHD (Gy)": describe_arr(mean_heart_dose)}),
-            use_container_width=True,
-        )
-        if dist_mode == DIST_ARTICLE:
-            st.caption("Referentie: GTV gem.≈110 cc, med.≈69 cc, SD≈130 cc; "
-                       "MHD gem.≈12 Gy, med.≈11 Gy, SD≈8.2 Gy.")
-    with vc2:
-        st.metric("Pearson r (GTV ↔ MHD)", f"{pearson_r:.3f}")
-        st.metric("p-waarde correlatie",    fmt_pval(pearson_p))
-        st.markdown("**Baseline vs gesimuleerd**")
-        st.dataframe(
-            pd.DataFrame({
-                "": ["Geselecteerd", "Gesimuleerd"],
-                "2-jaars overleving":      [f"{baseline_survival*100:.1f} %",
-                                            f"{(1-obs_mort_rate)*100:.1f} %"],
-                "24-maands mortaliteit":   [f"{_baseline_mort*100:.1f} %",
-                                            f"{obs_mort_rate*100:.1f} %"],
-            }),
-            use_container_width=True, hide_index=True,
-        )
-        if survival_scenario == SCEN_C and not calibrate_article:
-            st.caption("Scenario C gebruikt vaste artikel-intercept (−1.3409).")
-
-# ── raw data ──────────────────────────────────────────────────────────────────
-
-if show_raw:
-    st.subheader("Ruwe data (eerste 50 rijen)")
-    st.dataframe(df.head(50), use_container_width=True)
-
-# ── summary metrics ───────────────────────────────────────────────────────────
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Patiënten",                n_patients)
-c2.metric("24-maands mortaliteit",    f"{obs_mort_rate*100:.1f}%")
-c3.metric("Pearson r (GTV ↔ MHD)",   f"{pearson_r:.3f}")
-c4.metric("p-waarde correlatie",      fmt_pval(pearson_p))
-
-# ── true mortality-generating formula ─────────────────────────────────────────
-
-with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
-    if survival_scenario == SCEN_C:
-        _int_label = f"{_display_int:.4f}"
-        _coef_line = "0.0590 · √GTV + 0.2635 · √MHD"
-        st.markdown(
-            f"**Scenario C — Artikel-formule**\n\n"
-            f"```\nlogit(p_mortaliteit) = {_int_label} + {_coef_line}\n```\n\n"
-            f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
-        )
-    else:
-        _gtv_t = "√GTV" if use_sqrt else "GTV (gestand.)"
-        _mhd_t = "√MHD" if use_sqrt else "MHD (gestand.)"
-        _b2_line = f" + {b2_val:.2f} · {_mhd_t}" if survival_scenario == SCEN_B else ""
-        _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
-        st.markdown(
-            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
-            f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
-            f" + {b1:.2f} · {_gtv_t}{_b2_line}{_noise_line}\n```"
-        )
-    param_rows = [
-        ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
-         f"= logit({_baseline_mort*100:.1f} %)"),
-        ("b1 — GTV-coëfficiënt", f"{b1:.4f}",
-         "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar"),
-    ]
-    if survival_scenario != SCEN_A:
-        param_rows.append(
-            ("b2 — MHD-coëfficiënt", f"{b2_val:.4f}",
-             "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar")
-        )
-    if survival_scenario in (SCEN_A, SCEN_B):
-        param_rows += [
-            ("Mortaliteitsruisniveau σ", f"{surv_noise:.2f}", "N(0,σ) toegevoegd aan logit"),
-        ]
-    param_rows += [
-        ("Geselecteerde baseline mortaliteit", f"{_baseline_mort*100:.1f} %", ""),
-        ("Gesimuleerde mortaliteit",           f"{obs_mort_rate*100:.1f} %", ""),
-    ]
-    st.dataframe(
-        pd.DataFrame(param_rows, columns=["Parameter", "Waarde", "Toelichting"]),
-        use_container_width=True, hide_index=True,
-    )
 
 # ── feature preparation ───────────────────────────────────────────────────────
 
@@ -458,13 +370,18 @@ else:
     X_feat = X_raw.copy()
     fl = ["GTV", "MHD"]
 
+if use_sqrt:
+    X_feat_proton = np.column_stack([np.sqrt(tumor_volume), np.sqrt(mhd_proton)])
+else:
+    X_feat_proton = np.column_stack([tumor_volume, mhd_proton])
+
 # ── train / test split ────────────────────────────────────────────────────────
 
 X_train, X_test, y_train, y_test = train_test_split(
     X_feat, y, test_size=test_size, random_state=int(seed)
 )
 
-# ── three pipeline models (predicting mortality) ───────────────────────────────
+# ── three pipeline models (predicting mortality) ──────────────────────────────
 
 pipe_A, pipe_B, pipe_C = make_pipe(), make_pipe(), make_pipe()
 pipe_A.fit(X_train[:, [0]], y_train)
@@ -515,6 +432,53 @@ roc_summary = pd.DataFrame({
                              _coefstr(pipe_C, fl)],
 })
 
+# ── proton benefit model outputs ──────────────────────────────────────────────
+
+p_mort_photon = pipe_C.predict_proba(X_feat)[:, 1]
+p_mort_proton = pipe_C.predict_proba(X_feat_proton)[:, 1]
+delta_model   = p_mort_photon - p_mort_proton
+nnt_model     = np.where(delta_model > 0, 1.0 / delta_model, np.nan)
+
+if apply_true_proton and proton_effect_strength > 0:
+    mhd_diff             = mean_heart_dose - mhd_proton
+    true_mort_logit_prot = true_mort_logit - proton_effect_strength * mhd_diff
+    true_p_mort_photon   = 1.0 / (1.0 + np.exp(-true_mort_logit))
+    true_p_mort_proton   = 1.0 / (1.0 + np.exp(-true_mort_logit_prot))
+    true_delta           = true_p_mort_photon - true_p_mort_proton
+else:
+    true_delta = None
+
+# ── noise impact helper (scenarios A/B only) ─────────────────────────────────
+
+def _noise_auc_row(nl: float) -> dict:
+    rng_n = np.random.default_rng(int(seed))
+    tv_n  = (tumor_volume - tumor_volume.mean()) / tumor_volume.std()
+    mh_n  = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
+    logit_n = _display_int + b1 * tv_n + b2_val * mh_n + nl * rng_n.standard_normal(n_patients)
+    mort_n  = rng_n.binomial(1, 1.0 / (1.0 + np.exp(-logit_n))).astype(int)
+    Xtr, Xte, ytr, yte = train_test_split(X_feat, mort_n,
+                                           test_size=test_size, random_state=int(seed))
+    pa, pb, pc = make_pipe(), make_pipe(), make_pipe()
+    pa.fit(Xtr[:, [0]], ytr); pb.fit(Xtr[:, [1]], ytr); pc.fit(Xtr, ytr)
+    fa, ta, _ = roc_curve(yte, pa.predict_proba(Xte[:, [0]])[:, 1])
+    fb, tb, _ = roc_curve(yte, pb.predict_proba(Xte[:, [1]])[:, 1])
+    fc, tc, _ = roc_curve(yte, pc.predict_proba(Xte)[:, 1])
+    return {
+        "Ruisniveau σ":         nl,
+        "Obs. mortaliteit":     f"{mort_n.mean()*100:.1f} %",
+        f"AUC {fl[0]}":         f"{auc(fa, ta):.3f}",
+        f"AUC {fl[1]}":         f"{auc(fb, tb):.3f}",
+        f"AUC {fl[0]}+{fl[1]}": f"{auc(fc, tc):.3f}",
+    }
+
+# ── colour / style maps ───────────────────────────────────────────────────────
+
+MC = {1: "#e74c3c", 0: "#2ecc71"}   # 1=gestorven=red, 0=niet gestorven=green
+ML = {1: "Gestorven", 0: "Niet gestorven"}
+MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "dashdot")}
+
+# ── main page: regression model ───────────────────────────────────────────────
+
 st.subheader("Logistische regressie — gecombineerd mortaliteitsmodel")
 r1, r2 = st.columns([3, 1])
 with r1:
@@ -541,163 +505,108 @@ else:
     st.success(f"MHD heeft een causaal effect op mortaliteit. "
                f"Coëfficiënt {fl[1]}: {coefs_C[1]:.3f},  p = {fmt_pval(pvals_C[1])}.")
 
-# ── proton calculations ───────────────────────────────────────────────────────
+# ── main page: formula expanders ──────────────────────────────────────────────
 
-mhd_proton      = mean_heart_dose * mhd_reduction_factor
-if use_sqrt:
-    X_feat_proton = np.column_stack([np.sqrt(tumor_volume), np.sqrt(mhd_proton)])
-else:
-    X_feat_proton = np.column_stack([tumor_volume, mhd_proton])
+with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
+    if survival_scenario == SCEN_C:
+        st.markdown(
+            f"**Scenario C — Artikel-formule**\n\n"
+            f"```\nlogit(p_mortaliteit) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```\n\n"
+            f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
+        )
+    else:
+        _gtv_t  = "√GTV" if use_sqrt else "GTV (gestand.)"
+        _mhd_t  = "√MHD" if use_sqrt else "MHD (gestand.)"
+        _b2_line    = f" + {b2_val:.2f} · {_mhd_t}" if survival_scenario == SCEN_B else ""
+        _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+        st.markdown(
+            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
+            f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
+            f" + {b1:.2f} · {_gtv_t}{_b2_line}{_noise_line}\n```"
+        )
+    param_rows = [
+        ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
+         f"= logit({_baseline_mort*100:.1f} %)"),
+        ("b1 — GTV-coëfficiënt", f"{b1:.4f}",
+         "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar"),
+    ]
+    if survival_scenario != SCEN_A:
+        param_rows.append(
+            ("b2 — MHD-coëfficiënt", f"{b2_val:.4f}",
+             "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar")
+        )
+    if survival_scenario in (SCEN_A, SCEN_B):
+        param_rows.append(("Mortaliteitsruisniveau σ", f"{surv_noise:.2f}", "N(0,σ) toegevoegd aan logit"))
+    param_rows += [
+        ("Geselecteerde baseline mortaliteit", f"{_baseline_mort*100:.1f} %", ""),
+        ("Gesimuleerde mortaliteit",           f"{obs_mort_rate*100:.1f} %", ""),
+    ]
+    st.dataframe(
+        pd.DataFrame(param_rows, columns=["Parameter", "Waarde", "Toelichting"]),
+        use_container_width=True, hide_index=True,
+    )
 
-p_mort_photon = pipe_C.predict_proba(X_feat)[:, 1]          # predicted mortality, photon
-p_mort_proton = pipe_C.predict_proba(X_feat_proton)[:, 1]   # predicted mortality, proton
-delta_model   = p_mort_photon - p_mort_proton                # positive = proton reduces mortality
-nnt_model     = np.where(delta_model > 0, 1.0 / delta_model, np.nan)
-
-if apply_true_proton and proton_effect_strength > 0:
-    mhd_diff             = mean_heart_dose - mhd_proton
-    true_mort_logit_prot = true_mort_logit - proton_effect_strength * mhd_diff
-    true_p_mort_photon   = 1.0 / (1.0 + np.exp(-true_mort_logit))
-    true_p_mort_proton   = 1.0 / (1.0 + np.exp(-true_mort_logit_prot))
-    true_delta           = true_p_mort_photon - true_p_mort_proton
-else:
-    true_delta = None
-
-# ── noise impact (scenarios A/B only) ────────────────────────────────────────
-
-def _noise_auc_row(nl: float) -> dict:
-    """Recompute mortality + AUC for a given noise level using same GTV/MHD."""
-    rng_n = np.random.default_rng(int(seed))
-    tv_n  = (tumor_volume - tumor_volume.mean()) / tumor_volume.std()
-    mh_n  = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
-    logit_n = _display_int + b1 * tv_n + b2_val * mh_n + nl * rng_n.standard_normal(n_patients)
-    mort_n  = rng_n.binomial(1, 1.0 / (1.0 + np.exp(-logit_n))).astype(int)
-    Xtr, Xte, ytr, yte = train_test_split(X_feat, mort_n,
-                                           test_size=test_size, random_state=int(seed))
-    pa, pb, pc = make_pipe(), make_pipe(), make_pipe()
-    pa.fit(Xtr[:, [0]], ytr); pb.fit(Xtr[:, [1]], ytr); pc.fit(Xtr, ytr)
-    def _a(p, X, c=None):
-        Xi = X[:, c] if c is not None else X
-        _, _, a = _roc(p, Xi) if False else (None, None,
-                   auc(*roc_curve(yte, p.predict_proba(Xi[:, c] if c else Xi)[:, 1])[:2]))
-        return a
-    fa, ta, aa = roc_curve(yte, pa.predict_proba(Xte[:, [0]])[:, 1])
-    fb, tb, ab = roc_curve(yte, pb.predict_proba(Xte[:, [1]])[:, 1])
-    fc, tc, ac = roc_curve(yte, pc.predict_proba(Xte)[:, 1])
-    return {
-        "Ruisniveau σ":      nl,
-        "Obs. mortaliteit":  f"{mort_n.mean()*100:.1f} %",
-        f"AUC {fl[0]}":      f"{auc(fa, ta):.3f}",
-        f"AUC {fl[1]}":      f"{auc(fb, tb):.3f}",
-        f"AUC {fl[0]}+{fl[1]}": f"{auc(fc, tc):.3f}",
-    }
+with st.expander("Toon ware mortaliteitslogitfunctie", expanded=False):
+    if survival_scenario == SCEN_C:
+        st.markdown(
+            "**Scenario C — logit-bijdragen op √-schaal (niet gestandaardiseerd)**\n\n"
+            f"```\nlogit(p) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```"
+        )
+        x_range = np.linspace(0, 15, 300)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(x_range, 0.059  * x_range, color=MS["A"][0], lw=2, label="0.0590 · √GTV")
+        ax.plot(x_range, 0.2635 * x_range, color=MS["B"][0], lw=2, linestyle="--",
+                label="0.2635 · √MHD")
+        ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+        ax.set_xlabel("Predictor op √-schaal"); ax.set_ylabel("Logit-bijdrage")
+        ax.set_title("Logit-bijdragen per predictor (Scenario C)")
+        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        centered(fig)
+    else:
+        _b2_str    = f" + {b2_val:.2f} · z_MHD" if survival_scenario == SCEN_B else ""
+        _noise_str = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
+        st.markdown(
+            f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'} — "
+            f"gestandaardiseerde logitfunctie:**\n\n"
+            f"```\nlogit(p) = {_display_int:.4f} + {b1:.2f} · z_GTV{_b2_str}{_noise_str}\n```\n\n"
+            f"z_GTV = (GTV − gem.) / SD,   z_MHD = (MHD − gem.) / SD"
+        )
+        x_range = np.linspace(-3, 3, 300)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.2f} · z_GTV")
+        if survival_scenario == SCEN_B:
+            ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2, linestyle="--",
+                    label=f"{b2_val:.2f} · z_MHD")
+        ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+        ax.axvline(0, color="gray", lw=0.8, linestyle=":")
+        ax.set_xlabel("Gestandaardiseerde predictor (z-score)")
+        ax.set_ylabel("Bijdrage aan logit(p_mortaliteit)")
+        ax.set_title("Logit-bijdragen op gestandaardiseerde schaal")
+        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        centered(fig)
+    st.caption(
+        "De logit-bijdrage is het lineaire effect van de predictor op de logit-schaal, "
+        "niet de mortaliteitskans direct. "
+        "De kans volgt via p = 1 / (1 + exp(−logit)). "
+        "Een logit-toename van +1 rondom logit = 0 verhoogt de kans van 50 % naar ~73 %."
+    )
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
 st.subheader("Visualisaties")
 
-MC = {1: "#e74c3c", 0: "#2ecc71"}   # mortality colours: 1=gestorven=red, 0=niet gestorven=green
-ML = {1: "Gestorven", 0: "Niet gestorven"}
-MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "dashdot")}
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "Histogrammen", "Scatter GTV ↔ MHD", "Correlatiemat.",
-    "ROC-curve", "Verwarringsmatrix", "ROC vergelijking",
-    "Dosis-effect", "Ruis-impact", "Proton benefit",
+(tab_roc, tab_hist, tab_dose, tab_proton, tab_data, tab_raw,
+ tab_scatter, tab_corr, tab_cm, tab_noise) = st.tabs([
+    "ROC vergelijking", "Histogrammen", "Dosis-effect", "Proton benefit",
+    "Data summary", "Ruwe data",
+    "Scatter GTV ↔ MHD", "Correlatiemat.", "Verwarringsmatrix", "Ruis-impact",
 ])
 
-# ── tab 1: histograms ─────────────────────────────────────────────────────────
+# ── tab: ROC vergelijking ─────────────────────────────────────────────────────
 
-with tab1:
-    show_cumul = st.checkbox(
-        "Toon cumulatieve histogrammen", value=False,
-        help="Toon cumulatieve verdelingen gesplitst op mortaliteitsstatus.",
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    for ax, col, xlabel in zip(axes,
-        ["tumor_volume_cc", "mean_heart_dose_gy"], ["GTV (cc)", "Mean Heart Dose (Gy)"]):
-        for val in [0, 1]:
-            data = df.loc[df["mortality"] == val, col].values
-            if show_cumul:
-                ax.hist(data, bins=60, density=True, cumulative=True,
-                        alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
-                ax.set_ylabel("Cumulatief aandeel")
-                ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
-            else:
-                ax.hist(data, bins=30, alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
-                ax.set_ylabel("Aantal patiënten")
-        ax.set_xlabel(xlabel); ax.legend()
-    title = "Cumulatieve verdeling" if show_cumul else "Verdeling"
-    fig.suptitle(f"{title} per mortaliteitsstatus", fontsize=12)
-    fig.tight_layout()
-    centered(fig)
-
-# ── tab 2: scatter GTV ↔ MHD ─────────────────────────────────────────────────
-
-with tab2:
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(tumor_volume, mean_heart_dose,
-               c=[MC[m] for m in mortality], alpha=0.4, s=18, linewidths=0)
-    m_r, b_r, *_ = stats.linregress(tumor_volume, mean_heart_dose)
-    xl = np.array([tumor_volume.min(), tumor_volume.max()])
-    ax.plot(xl, m_r * xl + b_r, color="#2c3e50", lw=1.5,
-            label=f"y = {m_r:.2f}x + {b_r:.1f}  (r = {pearson_r:.2f}, p = {fmt_pval(pearson_p)})")
-    h = [Patch(color=MC[v], alpha=0.7, label=ML[v]) for v in [1, 0]]
-    l1 = ax.legend(handles=h, loc="upper left", fontsize=8)
-    ax.add_artist(l1)
-    ax.legend(loc="lower right", fontsize=8)
-    ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Mean Heart Dose (Gy)")
-    ax.set_title("Scatter: GTV vs MHD — kleur = mortaliteitsstatus")
-    fig.tight_layout()
-    centered(fig)
-    st.caption("De regressielijn toont GTV → MHD. Doordat mortaliteit afhangt van GTV, "
-               "lijkt MHD ook te scheiden — dit is de confounder.")
-
-# ── tab 3: correlation matrix ─────────────────────────────────────────────────
-
-with tab3:
-    corr_df = df[["tumor_volume_cc", "mean_heart_dose_gy", "mortality"]].corr()
-    fig, ax = plt.subplots(figsize=(5, 4))
-    sns.heatmap(corr_df, annot=True, fmt=".3f", cmap="RdYlGn",
-                center=0, vmin=-1, vmax=1, mask=np.eye(3, dtype=bool),
-                ax=ax, linewidths=0.5)
-    ax.set_title("Pearson correlatiemat.")
-    fig.tight_layout()
-    centered(fig)
-    st.caption("MHD correleert met zowel GTV als mortaliteit, "
-               "ook zonder causaal pad MHD → mortaliteit (scenario A).")
-
-# ── tab 4: ROC combined model ─────────────────────────────────────────────────
-
-with tab4:
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(fpr_C, tpr_C, color=MS["C"][0], lw=2,
-            label=f"{fl[0]} + {fl[1]}  (AUC = {auc_C:.3f})")
-    ax.plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1, label="Toeval")
-    ax.fill_between(fpr_C, tpr_C, alpha=0.08, color=MS["C"][0])
-    ax.set_xlabel("False Positive Rate (1 − specificiteit)")
-    ax.set_ylabel("True Positive Rate (sensitiviteit)")
-    ax.set_title("ROC-curve — gecombineerd mortaliteitsmodel (testset)")
-    ax.legend(loc="lower right"); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    fig.tight_layout()
-    centered(fig)
-
-# ── tab 5: confusion matrix ───────────────────────────────────────────────────
-
-with tab5:
-    cm = confusion_matrix(y_test, y_pred_C)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Reds",
-                xticklabels=["Niet gestorven", "Gestorven"],
-                yticklabels=["Niet gestorven", "Gestorven"], ax=ax)
-    ax.set_xlabel("Voorspeld"); ax.set_ylabel("Werkelijk")
-    ax.set_title("Verwarringsmatrix — mortaliteit (testset)")
-    fig.tight_layout()
-    centered(fig)
-
-# ── tab 6: ROC comparison + fitted mortality functions ────────────────────────
-
-with tab6:
+with tab_roc:
     st.markdown(
         "> **Predictie vs. causaliteit** — Het MHD-only model kan 24-maands mortaliteit "
         "voorspellen wanneer MHD correleert met tumorvolume, ook als MHD **geen** direct "
@@ -705,12 +614,11 @@ with tab6:
         "behandeldoelstelling te zijn."
     )
 
-    st.markdown("### ROC-vergelijking")
     fig, ax = plt.subplots(figsize=(8, 5))
     for key, name, f, t, a_val in [
-        ("A", f"{fl[0]} only",         fpr_A, tpr_A, auc_A),
-        ("B", f"{fl[1]} only",         fpr_B, tpr_B, auc_B),
-        ("C", f"{fl[0]} + {fl[1]}",   fpr_C, tpr_C, auc_C),
+        ("A", f"{fl[0]} only",       fpr_A, tpr_A, auc_A),
+        ("B", f"{fl[1]} only",       fpr_B, tpr_B, auc_B),
+        ("C", f"{fl[0]} + {fl[1]}", fpr_C, tpr_C, auc_C),
     ]:
         color, ls = MS[key]
         ax.plot(f, t, color=color, lw=2, linestyle=ls, label=f"{name},  AUC = {a_val:.3f}")
@@ -733,15 +641,13 @@ with tab6:
     elif not mhd_is_causal:
         st.info(f"Model B ({fl[1]} only, AUC = {auc_B:.3f}) presteert nauwelijks beter dan toeval.")
     else:
-        st.success(f"MHD heeft causaal effect op mortaliteit. "
-                   f"Model B AUC = {auc_B:.3f}, C AUC = {auc_C:.3f}.")
+        st.success(f"MHD heeft causaal effect. Model B AUC = {auc_B:.3f}, C AUC = {auc_C:.3f}.")
 
-    # ── fitted mortality functions ─────────────────────────────────────────────
     st.markdown("### Fitted mortaliteitsfuncties")
-    tv_grid   = np.linspace(tumor_volume.min(), tumor_volume.max(), 200)
-    mhd_grid  = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 200)
-    tv_in     = np.sqrt(tv_grid)  if use_sqrt else tv_grid
-    mhd_in    = np.sqrt(mhd_grid) if use_sqrt else mhd_grid
+    tv_grid  = np.linspace(tumor_volume.min(), tumor_volume.max(), 200)
+    mhd_grid = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 200)
+    tv_in    = np.sqrt(tv_grid)  if use_sqrt else tv_grid
+    mhd_in   = np.sqrt(mhd_grid) if use_sqrt else mhd_grid
     mhd_p10, mhd_p50, mhd_p90 = (np.percentile(mean_heart_dose, q) for q in [10, 50, 90])
 
     sv1, sv2, sv3 = st.columns(3)
@@ -782,13 +688,39 @@ with tab6:
         fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
 
     st.caption(
-        "Rode punten = gestorven (mortaliteit=1); groene punten = niet gestorven. "
-        "In scenario A weerspiegelen de drie MHD-curves in plot C confounding, niet een direct effect."
+        "Rode punten = gestorven; groene punten = niet gestorven. "
+        "In scenario A weerspiegelen de drie MHD-curves confounding, niet een direct effect."
     )
 
-# ── tab 7: dose-effect curves (mortality only) ────────────────────────────────
+# ── tab: Histogrammen ─────────────────────────────────────────────────────────
 
-with tab7:
+with tab_hist:
+    show_cumul = st.checkbox(
+        "Toon cumulatieve histogrammen", value=False,
+        help="Toon cumulatieve verdelingen gesplitst op mortaliteitsstatus.",
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    for ax, col, xlabel in zip(axes,
+        ["tumor_volume_cc", "mean_heart_dose_gy"], ["GTV (cc)", "Mean Heart Dose (Gy)"]):
+        for val in [0, 1]:
+            data = df.loc[df["mortality"] == val, col].values
+            if show_cumul:
+                ax.hist(data, bins=60, density=True, cumulative=True,
+                        alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
+                ax.set_ylabel("Cumulatief aandeel")
+                ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+            else:
+                ax.hist(data, bins=30, alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
+                ax.set_ylabel("Aantal patiënten")
+        ax.set_xlabel(xlabel); ax.legend()
+    title = "Cumulatieve verdeling" if show_cumul else "Verdeling"
+    fig.suptitle(f"{title} per mortaliteitsstatus", fontsize=12)
+    fig.tight_layout()
+    centered(fig)
+
+# ── tab: Dosis-effect ─────────────────────────────────────────────────────────
+
+with tab_dose:
     st.markdown("### Dosis-effect op 24-maands mortaliteit — gecombineerd model")
 
     gtv_med  = np.median(tumor_volume)
@@ -831,9 +763,9 @@ with tab7:
     st.markdown("#### Mortaliteit vs GTV voor drie MHD-niveaus (Plot C)")
     fig, ax = plt.subplots(figsize=(7, 5))
     for mhd_val, label, color in [
-        (mhd_p10_de,   f"MHD laag (p10) = {mhd_p10_de:.1f} Gy",   "#1a9641"),
-        (mhd_med,      f"MHD mediaan = {mhd_med:.1f} Gy",           "#fdae61"),
-        (mhd_p90_de,   f"MHD hoog (p90) = {mhd_p90_de:.1f} Gy",   "#d7191c"),
+        (mhd_p10_de, f"MHD laag (p10) = {mhd_p10_de:.1f} Gy", "#1a9641"),
+        (mhd_med,    f"MHD mediaan = {mhd_med:.1f} Gy",         "#fdae61"),
+        (mhd_p90_de, f"MHD hoog (p90) = {mhd_p90_de:.1f} Gy", "#d7191c"),
     ]:
         ax.plot(tv_g, pipe_C.predict_proba(_X(tv_g, np.full_like(tv_g, mhd_val)))[:, 1],
                 color=color, lw=2, label=label)
@@ -845,9 +777,9 @@ with tab7:
     st.markdown("#### Mortaliteit vs MHD voor drie GTV-niveaus (Plot D)")
     fig, ax = plt.subplots(figsize=(7, 5))
     for gtv_val, label, color in [
-        (gtv_p10,  f"GTV laag (p10) = {gtv_p10:.0f} cc",   "#1a9641"),
-        (gtv_med,  f"GTV mediaan = {gtv_med:.0f} cc",        "#fdae61"),
-        (gtv_p90,  f"GTV hoog (p90) = {gtv_p90:.0f} cc",   "#d7191c"),
+        (gtv_p10, f"GTV laag (p10) = {gtv_p10:.0f} cc", "#1a9641"),
+        (gtv_med, f"GTV mediaan = {gtv_med:.0f} cc",      "#fdae61"),
+        (gtv_p90, f"GTV hoog (p90) = {gtv_p90:.0f} cc", "#d7191c"),
     ]:
         ax.plot(mhd_g, pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_val), mhd_g))[:, 1],
                 color=color, lw=2, label=label)
@@ -863,60 +795,26 @@ with tab7:
             "ontstaat doordat hogere MHD samenhangt met grotere GTV."
         )
 
-# ── tab 8: noise impact ───────────────────────────────────────────────────────
+# ── tab: Proton benefit ───────────────────────────────────────────────────────
 
-with tab8:
-    st.markdown("### Ruis-impact op mortaliteitsmodel")
-    st.markdown(
-        "Hieronder worden voor verschillende mortaliteitsruisniveaus de AUC-waarden "
-        "van de drie modellen gesimuleerd op basis van dezelfde GTV- en MHD-waarden."
-    )
-    if survival_scenario == SCEN_C:
-        st.info(
-            "Scenario C gebruikt een vaste artikel-formule zonder ruisparameter. "
-            "De ruis-impact-analyse is alleen beschikbaar voor scenario A en B."
-        )
-    else:
-        noise_rows = [_noise_auc_row(nl) for nl in _NOISE_LEVELS]
-        noise_df   = pd.DataFrame(noise_rows)
-        st.dataframe(noise_df, use_container_width=True, hide_index=True)
-        st.caption(
-            f"Huidige instelling: σ = {surv_noise:.2f}. "
-            "De AUC daalt naarmate het ruisniveau toeneemt doordat de relatie "
-            "tussen GTV/MHD en mortaliteit minder zichtbaar wordt."
-        )
-
-        # AUC vs noise plot
-        col_a = f"AUC {fl[0]}"
-        col_b = f"AUC {fl[1]}"
-        col_c = f"AUC {fl[0]}+{fl[1]}"
-        fig, ax = plt.subplots(figsize=(7, 4))
-        for col, color, ls, lab in [
-            (col_a, MS["A"][0], MS["A"][1], f"{fl[0]} only"),
-            (col_b, MS["B"][0], MS["B"][1], f"{fl[1]} only"),
-            (col_c, MS["C"][0], MS["C"][1], f"{fl[0]} + {fl[1]}"),
-        ]:
-            ax.plot(_NOISE_LEVELS, [float(r[col]) for r in noise_rows],
-                    color=color, linestyle=ls, lw=2, marker="o", ms=5, label=lab)
-        ax.axvline(surv_noise, color="gray", linestyle=":", lw=1,
-                   label=f"Huidig σ = {surv_noise:.2f}")
-        ax.set_xlabel("Mortaliteitsruisniveau σ")
-        ax.set_ylabel("ROC AUC (testset)")
-        ax.set_title("AUC vs mortaliteitsruisniveau")
-        ax.legend(fontsize=8); ax.set_ylim(0.4, 1.0)
-        fig.tight_layout(); centered(fig)
-
-# ── tab 9: proton benefit ─────────────────────────────────────────────────────
-
-with tab9:
+with tab_proton:
     st.markdown(
         "Dit tabblad vergelijkt foton- en gesimuleerde protonenplannen door de MHD te verlagen. "
         "**De voorspelde absolute mortaliteitsreductie komt van het gefitte model.** "
         "Als MHD alleen correleert met GTV maar niet causaal is, kan het model "
-        "mortaliteitsreductie voorspellen terwijl de werkelijke gesimuleerde uitkomst "
-        "niet verbetert. Dit illustreert het verschil tussen model-gebaseerde "
-        "voorspellingen en causale behandeleffecten."
+        "mortaliteitsreductie voorspellen terwijl de werkelijke uitkomst niet verbetert."
     )
+
+    if proton_reduction_mode == PROTON_MULT:
+        st.info(
+            f"**Modus A — Multiplicatief:** mhd_proton = mhd_photon × {mhd_reduction_factor:.2f}  "
+            f"(MHD teruggebracht tot {mhd_reduction_factor*100:.0f} % van de fotonwaarde; min. 0 Gy)"
+        )
+    else:
+        st.info(
+            f"**Modus B — Absoluut:** mhd_proton = mhd_photon − {mhd_absolute_reduction:.1f} Gy  "
+            f"(vaste reductie van {mhd_absolute_reduction:.1f} Gy per patiënt; min. 0 Gy)"
+        )
 
     pm1, pm2, pm3, pm4 = st.columns(4)
     pm1.metric("Gem. mortaliteit (foton)",                f"{p_mort_photon.mean()*100:.1f}%")
@@ -968,7 +866,7 @@ with tab9:
     ax.bar_label(bars, padding=2, fontsize=7)
     ax.set_xlabel("Absolute mortaliteitsreductie Δ")
     ax.set_ylabel("Aantal patiënten")
-    ax.set_title(f"Patiënten per Δ-bin  (MHD reductiefactor = {mhd_reduction_factor})")
+    ax.set_title(f"Patiënten per Δ-bin  (MHD-reductie: {_proton_label})")
     ax.tick_params(axis="x", rotation=40, labelsize=7)
     fig.tight_layout(); centered(fig)
 
@@ -978,6 +876,156 @@ with tab9:
             "ook een grotere GTV — hun hogere 'voorspelde mortaliteitsreductie' is een "
             "artefact van confounding."
         )
+
+# ── tab: Data summary ─────────────────────────────────────────────────────────
+
+with tab_data:
+    st.markdown("### Gegevenssamenvatting")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Patiënten",              n_patients)
+    c2.metric("24-maands mortaliteit",  f"{obs_mort_rate*100:.1f}%")
+    c3.metric("Pearson r (GTV ↔ MHD)", f"{pearson_r:.3f}")
+    c4.metric("p-waarde correlatie",    fmt_pval(pearson_p))
+
+    st.markdown("#### Beschrijvende statistieken")
+    vc1, vc2 = st.columns(2)
+    with vc1:
+        st.dataframe(
+            pd.DataFrame({"GTV (cc)": describe_arr(tumor_volume),
+                          "MHD (Gy)": describe_arr(mean_heart_dose)}),
+            use_container_width=True,
+        )
+        if dist_mode == DIST_ARTICLE:
+            st.caption("Referentie: GTV gem.≈110 cc, med.≈69 cc, SD≈130 cc; "
+                       "MHD gem.≈12 Gy, med.≈11 Gy, SD≈8.2 Gy.")
+    with vc2:
+        st.markdown("**Baseline vs gesimuleerd**")
+        st.dataframe(
+            pd.DataFrame({
+                "": ["Geselecteerd", "Gesimuleerd"],
+                "2-jaars overleving":    [f"{baseline_survival*100:.1f} %",
+                                          f"{(1-obs_mort_rate)*100:.1f} %"],
+                "24-maands mortaliteit": [f"{_baseline_mort*100:.1f} %",
+                                          f"{obs_mort_rate*100:.1f} %"],
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        if survival_scenario == SCEN_C and not calibrate_article:
+            st.caption("Scenario C gebruikt vaste artikel-intercept (−1.3409).")
+
+    st.markdown("#### MHD-reductie samenvatting (protonentherapie)")
+    pd_proton = pd.DataFrame({
+        "": ["Fotontherapie", "Protonentherapie", "Reductie"],
+        "Gem. MHD (Gy)": [
+            f"{mean_heart_dose.mean():.2f}",
+            f"{mhd_proton.mean():.2f}",
+            f"{(mean_heart_dose - mhd_proton).mean():.2f}",
+        ],
+        "Mediaan MHD (Gy)": [
+            f"{np.median(mean_heart_dose):.2f}",
+            f"{np.median(mhd_proton):.2f}",
+            f"{np.median(mean_heart_dose - mhd_proton):.2f}",
+        ],
+    })
+    st.dataframe(pd_proton, use_container_width=True, hide_index=True)
+    st.caption(f"Proton MHD reductie modus: {proton_reduction_mode} ({_proton_label})")
+
+# ── tab: Ruwe data ────────────────────────────────────────────────────────────
+
+with tab_raw:
+    st.subheader("Ruwe data (eerste 50 rijen)")
+    st.dataframe(df.head(50), use_container_width=True)
+
+# ── tab: Scatter GTV ↔ MHD ───────────────────────────────────────────────────
+
+with tab_scatter:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(tumor_volume, mean_heart_dose,
+               c=[MC[m] for m in mortality], alpha=0.4, s=18, linewidths=0)
+    m_r, b_r, *_ = stats.linregress(tumor_volume, mean_heart_dose)
+    xl = np.array([tumor_volume.min(), tumor_volume.max()])
+    ax.plot(xl, m_r * xl + b_r, color="#2c3e50", lw=1.5,
+            label=f"y = {m_r:.2f}x + {b_r:.1f}  (r = {pearson_r:.2f}, p = {fmt_pval(pearson_p)})")
+    h = [Patch(color=MC[v], alpha=0.7, label=ML[v]) for v in [1, 0]]
+    l1 = ax.legend(handles=h, loc="upper left", fontsize=8)
+    ax.add_artist(l1)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Mean Heart Dose (Gy)")
+    ax.set_title("Scatter: GTV vs MHD — kleur = mortaliteitsstatus")
+    fig.tight_layout()
+    centered(fig)
+    st.caption("De regressielijn toont GTV → MHD. Doordat mortaliteit afhangt van GTV, "
+               "lijkt MHD ook te scheiden — dit is de confounder.")
+
+# ── tab: Correlatiemat. ───────────────────────────────────────────────────────
+
+with tab_corr:
+    corr_df = df[["tumor_volume_cc", "mean_heart_dose_gy", "mortality"]].corr()
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(corr_df, annot=True, fmt=".3f", cmap="RdYlGn",
+                center=0, vmin=-1, vmax=1, mask=np.eye(3, dtype=bool),
+                ax=ax, linewidths=0.5)
+    ax.set_title("Pearson correlatiemat.")
+    fig.tight_layout()
+    centered(fig)
+    st.caption("MHD correleert met zowel GTV als mortaliteit, "
+               "ook zonder causaal pad MHD → mortaliteit (scenario A).")
+
+# ── tab: Verwarringsmatrix ────────────────────────────────────────────────────
+
+with tab_cm:
+    cm = confusion_matrix(y_test, y_pred_C)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Reds",
+                xticklabels=["Niet gestorven", "Gestorven"],
+                yticklabels=["Niet gestorven", "Gestorven"], ax=ax)
+    ax.set_xlabel("Voorspeld"); ax.set_ylabel("Werkelijk")
+    ax.set_title("Verwarringsmatrix — mortaliteit (testset)")
+    fig.tight_layout()
+    centered(fig)
+
+# ── tab: Ruis-impact ──────────────────────────────────────────────────────────
+
+with tab_noise:
+    st.markdown("### Ruis-impact op mortaliteitsmodel")
+    st.markdown(
+        "Hieronder worden voor verschillende mortaliteitsruisniveaus de AUC-waarden "
+        "van de drie modellen gesimuleerd op basis van dezelfde GTV- en MHD-waarden."
+    )
+    if survival_scenario == SCEN_C:
+        st.info(
+            "Scenario C gebruikt een vaste artikel-formule zonder ruisparameter. "
+            "De ruis-impact-analyse is alleen beschikbaar voor scenario A en B."
+        )
+    else:
+        noise_rows = [_noise_auc_row(nl) for nl in _NOISE_LEVELS]
+        noise_df   = pd.DataFrame(noise_rows)
+        st.dataframe(noise_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Huidige instelling: σ = {surv_noise:.2f}. "
+            "De AUC daalt naarmate het ruisniveau toeneemt doordat de relatie "
+            "tussen GTV/MHD en mortaliteit minder zichtbaar wordt."
+        )
+
+        col_a = f"AUC {fl[0]}"
+        col_b = f"AUC {fl[1]}"
+        col_c = f"AUC {fl[0]}+{fl[1]}"
+        fig, ax = plt.subplots(figsize=(7, 4))
+        for col, color, ls, lab in [
+            (col_a, MS["A"][0], MS["A"][1], f"{fl[0]} only"),
+            (col_b, MS["B"][0], MS["B"][1], f"{fl[1]} only"),
+            (col_c, MS["C"][0], MS["C"][1], f"{fl[0]} + {fl[1]}"),
+        ]:
+            ax.plot(_NOISE_LEVELS, [float(r[col]) for r in noise_rows],
+                    color=color, linestyle=ls, lw=2, marker="o", ms=5, label=lab)
+        ax.axvline(surv_noise, color="gray", linestyle=":", lw=1,
+                   label=f"Huidig σ = {surv_noise:.2f}")
+        ax.set_xlabel("Mortaliteitsruisniveau σ")
+        ax.set_ylabel("ROC AUC (testset)")
+        ax.set_title("AUC vs mortaliteitsruisniveau")
+        ax.legend(fontsize=8); ax.set_ylim(0.4, 1.0)
+        fig.tight_layout(); centered(fig)
 
 # ── footer ────────────────────────────────────────────────────────────────────
 
