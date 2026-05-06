@@ -836,6 +836,30 @@ ML = {1: "Died", 0: "Survived"}
 MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "dashdot")}
 
 
+def _bootstrap_auc(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    n_boot: int = 1000,
+    seed: int = 0,
+    ci: float = 0.95,
+) -> tuple[float, float]:
+    """Return (lower, upper) bootstrap CI for AUC.
+    Resamples with replacement from the test set n_boot times."""
+    rng_b = np.random.default_rng(seed)
+    aucs  = []
+    for _ in range(n_boot):
+        idx = rng_b.integers(0, len(y_true), size=len(y_true))
+        yt, ys = y_true[idx], y_score[idx]
+        if len(np.unique(yt)) < 2:
+            continue
+        fp, tp, _ = roc_curve(yt, ys)
+        aucs.append(auc(fp, tp))
+    if not aucs:
+        return float("nan"), float("nan")
+    lo = (1 - ci) / 2
+    return float(np.percentile(aucs, lo * 100)), float(np.percentile(aucs, (1 - lo) * 100))
+
+
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
 (tab_core, tab_article, tab_proton, tab_dose,
@@ -968,6 +992,98 @@ with tab_core:
             pd.DataFrame(param_rows, columns=["Parameter", "Value", "Note"]),
             use_container_width=True, hide_index=True,
         )
+
+    st.divider()
+
+    # ── ROC curves ───────────────────────────────────────────────────────────
+    st.subheader("Predictive discrimination — ROC curves")
+
+    st.markdown(
+        "> **Important distinction:** a variable can improve mortality prediction (higher AUC) "
+        "without being a causal treatment target. "
+        "In Scenario A, MHD may lift AUC because it correlates with GTV or hidden disease "
+        "severity — even when MHD itself has no causal effect on mortality."
+    )
+
+    _show_ci = st.checkbox(
+        "Show bootstrap 95 % CI for AUC (1 000 resamples — adds ~1 s)",
+        value=False,
+        key="roc_show_ci",
+    )
+
+    # Probability scores for each model on the test set
+    _prob_A = pipe_A.predict_proba(X_test[:, [0]])[:, 1]
+    _prob_B = pipe_B.predict_proba(X_test[:, [1]])[:, 1]
+    _prob_C = pipe_C.predict_proba(X_test)[:, 1]
+
+    if _show_ci:
+        with st.spinner("Bootstrapping CIs…"):
+            _ci_A = _bootstrap_auc(y_test, _prob_A, seed=int(seed))
+            _ci_B = _bootstrap_auc(y_test, _prob_B, seed=int(seed))
+            _ci_C = _bootstrap_auc(y_test, _prob_C, seed=int(seed))
+        _leg_A = f"GTV only  — AUC = {auc_A:.3f}  (95 % CI {_ci_A[0]:.3f}–{_ci_A[1]:.3f})"
+        _leg_B = f"MHD only  — AUC = {auc_B:.3f}  (95 % CI {_ci_B[0]:.3f}–{_ci_B[1]:.3f})"
+        _leg_C = f"GTV + MHD — AUC = {auc_C:.3f}  (95 % CI {_ci_C[0]:.3f}–{_ci_C[1]:.3f})"
+    else:
+        _leg_A = f"GTV only  — AUC = {auc_A:.3f}"
+        _leg_B = f"MHD only  — AUC = {auc_B:.3f}"
+        _leg_C = f"GTV + MHD — AUC = {auc_C:.3f}"
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(fpr_A, tpr_A, color=MS["A"][0], lw=2.5, linestyle=MS["A"][1], label=_leg_A)
+    ax.plot(fpr_B, tpr_B, color=MS["B"][0], lw=2.5, linestyle=MS["B"][1], label=_leg_B)
+    ax.plot(fpr_C, tpr_C, color=MS["C"][0], lw=2.5, linestyle=MS["C"][1], label=_leg_C)
+    ax.plot([0, 1], [0, 1], color="#aaaaaa", lw=1.2, linestyle=":", label="Chance (AUC = 0.500)")
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate", fontsize=12)
+    ax.set_title("ROC curves — 24-month mortality (test set)", fontsize=13)
+    ax.legend(loc="lower right", fontsize=10, framealpha=0.9)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.tick_params(labelsize=10)
+    fig.tight_layout()
+    centered(fig)
+
+    # delta-AUC table
+    _dauc_rows = [
+        {"Model": "GTV only",  "AUC": f"{auc_A:.3f}", "ΔAUC vs GTV-only": "reference",
+         "Causal in simulation?": "Yes"},
+        {"Model": "MHD only",  "AUC": f"{auc_B:.3f}",
+         "ΔAUC vs GTV-only": f"{auc_B - auc_A:+.3f}",
+         "Causal in simulation?": "Yes" if mhd_is_causal else "No"},
+        {"Model": "GTV + MHD", "AUC": f"{auc_C:.3f}",
+         "ΔAUC vs GTV-only": f"{auc_C - auc_A:+.3f}",
+         "Causal in simulation?": "Yes"},
+    ]
+    st.dataframe(pd.DataFrame(_dauc_rows), use_container_width=True, hide_index=True)
+
+    if not mhd_is_causal:
+        if auc_B > auc_A:
+            st.warning(
+                f"**Scenario A:** MHD-only AUC ({auc_B:.3f}) exceeds GTV-only AUC ({auc_A:.3f}) "
+                f"despite MHD having no causal effect. "
+                f"GTV-MHD correlation (r = {pearson_r:.2f}) transfers GTV's prognostic signal to MHD."
+            )
+        else:
+            st.info(
+                f"**Scenario A:** MHD-only AUC ({auc_B:.3f}) is similar to or below GTV-only "
+                f"({auc_A:.3f}). Low GTV-MHD correlation (r = {pearson_r:.2f}) limits "
+                "MHD's spurious prognostic value."
+            )
+    elif survival_scenario == SCEN_B:
+        st.success(
+            f"**Scenario B:** MHD-only AUC = {auc_B:.3f}, reflecting a true causal pathway. "
+            f"Combined model AUC = {auc_C:.3f}."
+        )
+    else:
+        st.success(
+            f"**Scenario C:** article formula — combined AUC = {auc_C:.3f}."
+        )
+
+    st.caption(
+        "AUC measures how well a model ranks patients by mortality risk. "
+        "Higher AUC does not imply causal importance — a correlated non-causal variable "
+        "can rank patients almost as well as the true cause."
+    )
 
 
 # ── tab: Article match ────────────────────────────────────────────────────────
@@ -1418,36 +1534,10 @@ with tab_datachk:
 with tab_adv:
     st.markdown("### Advanced diagnostics")
 
-    # ── ROC comparison ────────────────────────────────────────────────────────
-    st.subheader("ROC comparison")
-    st.markdown(
-        "> A good predictor does not need to be a good treatment target. "
-        "MHD-only can predict mortality better than chance even when MHD is not causal, "
-        "because MHD correlates with GTV."
-    )
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for key, name, f, t, a_val in [
-        ("A", "GTV only",  fpr_A, tpr_A, auc_A),
-        ("B", "MHD only",  fpr_B, tpr_B, auc_B),
-        ("C", "GTV + MHD", fpr_C, tpr_C, auc_C),
-    ]:
-        color, ls = MS[key]
-        ax.plot(f, t, color=color, lw=2, linestyle=ls,
-                label=f"{name},  AUC = {a_val:.3f}")
-    ax.plot([0, 1], [0, 1], color="gray", linestyle=":", lw=1, label="Chance (AUC = 0.500)")
-    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC comparison — 24-month mortality (test set)")
-    ax.legend(loc="lower right", fontsize=9); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    fig.tight_layout(); centered(fig)
-
+    # ── ROC summary (full ROC is on Core results tab) ─────────────────────────
+    st.subheader("ROC summary")
+    st.caption("The full ROC figure with bootstrap CIs is on the **Core results** tab.")
     st.dataframe(roc_summary, use_container_width=True, hide_index=True)
-
-    if not mhd_is_causal and auc_B > 0.55:
-        st.warning(
-            f"MHD-only model (AUC = {auc_B:.3f}) predicts mortality better than chance "
-            f"despite MHD having no causal effect (r(GTV,MHD) = {pearson_r:.2f})."
-        )
 
     st.markdown("#### Fitted mortality functions")
     tv_grid  = np.linspace(tumor_volume.min(), tumor_volume.max(), 200)
