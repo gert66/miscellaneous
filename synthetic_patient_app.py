@@ -1,8 +1,13 @@
 """
 Synthetic patient dataset — confounding demo (mortality framing).
 
+Core question:
+  Can a model show an apparent MHD effect on 24-month mortality even when
+  MHD is not truly causal, because MHD is correlated with GTV or hidden
+  disease severity?
+
 Causal structure:
-  Scenario A:  GTV ──► mortality   GTV ──► MHD   (MHD is confounder only)
+  Scenario A:  GTV ──► mortality   GTV ──► MHD   (MHD not causal)
   Scenario B:  GTV ──► mortality   MHD ──► mortality   GTV ──► MHD
   Scenario C:  logit(p_mortality) = −1.3409 + 0.059·√GTV + 0.2635·√MHD
 """
@@ -52,23 +57,29 @@ _BLABELS = ["0–2 %", "2–5 %", "5–10 %", "10–20 %", "20–30 %", "30–40
 
 _NOISE_LEVELS = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0]
 
-# ── article calibration target ────────────────────────────────────────────────
-# Van Loon et al.: GTV med ≈ 69 cc, mean ≈ 110 cc; MHD mean ≈ 12 Gy, SD ≈ 8.2 Gy
-# Pearson r(GTV, MHD) ≈ 0.45 (reported in article)
-_ARTICLE_TARGET_R = 0.45
+_FIT_TARGETS = {
+    "beta_gtv":  0.0590,
+    "beta_mhd":  0.2635,
+    "auc":       0.640,
+    "mortality": 0.506,
+}
+_FIT_WEIGHTS = {"beta_gtv": 1.0, "beta_mhd": 1.0, "auc": 2.0, "mortality": 2.0}
 
+# Copula target r used internally for the "estimate rho" advanced tool.
+# Does NOT claim this is reported in the article.
+_COPULA_ESTIMATE_TARGET_R = 0.45
+
+
+# ── cached computation functions ──────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def _calibrate_correlation(
-    target_pearson_r: float = _ARTICLE_TARGET_R,
+    target_pearson_r: float = _COPULA_ESTIMATE_TARGET_R,
     n: int = 5000,
     seed: int = 0,
 ) -> tuple[float, float]:
-    """
-    Grid-search the Gaussian copula rho that best reproduces
-    the article's observed Pearson r(GTV, MHD).
-    Returns (best_rho, achieved_r).  Result is cached after first run.
-    """
+    """Grid-search the Gaussian copula rho that best reproduces a target
+    Pearson r(GTV, MHD).  Returns (best_rho, achieved_r).  Cached after first run."""
     rng0 = np.random.default_rng(seed)
     best_rho, best_err, best_r = 0.45, 1.0, 0.45
     for rho in np.linspace(0.0, 0.95, 96):
@@ -82,15 +93,6 @@ def _calibrate_correlation(
         if err < best_err:
             best_err, best_rho, best_r = err, float(rho), float(r)
     return best_rho, best_r
-
-
-_FIT_TARGETS = {
-    "beta_gtv":  0.0590,
-    "beta_mhd":  0.2635,
-    "auc":       0.640,
-    "mortality": 0.506,
-}
-_FIT_WEIGHTS = {"beta_gtv": 1.0, "beta_mhd": 1.0, "auc": 2.0, "mortality": 2.0}
 
 
 @st.cache_data(show_spinner=False)
@@ -127,7 +129,6 @@ def _fit_to_article(
             gtv = lognorm.ppf(U1, s=_GTV_SIGMA, scale=np.exp(_GTV_MU)).clip(0.0, 1800.0)
             mhd = sp_gamma.ppf(U2, a=_MHD_K, scale=_MHD_THETA).clip(0.0, 45.0)
 
-            # mortality via SCALE_SQRT_RAW; true_b2=0 for Scenario A, 0.2635 for B/C
             tv_gen  = np.sqrt(gtv)
             mhd_gen = np.sqrt(mhd)
             gen_sl  = _FIT_TARGETS["beta_gtv"] * tv_gen + true_b2 * mhd_gen
@@ -226,11 +227,11 @@ def centered(fig, use_container_width: bool = False) -> None:
 
 def describe_arr(arr: np.ndarray) -> dict:
     return {
-        "Gemiddelde": f"{arr.mean():.2f}",
-        "SD":         f"{arr.std(ddof=1):.2f}",
-        "Mediaan":    f"{np.median(arr):.2f}",
-        "Min":        f"{arr.min():.2f}",
-        "Max":        f"{arr.max():.2f}",
+        "Mean":   f"{arr.mean():.2f}",
+        "SD":     f"{arr.std(ddof=1):.2f}",
+        "Median": f"{np.median(arr):.2f}",
+        "Min":    f"{arr.min():.2f}",
+        "Max":    f"{arr.max():.2f}",
     }
 
 
@@ -242,6 +243,7 @@ def fmt_f(v, decimals=1):
 
 
 def build_nnt_table(delta: np.ndarray, n_total: int) -> pd.DataFrame:
+    """Original single-delta NNT table (kept for backward compatibility)."""
     rows = []
     for label, lo, hi in zip(_BLABELS, _BINS[:-1], _BINS[1:]):
         mask = (delta >= lo) & (delta < hi)
@@ -268,250 +270,302 @@ def build_nnt_table(delta: np.ndarray, n_total: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_nnt_comparison_table(
+    delta_pred: np.ndarray,
+    delta_true: np.ndarray | None,
+    n_total: int,
+) -> pd.DataFrame:
+    """NNT comparison table binned on predicted delta.
+
+    Shows predicted NNT, true causal NNT, and NNT inflation factor
+    (true_NNT / predicted_NNT) for each bin.
+    delta_true=None means no true benefit is available (Scenario A, no override).
+    """
+    rows = []
+    for label, lo, hi in zip(_BLABELS, _BINS[:-1], _BINS[1:]):
+        mask = (delta_pred >= lo) & (delta_pred < hi)
+        n = int(mask.sum())
+        dp = delta_pred[mask]
+        dt = delta_true[mask] if delta_true is not None else None
+
+        if n == 0:
+            rows.append({
+                "Predicted Δ bin": label, "N": 0,
+                "Mean predicted Δ": "—", "Mean true Δ": "—",
+                "Predicted NNT": "—", "True causal NNT": "—",
+                "NNT inflation": "—",
+            })
+            continue
+
+        mean_dp  = dp.mean()
+        pred_nnt = (1.0 / mean_dp) if mean_dp > 0 else float("nan")
+
+        if dt is not None:
+            mean_dt   = dt.mean()
+            true_nnt  = (1.0 / mean_dt) if mean_dt > 0 else float("nan")
+            inflation = (true_nnt / pred_nnt
+                         if (not np.isnan(true_nnt) and not np.isnan(pred_nnt) and pred_nnt > 0)
+                         else float("nan"))
+            mean_dt_str  = f"{mean_dt * 100:.2f} %"
+            true_nnt_str = fmt_f(true_nnt)
+            infl_str     = fmt_f(inflation)
+        else:
+            mean_dt_str  = "0 % (no true effect)"
+            true_nnt_str = "No true benefit"
+            infl_str     = "∞"
+
+        rows.append({
+            "Predicted Δ bin":   label,
+            "N":                 n,
+            "Mean predicted Δ":  f"{mean_dp * 100:.2f} %",
+            "Mean true Δ":       mean_dt_str,
+            "Predicted NNT":     fmt_f(pred_nnt),
+            "True causal NNT":   true_nnt_str,
+            "NNT inflation":     infl_str,
+        })
+    return pd.DataFrame(rows)
+
+
 # ── page config ───────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Mortaliteitsmodel — Confounding Demo", layout="wide")
+st.set_page_config(page_title="MHD Confounding Simulator", layout="wide")
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("Simulatie-instellingen")
+    st.header("Simulation settings")
 
-    # Read the fit-to-article toggle state before any widgets so "Overridden"
-    # captions can appear on sliders that are rendered earlier in the sidebar.
-    _fit_preview = st.session_state.get("fit_to_article_toggle", False)
+    # ── A. Data generation ────────────────────────────────────────────────────
+    st.subheader("A. Data generation")
 
     dist_mode = st.selectbox(
         "Distribution mode",
         [DIST_ARTICLE, DIST_SIMPLE],
         help=(
-            "**Artikel-achtig:** log-normale GTV en gamma-verdeelde MHD via Gaussian copula "
-            "(GTV gem.≈110 cc, med.≈69 cc; MHD gem.≈12 Gy, med.≈11 Gy). "
-            "**Eenvoudig:** normale verdelingen met instelbare parameters."
+            "**Article-like:** log-normal GTV and gamma-distributed MHD via Gaussian copula. "
+            "**Simple:** normal distributions with adjustable parameters."
         ),
     )
 
-    st.subheader("Steekproef")
-    n_patients = st.slider(
-        "Steekproefgrootte", 100, 3000, 500, step=50,
-        help="Aantal synthetische patiënten.",
-    )
-    seed = st.number_input(
-        "Random seed", value=42, step=1,
-        help="Startnummer voor de pseudo-random generator.",
-    )
+    n_patients = st.slider("Sample size", 100, 3000, 500, step=50)
+    seed       = st.number_input("Random seed", value=42, step=1)
 
-    use_calibrated = False   # will be overridden in DIST_ARTICLE branch
+    use_calibrated = False  # overridden below for DIST_ARTICLE
 
     if dist_mode == DIST_SIMPLE:
-        st.subheader("Tumorvolume (GTV)")
-        tv_mu    = st.slider("Gemiddelde GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
-        tv_sigma = st.slider("Spreiding GTV (cc)",   5.0,  60.0, 15.0, step=1.0)
-        st.subheader("Mean Heart Dose = a·GTV + ruis")
-        corr_a       = st.slider("Correlatiecoëfficiënt a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05)
-        mhd_noise_sd = st.slider("Ruisniveau MHD (Gy)", 0.1, 10.0, 3.0, step=0.1)
+        tv_mu        = st.slider("Mean GTV (cc)",          10.0, 200.0, 45.0, step=1.0)
+        tv_sigma     = st.slider("SD GTV (cc)",             5.0,  60.0, 15.0, step=1.0)
+        corr_a       = st.slider("GTV → MHD coefficient",  0.0,   1.0,  0.5, step=0.05)
+        mhd_noise_sd = st.slider("MHD noise SD (Gy)",      0.1,  10.0,  3.0, step=0.1)
+        target_corr  = corr_a
     else:
-        st.subheader("Correlatie (Gaussian copula)")
-        use_calibrated = st.toggle(
-            "Kalibreer GTV-MHD correlatie naar artikelwaarde",
-            value=False,
+        target_corr = st.slider(
+            "GTV ↔ MHD copula correlation (ρ)", 0.0, 0.9, 0.45, step=0.05,
             help=(
-                "Zoekt automatisch de copula-correlatie die de Pearson r uit Van Loon et al. "
-                f"het best reproduceert (doel r ≈ {_ARTICLE_TARGET_R}). "
-                "Kalibratie wordt eenmalig berekend en gecached — eerste run duurt ~1 s."
+                "Controls how strongly larger tumors also tend to receive higher mean heart dose. "
+                "Higher ρ → stronger GTV-MHD correlation in the generated data."
             ),
         )
-        if use_calibrated:
-            with st.spinner("Kalibratie berekenen…"):
-                _cal_rho, _cal_r = _calibrate_correlation()
-            target_corr = _cal_rho
-            st.caption(
-                f"✅ **Beste parametersets toegepast** — "
-                f"copula ρ = **{_cal_rho:.3f}** → Pearson r ≈ {_cal_r:.3f} "
-                f"(doel {_ARTICLE_TARGET_R}, Van Loon et al.)\n\n"
-                f"GTV: log-normaal (med. ≈ 69 cc, gem. ≈ 110 cc, SD ≈ 130 cc)\n\n"
-                f"MHD: gamma (gem. ≈ 12 Gy, SD ≈ 8.2 Gy)"
-            )
-        else:
-            target_corr = st.slider(
-                "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
-                help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
-            )
-            if _fit_preview:
-                st.caption("⚙️ *Overschreven door optimalisatie*")
 
-    st.subheader("Mortaliteitsscenario")
-    survival_scenario = st.selectbox(
-        "Scenario",
-        [SCEN_A, SCEN_B, SCEN_C],
-        help=(
-            "**A:** Mortaliteit vanuit GTV alleen. MHD correleert met GTV maar heeft geen causaal effect. "
-            "**B:** GTV en MHD zijn beide causaal. "
-            "**C:** Artikel-formule met √GTV en √MHD."
-        ),
-    )
+    # ── B. Mortality scenario ─────────────────────────────────────────────────
+    st.subheader("B. Mortality scenario")
+
+    survival_scenario = st.selectbox("Scenario", [SCEN_A, SCEN_B, SCEN_C])
+
+    if survival_scenario == SCEN_A:
+        st.info(
+            "**Scenario A — GTV causal, MHD not causal.**  \n"
+            "Mortality depends only on GTV. MHD correlates with GTV but has no "
+            "direct effect on mortality. Any fitted MHD coefficient arises from "
+            "correlation or noise alone."
+        )
+    elif survival_scenario == SCEN_B:
+        st.info(
+            "**Scenario B — GTV and MHD both causal.**  \n"
+            "Both GTV and MHD have a true direct effect on mortality. "
+            "The fitted MHD coefficient reflects a real causal pathway."
+        )
+    else:
+        st.info(
+            "**Scenario C — Article formula.**  \n"
+            "`logit(p) = −1.3409 + 0.059·√GTV + 0.2635·√MHD`  \n"
+            "Data generated directly from the Van Loon et al. model. "
+            "Both GTV and MHD are causal in this scenario."
+        )
+
+    mhd_is_causal = survival_scenario in (SCEN_B, SCEN_C)
+
+    # ── C. True effect controls ───────────────────────────────────────────────
+    st.subheader("C. True effect controls")
+
     if survival_scenario in (SCEN_A, SCEN_B):
         _default_scale = SCALE_SQRT_RAW if dist_mode == DIST_ARTICLE else SCALE_Z_RAW
         gen_scale = st.selectbox(
-            "Schaal ware mortaliteitsformule",
+            "True mortality formula scale",
             [SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z],
             index=[SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z].index(_default_scale),
             key=f"gen_scale_{dist_mode}_{survival_scenario}",
             help=(
-                "**Gestand. ruw GTV/MHD:** b1/b2 zijn gestandaardiseerde logit-effecten van ruwe waarden. "
-                "**√GTV/MHD ongestand.:** b1/b2 op dezelfde schaal als het Van Loon artikel. "
-                "**√GTV/MHD gestand.:** b1/b2 zijn gestand. logit-effecten van √-getransf. waarden."
+                "**Standardised raw:** b1/b2 are standardised logit effects of raw values. "
+                "**√ unstandardised:** same scale as the Van Loon article (0.059 / 0.264). "
+                "**√ standardised:** b1/b2 are standardised logit effects of √-transformed values."
             ),
         )
         if gen_scale == SCALE_SQRT_RAW:
-            _b1_label = "b1 — echt effect van √GTV op 24-maands mortaliteit"
-            _b2_label = "b2 — echt effect van √MHD op 24-maands mortaliteit"
             _b1_def, _b1_max, _b1_step = 0.0590, 0.5,  0.005
             _b2_def, _b2_max, _b2_step = 0.2635, 1.0,  0.005
+            _b1_label = "b1 — true √GTV effect (logit)"
+            _b2_label = "b2 — true √MHD effect (logit)"
         elif gen_scale == SCALE_SQRT_Z:
-            _b1_label = "b1 — echt effect van gestand. √GTV op 24-maands mortaliteit"
-            _b2_label = "b2 — echt effect van gestand. √MHD op 24-maands mortaliteit"
             _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
             _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
-        else:  # SCALE_Z_RAW
-            _b1_label = "b1 — causaal effect GTV op mortaliteit (logit, gestand.)"
-            _b2_label = "b2 — causaal effect MHD op mortaliteit (logit, gestand.)"
+            _b1_label = "b1 — true effect of standardised √GTV (logit)"
+            _b2_label = "b2 — true effect of standardised √MHD (logit)"
+        else:
             _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
             _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
+            _b1_label = "b1 — true GTV effect, standardised (logit)"
+            _b2_label = "b2 — true MHD effect, standardised (logit)"
+
         b1 = st.slider(_b1_label, 0.0, _b1_max, _b1_def, step=_b1_step,
-                       key=f"b1_{gen_scale}",
-                       help="Werkelijk causaal effect van GTV op de logit-schaal.")
+                       key=f"b1_{gen_scale}")
         if survival_scenario == SCEN_B:
             b2_val = st.slider(_b2_label, 0.0, _b2_max, _b2_def, step=_b2_step,
                                key=f"b2_{gen_scale}")
         else:
             b2_val = 0.0
-        if gen_scale == SCALE_SQRT_RAW:
-            st.caption("Deze coëfficiënten zijn op dezelfde schaal als de Van Loon artikel-formule.")
+
         surv_noise = st.slider(
-            "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
-            help="Willekeurige variatie op de logit-schaal niet verklaard door GTV of MHD.",
+            "Mortality noise level (σ)", 0.0, 3.0, 1.0, step=0.1,
+            help="Random variation on the logit scale not explained by GTV or MHD.",
         )
-        if _fit_preview:
-            st.caption("⚙️ *Overschreven door optimalisatie*")
     else:
-        gen_scale = SCALE_SQRT_RAW  # SCEN_C uses sqrt; gen_scale not used for generation
+        gen_scale  = SCALE_SQRT_RAW
         b1, b2_val, surv_noise = 0.059, 0.2635, 0.0
-        st.info(
-            "Mortaliteit via artikel-formule:\n\n"
-            "`logit(p) = −1.3409 + 0.0590·√GTV + 0.2635·√MHD`\n\n"
-            "GTV én MHD zijn beide causaal."
-        )
 
-    mhd_is_causal = survival_scenario in (SCEN_B, SCEN_C)
-
-    st.subheader("Baseline mortaliteit")
     baseline_survival = st.slider(
-        "Baseline 2-jaars overleving", 0.20, 0.90, 0.494, step=0.01,
-        help=(
-            "Gemiddeld 2-jaars overlevingsniveau vóór individuele risicoverschillen. "
-            "Het artikel rapporteert ~49.4 % 2-jaars overleving (= 50.6 % mortaliteit)."
-        ),
+        "Baseline 2-year survival", 0.20, 0.90, 0.494, step=0.01,
+        help="Target mean survival before individual risk differences. 49.4 % ≈ 50.6 % mortality.",
     )
+
     if survival_scenario == SCEN_C:
         calibrate_article = st.checkbox(
-            "Kalibreer artikel-model op geselecteerde baseline",
-            value=use_calibrated,
-            help="Past alleen het intercept aan zodat de gemiddelde gesimuleerde mortaliteit overeenkomt "
-                 "met de geselecteerde baseline. De slopes (0.0590 en 0.2635) blijven ongewijzigd.",
+            "Calibrate article intercept to selected baseline",
+            value=False,
+            help="Adjusts only the intercept so mean simulated mortality matches the baseline. "
+                 "Slopes (0.0590 and 0.2635) remain unchanged.",
         )
     else:
         calibrate_article = False
 
-    st.subheader("Modelinstellingen")
-    use_sqrt = st.checkbox(
-        "Gebruik √-getransformeerde predictoren",
-        value=(dist_mode == DIST_ARTICLE),
-        key=f"use_sqrt_{dist_mode}",
-        help="Modellen gefit op √GTV en √MHD. Beïnvloedt alleen het model, niet de datagen.",
-    )
-    test_size = st.slider(
-        "Testset aandeel", 0.1, 0.5, 0.2, step=0.05,
-        help="Aandeel patiënten gereserveerd voor modelvalidatie.",
-    )
+    # ── D. Proton simulation ──────────────────────────────────────────────────
+    st.subheader("D. Proton simulation")
 
-    st.divider()
-    st.subheader("Fit to article")
-    _fit_eligible = (
-        dist_mode == DIST_ARTICLE
-        and survival_scenario in (SCEN_A, SCEN_B)
-        and gen_scale == SCALE_SQRT_RAW
-    )
-    if not _fit_eligible:
-        st.caption(
-            "Beschikbaar wanneer: artikel-verdeling + scenario A of B + schaal √GTV/MHD ongestand."
-        )
-        fit_to_article = False
-    else:
-        fit_to_article = st.toggle(
-            "Optimaliseer parameters naar artikel",
-            key="fit_to_article_toggle",
-            value=False,
-            help=(
-                "Zoekt via grid search de combinatie van copula-ρ en ruisniveau die de "
-                "Van Loon artikel-resultaten het best reproduceert: "
-                "β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortaliteit ≈ 50.6 %. "
-                "Resultaat wordt gecached — eerste run ~5 s."
-            ),
-        )
-        if fit_to_article:
-            with st.spinner("Grid search uitvoeren…"):
-                _true_b2_for_optimizer = (
-                    0.0 if survival_scenario == SCEN_A else _FIT_TARGETS["beta_mhd"]
-                )
-                _fit_result = _fit_to_article(
-                    n=n_patients, test_size=test_size, seed=int(seed),
-                    true_b2=_true_b2_for_optimizer,
-                )
-            st.caption(
-                f"✅ **Optimum gevonden** — "
-                f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
-                f"β_√GTV = {_fit_result['beta_gtv']:.4f} (doel 0.0590)  \n"
-                f"β_√MHD = {_fit_result['beta_mhd']:.4f} (doel 0.2635)  \n"
-                f"AUC = {_fit_result['auc']:.3f} (doel 0.640)  \n"
-                f"Mortaliteit = {_fit_result['mortality']*100:.1f} % (doel 50.6 %)"
-            )
-
-    st.divider()
-    st.subheader("Protonentherapie")
     proton_reduction_mode = st.selectbox(
-        "Proton MHD reduction mode",
+        "MHD reduction mode",
         [PROTON_MULT, PROTON_ABS],
         help=(
-            "**A — Multiplicatief:** mhd_proton = mhd_photon × factor. "
-            "**B — Absoluut:** mhd_proton = mhd_photon − reductie (Gy), minimaal 0."
+            "**Multiplicative:** mhd_proton = mhd_photon × factor.  "
+            "**Absolute:** mhd_proton = mhd_photon − reduction (Gy), minimum 0."
         ),
     )
     if proton_reduction_mode == PROTON_MULT:
-        mhd_reduction_factor = st.slider(
-            "MHD reduction factor", 0.0, 1.0, 0.6, step=0.05,
-            help="0.6 means proton therapy reduces MHD to 60% of the photon value.",
-        )
+        mhd_reduction_factor   = st.slider("MHD reduction factor", 0.0, 1.0, 0.6, step=0.05,
+                                           help="0.6 = proton reduces MHD to 60 % of photon value.")
         mhd_absolute_reduction = 0.0
     else:
-        mhd_absolute_reduction = st.slider(
-            "Absolute MHD reduction (Gy)", 0.0, 30.0, 5.0, step=0.5,
-            help="Subtracts a fixed number of Gy from each patient's photon MHD.",
-        )
-        mhd_reduction_factor = 1.0
+        mhd_absolute_reduction = st.slider("Absolute MHD reduction (Gy)", 0.0, 30.0, 5.0, step=0.5)
+        mhd_reduction_factor   = 1.0
 
-    apply_true_proton = st.toggle(
-        "Echte mortaliteitswinst van MHD-reductie",
-        value=False,
-        help="Uit: protonreductie beïnvloedt alleen het model. "
-             "Aan: verlaagde MHD vermindert ook de werkelijke gesimuleerde mortaliteit.",
-    )
-    if apply_true_proton:
-        proton_effect_strength = st.slider(
-            "Sterkte echt MHD-reductieffect", 0.0, 1.0, 0.1, step=0.01,
+    # ── Advanced controls ─────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("Advanced controls", expanded=False):
+
+        st.markdown("**Model settings**")
+        use_sqrt = st.checkbox(
+            "Use √-transformed predictors in model",
+            value=(dist_mode == DIST_ARTICLE),
+            key=f"use_sqrt_{dist_mode}",
+            help="Fits the logistic model on √GTV and √MHD. Affects model only, not data generation.",
         )
-    else:
-        proton_effect_strength = 0.0
+        test_size = st.slider("Test set fraction", 0.1, 0.5, 0.2, step=0.05)
+
+        st.markdown("**Estimate copula ρ for a target Pearson r**")
+        st.caption(
+            "Grid-searches the copula ρ that best reproduces a chosen Pearson r(GTV, MHD) "
+            "under the article-like distributions. Does not claim the article reports this value."
+        )
+        if dist_mode == DIST_ARTICLE:
+            _adv_target_r = st.slider(
+                "Target Pearson r", 0.10, 0.90, _COPULA_ESTIMATE_TARGET_R, step=0.05,
+                key="adv_target_r",
+            )
+            use_calibrated = st.toggle("Apply estimated ρ to simulation", value=False)
+            if use_calibrated:
+                with st.spinner("Estimating copula ρ…"):
+                    _cal_rho, _cal_r = _calibrate_correlation(target_pearson_r=_adv_target_r)
+                target_corr = _cal_rho
+                st.caption(
+                    f"Best copula ρ = **{_cal_rho:.3f}** → achieved Pearson r ≈ {_cal_r:.3f} "
+                    f"(target {_adv_target_r:.2f})"
+                )
+        else:
+            st.caption("Only available with article-like distributions.")
+
+        st.markdown("**True mortality gain from MHD reduction**")
+        st.caption(
+            "Off: proton MHD reduction only changes model-predicted risk. "
+            "Actual simulated outcome does not improve unless MHD is truly causal.  \n"
+            "On: forces a true treatment effect proportional to MHD reduction, "
+            "regardless of scenario causal structure."
+        )
+        apply_true_proton = st.toggle("Enable forced true treatment effect", value=False)
+        if apply_true_proton:
+            proton_effect_strength = st.slider(
+                "True MHD reduction effect strength", 0.0, 1.0, 0.1, step=0.01,
+            )
+        else:
+            proton_effect_strength = 0.0
+
+        st.markdown("**Fit to article targets**")
+        _fit_eligible = (
+            dist_mode == DIST_ARTICLE
+            and survival_scenario in (SCEN_A, SCEN_B)
+            and gen_scale == SCALE_SQRT_RAW
+        )
+        if not _fit_eligible:
+            st.caption(
+                "Available when: article-like distributions + Scenario A or B + √ unstandardised scale."
+            )
+            fit_to_article = False
+        else:
+            fit_to_article = st.toggle(
+                "Optimise parameters to article targets",
+                key="fit_to_article_toggle",
+                value=False,
+                help=(
+                    "Grid search over copula ρ and noise to best reproduce: "
+                    "β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortality ≈ 50.6 %. "
+                    "Result is cached — first run ~5 s."
+                ),
+            )
+            if fit_to_article:
+                with st.spinner("Running grid search…"):
+                    _true_b2_for_optimizer = (
+                        0.0 if survival_scenario == SCEN_A else _FIT_TARGETS["beta_mhd"]
+                    )
+                    _fit_result = _fit_to_article(
+                        n=n_patients, test_size=test_size, seed=int(seed),
+                        true_b2=_true_b2_for_optimizer,
+                    )
+                st.caption(
+                    f"✅ **Optimum found** — "
+                    f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
+                    f"β_√GTV = {_fit_result['beta_gtv']:.4f} (target 0.0590)  \n"
+                    f"β_√MHD = {_fit_result['beta_mhd']:.4f} (target 0.2635)  \n"
+                    f"AUC = {_fit_result['auc']:.3f} (target 0.640)  \n"
+                    f"Mortality = {_fit_result['mortality']*100:.1f} % (target 50.6 %)"
+                )
 
 
 # ── fit-to-article overrides ──────────────────────────────────────────────────
@@ -584,7 +638,7 @@ else:
                        + surv_noise * rng.standard_normal(n_patients))
 
 p_mortality = 1.0 / (1.0 + np.exp(-true_mort_logit))
-mortality   = rng.binomial(1, p_mortality).astype(int)   # 1 = died, 0 = survived
+mortality   = rng.binomial(1, p_mortality).astype(int)
 survival    = 1 - mortality
 
 # ── dataframe ─────────────────────────────────────────────────────────────────
@@ -594,7 +648,7 @@ df = pd.DataFrame({
     "mean_heart_dose_gy": mean_heart_dose.round(2),
     "mortality":          mortality,
 })
-y = df["mortality"].values   # 1 = died; models predict P(mortality=1)
+y = df["mortality"].values
 
 # ── proton MHD reduction ──────────────────────────────────────────────────────
 
@@ -608,17 +662,17 @@ else:
 # ── statistics ────────────────────────────────────────────────────────────────
 
 pearson_r, pearson_p = stats.pearsonr(tumor_volume, mean_heart_dose)
-obs_mort_rate = mortality.mean()
+obs_mort_rate        = mortality.mean()
 
 # ── feature preparation ───────────────────────────────────────────────────────
 
 X_raw = df[["tumor_volume_cc", "mean_heart_dose_gy"]].values
 if use_sqrt:
     X_feat = np.sqrt(X_raw)
-    fl = ["√GTV", "√MHD"]
+    fl     = ["√GTV", "√MHD"]
 else:
     X_feat = X_raw.copy()
-    fl = ["GTV", "MHD"]
+    fl     = ["GTV", "MHD"]
 
 if use_sqrt:
     X_feat_proton = np.column_stack([np.sqrt(tumor_volume), np.sqrt(mhd_proton)])
@@ -631,14 +685,16 @@ X_train, X_test, y_train, y_test = train_test_split(
     X_feat, y, test_size=test_size, random_state=int(seed)
 )
 
-# ── three pipeline models (predicting mortality) ──────────────────────────────
+# ── guard: need both classes in training set ──────────────────────────────────
 
 if len(np.unique(y_train)) < 2:
     st.warning(
-        "⚠️ De trainingsset bevat slechts één klasse — alle patiënten hebben dezelfde uitkomst. "
-        "Vergroot de steekproef, pas de baseline mortaliteit aan, of verlaag het ruisniveau."
+        "⚠️ Training set contains only one class. "
+        "Increase sample size, adjust baseline mortality, or lower noise."
     )
     st.stop()
+
+# ── three pipeline models ─────────────────────────────────────────────────────
 
 pipe_A, pipe_B, pipe_C = make_pipe(), make_pipe(), make_pipe()
 pipe_A.fit(X_train[:, [0]], y_train)
@@ -661,7 +717,7 @@ _coefstr = lambda p, labels: ", ".join(
     f"{l}: {c:.3f}" for l, c in zip(labels, _lr(p).coef_[0])
 )
 
-# ── regression results (combined model) ───────────────────────────────────────
+# ── combined model regression results ─────────────────────────────────────────
 
 pvals_C    = wald_pvalues_pipe(pipe_C, X_feat)
 coefs_C    = _lr(pipe_C).coef_[0]
@@ -669,47 +725,48 @@ interc_C   = _lr(pipe_C).intercept_[0]
 y_pred_C   = pipe_C.predict(X_test)
 accuracy_C = (y_pred_C == y_test).mean()
 
-# Unstandardized logistic regression on main dataset for article comparison.
-# Uses same X_train / X_test (already sqrt-transformed if use_sqrt=True).
-# Coefficients are directly comparable to article values (0.0590 / 0.2635).
+# Unstandardised logistic regression for article coefficient comparison
 if use_sqrt and X_train.shape[1] == 2:
-    _lr_unstd = LogisticRegression(max_iter=1000, fit_intercept=True)
+    _lr_unstd        = LogisticRegression(max_iter=1000, fit_intercept=True)
     _lr_unstd.fit(X_train, y_train)
-    _beta_gtv_unstd   = float(_lr_unstd.coef_[0][0])
-    _beta_mhd_unstd   = float(_lr_unstd.coef_[0][1])
-    _intercept_unstd  = float(_lr_unstd.intercept_[0])
-    _fp_u, _tp_u, _   = roc_curve(y_test, _lr_unstd.predict_proba(X_test)[:, 1])
-    _auc_unstd        = float(auc(_fp_u, _tp_u))
+    _beta_gtv_unstd  = float(_lr_unstd.coef_[0][0])
+    _beta_mhd_unstd  = float(_lr_unstd.coef_[0][1])
+    _intercept_unstd = float(_lr_unstd.intercept_[0])
+    _fp_u, _tp_u, _  = roc_curve(y_test, _lr_unstd.predict_proba(X_test)[:, 1])
+    _auc_unstd       = float(auc(_fp_u, _tp_u))
 else:
     _beta_gtv_unstd = _beta_mhd_unstd = _intercept_unstd = _auc_unstd = float("nan")
 
+# Coefficient table for core results tab
 coef_df = pd.DataFrame({
-    "Feature":            fl,
-    "Coëfficiënt (std.)": coefs_C.round(4),
-    "p-waarde":           [fmt_pval(p) for p in pvals_C],
-    "Significantie":      [sig_stars(p) for p in pvals_C],
-    "Causaal effect?":    ["Ja", "Ja" if mhd_is_causal else "Nee — confounder"],
+    "Feature":               fl,
+    "Std. coefficient":      coefs_C.round(4),
+    "Unstd. coefficient":    [
+        f"{_beta_gtv_unstd:.4f}" if not np.isnan(_beta_gtv_unstd) else "n/a",
+        f"{_beta_mhd_unstd:.4f}" if not np.isnan(_beta_mhd_unstd) else "n/a",
+    ],
+    "p-value":               [fmt_pval(p) for p in pvals_C],
+    "Sig.":                  [sig_stars(p) for p in pvals_C],
+    "Causal in simulation?": ["Yes", "Yes" if mhd_is_causal else "No"],
 })
 
 roc_summary = pd.DataFrame({
-    "Model":                [f"A — {fl[0]} only", f"B — {fl[1]} only", f"C — {fl[0]} + {fl[1]}"],
-    "Predictoren":          [fl[0], fl[1], f"{fl[0]} + {fl[1]}"],
-    "AUC (testset)":        [f"{auc_A:.3f}", f"{auc_B:.3f}", f"{auc_C:.3f}"],
-    "Intercept":            [f"{_lr(pipe_A).intercept_[0]:.3f}",
-                             f"{_lr(pipe_B).intercept_[0]:.3f}",
-                             f"{interc_C:.3f}"],
-    "Coëfficiënten (std.)": [_coefstr(pipe_A, [fl[0]]),
-                             _coefstr(pipe_B, [fl[1]]),
-                             _coefstr(pipe_C, fl)],
+    "Model":          ["GTV only", "MHD only", "GTV + MHD"],
+    "Predictors":     [fl[0], fl[1], f"{fl[0]} + {fl[1]}"],
+    "AUC (test set)": [f"{auc_A:.3f}", f"{auc_B:.3f}", f"{auc_C:.3f}"],
+    "Std. coefs":     [_coefstr(pipe_A, [fl[0]]),
+                       _coefstr(pipe_B, [fl[1]]),
+                       _coefstr(pipe_C, fl)],
 })
 
-# ── proton benefit model outputs ──────────────────────────────────────────────
+# ── proton benefit calculations ───────────────────────────────────────────────
 
 p_mort_photon = pipe_C.predict_proba(X_feat)[:, 1]
 p_mort_proton = pipe_C.predict_proba(X_feat_proton)[:, 1]
 delta_model   = p_mort_photon - p_mort_proton
 nnt_model     = np.where(delta_model > 0, 1.0 / delta_model, np.nan)
 
+# True causal delta — only non-zero when forced true treatment effect is on
 if apply_true_proton and proton_effect_strength > 0:
     mhd_diff             = mean_heart_dose - mhd_proton
     true_mort_logit_prot = true_mort_logit - proton_effect_strength * mhd_diff
@@ -719,20 +776,36 @@ if apply_true_proton and proton_effect_strength > 0:
 else:
     true_delta = None
 
-# ── noise impact helper (scenarios A/B only) ─────────────────────────────────
+# Aggregate NNT metrics
+_mean_pred_delta = delta_model.mean()
+_pred_nnt_mean   = (1.0 / _mean_pred_delta) if _mean_pred_delta > 0 else float("nan")
+
+if true_delta is not None:
+    _mean_true_delta = true_delta.mean()
+    _true_nnt_mean   = (1.0 / _mean_true_delta) if _mean_true_delta > 0 else float("nan")
+    _nnt_inflation   = (
+        _true_nnt_mean / _pred_nnt_mean
+        if (not np.isnan(_true_nnt_mean) and not np.isnan(_pred_nnt_mean) and _pred_nnt_mean > 0)
+        else float("nan")
+    )
+else:
+    _mean_true_delta = 0.0
+    _true_nnt_mean   = float("nan")
+    _nnt_inflation   = float("nan")
+
+# ── noise impact helper ───────────────────────────────────────────────────────
 
 def _noise_auc_row(nl: float) -> dict:
     rng_n = np.random.default_rng(int(seed))
     if gen_scale == SCALE_SQRT_RAW:
-        tv_n  = np.sqrt(tumor_volume)
-        mh_n  = np.sqrt(mean_heart_dose)
+        tv_n = np.sqrt(tumor_volume); mh_n = np.sqrt(mean_heart_dose)
     elif gen_scale == SCALE_SQRT_Z:
         _sg = np.sqrt(tumor_volume); _sm = np.sqrt(mean_heart_dose)
-        tv_n  = (_sg - _sg.mean()) / _sg.std()
-        mh_n  = (_sm - _sm.mean()) / _sm.std()
-    else:  # SCALE_Z_RAW
-        tv_n  = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
-        mh_n  = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
+        tv_n = (_sg - _sg.mean()) / _sg.std()
+        mh_n = (_sm - _sm.mean()) / _sm.std()
+    else:
+        tv_n = (tumor_volume    - tumor_volume.mean())    / tumor_volume.std()
+        mh_n = (mean_heart_dose - mean_heart_dose.mean()) / mean_heart_dose.std()
     logit_n = _display_int + b1 * tv_n + b2_val * mh_n + nl * rng_n.standard_normal(n_patients)
     mort_n  = rng_n.binomial(1, 1.0 / (1.0 + np.exp(-logit_n))).astype(int)
     Xtr, Xte, ytr, yte = train_test_split(X_feat, mort_n,
@@ -743,8 +816,8 @@ def _noise_auc_row(nl: float) -> dict:
     fb, tb, _ = roc_curve(yte, pb.predict_proba(Xte[:, [1]])[:, 1])
     fc, tc, _ = roc_curve(yte, pc.predict_proba(Xte)[:, 1])
     return {
-        "Ruisniveau σ":         nl,
-        "Obs. mortaliteit":     f"{mort_n.mean()*100:.1f} %",
+        "Noise σ":              nl,
+        "Obs. mortality":       f"{mort_n.mean()*100:.1f} %",
         f"AUC {fl[0]}":         f"{auc(fa, ta):.3f}",
         f"AUC {fl[1]}":         f"{auc(fb, tb):.3f}",
         f"AUC {fl[0]}+{fl[1]}": f"{auc(fc, tc):.3f}",
@@ -752,557 +825,517 @@ def _noise_auc_row(nl: float) -> dict:
 
 # ── colour / style maps ───────────────────────────────────────────────────────
 
-MC = {1: "#e74c3c", 0: "#2ecc71"}   # 1=gestorven=red, 0=niet gestorven=green
-ML = {1: "Gestorven", 0: "Niet gestorven"}
+MC = {1: "#e74c3c", 0: "#2ecc71"}
+ML = {1: "Died", 0: "Survived"}
 MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "dashdot")}
+
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
-(tab_model, tab_roc, tab_hist, tab_dose, tab_proton, tab_data,
- tab_noise, tab_scatter, tab_corr, tab_cm, tab_raw) = st.tabs([
-    "Model results", "ROC vergelijking", "Histogrammen", "Dosis-effect",
-    "Proton benefit", "Data summary", "Ruis-impact",
-    "Scatter GTV ↔ MHD", "Correlatiemat.", "Verwarringsmatrix", "Ruwe data",
+(tab_core, tab_article, tab_proton, tab_dose,
+ tab_datachk, tab_adv) = st.tabs([
+    "Core results",
+    "Article match",
+    "Proton simulation",
+    "Dose curves",
+    "Data checks",
+    "Advanced diagnostics",
 ])
 
-# ── tab: Model results ────────────────────────────────────────────────────────
+# ── tab: Core results ─────────────────────────────────────────────────────────
 
-with tab_model:
-    st.title("24-maands mortaliteit: confounding in klinische data")
+with tab_core:
     st.markdown(
-        "**Doel:** laat zien dat een variabele zonder causale werking "
-        "(_mean heart dose_) toch statistisch significant kan lijken doordat ze "
-        "correleert met de echte oorzaak (_tumorvolume_)."
+        "> **This simulator separates three things that are often mixed together: "
+        "true causal effects, statistical prediction, and model-based treatment benefit. "
+        "The key question is whether an apparent MHD coefficient can arise without MHD "
+        "being the true driver.**"
     )
 
-    st.subheader("Logistische regressie — gecombineerd mortaliteitsmodel")
+    st.subheader("True causal structure")
+    if survival_scenario == SCEN_A:
+        st.code(
+            "GTV ──► mortality\n"
+            "GTV ──► MHD\n"
+            "\n"
+            "MHD has NO direct path to mortality.",
+            language=None,
+        )
+        st.info(
+            "**Scenario A:** MHD has no direct causal effect. "
+            "Any fitted MHD coefficient must come from its correlation with GTV, "
+            "random noise, or other hidden structure."
+        )
+    elif survival_scenario == SCEN_B:
+        st.code(
+            "GTV ──► mortality\n"
+            "MHD ──► mortality\n"
+            "GTV ──► MHD",
+            language=None,
+        )
+        st.success(
+            "**Scenario B:** MHD has a true causal effect in the simulation. "
+            "The fitted MHD coefficient reflects a real pathway."
+        )
+    else:
+        st.code(
+            "logit(p_mortality) = −1.3409 + 0.059·√GTV + 0.2635·√MHD\n"
+            "\n"
+            "Both GTV and MHD are causal (article formula).",
+            language=None,
+        )
+        st.success(
+            "**Scenario C:** Data generated directly from the Van Loon et al. formula. "
+            "Both GTV and MHD are causal."
+        )
+
+    st.divider()
+
+    st.subheader("Fitted combined model:  mortality ~ " + " + ".join(fl))
     r1, r2 = st.columns([3, 1])
     with r1:
         st.dataframe(coef_df, use_container_width=True, hide_index=True)
         st.caption(
-            f"Predictoren: {', '.join(fl)} (StandardScaler). "
-            "Uitkomst: 24-maands mortaliteit (1 = gestorven). "
-            "p-waarden via Wald-test.  *** p<0.001  ** p<0.01  * p<0.05  ns p≥0.05"
+            f"Predictors: {', '.join(fl)} (StandardScaler applied for std. coefficients). "
+            "Outcome: 24-month mortality (1 = died). "
+            "p-values via Wald test.  *** p<0.001  ** p<0.01  * p<0.05  ns p≥0.05"
         )
     with r2:
-        st.metric("ROC AUC (testset)", f"{auc_C:.3f}")
-        st.metric("Nauwkeurigheid",    f"{accuracy_C*100:.1f}%")
-
-    if not mhd_is_causal and pvals_C[1] < 0.05:
-        st.warning(
-            f"**Confounding waarschuwing:** {fl[1]} is statistisch significant "
-            f"(p = {fmt_pval(pvals_C[1])}) terwijl het **geen causale invloed** heeft op mortaliteit. "
-            f"Dit komt doordat MHD correleert met GTV (r = {pearson_r:.2f})."
-        )
-    elif not mhd_is_causal:
-        st.info(f"{fl[1]} is niet significant (p = {fmt_pval(pvals_C[1])}). "
-                f"Vergroot de correlatie of steekproef om confounding zichtbaar te maken.")
-    else:
-        st.success(f"MHD heeft een causaal effect op mortaliteit. "
-                   f"Coëfficiënt {fl[1]}: {coefs_C[1]:.3f},  p = {fmt_pval(pvals_C[1])}.")
+        st.metric("AUC (test set)",            f"{auc_C:.3f}")
+        st.metric("Observed mortality",         f"{obs_mort_rate*100:.1f}%")
+        st.metric("GTV-MHD correlation (r)",    f"{pearson_r:.3f}")
 
     if survival_scenario != SCEN_C:
         _gen_uses_sqrt = gen_scale in (SCALE_SQRT_RAW, SCALE_SQRT_Z)
         if _gen_uses_sqrt != use_sqrt:
             st.warning(
-                "⚠️ **Schaalverschil:** De ware mortaliteitsformule gebruikt "
-                f"{'√-getransformeerde' if _gen_uses_sqrt else 'ruwe (niet-√)'} predictoren, "
-                f"terwijl het gefitte model {'√-getransformeerde' if use_sqrt else 'ruwe'} predictoren gebruikt. "
-                "De coëfficiënten b1/b2 kunnen niet direct worden vergeleken met de gefitte coëfficiënten."
+                "⚠️ **Scale mismatch:** the true mortality formula uses "
+                f"{'√-transformed' if _gen_uses_sqrt else 'raw'} predictors, "
+                f"but the fitted model uses {'√-transformed' if use_sqrt else 'raw'} predictors. "
+                "Coefficients b1/b2 cannot be directly compared to fitted coefficients."
             )
 
-    if _fit_overridden:
-        st.info(
-            f"**Fit-to-article actief** — parameters overschreven door grid search:  \n"
-            f"Copula ρ = **{_fit_result['rho']:.2f}** · "
-            f"Ruisniveau σ = **{_fit_result['noise']:.2f}**  \n"
-            f"Coëfficiënten hieronder zijn van het opnieuw gefitte model op de "
-            f"gegenereerde dataset (ongestandaardiseerd, √-schaal)."
-        )
-        fa1, fa2, fa3, fa4 = st.columns(4)
-        fa1.metric("β_√GTV (gefitst, unstd.)", f"{_beta_gtv_unstd:.4f}",
-                   delta=f"{_beta_gtv_unstd-0.059:+.4f} vs 0.059")
-        fa2.metric("β_√MHD (gefitst, unstd.)", f"{_beta_mhd_unstd:.4f}",
-                   delta=f"{_beta_mhd_unstd-0.2635:+.4f} vs 0.264")
-        fa3.metric("AUC (testset)", f"{auc_C:.3f}",
-                   delta=f"{auc_C-0.64:+.3f} vs 0.640")
-        fa4.metric("Mortaliteit (gegenereerd)", f"{obs_mort_rate*100:.1f}%",
-                   delta=f"{(obs_mort_rate-0.506)*100:+.1f}pp vs 50.6%")
-        st.warning(
-            "**Gelijke coëfficiënten bewijzen geen causaliteit.**  \n"
-            "Verschillende onderliggende data-genererende mechanismen kunnen hetzelfde "
-            "gefitte model produceren. Dezelfde β-waarden als Van Loon et al. betekenen "
-            "niet dat de causale structuur overeenkomt."
-        )
+    st.divider()
 
-    with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
+    with st.expander("True data-generating formula", expanded=False):
         if survival_scenario == SCEN_C:
             st.markdown(
-                f"**Scenario C — Artikel-formule**\n\n"
-                f"```\nlogit(p_mortaliteit) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```\n\n"
-                f"{'*(intercept gekalibreerd op geselecteerde baseline)*' if calibrate_article else '*(artikel-intercept −1.3409)*'}"
+                f"**Scenario C — Article formula**\n\n"
+                f"```\nlogit(p) = {_display_int:.4f} + 0.0590·√GTV + 0.2635·√MHD\n```\n\n"
+                f"{'*(intercept calibrated to selected baseline)*' if calibrate_article else '*(article intercept −1.3409)*'}"
             )
         else:
             _noise_line = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
             if gen_scale == SCALE_SQRT_RAW:
-                _pred_gtv  = "√GTV"
-                _pred_mhd  = "√MHD"
-                _scale_note = "*(ongestandaardiseerde √-waarden — dezelfde schaal als Van Loon artikel)*"
+                _pred_gtv, _pred_mhd = "√GTV", "√MHD"
+                _scale_note = "*(unstandardised √-values — same scale as Van Loon article)*"
             elif gen_scale == SCALE_SQRT_Z:
-                _pred_gtv  = "z_√GTV"
-                _pred_mhd  = "z_√MHD"
-                _scale_note = (
-                    "z\\_√GTV = (√GTV − gem.) / SD,   z\\_√MHD = (√MHD − gem.) / SD  "
-                    "*(gestandaardiseerde √-waarden)*"
-                )
-            else:  # SCALE_Z_RAW
-                _pred_gtv  = "z_GTV"
-                _pred_mhd  = "z_MHD"
-                _scale_note = (
-                    "z\\_GTV = (GTV − gem.) / SD,   z\\_MHD = (MHD − gem.) / SD  "
-                    "*(gestandaardiseerde ruwe waarden)*"
-                )
-            _b2_line = f" + {b2_val:.4f} · {_pred_mhd}" if survival_scenario == SCEN_B else ""
+                _pred_gtv, _pred_mhd = "z_√GTV", "z_√MHD"
+                _scale_note = "z\\_√GTV = (√GTV − mean)/SD,  z\\_√MHD = (√MHD − mean)/SD"
+            else:
+                _pred_gtv, _pred_mhd = "z_GTV", "z_MHD"
+                _scale_note = "z\\_GTV = (GTV − mean)/SD,  z\\_MHD = (MHD − mean)/SD"
+            _b2_line = f" + {b2_val:.4f}·{_pred_mhd}" if survival_scenario == SCEN_B else ""
             st.markdown(
                 f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}**\n\n"
-                f"```\nlogit(p_mortaliteit) = {_display_int:.4f}"
-                f" + {b1:.4f} · {_pred_gtv}{_b2_line}{_noise_line}\n```\n\n"
+                f"```\nlogit(p) = {_display_int:.4f}"
+                f" + {b1:.4f}·{_pred_gtv}{_b2_line}{_noise_line}\n```\n\n"
                 f"{_scale_note}"
             )
         param_rows = [
-            ("Intercept (logit mortaliteit)", f"{_display_int:.4f}",
-             f"= logit({_baseline_mort*100:.1f} %)"),
-            ("b1 — GTV-coëfficiënt", f"{b1:.4f}",
-             "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar"),
+            ("Intercept (logit)", f"{_display_int:.4f}", f"= logit({_baseline_mort*100:.1f} %)"),
+            ("b1 — GTV coefficient", f"{b1:.4f}",
+             "fixed article value" if survival_scenario == SCEN_C else "user-set"),
         ]
         if survival_scenario != SCEN_A:
-            param_rows.append(
-                ("b2 — MHD-coëfficiënt", f"{b2_val:.4f}",
-                 "vaste artikel-coëfficiënt" if survival_scenario == SCEN_C else "instelbaar")
-            )
+            param_rows.append((
+                "b2 — MHD coefficient", f"{b2_val:.4f}",
+                "fixed article value" if survival_scenario == SCEN_C else "user-set",
+            ))
         if survival_scenario in (SCEN_A, SCEN_B):
-            param_rows.append(("Mortaliteitsruisniveau σ", f"{surv_noise:.2f}", "N(0,σ) toegevoegd aan logit"))
+            param_rows.append(("Noise σ", f"{surv_noise:.2f}", "N(0,σ) added to logit"))
         param_rows += [
-            ("Geselecteerde baseline mortaliteit", f"{_baseline_mort*100:.1f} %", ""),
-            ("Gesimuleerde mortaliteit",           f"{obs_mort_rate*100:.1f} %", ""),
+            ("Target baseline mortality", f"{_baseline_mort*100:.1f} %", ""),
+            ("Simulated mortality",       f"{obs_mort_rate*100:.1f} %",  ""),
         ]
         st.dataframe(
-            pd.DataFrame(param_rows, columns=["Parameter", "Waarde", "Toelichting"]),
+            pd.DataFrame(param_rows, columns=["Parameter", "Value", "Note"]),
             use_container_width=True, hide_index=True,
         )
 
-    with st.expander("Toon ware mortaliteitslogitfunctie", expanded=False):
-        if survival_scenario == SCEN_C:
-            st.markdown(
-                "**Scenario C — logit-bijdragen op √-schaal (niet gestandaardiseerd)**\n\n"
-                f"```\nlogit(p) = {_display_int:.4f} + 0.0590 · √GTV + 0.2635 · √MHD\n```"
-            )
-            x_range = np.linspace(0, 15, 300)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(x_range, 0.059  * x_range, color=MS["A"][0], lw=2, label="0.0590 · √GTV")
-            ax.plot(x_range, 0.2635 * x_range, color=MS["B"][0], lw=2, linestyle="--",
-                    label="0.2635 · √MHD")
-            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
-            ax.set_xlabel("Predictor op √-schaal"); ax.set_ylabel("Logit-bijdrage")
-            ax.set_title("Logit-bijdragen per predictor (Scenario C)")
-            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            centered(fig)
-        else:
-            _noise_str = f" + N(0, {surv_noise:.2f})" if surv_noise > 0 else ""
-            if gen_scale == SCALE_SQRT_RAW:
-                _vp_gtv = "√GTV";    _vp_mhd = "√MHD"
-                _xlabel = "Predictor op √-schaal (ongestand.)"
-                _title  = "Logit-bijdragen op √-schaal (ongestandaardiseerd)"
-                x_range = np.linspace(0, 15, 300)
-            elif gen_scale == SCALE_SQRT_Z:
-                _vp_gtv = "z_√GTV";  _vp_mhd = "z_√MHD"
-                _xlabel = "Gestandaardiseerde √-predictor (z-score)"
-                _title  = "Logit-bijdragen op gestandaardiseerde √-schaal"
-                x_range = np.linspace(-3, 3, 300)
-            else:  # SCALE_Z_RAW
-                _vp_gtv = "z_GTV";   _vp_mhd = "z_MHD"
-                _xlabel = "Gestandaardiseerde predictor (z-score)"
-                _title  = "Logit-bijdragen op gestandaardiseerde schaal"
-                x_range = np.linspace(-3, 3, 300)
-            _b2_str = f" + {b2_val:.4f} · {_vp_mhd}" if survival_scenario == SCEN_B else ""
-            st.markdown(
-                f"**Scenario {'A' if survival_scenario == SCEN_A else 'B'}:**\n\n"
-                f"```\nlogit(p) = {_display_int:.4f} + {b1:.4f} · {_vp_gtv}{_b2_str}{_noise_str}\n```"
-            )
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.4f} · {_vp_gtv}")
-            if survival_scenario == SCEN_B:
-                ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2, linestyle="--",
-                        label=f"{b2_val:.4f} · {_vp_mhd}")
-            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
-            if gen_scale != SCALE_SQRT_RAW:
-                ax.axvline(0, color="gray", lw=0.8, linestyle=":")
-            ax.set_xlabel(_xlabel)
-            ax.set_ylabel("Bijdrage aan logit(p_mortaliteit)")
-            ax.set_title(_title)
-            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            centered(fig)
-        st.caption(
-            "De logit-bijdrage is het lineaire effect van de predictor op de logit-schaal, "
-            "niet de mortaliteitskans direct. "
-            "De kans volgt via p = 1 / (1 + exp(−logit)). "
-            "Een logit-toename van +1 rondom logit = 0 verhoogt de kans van 50 % naar ~73 %."
-        )
 
-    # ── sanity-check warning for Scenario A ──────────────────────────────────
-    if (
-        survival_scenario == SCEN_A
-        and use_sqrt
-        and not np.isnan(_beta_mhd_unstd)
-        and abs(pearson_r) < 0.05
-        and abs(_beta_mhd_unstd) > 0.05
-    ):
-        st.warning(
-            "⚠️ **Unexpected large MHD coefficient despite near-zero correlation "
-            "and no causal MHD effect.**  \n"
-            f"Observed Pearson r(GTV, MHD) = {pearson_r:.3f} · "
-            f"Fitted β_√MHD (unstd.) = {_beta_mhd_unstd:.4f}  \n"
-            "This may indicate leakage or optimizer inconsistency. "
-            "Check the Optimizer debug info expander below."
-        )
+# ── tab: Article match ────────────────────────────────────────────────────────
 
-    # ── optimizer debug info expander ────────────────────────────────────────
-    with st.expander("Optimizer debug info", expanded=False):
-        _opt_rho   = _fit_result["rho"]   if _fit_overridden else float(target_corr if dist_mode == DIST_ARTICLE else 0.0)
-        _opt_noise = _fit_result["noise"] if _fit_overridden else surv_noise
-        _debug_rows = [
-            ("Actief scenario",                survival_scenario),
-            ("Optimizer gebruikt b2=0 (Scenario A)?",
-             "Ja" if survival_scenario == SCEN_A else "Nee — b2 = 0.2635"),
-            ("Geoptimaliseerde copula ρ",       f"{_opt_rho:.4f}"),
-            ("Geoptimaliseerde mortaliteitsruis σ", f"{_opt_noise:.4f}"),
-            ("Ware b1 (√GTV-effect)",           f"{b1:.4f}"),
-            ("Ware b2 (√MHD-effect)",           f"{b2_val:.4f}"),
-            ("Obs. Pearson r(GTV, MHD)",        f"{pearson_r:.4f}"),
-            ("Gefitte β_√GTV (unstd.)",
-             f"{_beta_gtv_unstd:.4f}" if not np.isnan(_beta_gtv_unstd) else "n/a (use_sqrt=False)"),
-            ("Gefitte β_√MHD (unstd.)",
-             f"{_beta_mhd_unstd:.4f}" if not np.isnan(_beta_mhd_unstd) else "n/a (use_sqrt=False)"),
-            ("Gefitst intercept (unstd.)",
-             f"{_intercept_unstd:.4f}" if not np.isnan(_intercept_unstd) else "n/a"),
-            ("AUC (testset, gecombineerd model)", f"{auc_C:.4f}"),
-            ("Gesimuleerde mortaliteitsrate",    f"{obs_mort_rate*100:.2f} %"),
-        ]
-        if _fit_overridden:
-            _debug_rows += [
-                ("Optimizer interne β_√GTV (SCEN-specifiek)",  f"{_fit_result['beta_gtv']:.4f}"),
-                ("Optimizer interne β_√MHD (SCEN-specifiek)",  f"{_fit_result['beta_mhd']:.4f}"),
-                ("Optimizer interne AUC",                      f"{_fit_result['auc']:.4f}"),
-                ("Optimizer interne mortaliteit",              f"{_fit_result['mortality']*100:.2f} %"),
-                ("Optimizer verlies",                          f"{_fit_result.get('loss', float('nan')):.6f}"),
-            ]
-        st.dataframe(
-            pd.DataFrame(_debug_rows, columns=["Parameter", "Waarde"]),
-            use_container_width=True, hide_index=True,
+with tab_article:
+    st.markdown(
+        "Compare current simulation output to the Van Loon et al. article targets. "
+        "These targets describe what the article reports, not what the true causal "
+        "structure must be."
+    )
+
+    _targets = {
+        "Mortality":       (obs_mort_rate,     _FIT_TARGETS["mortality"], ".1%"),
+        "AUC":             (auc_C,             _FIT_TARGETS["auc"],       ".3f"),
+        "β √GTV (unstd.)": (_beta_gtv_unstd,   _FIT_TARGETS["beta_gtv"], ".4f"),
+        "β √MHD (unstd.)": (_beta_mhd_unstd,   _FIT_TARGETS["beta_mhd"], ".4f"),
+    }
+
+    match_rows = []
+    for metric, (current, target, fmt) in _targets.items():
+        if np.isnan(current):
+            match_rows.append({
+                "Metric":     metric,
+                "Current":    "n/a (enable √ model)",
+                "Target":     format(target, fmt),
+                "Difference": "—",
+                "Status":     "⚠️ unavailable",
+            })
+            continue
+        diff    = current - target
+        curr_str = f"{current:.1%}" if fmt == ".1%" else format(current, fmt)
+        diff_str = f"{diff:+.1%}"   if fmt == ".1%" else f"{diff:+{fmt}}"
+        pct_off  = abs(diff / target) if target != 0 else float("nan")
+        status   = "✅ close" if pct_off < 0.10 else ("⚠️ moderate" if pct_off < 0.25 else "❌ far")
+        match_rows.append({
+            "Metric":     metric,
+            "Current":    curr_str,
+            "Target":     format(target, fmt),
+            "Difference": diff_str,
+            "Status":     status,
+        })
+
+    st.dataframe(pd.DataFrame(match_rows), use_container_width=True, hide_index=True)
+    st.caption(
+        "β values require √-transformed predictors (enable in Advanced controls). "
+        "Status: ✅ within 10 % of target · ⚠️ within 25 % · ❌ more than 25 % off."
+    )
+
+    if not use_sqrt:
+        st.info(
+            "Enable **Use √-transformed predictors in model** (Advanced controls) "
+            "to compute unstandardised β coefficients comparable to the article."
         )
-        if _fit_overridden and survival_scenario == SCEN_A:
-            st.info(
-                "**Scenario A — optimizer gebruikt b2 = 0.**  \n"
-                "Gefitte β_√MHD op de gegenereerde dataset kan enkel groter dan ~0 zijn "
-                "door confounding (positieve correlatie GTV ↔ MHD). "
-                "Met ρ ≈ 0 én b2 = 0 moet β_√MHD (unstd.) dicht bij 0 liggen."
-            )
 
     st.divider()
-    st.caption(
-        f"Scenario {survival_scenario[:1]} · "
-        "Causaal diagram (A): **GTV → mortaliteit** en **GTV → MHD**. "
-        "In scenario A heeft MHD geen direct pad naar mortaliteit. "
-        "In scenario B en C heeft MHD ook een causaal effect."
-    )
+    st.subheader("Fit-to-article optimizer")
 
-# ── tab: ROC vergelijking ─────────────────────────────────────────────────────
-
-with tab_roc:
-    st.markdown(
-        "> **Predictie vs. causaliteit** — Het MHD-only model kan 24-maands mortaliteit "
-        "voorspellen wanneer MHD correleert met tumorvolume, ook als MHD **geen** direct "
-        "causaal effect heeft op mortaliteit. Een goede predictor hoeft geen effectieve "
-        "behandeldoelstelling te zijn."
-    )
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for key, name, f, t, a_val in [
-        ("A", f"{fl[0]} only",       fpr_A, tpr_A, auc_A),
-        ("B", f"{fl[1]} only",       fpr_B, tpr_B, auc_B),
-        ("C", f"{fl[0]} + {fl[1]}", fpr_C, tpr_C, auc_C),
-    ]:
-        color, ls = MS[key]
-        ax.plot(f, t, color=color, lw=2, linestyle=ls, label=f"{name},  AUC = {a_val:.3f}")
-    ax.plot([0, 1], [0, 1], color="gray", linestyle=":", lw=1, label="Toeval  (AUC = 0.500)")
-    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC-vergelijking — 24-maands mortaliteit (testset)")
-    ax.legend(loc="lower right", fontsize=9); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    fig.tight_layout()
-    centered(fig)
-
-    st.markdown("**Samenvatting per model**")
-    st.dataframe(roc_summary, use_container_width=True, hide_index=True)
-
-    if not mhd_is_causal and auc_B > 0.55:
-        st.warning(
-            f"**Confounding zichtbaar:** Model B ({fl[1]} only, AUC = {auc_B:.3f}) "
-            f"voorspelt mortaliteit beter dan toeval zonder causale werking "
-            f"(r(GTV,MHD) = {pearson_r:.2f})."
+    if not _fit_overridden:
+        st.info(
+            "The optimizer is off. Enable **Optimise parameters to article targets** "
+            "in Advanced controls to run a grid search over copula ρ and noise level."
         )
-    elif not mhd_is_causal:
-        st.info(f"Model B ({fl[1]} only, AUC = {auc_B:.3f}) presteert nauwelijks beter dan toeval.")
     else:
-        st.success(f"MHD heeft causaal effect. Model B AUC = {auc_B:.3f}, C AUC = {auc_C:.3f}.")
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        oc1.metric("β_√GTV (fitted, unstd.)", f"{_beta_gtv_unstd:.4f}",
+                   delta=f"{_beta_gtv_unstd - 0.059:+.4f} vs 0.059")
+        oc2.metric("β_√MHD (fitted, unstd.)", f"{_beta_mhd_unstd:.4f}",
+                   delta=f"{_beta_mhd_unstd - 0.2635:+.4f} vs 0.264")
+        oc3.metric("AUC (test set)", f"{auc_C:.3f}",
+                   delta=f"{auc_C - 0.64:+.3f} vs 0.640")
+        oc4.metric("Mortality (simulated)", f"{obs_mort_rate*100:.1f}%",
+                   delta=f"{(obs_mort_rate - 0.506)*100:+.1f}pp vs 50.6%")
 
-    st.markdown("### Fitted mortaliteitsfuncties")
-    tv_grid  = np.linspace(tumor_volume.min(), tumor_volume.max(), 200)
-    mhd_grid = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 200)
-    tv_in    = np.sqrt(tv_grid)  if use_sqrt else tv_grid
-    mhd_in   = np.sqrt(mhd_grid) if use_sqrt else mhd_grid
-    mhd_p10, mhd_p50, mhd_p90 = (np.percentile(mean_heart_dose, q) for q in [10, 50, 90])
+        st.success(
+            f"Optimizer found: copula ρ = **{_fit_result['rho']:.2f}**, "
+            f"noise σ = **{_fit_result['noise']:.2f}**  \n"
+            f"Optimizer loss = {_fit_result.get('loss', float('nan')):.6f}"
+        )
+        st.warning(
+            "**Equal coefficients do not prove causality.**  \n"
+            "Different data-generating mechanisms can produce the same fitted model. "
+            "Matching the article's β values does not mean the causal structure matches."
+        )
 
-    sv1, sv2, sv3 = st.columns(3)
-    with sv1:
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(tumor_volume, mortality, c=[MC[m] for m in mortality],
-                   alpha=0.25, s=10, linewidths=0, zorder=1)
-        ax.plot(tv_grid, pipe_A.predict_proba(tv_in.reshape(-1, 1))[:, 1],
-                color=MS["A"][0], lw=2, zorder=2)
-        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-        ax.set_title(f"Model A — {fl[0]} only"); ax.set_ylim(0, 1)
-        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
+        if survival_scenario == SCEN_A:
+            st.subheader("Scenario A — how can β_√MHD be large with b2 = 0?")
+            _cols = st.columns(3)
+            _cols[0].metric("True b2 (MHD causal effect)", "0.000")
+            _cols[1].metric("Fitted β_√MHD (unstd.)",
+                            f"{_beta_mhd_unstd:.4f}" if not np.isnan(_beta_mhd_unstd) else "n/a")
+            _cols[2].metric("Observed GTV-MHD correlation (r)", f"{pearson_r:.3f}")
 
-    with sv2:
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(mean_heart_dose, mortality, c=[MC[m] for m in mortality],
-                   alpha=0.25, s=10, linewidths=0, zorder=1)
-        ax.plot(mhd_grid, pipe_B.predict_proba(mhd_in.reshape(-1, 1))[:, 1],
-                color=MS["B"][0], lw=2, zorder=2)
-        ax.set_xlabel("MHD (Gy)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-        ax.set_title(f"Model B — {fl[1]} only"); ax.set_ylim(0, 1)
-        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
-
-    with sv3:
-        fig, ax = plt.subplots(figsize=(5, 4))
-        for mhd_val, label, color in [
-            (mhd_p10, f"MHD p10 = {mhd_p10:.1f} Gy", "#1a9641"),
-            (mhd_p50, f"MHD med = {mhd_p50:.1f} Gy",  "#fdae61"),
-            (mhd_p90, f"MHD p90 = {mhd_p90:.1f} Gy",  "#d7191c"),
-        ]:
-            Xc = (np.column_stack([np.sqrt(tv_grid), np.full_like(tv_grid, np.sqrt(mhd_val))])
-                  if use_sqrt else
-                  np.column_stack([tv_grid, np.full_like(tv_grid, mhd_val)]))
-            ax.plot(tv_grid, pipe_C.predict_proba(Xc)[:, 1], color=color, lw=2, label=label)
-        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-        ax.set_title(f"Model C — {fl[0]} + {fl[1]}"); ax.set_ylim(0, 1)
-        ax.legend(fontsize=6.5, loc="lower right")
-        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
-
-    st.caption(
-        "Rode punten = gestorven; groene punten = niet gestorven. "
-        "In scenario A weerspiegelen de drie MHD-curves confounding, niet een direct effect."
-    )
-
-# ── tab: Histogrammen ─────────────────────────────────────────────────────────
-
-with tab_hist:
-    show_cumul = st.checkbox(
-        "Toon cumulatieve histogrammen", value=False,
-        help="Toon cumulatieve verdelingen gesplitst op mortaliteitsstatus.",
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    for ax, col, xlabel in zip(axes,
-        ["tumor_volume_cc", "mean_heart_dose_gy"], ["GTV (cc)", "Mean Heart Dose (Gy)"]):
-        for val in [0, 1]:
-            data = df.loc[df["mortality"] == val, col].values
-            if show_cumul:
-                ax.hist(data, bins=60, density=True, cumulative=True,
-                        alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
-                ax.set_ylabel("Cumulatief aandeel")
-                ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+            if not np.isnan(_beta_mhd_unstd) and abs(_beta_mhd_unstd) > 0.05:
+                if abs(pearson_r) > 0.30:
+                    st.warning(
+                        f"The fitted β_√MHD = {_beta_mhd_unstd:.4f} despite b2 = 0. "
+                        f"The observed GTV-MHD correlation (r = {pearson_r:.3f}) is the driver: "
+                        "MHD carries GTV signal into the model."
+                    )
+                else:
+                    st.warning(
+                        f"The fitted β_√MHD = {_beta_mhd_unstd:.4f} despite b2 = 0 "
+                        f"and low correlation (r = {pearson_r:.3f}). "
+                        "This article-like MHD coefficient requires strong correlation "
+                        "or another hidden driver — check optimizer debug info in Advanced diagnostics."
+                    )
             else:
-                ax.hist(data, bins=30, alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
-                ax.set_ylabel("Aantal patiënten")
-        ax.set_xlabel(xlabel); ax.legend()
-    title = "Cumulatieve verdeling" if show_cumul else "Verdeling"
-    fig.suptitle(f"{title} per mortaliteitsstatus", fontsize=12)
+                st.info(
+                    f"With low GTV-MHD correlation (r = {pearson_r:.3f}) and b2 = 0, "
+                    "the fitted β_√MHD stays near zero — confounding is weak."
+                )
+
+
+# ── tab: Proton simulation ────────────────────────────────────────────────────
+
+with tab_proton:
+    st.markdown(
+        "This tab separates model-based treatment selection from true causal treatment benefit. "
+        "The model may predict that reducing MHD lowers mortality, but if MHD is only partly "
+        "causal, the true absolute benefit may be smaller and the true NNT much higher."
+    )
+
+    if proton_reduction_mode == PROTON_MULT:
+        st.info(
+            f"**Multiplicative mode:** mhd_proton = mhd_photon × {mhd_reduction_factor:.2f}  "
+            f"(MHD reduced to {mhd_reduction_factor*100:.0f}% of photon value, min. 0 Gy)"
+        )
+    else:
+        st.info(
+            f"**Absolute mode:** mhd_proton = mhd_photon − {mhd_absolute_reduction:.1f} Gy  "
+            f"(fixed reduction per patient, min. 0 Gy)"
+        )
+
+    # ── Section A: Model-predicted benefit ────────────────────────────────────
+    st.subheader("A. Model-predicted proton benefit")
+    st.caption(
+        "Calculated from the fitted model after substituting reduced MHD. "
+        "This is what the model says — not necessarily what would happen in reality."
+    )
+
+    pm1, pm2, pm3, pm4 = st.columns(4)
+    pm1.metric("Mean mortality (photon)",   f"{p_mort_photon.mean()*100:.1f}%")
+    pm2.metric("Mean mortality (proton)",   f"{p_mort_proton.mean()*100:.1f}%")
+    pm3.metric("Mean predicted Δ",          f"{_mean_pred_delta*100:.2f}%")
+    pm4.metric("Predicted NNT (1/mean Δ)", fmt_f(_pred_nnt_mean))
+
+    # ── Section B: True simulated benefit ─────────────────────────────────────
+    st.subheader("B. True simulated proton benefit")
+
+    if not apply_true_proton:
+        if survival_scenario == SCEN_A:
+            st.warning(
+                "**Scenario A — no forced true treatment effect.**  \n"
+                "MHD is not causal in this simulation. Proton MHD reduction only changes "
+                "model-predicted risk. The true simulated mortality does not improve.  \n"
+                "Expected true benefit ≈ 0. If the model predicts benefit, it is "
+                "**model-predicted benefit only** — not a real outcome improvement."
+            )
+        elif survival_scenario == SCEN_B:
+            st.info(
+                "**Scenario B — MHD is causal, but forced true treatment effect is off.**  \n"
+                "MHD has a true causal effect (b2 > 0), but the true proton benefit is not "
+                "separately computed here because 'Enable forced true treatment effect' is off. "
+                "Enable it in Advanced controls to quantify the true benefit."
+            )
+        else:
+            st.info(
+                "**Scenario C — article formula.**  \n"
+                "MHD is causal in the article formula. Enable the forced true treatment effect "
+                "in Advanced controls to quantify the true simulated benefit."
+            )
+        pt1, pt2 = st.columns(2)
+        pt1.metric("Mean true Δ", "0 % (no true effect active)")
+        pt2.metric("True causal NNT", "No true benefit")
+    else:
+        st.success(
+            f"**Forced true treatment effect is ON** (strength = {proton_effect_strength:.2f}).  \n"
+            "The true simulated mortality is reduced proportionally to MHD reduction. "
+            "This applies regardless of the scenario causal structure — it is a manual override."
+        )
+        pt1, pt2, pt3, pt4 = st.columns(4)
+        pt1.metric("Mean true Δ",      f"{_mean_true_delta*100:.2f}%")
+        pt2.metric("True causal NNT",  fmt_f(_true_nnt_mean))
+        pt3.metric("Mean predicted Δ", f"{_mean_pred_delta*100:.2f}%")
+        pt4.metric("Predicted NNT",    fmt_f(_pred_nnt_mean))
+
+    # ── NNT inflation ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("NNT inflation factor")
+
+    if true_delta is None:
+        st.markdown(
+            "**NNT inflation factor:** not computable — no true treatment effect is active.  \n"
+            "Enable the forced true treatment effect in Advanced controls to see inflation."
+        )
+    else:
+        ni1, ni2, ni3 = st.columns(3)
+        ni1.metric("Predicted NNT",   fmt_f(_pred_nnt_mean))
+        ni2.metric("True causal NNT", fmt_f(_true_nnt_mean))
+        ni3.metric(
+            "NNT inflation factor  (true NNT / predicted NNT)",
+            fmt_f(_nnt_inflation),
+            help="1.0 = no inflation. >1 = true NNT is higher than model predicts.",
+        )
+
+        if not np.isnan(_nnt_inflation):
+            if _nnt_inflation > 3:
+                st.error(
+                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
+                    "the true NNT is much higher than the model-predicted NNT. "
+                    "The model may substantially overstate the treatment benefit."
+                )
+            elif _nnt_inflation > 1.5:
+                st.warning(
+                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
+                    "the true NNT is higher than the model-predicted NNT."
+                )
+            else:
+                st.success(
+                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
+                    "model-predicted and true NNT are broadly consistent."
+                )
+
+    # ── Delta histogram ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Distribution of absolute mortality reduction per patient")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(delta_model * 100, bins=40, color="#2980b9", edgecolor="none",
+            alpha=0.8, label="Model-predicted Δ")
+    if true_delta is not None:
+        ax.hist(true_delta * 100, bins=40, color="#e67e22", edgecolor="none",
+                alpha=0.6, label="True simulated Δ (forced effect)")
+        ax.legend(fontsize=9)
+    ax.set_xlabel("Absolute mortality reduction Δ (percentage points)")
+    ax.set_ylabel("Number of patients")
+    ax.set_title(f"Predicted Δ distribution  (MHD reduction: {_proton_label})")
     fig.tight_layout()
     centered(fig)
 
-# ── tab: Dosis-effect ─────────────────────────────────────────────────────────
+    # ── NNT comparison table ──────────────────────────────────────────────────
+    st.subheader("NNT table by predicted benefit bin")
+    nnt_cmp_df = build_nnt_comparison_table(delta_model, true_delta, n_patients)
+    st.dataframe(nnt_cmp_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "Binned on **predicted** Δ. "
+        "Predicted NNT = 1 / mean predicted Δ within bin. "
+        "True causal NNT = 1 / mean true Δ within bin. "
+        "NNT inflation = true NNT / predicted NNT — higher means the model overstates benefit."
+    )
+
+    # ── Patients per bin bar chart ────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(_BLABELS, nnt_cmp_df["N"].values,
+                  color="#2980b9", edgecolor="white", linewidth=0.5)
+    ax.bar_label(bars, padding=2, fontsize=7)
+    ax.set_xlabel("Predicted absolute mortality reduction Δ")
+    ax.set_ylabel("Number of patients")
+    ax.set_title(f"Patients per predicted Δ bin  (MHD reduction: {_proton_label})")
+    ax.tick_params(axis="x", rotation=40, labelsize=7)
+    fig.tight_layout()
+    centered(fig)
+
+    if survival_scenario == SCEN_A and not apply_true_proton:
+        st.caption(
+            "Scenario A, no forced true effect: patients with high predicted Δ have large GTV "
+            "and correspondingly high MHD. The model sees MHD reduction as beneficial because "
+            "MHD carries GTV signal. No true outcome improvement occurs."
+        )
+
+
+# ── tab: Dose curves ──────────────────────────────────────────────────────────
 
 with tab_dose:
-    st.markdown("### Dosis-effect op 24-maands mortaliteit — gecombineerd model")
+    st.markdown("### Mortality vs dose — combined model")
+    st.caption("All curves show **mortality probability** predicted by the fitted combined model.")
 
-    gtv_med  = np.median(tumor_volume)
-    mhd_med  = np.median(mean_heart_dose)
-    gtv_p10, gtv_p90 = np.percentile(tumor_volume, [10, 90])
-    mhd_p10_de, mhd_p90_de = np.percentile(mean_heart_dose, [10, 90])
-
-    tv_g  = np.linspace(tumor_volume.min(),    tumor_volume.max(),    300)
-    mhd_g = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 300)
+    if survival_scenario == SCEN_A:
+        st.info(
+            "Scenario A: the MHD curves below reflect GTV-MHD correlation, "
+            "not a direct causal effect of MHD on mortality."
+        )
 
     def _X(gtv_arr, mhd_arr):
         if use_sqrt:
             return np.column_stack([np.sqrt(gtv_arr), np.sqrt(mhd_arr)])
         return np.column_stack([gtv_arr, mhd_arr])
 
+    gtv_med              = np.median(tumor_volume)
+    mhd_med              = np.median(mean_heart_dose)
+    gtv_p10, gtv_p90     = np.percentile(tumor_volume,    [10, 90])
+    mhd_p10, mhd_p90     = np.percentile(mean_heart_dose, [10, 90])
+
+    tv_g  = np.linspace(tumor_volume.min(),    tumor_volume.max(),    300)
+    mhd_g = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 300)
+
     mort_vs_gtv = pipe_C.predict_proba(_X(tv_g,  np.full_like(tv_g,  mhd_med)))[:, 1]
     mort_vs_mhd = pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_med), mhd_g))[:, 1]
 
-    de1, de2 = st.columns(2)
-    with de1:
-        fig, ax = plt.subplots(figsize=(7, 5))
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(tv_g, mort_vs_gtv, color="#e74c3c", lw=2)
         ax.axvline(gtv_med, color="gray", lw=1, linestyle=":",
-                   label=f"Mediaan GTV = {gtv_med:.0f} cc")
-        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-        ax.set_title(f"Plot A — mortaliteit vs GTV\n(MHD vast op mediaan {mhd_med:.1f} Gy)")
+                   label=f"Median GTV = {gtv_med:.0f} cc")
+        ax.set_xlabel("GTV (cc)")
+        ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_title(f"Mortality vs GTV\n(MHD fixed at median {mhd_med:.1f} Gy)")
         ax.set_ylim(0, 1); ax.legend(fontsize=8)
-        fig.tight_layout(); st.pyplot(fig, use_container_width=False); plt.close(fig)
+        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-    with de2:
-        fig, ax = plt.subplots(figsize=(7, 5))
+    with dc2:
+        fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(mhd_g, mort_vs_mhd, color="#e74c3c", lw=2)
         ax.axvline(mhd_med, color="gray", lw=1, linestyle=":",
-                   label=f"Mediaan MHD = {mhd_med:.1f} Gy")
-        ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-        ax.set_title(f"Plot B — mortaliteit vs MHD\n(GTV vast op mediaan {gtv_med:.0f} cc)")
+                   label=f"Median MHD = {mhd_med:.1f} Gy")
+        ax.set_xlabel("Mean Heart Dose (Gy)")
+        ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_title(f"Mortality vs MHD\n(GTV fixed at median {gtv_med:.0f} cc)")
         ax.set_ylim(0, 1); ax.legend(fontsize=8)
-        fig.tight_layout(); st.pyplot(fig, use_container_width=False); plt.close(fig)
+        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-    st.markdown("#### Mortaliteit vs GTV voor drie MHD-niveaus (Plot C)")
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for mhd_val, label, color in [
-        (mhd_p10_de, f"MHD laag (p10) = {mhd_p10_de:.1f} Gy", "#1a9641"),
-        (mhd_med,    f"MHD mediaan = {mhd_med:.1f} Gy",         "#fdae61"),
-        (mhd_p90_de, f"MHD hoog (p90) = {mhd_p90_de:.1f} Gy", "#d7191c"),
-    ]:
-        ax.plot(tv_g, pipe_C.predict_proba(_X(tv_g, np.full_like(tv_g, mhd_val)))[:, 1],
-                color=color, lw=2, label=label)
-    ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-    ax.set_title("Plot C — mortaliteit vs GTV voor laag/mediaan/hoog MHD")
-    ax.set_ylim(0, 1); ax.legend(fontsize=8)
-    fig.tight_layout(); centered(fig)
+    show_stratified = st.checkbox("Show stratified curves (low / median / high)", value=False)
 
-    st.markdown("#### Mortaliteit vs MHD voor drie GTV-niveaus (Plot D)")
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for gtv_val, label, color in [
-        (gtv_p10, f"GTV laag (p10) = {gtv_p10:.0f} cc", "#1a9641"),
-        (gtv_med, f"GTV mediaan = {gtv_med:.0f} cc",      "#fdae61"),
-        (gtv_p90, f"GTV hoog (p90) = {gtv_p90:.0f} cc", "#d7191c"),
-    ]:
-        ax.plot(mhd_g, pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_val), mhd_g))[:, 1],
-                color=color, lw=2, label=label)
-    ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("Voorspelde 24-maands mortaliteit")
-    ax.set_title("Plot D — mortaliteit vs MHD voor laag/mediaan/hoog GTV")
-    ax.set_ylim(0, 1); ax.legend(fontsize=8)
-    fig.tight_layout(); centered(fig)
+    if show_stratified:
+        st.markdown("#### Mortality vs GTV at low / median / high MHD")
+        fig, ax = plt.subplots(figsize=(7, 4))
+        for mhd_val, label, color in [
+            (mhd_p10, f"MHD p10 = {mhd_p10:.1f} Gy",  "#1a9641"),
+            (mhd_med, f"MHD median = {mhd_med:.1f} Gy", "#fdae61"),
+            (mhd_p90, f"MHD p90 = {mhd_p90:.1f} Gy",   "#d7191c"),
+        ]:
+            ax.plot(tv_g,
+                    pipe_C.predict_proba(_X(tv_g, np.full_like(tv_g, mhd_val)))[:, 1],
+                    color=color, lw=2, label=label)
+        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_title("Mortality vs GTV — low / median / high MHD")
+        ax.set_ylim(0, 1); ax.legend(fontsize=8)
+        fig.tight_layout(); centered(fig)
 
-    if not mhd_is_causal:
-        st.info(
-            "In scenario A (GTV causaal, MHD confounder): de MHD-curves (Plot B en D) "
-            "tonen een associatie die **niet causaal** is. De scheiding in Plot C "
-            "ontstaat doordat hogere MHD samenhangt met grotere GTV."
-        )
+        st.markdown("#### Mortality vs MHD at low / median / high GTV")
+        fig, ax = plt.subplots(figsize=(7, 4))
+        for gtv_val, label, color in [
+            (gtv_p10, f"GTV p10 = {gtv_p10:.0f} cc",   "#1a9641"),
+            (gtv_med, f"GTV median = {gtv_med:.0f} cc",  "#fdae61"),
+            (gtv_p90, f"GTV p90 = {gtv_p90:.0f} cc",   "#d7191c"),
+        ]:
+            ax.plot(mhd_g,
+                    pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_val), mhd_g))[:, 1],
+                    color=color, lw=2, label=label)
+        ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_title("Mortality vs MHD — low / median / high GTV")
+        ax.set_ylim(0, 1); ax.legend(fontsize=8)
+        fig.tight_layout(); centered(fig)
 
-# ── tab: Proton benefit ───────────────────────────────────────────────────────
-
-with tab_proton:
-    st.markdown(
-        "Dit tabblad vergelijkt foton- en gesimuleerde protonenplannen door de MHD te verlagen. "
-        "**De voorspelde absolute mortaliteitsreductie komt van het gefitte model.** "
-        "Als MHD alleen correleert met GTV maar niet causaal is, kan het model "
-        "mortaliteitsreductie voorspellen terwijl de werkelijke uitkomst niet verbetert."
-    )
-
-    if proton_reduction_mode == PROTON_MULT:
-        st.info(
-            f"**Modus A — Multiplicatief:** mhd_proton = mhd_photon × {mhd_reduction_factor:.2f}  "
-            f"(MHD teruggebracht tot {mhd_reduction_factor*100:.0f} % van de fotonwaarde; min. 0 Gy)"
-        )
-    else:
-        st.info(
-            f"**Modus B — Absoluut:** mhd_proton = mhd_photon − {mhd_absolute_reduction:.1f} Gy  "
-            f"(vaste reductie van {mhd_absolute_reduction:.1f} Gy per patiënt; min. 0 Gy)"
-        )
-
-    pm1, pm2, pm3, pm4 = st.columns(4)
-    pm1.metric("Gem. mortaliteit (foton)",                f"{p_mort_photon.mean()*100:.1f}%")
-    pm2.metric("Gem. mortaliteit (proton)",               f"{p_mort_proton.mean()*100:.1f}%")
-    pm3.metric("Gem. absolute mortaliteitsreductie (Δ)",  f"{delta_model.mean()*100:.2f}%")
-    pm4.metric("Gem. NNT (model)",                        fmt_f(np.nanmean(nnt_model)))
-
-    if true_delta is not None:
-        pt1, pt2, *_ = st.columns(4)
-        pt1.metric("Gem. werkelijke Δ (via causaal logit)", f"{true_delta.mean()*100:.2f}%")
-        pt2.metric(
-            "Overestimatie door confounding",
-            f"{(delta_model.mean() - true_delta.mean())*100:.2f}%-punt",
-            help="Positief = model voorspelt meer mortaliteitsreductie dan werkelijk optreedt.",
-        )
-        if not mhd_is_causal:
-            st.warning(
-                f"**Confounding in de mortaliteitsreductie:** het model voorspelt gemiddeld "
-                f"{delta_model.mean()*100:.2f}% absolute mortaliteitsreductie, maar de werkelijke "
-                f"gesimuleerde reductie is slechts {true_delta.mean()*100:.2f}%. "
-                f"MHD is gecorreleerd met GTV maar heeft geen direct causaal effect."
+        if survival_scenario == SCEN_A:
+            st.caption(
+                "The MHD curves show model-predicted associations driven by GTV-MHD "
+                "correlation — not a direct causal effect."
             )
 
-    st.markdown("---")
-    st.markdown("#### Verdeling van voorspelde absolute mortaliteitsreductie (Δ) per patiënt")
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(delta_model * 100, bins=40, color="#2980b9", edgecolor="none", alpha=0.8,
-            label="Model-gebaseerde Δ")
-    if true_delta is not None:
-        ax.hist(true_delta * 100, bins=40, color="#e67e22", edgecolor="none",
-                alpha=0.5, label="Werkelijke Δ (causaal logit)")
-        ax.legend(fontsize=8)
-    ax.set_xlabel("Absolute mortaliteitsreductie Δ (%-punt)")
-    ax.set_ylabel("Aantal patiënten")
-    ax.set_title("Verdeling van model-gebaseerde mortaliteitsreductie")
-    fig.tight_layout(); centered(fig)
 
-    st.markdown("#### NNT-tabel per Δ-bin")
-    nnt_df = build_nnt_table(delta_model, n_patients)
-    st.dataframe(nnt_df, use_container_width=True, hide_index=True)
-    st.caption(
-        "Δ = mortaliteit(foton) − mortaliteit(proton); positief = proton reduceert mortaliteit. "
-        "NNT = 1/Δ per patiënt. 1/Mean Δ en 1/Median Δ zijn NNT-schattingen op groepsniveau."
-    )
+# ── tab: Data checks ──────────────────────────────────────────────────────────
 
-    st.markdown("#### Patiënten per Δ-bin")
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(_BLABELS, nnt_df["N"].values, color="#2980b9", edgecolor="white", linewidth=0.5)
-    ax.bar_label(bars, padding=2, fontsize=7)
-    ax.set_xlabel("Absolute mortaliteitsreductie Δ")
-    ax.set_ylabel("Aantal patiënten")
-    ax.set_title(f"Patiënten per Δ-bin  (MHD-reductie: {_proton_label})")
-    ax.tick_params(axis="x", rotation=40, labelsize=7)
-    fig.tight_layout(); centered(fig)
-
-    if not mhd_is_causal:
-        st.caption(
-            "Scenario A: MHD heeft geen causale werking. Patiënten met hoge MHD hebben "
-            "ook een grotere GTV — hun hogere 'voorspelde mortaliteitsreductie' is een "
-            "artefact van confounding."
-        )
-
-# ── tab: Data summary ─────────────────────────────────────────────────────────
-
-with tab_data:
-    st.markdown("### Gegevenssamenvatting")
+with tab_datachk:
+    st.markdown("### Data summary")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Patiënten",              n_patients)
-    c2.metric("24-maands mortaliteit",  f"{obs_mort_rate*100:.1f}%")
+    c1.metric("Patients",               n_patients)
+    c2.metric("24-month mortality",     f"{obs_mort_rate*100:.1f}%")
     c3.metric("Pearson r (GTV ↔ MHD)", f"{pearson_r:.3f}")
-    c4.metric("p-waarde correlatie",    fmt_pval(pearson_p))
+    c4.metric("p-value (correlation)",  fmt_pval(pearson_p))
 
-    st.markdown("#### Beschrijvende statistieken")
+    st.markdown("#### Descriptive statistics")
     vc1, vc2 = st.columns(2)
     with vc1:
         st.dataframe(
@@ -1311,49 +1344,155 @@ with tab_data:
             use_container_width=True,
         )
         if dist_mode == DIST_ARTICLE:
-            st.caption("Referentie: GTV gem.≈110 cc, med.≈69 cc, SD≈130 cc; "
-                       "MHD gem.≈12 Gy, med.≈11 Gy, SD≈8.2 Gy.")
+            st.caption(
+                "Reference: GTV mean ≈ 110 cc, median ≈ 69 cc, SD ≈ 130 cc; "
+                "MHD mean ≈ 12 Gy, median ≈ 11 Gy, SD ≈ 8.2 Gy."
+            )
     with vc2:
-        st.markdown("**Baseline vs gesimuleerd**")
+        st.markdown("**Baseline vs simulated mortality**")
         st.dataframe(
             pd.DataFrame({
-                "": ["Geselecteerd", "Gesimuleerd"],
-                "2-jaars overleving":    [f"{baseline_survival*100:.1f} %",
-                                          f"{(1-obs_mort_rate)*100:.1f} %"],
-                "24-maands mortaliteit": [f"{_baseline_mort*100:.1f} %",
-                                          f"{obs_mort_rate*100:.1f} %"],
+                "":                   ["Target", "Simulated"],
+                "2-year survival":    [f"{baseline_survival*100:.1f}%",
+                                       f"{(1-obs_mort_rate)*100:.1f}%"],
+                "24-month mortality": [f"{_baseline_mort*100:.1f}%",
+                                       f"{obs_mort_rate*100:.1f}%"],
             }),
             use_container_width=True, hide_index=True,
         )
         if survival_scenario == SCEN_C and not calibrate_article:
-            st.caption("Scenario C gebruikt vaste artikel-intercept (−1.3409).")
+            st.caption("Scenario C uses fixed article intercept (−1.3409).")
 
-    st.markdown("#### MHD-reductie samenvatting (protonentherapie)")
-    pd_proton = pd.DataFrame({
-        "": ["Fotontherapie", "Protonentherapie", "Reductie"],
-        "Gem. MHD (Gy)": [
-            f"{mean_heart_dose.mean():.2f}",
-            f"{mhd_proton.mean():.2f}",
-            f"{(mean_heart_dose - mhd_proton).mean():.2f}",
-        ],
-        "Mediaan MHD (Gy)": [
-            f"{np.median(mean_heart_dose):.2f}",
-            f"{np.median(mhd_proton):.2f}",
-            f"{np.median(mean_heart_dose - mhd_proton):.2f}",
-        ],
-    })
-    st.dataframe(pd_proton, use_container_width=True, hide_index=True)
-    st.caption(f"Proton MHD reductie modus: {proton_reduction_mode} ({_proton_label})")
+    st.markdown("#### MHD reduction summary (proton therapy)")
+    st.dataframe(
+        pd.DataFrame({
+            "":                ["Photon", "Proton", "Reduction"],
+            "Mean MHD (Gy)":   [f"{mean_heart_dose.mean():.2f}",
+                                 f"{mhd_proton.mean():.2f}",
+                                 f"{(mean_heart_dose - mhd_proton).mean():.2f}"],
+            "Median MHD (Gy)": [f"{np.median(mean_heart_dose):.2f}",
+                                 f"{np.median(mhd_proton):.2f}",
+                                 f"{np.median(mean_heart_dose - mhd_proton):.2f}"],
+        }),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(f"Proton MHD reduction mode: {proton_reduction_mode} ({_proton_label})")
 
-# ── tab: Ruwe data ────────────────────────────────────────────────────────────
+    st.markdown("#### Distributions")
+    show_cumul = st.checkbox("Show cumulative histograms", value=False)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+    for ax, col, xlabel in zip(
+        axes,
+        ["tumor_volume_cc", "mean_heart_dose_gy"],
+        ["GTV (cc)", "Mean Heart Dose (Gy)"],
+    ):
+        for val in [0, 1]:
+            data = df.loc[df["mortality"] == val, col].values
+            if show_cumul:
+                ax.hist(data, bins=60, density=True, cumulative=True,
+                        alpha=0.6, color=MC[val], label=ML[val], edgecolor="none")
+                ax.set_ylabel("Cumulative fraction")
+                ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+            else:
+                ax.hist(data, bins=30, alpha=0.6, color=MC[val],
+                        label=ML[val], edgecolor="none")
+                ax.set_ylabel("Number of patients")
+        ax.set_xlabel(xlabel); ax.legend(fontsize=8)
+    fig.suptitle(
+        ("Cumulative distribution" if show_cumul else "Distribution") + " by mortality status",
+        fontsize=12,
+    )
+    fig.tight_layout(); centered(fig)
 
-with tab_raw:
-    st.subheader("Ruwe data (eerste 50 rijen)")
-    st.dataframe(df.head(50), use_container_width=True)
 
-# ── tab: Scatter GTV ↔ MHD ───────────────────────────────────────────────────
+# ── tab: Advanced diagnostics ─────────────────────────────────────────────────
 
-with tab_scatter:
+with tab_adv:
+    st.markdown("### Advanced diagnostics")
+
+    # ── ROC comparison ────────────────────────────────────────────────────────
+    st.subheader("ROC comparison")
+    st.markdown(
+        "> A good predictor does not need to be a good treatment target. "
+        "MHD-only can predict mortality better than chance even when MHD is not causal, "
+        "because MHD correlates with GTV."
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for key, name, f, t, a_val in [
+        ("A", "GTV only",  fpr_A, tpr_A, auc_A),
+        ("B", "MHD only",  fpr_B, tpr_B, auc_B),
+        ("C", "GTV + MHD", fpr_C, tpr_C, auc_C),
+    ]:
+        color, ls = MS[key]
+        ax.plot(f, t, color=color, lw=2, linestyle=ls,
+                label=f"{name},  AUC = {a_val:.3f}")
+    ax.plot([0, 1], [0, 1], color="gray", linestyle=":", lw=1, label="Chance (AUC = 0.500)")
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC comparison — 24-month mortality (test set)")
+    ax.legend(loc="lower right", fontsize=9); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    fig.tight_layout(); centered(fig)
+
+    st.dataframe(roc_summary, use_container_width=True, hide_index=True)
+
+    if not mhd_is_causal and auc_B > 0.55:
+        st.warning(
+            f"MHD-only model (AUC = {auc_B:.3f}) predicts mortality better than chance "
+            f"despite MHD having no causal effect (r(GTV,MHD) = {pearson_r:.2f})."
+        )
+
+    st.markdown("#### Fitted mortality functions")
+    tv_grid  = np.linspace(tumor_volume.min(), tumor_volume.max(), 200)
+    mhd_grid = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 200)
+    tv_in    = np.sqrt(tv_grid)  if use_sqrt else tv_grid
+    mhd_in   = np.sqrt(mhd_grid) if use_sqrt else mhd_grid
+    _mhd_p10, _mhd_p50, _mhd_p90 = (np.percentile(mean_heart_dose, q) for q in [10, 50, 90])
+
+    sv1, sv2, sv3 = st.columns(3)
+    with sv1:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.scatter(tumor_volume, mortality, c=[MC[m] for m in mortality],
+                   alpha=0.25, s=10, linewidths=0, zorder=1)
+        ax.plot(tv_grid, pipe_A.predict_proba(tv_in.reshape(-1, 1))[:, 1],
+                color=MS["A"][0], lw=2, zorder=2)
+        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Predicted mortality")
+        ax.set_title("GTV only"); ax.set_ylim(0, 1)
+        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+    with sv2:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.scatter(mean_heart_dose, mortality, c=[MC[m] for m in mortality],
+                   alpha=0.25, s=10, linewidths=0, zorder=1)
+        ax.plot(mhd_grid, pipe_B.predict_proba(mhd_in.reshape(-1, 1))[:, 1],
+                color=MS["B"][0], lw=2, zorder=2)
+        ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("Predicted mortality")
+        ax.set_title("MHD only"); ax.set_ylim(0, 1)
+        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+    with sv3:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        for mhd_val, label, color in [
+            (_mhd_p10, f"MHD p10 = {_mhd_p10:.1f} Gy", "#1a9641"),
+            (_mhd_p50, f"MHD med = {_mhd_p50:.1f} Gy",  "#fdae61"),
+            (_mhd_p90, f"MHD p90 = {_mhd_p90:.1f} Gy",  "#d7191c"),
+        ]:
+            Xc = (np.column_stack([np.sqrt(tv_grid), np.full_like(tv_grid, np.sqrt(mhd_val))])
+                  if use_sqrt else
+                  np.column_stack([tv_grid, np.full_like(tv_grid, mhd_val)]))
+            ax.plot(tv_grid, pipe_C.predict_proba(Xc)[:, 1], color=color, lw=2, label=label)
+        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Predicted mortality")
+        ax.set_title("GTV + MHD"); ax.set_ylim(0, 1)
+        ax.legend(fontsize=6.5, loc="lower right")
+        fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+    st.caption(
+        "Red = died, green = survived. "
+        "In Scenario A the MHD curves reflect correlation with GTV, not a direct causal effect."
+    )
+
+    # ── Scatter plot ──────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Scatter: GTV ↔ MHD")
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.scatter(tumor_volume, mean_heart_dose,
                c=[MC[m] for m in mortality], alpha=0.4, s=18, linewidths=0)
@@ -1363,64 +1502,55 @@ with tab_scatter:
             label=f"y = {m_r:.2f}x + {b_r:.1f}  (r = {pearson_r:.2f}, p = {fmt_pval(pearson_p)})")
     h = [Patch(color=MC[v], alpha=0.7, label=ML[v]) for v in [1, 0]]
     l1 = ax.legend(handles=h, loc="upper left", fontsize=8)
-    ax.add_artist(l1)
-    ax.legend(loc="lower right", fontsize=8)
+    ax.add_artist(l1); ax.legend(loc="lower right", fontsize=8)
     ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Mean Heart Dose (Gy)")
-    ax.set_title("Scatter: GTV vs MHD — kleur = mortaliteitsstatus")
-    fig.tight_layout()
-    centered(fig)
-    st.caption("De regressielijn toont GTV → MHD. Doordat mortaliteit afhangt van GTV, "
-               "lijkt MHD ook te scheiden — dit is de confounder.")
+    ax.set_title("GTV vs MHD — colour = mortality status")
+    fig.tight_layout(); centered(fig)
 
-# ── tab: Correlatiemat. ───────────────────────────────────────────────────────
-
-with tab_corr:
+    # ── Correlation matrix ────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Correlation matrix")
     corr_df = df[["tumor_volume_cc", "mean_heart_dose_gy", "mortality"]].corr()
     fig, ax = plt.subplots(figsize=(5, 4))
     sns.heatmap(corr_df, annot=True, fmt=".3f", cmap="RdYlGn",
                 center=0, vmin=-1, vmax=1, mask=np.eye(3, dtype=bool),
                 ax=ax, linewidths=0.5)
-    ax.set_title("Pearson correlatiemat.")
-    fig.tight_layout()
-    centered(fig)
-    st.caption("MHD correleert met zowel GTV als mortaliteit, "
-               "ook zonder causaal pad MHD → mortaliteit (scenario A).")
+    ax.set_title("Pearson correlation matrix")
+    fig.tight_layout(); centered(fig)
+    st.caption(
+        "MHD correlates with both GTV and mortality even in Scenario A "
+        "(no causal MHD → mortality path)."
+    )
 
-# ── tab: Verwarringsmatrix ────────────────────────────────────────────────────
-
-with tab_cm:
+    # ── Confusion matrix ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Confusion matrix — combined model (test set)")
     cm = confusion_matrix(y_test, y_pred_C)
     fig, ax = plt.subplots(figsize=(5, 4))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Reds",
-                xticklabels=["Niet gestorven", "Gestorven"],
-                yticklabels=["Niet gestorven", "Gestorven"], ax=ax)
-    ax.set_xlabel("Voorspeld"); ax.set_ylabel("Werkelijk")
-    ax.set_title("Verwarringsmatrix — mortaliteit (testset)")
-    fig.tight_layout()
-    centered(fig)
+                xticklabels=["Survived", "Died"],
+                yticklabels=["Survived", "Died"], ax=ax)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+    ax.set_title("Confusion matrix — 24-month mortality")
+    fig.tight_layout(); centered(fig)
 
-# ── tab: Ruis-impact ──────────────────────────────────────────────────────────
-
-with tab_noise:
-    st.markdown("### Ruis-impact op mortaliteitsmodel")
-    st.markdown(
-        "Hieronder worden voor verschillende mortaliteitsruisniveaus de AUC-waarden "
-        "van de drie modellen gesimuleerd op basis van dezelfde GTV- en MHD-waarden."
-    )
+    # ── Noise impact ──────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Noise impact on AUC")
     if survival_scenario == SCEN_C:
         st.info(
-            "Scenario C gebruikt een vaste artikel-formule zonder ruisparameter. "
-            "De ruis-impact-analyse is alleen beschikbaar voor scenario A en B."
+            "Scenario C uses a fixed article formula without a noise parameter. "
+            "Noise impact analysis is only available for Scenarios A and B."
         )
     else:
+        st.markdown(
+            "AUC across three models for increasing mortality noise levels, "
+            "using the same GTV and MHD values."
+        )
         noise_rows = [_noise_auc_row(nl) for nl in _NOISE_LEVELS]
         noise_df   = pd.DataFrame(noise_rows)
         st.dataframe(noise_df, use_container_width=True, hide_index=True)
-        st.caption(
-            f"Huidige instelling: σ = {surv_noise:.2f}. "
-            "De AUC daalt naarmate het ruisniveau toeneemt doordat de relatie "
-            "tussen GTV/MHD en mortaliteit minder zichtbaar wordt."
-        )
+        st.caption(f"Current setting: σ = {surv_noise:.2f}.")
 
         col_a = f"AUC {fl[0]}"
         col_b = f"AUC {fl[1]}"
@@ -1434,10 +1564,91 @@ with tab_noise:
             ax.plot(_NOISE_LEVELS, [float(r[col]) for r in noise_rows],
                     color=color, linestyle=ls, lw=2, marker="o", ms=5, label=lab)
         ax.axvline(surv_noise, color="gray", linestyle=":", lw=1,
-                   label=f"Huidig σ = {surv_noise:.2f}")
-        ax.set_xlabel("Mortaliteitsruisniveau σ")
-        ax.set_ylabel("ROC AUC (testset)")
-        ax.set_title("AUC vs mortaliteitsruisniveau")
+                   label=f"Current σ = {surv_noise:.2f}")
+        ax.set_xlabel("Mortality noise level σ"); ax.set_ylabel("ROC AUC (test set)")
+        ax.set_title("AUC vs mortality noise level")
         ax.legend(fontsize=8); ax.set_ylim(0.4, 1.0)
         fig.tight_layout(); centered(fig)
+
+    # ── Formula expanders ─────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("True logit function plot", expanded=False):
+        if survival_scenario == SCEN_C:
+            x_range = np.linspace(0, 15, 300)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x_range, 0.059  * x_range, color=MS["A"][0], lw=2, label="0.0590 · √GTV")
+            ax.plot(x_range, 0.2635 * x_range, color=MS["B"][0], lw=2,
+                    linestyle="--", label="0.2635 · √MHD")
+            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+            ax.set_xlabel("Predictor on √-scale"); ax.set_ylabel("Logit contribution")
+            ax.set_title("Logit contributions per predictor (Scenario C)")
+            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+            fig.tight_layout(); centered(fig)
+        else:
+            x_range = np.linspace(0, 15, 300) if gen_scale == SCALE_SQRT_RAW else np.linspace(-3, 3, 300)
+            _xlabel = "Predictor on √-scale (unstandardised)" if gen_scale == SCALE_SQRT_RAW else "Standardised predictor"
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x_range, b1 * x_range, color=MS["A"][0], lw=2, label=f"{b1:.4f} · GTV term")
+            if survival_scenario == SCEN_B:
+                ax.plot(x_range, b2_val * x_range, color=MS["B"][0], lw=2,
+                        linestyle="--", label=f"{b2_val:.4f} · MHD term")
+            ax.axhline(0, color="gray", lw=0.8, linestyle=":")
+            ax.set_xlabel(_xlabel); ax.set_ylabel("Logit contribution")
+            ax.set_title("True logit contributions by predictor")
+            ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+            fig.tight_layout(); centered(fig)
+        st.caption(
+            "Logit contribution = linear effect on the logit scale. "
+            "Probability follows p = 1 / (1 + exp(−logit)). "
+            "A logit increase of +1 around logit = 0 raises probability from 50% to ~73%."
+        )
+
+    # ── Optimizer debug info ──────────────────────────────────────────────────
+    with st.expander("Optimizer debug info", expanded=False):
+        _opt_rho   = _fit_result["rho"]   if _fit_overridden else float(target_corr if dist_mode == DIST_ARTICLE else 0.0)
+        _opt_noise = _fit_result["noise"] if _fit_overridden else surv_noise
+        _debug_rows = [
+            ("Active scenario",                     survival_scenario),
+            ("Optimizer used b2 = 0 (Scenario A)?",
+             "Yes" if survival_scenario == SCEN_A else "No — b2 = 0.2635"),
+            ("Optimised copula ρ",                  f"{_opt_rho:.4f}"),
+            ("Optimised noise σ",                   f"{_opt_noise:.4f}"),
+            ("True b1 (GTV effect)",                f"{b1:.4f}"),
+            ("True b2 (MHD effect)",                f"{b2_val:.4f}"),
+            ("Observed Pearson r(GTV, MHD)",        f"{pearson_r:.4f}"),
+            ("Fitted β_√GTV (unstd.)",
+             f"{_beta_gtv_unstd:.4f}" if not np.isnan(_beta_gtv_unstd) else "n/a (use_sqrt=False)"),
+            ("Fitted β_√MHD (unstd.)",
+             f"{_beta_mhd_unstd:.4f}" if not np.isnan(_beta_mhd_unstd) else "n/a (use_sqrt=False)"),
+            ("Fitted intercept (unstd.)",
+             f"{_intercept_unstd:.4f}" if not np.isnan(_intercept_unstd) else "n/a"),
+            ("AUC (test set, combined model)",      f"{auc_C:.4f}"),
+            ("Simulated mortality rate",            f"{obs_mort_rate*100:.2f}%"),
+        ]
+        if _fit_overridden:
+            _debug_rows += [
+                ("Optimizer internal β_√GTV",    f"{_fit_result['beta_gtv']:.4f}"),
+                ("Optimizer internal β_√MHD",    f"{_fit_result['beta_mhd']:.4f}"),
+                ("Optimizer internal AUC",       f"{_fit_result['auc']:.4f}"),
+                ("Optimizer internal mortality", f"{_fit_result['mortality']*100:.2f}%"),
+                ("Optimizer loss",               f"{_fit_result.get('loss', float('nan')):.6f}"),
+            ]
+        st.dataframe(
+            pd.DataFrame(_debug_rows, columns=["Parameter", "Value"]),
+            use_container_width=True, hide_index=True,
+        )
+        if _fit_overridden and survival_scenario == SCEN_A:
+            st.info(
+                "**Scenario A — optimizer used b2 = 0.**  \n"
+                "Fitted β_√MHD on the generated dataset can only be nonzero "
+                "through GTV-MHD correlation. With ρ ≈ 0 and b2 = 0, "
+                "β_√MHD (unstd.) should stay near zero."
+            )
+
+    # ── Raw data ──────────────────────────────────────────────────────────────
+    with st.expander("Raw data (first 50 rows)", expanded=False):
+        st.dataframe(df.head(50), use_container_width=True)
+
+
+
 
