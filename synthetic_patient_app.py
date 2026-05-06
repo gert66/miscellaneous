@@ -302,8 +302,6 @@ with st.sidebar:
         help="Starting number for the pseudo-random generator.",
     )
 
-    use_calibrated = False   # will be overridden in DIST_ARTICLE branch
-
     if dist_mode == DIST_SIMPLE:
         st.markdown("**Tumor volume (GTV)**")
         tv_mu    = st.slider("Mean GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
@@ -312,36 +310,27 @@ with st.sidebar:
         corr_a       = st.slider("Correlation coefficient a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05)
         mhd_noise_sd = st.slider("MHD noise level (Gy)", 0.1, 10.0, 3.0, step=0.1)
     else:
-        use_calibrated = st.toggle(
-            "Match GTV-MHD correlation to article value",
-            value=False,
+        target_pearson_r = st.slider(
+            "Target GTV-MHD correlation (r)", 0.0, 0.9, 0.45, step=0.05,
             help=(
-                "Automatically finds the correlation that best reproduces the Pearson r "
-                f"from Van Loon et al. (target r ≈ {_ARTICLE_TARGET_R}). "
-                "Calibration is computed once and cached — first run takes ~1 s."
+                "How strongly larger tumors tend to co-occur with higher heart dose. "
+                "The simulation automatically generates a population with approximately "
+                "this Pearson r between GTV and MHD."
             ),
         )
-        if use_calibrated:
-            with st.spinner("Calibrating…"):
-                _cal_rho, _cal_r = _calibrate_correlation()
-            target_corr = _cal_rho
+        if _fit_preview:
+            st.caption("⚙️ *Overridden by article optimisation*")
+        # Internally translate target Pearson r → copula ρ (grid search, cached).
+        _cal_rho, _cal_r = _calibrate_correlation(target_pearson_r)
+        target_corr = _cal_rho
+        with st.expander("🔧 Correlation diagnostics", expanded=False):
             st.caption(
-                f"✅ **Best match applied** — "
-                f"achieved Pearson r ≈ {_cal_r:.3f} "
-                f"(target {_ARTICLE_TARGET_R}, Van Loon et al.)\n\n"
-                f"GTV: log-normal (median ≈ 69 cc, mean ≈ 110 cc, SD ≈ 130 cc)\n\n"
-                f"MHD: gamma (mean ≈ 12 Gy, SD ≈ 8.2 Gy)"
+                f"**Target r:** {target_pearson_r:.2f}  \n"
+                f"**Internal copula ρ:** {_cal_rho:.3f}  \n"
+                f"**Expected achieved r:** {_cal_r:.3f}  \n"
+                "Observed Pearson r in the simulated sample is shown in the "
+                "**Data summary** tab."
             )
-        else:
-            target_corr = st.slider(
-                "Target GTV-MHD correlation (r)", 0.0, 0.9, 0.45, step=0.05,
-                help=(
-                    "This controls how strongly larger tumors tend to co-occur with higher heart dose. "
-                    "Higher values produce stronger GTV-MHD co-occurrence in the simulated population."
-                ),
-            )
-            if _fit_preview:
-                st.caption("⚙️ *Overridden by article optimisation*")
 
     # ── B. True causal mortality model ────────────────────────────────────────
     st.divider()
@@ -427,7 +416,7 @@ with st.sidebar:
     if survival_scenario == SCEN_C:
         calibrate_article = st.checkbox(
             "Calibrate article model to selected baseline",
-            value=use_calibrated,
+            value=False,
             help=(
                 "Adjusts only the intercept so that mean simulated mortality matches the selected baseline. "
                 "The slopes (0.0590 and 0.2635) remain unchanged."
@@ -537,7 +526,7 @@ with st.sidebar:
                     _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
                 st.caption(
                     f"✅ **Optimum found** — "
-                    f"r = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
+                    f"copula ρ = **{_fit_result['rho']:.2f}**, noise σ = **{_fit_result['noise']:.2f}**  \n"
                     f"β_√GTV = {_fit_result['beta_gtv']:.4f} (target 0.0590)  \n"
                     f"β_√MHD = {_fit_result['beta_mhd']:.4f} (target 0.2635)  \n"
                     f"AUC = {_fit_result['auc']:.3f} (target 0.640)  \n"
