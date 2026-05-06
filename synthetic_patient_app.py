@@ -459,21 +459,6 @@ with st.sidebar:
         )
         mhd_reduction_factor = 1.0
 
-    apply_true_proton = st.toggle(
-        "Apply true mortality benefit from MHD reduction",
-        value=False,
-        help=(
-            "Off: proton MHD reduction only affects the fitted model's predictions. "
-            "On: reduced MHD also lowers true simulated mortality via the causal model."
-        ),
-    )
-    if apply_true_proton:
-        proton_effect_strength = st.slider(
-            "Strength of true MHD-reduction effect", 0.0, 1.0, 0.1, step=0.01,
-        )
-    else:
-        proton_effect_strength = 0.0
-
     # ── D. Statistical regression model ──────────────────────────────────────
     st.divider()
     st.markdown("### 📊 D — Statistical regression model")
@@ -505,6 +490,38 @@ with st.sidebar:
             "See the **Article reproduction** tab.",
             icon="🔬",
         )
+
+    # ── E. Non-causal treatment-effect override (experimental) ───────────────
+    with st.expander("⚗️ Non-causal treatment-effect override", expanded=False):
+        st.warning(
+            "**This experimental mode injects a manually forced treatment benefit "
+            "that does not arise from the true causal mortality model.**  \n\n"
+            "Use only for sensitivity analysis, debugging, or methodological experiments.",
+        )
+        st.caption(
+            "⚠️ Enabling this intentionally breaks the normal causal logic of the simulator. "
+            "The injected benefit has no causal interpretation."
+        )
+        apply_true_proton = st.toggle(
+            "Inject non-causal treatment benefit",
+            value=False,
+            help=(
+                "When ON: a manually scaled mortality reduction is subtracted directly from "
+                "the true logit in proportion to the MHD dose reduction. "
+                "This effect is NOT mediated by the causal mortality model — "
+                "it is an artificial injection for sensitivity testing only."
+            ),
+        )
+        if apply_true_proton:
+            proton_effect_strength = st.slider(
+                "Override strength", 0.0, 1.0, 0.1, step=0.01,
+                help=(
+                    "Scales how strongly the MHD reduction is subtracted from the true logit. "
+                    "This parameter has no causal interpretation — it is a direct logit manipulation."
+                ),
+            )
+        else:
+            proton_effect_strength = 0.0
 
 
 # ── article-reproduction eligibility & overrides ─────────────────────────────
@@ -1306,19 +1323,30 @@ with tab_proton:
     pm4.metric("Gem. NNT (model)",                        fmt_f(np.nanmean(nnt_model)))
 
     if true_delta is not None:
+        st.error(
+            "⚗️ **Non-causal treatment-effect override is active.**  \n"
+            "The 'true Δ' shown below is an artificially injected logit manipulation — "
+            "it does **not** arise from the causal mortality model.  \n"
+            "Results below are for sensitivity analysis only and should not be "
+            "interpreted as a causal treatment effect.",
+        )
         pt1, pt2, *_ = st.columns(4)
-        pt1.metric("Gem. werkelijke Δ (via causaal logit)", f"{true_delta.mean()*100:.2f}%")
+        pt1.metric(
+            "Injected Δ (override, non-causal)",
+            f"{true_delta.mean()*100:.2f}%",
+            help="This is an artificially forced logit reduction, not a causal effect.",
+        )
         pt2.metric(
-            "Overestimatie door confounding",
-            f"{(delta_model.mean() - true_delta.mean())*100:.2f}%-punt",
-            help="Positief = model voorspelt meer mortaliteitsreductie dan werkelijk optreedt.",
+            "Model Δ vs. injected Δ",
+            f"{(delta_model.mean() - true_delta.mean())*100:.2f}%-pt",
+            help="Positive = model predicts more reduction than the injected override.",
         )
         if not mhd_is_causal:
             st.warning(
-                f"**Confounding in de mortaliteitsreductie:** het model voorspelt gemiddeld "
-                f"{delta_model.mean()*100:.2f}% absolute mortaliteitsreductie, maar de werkelijke "
-                f"gesimuleerde reductie is slechts {true_delta.mean()*100:.2f}%. "
-                f"MHD is gecorreleerd met GTV maar heeft geen direct causaal effect."
+                f"**Confounding note:** the model predicts {delta_model.mean()*100:.2f}% "
+                f"absolute mortality reduction, while the injected override is "
+                f"{true_delta.mean()*100:.2f}%. "
+                f"MHD correlates with GTV but has no causal path to mortality."
             )
 
     st.markdown("---")
@@ -1328,7 +1356,7 @@ with tab_proton:
             label="Model-gebaseerde Δ")
     if true_delta is not None:
         ax.hist(true_delta * 100, bins=40, color="#e67e22", edgecolor="none",
-                alpha=0.5, label="Werkelijke Δ (causaal logit)")
+                alpha=0.5, label="Injected Δ (non-causal override)")
         ax.legend(fontsize=8)
     ax.set_xlabel("Absolute mortaliteitsreductie Δ (%-punt)")
     ax.set_ylabel("Aantal patiënten")
