@@ -273,21 +273,21 @@ def build_nnt_table(delta: np.ndarray, n_total: int) -> pd.DataFrame:
 
 def build_nnt_comparison_table(
     delta_pred: np.ndarray,
-    delta_true: np.ndarray | None,
+    delta_true: np.ndarray,
     n_total: int,
 ) -> pd.DataFrame:
     """NNT comparison table binned on predicted delta.
 
     Shows predicted NNT, true causal NNT, and NNT inflation factor
     (true_NNT / predicted_NNT) for each bin.
-    delta_true=None means no true benefit is available (Scenario A, no override).
+    delta_true must always be an array (zeros for Scenario A).
     """
     rows = []
     for label, lo, hi in zip(_BLABELS, _BINS[:-1], _BINS[1:]):
         mask = (delta_pred >= lo) & (delta_pred < hi)
         n = int(mask.sum())
         dp = delta_pred[mask]
-        dt = delta_true[mask] if delta_true is not None else None
+        dt = delta_true[mask]
 
         if n == 0:
             rows.append({
@@ -301,18 +301,20 @@ def build_nnt_comparison_table(
         mean_dp  = dp.mean()
         pred_nnt = (1.0 / mean_dp) if mean_dp > 0 else float("nan")
 
-        if dt is not None:
-            mean_dt   = dt.mean()
-            true_nnt  = (1.0 / mean_dt) if mean_dt > 0 else float("nan")
-            inflation = (true_nnt / pred_nnt
-                         if (not np.isnan(true_nnt) and not np.isnan(pred_nnt) and pred_nnt > 0)
-                         else float("nan"))
+        mean_dt  = dt.mean()
+        if mean_dt > 0:
+            true_nnt = 1.0 / mean_dt
+            inflation = (
+                true_nnt / pred_nnt
+                if (not np.isnan(pred_nnt) and pred_nnt > 0)
+                else float("nan")
+            )
             mean_dt_str  = f"{mean_dt * 100:.2f} %"
             true_nnt_str = fmt_f(true_nnt)
             infl_str     = fmt_f(inflation)
         else:
-            mean_dt_str  = "0 % (no true effect)"
-            true_nnt_str = "No true benefit"
+            mean_dt_str  = "0.00 %  (no true benefit)"
+            true_nnt_str = "∞"
             infl_str     = "∞"
 
         rows.append({
@@ -520,13 +522,22 @@ with st.sidebar:
             "On: forces a true treatment effect proportional to MHD reduction, "
             "regardless of scenario causal structure."
         )
-        apply_true_proton = st.toggle("Enable forced true treatment effect", value=False)
-        if apply_true_proton:
-            proton_effect_strength = st.slider(
-                "True MHD reduction effect strength", 0.0, 1.0, 0.1, step=0.01,
+        with st.expander("⚠️ Experimental override mode", expanded=False):
+            st.warning(
+                "This mode injects an **artificial** treatment effect that is independent "
+                "of the true causal model. It overrides the scientifically-correct true "
+                "causal delta. Use only for sensitivity analysis."
             )
-        else:
-            proton_effect_strength = 0.0
+            apply_true_proton = st.toggle(
+                "Enable artificial treatment effect override", value=False,
+                key="apply_true_proton_toggle",
+            )
+            if apply_true_proton:
+                proton_effect_strength = st.slider(
+                    "Override effect strength", 0.0, 1.0, 0.1, step=0.01,
+                )
+            else:
+                proton_effect_strength = 0.0
 
         st.markdown("**Fit to article targets**")
         _fit_eligible = (
@@ -772,32 +783,68 @@ p_mort_proton = pipe_C.predict_proba(X_feat_proton)[:, 1]
 delta_model   = p_mort_photon - p_mort_proton
 nnt_model     = np.where(delta_model > 0, 1.0 / delta_model, np.nan)
 
-# True causal delta — only non-zero when forced true treatment effect is on
-if apply_true_proton and proton_effect_strength > 0:
-    mhd_diff             = mean_heart_dose - mhd_proton
-    true_mort_logit_prot = true_mort_logit - proton_effect_strength * mhd_diff
-    true_p_mort_photon   = 1.0 / (1.0 + np.exp(-true_mort_logit))
-    true_p_mort_proton   = 1.0 / (1.0 + np.exp(-true_mort_logit_prot))
-    true_delta           = true_p_mort_photon - true_p_mort_proton
-else:
-    true_delta = None
+# ── True causal delta — derived directly from the data-generating model ────────
+# For each scenario we replace only the MHD term in the true logit.
+# The noise term (unmeasured patient-level factors) is unchanged by MHD reduction.
+
+if survival_scenario == SCEN_A:
+    # b2 = 0: MHD has no causal path to mortality; true proton benefit is zero.
+    true_delta = np.zeros(n_patients)
+
+elif survival_scenario == SCEN_B:
+    # Recompute MHD contribution in the exact scale used for data generation.
+    if gen_scale == SCALE_SQRT_RAW:
+        _mhd_gen_photon = np.sqrt(mean_heart_dose)
+        _mhd_gen_proton = np.sqrt(mhd_proton)
+    elif gen_scale == SCALE_SQRT_Z:
+        _sq_mhd_phot    = np.sqrt(mean_heart_dose)
+        _sq_mhd_mean    = _sq_mhd_phot.mean()
+        _sq_mhd_std     = _sq_mhd_phot.std()
+        _mhd_gen_photon = (_sq_mhd_phot         - _sq_mhd_mean) / _sq_mhd_std
+        _mhd_gen_proton = (np.sqrt(mhd_proton)  - _sq_mhd_mean) / _sq_mhd_std
+    else:  # SCALE_Z_RAW
+        _mhd_mean       = mean_heart_dose.mean()
+        _mhd_std        = mean_heart_dose.std()
+        _mhd_gen_photon = (mean_heart_dose - _mhd_mean) / _mhd_std
+        _mhd_gen_proton = (mhd_proton      - _mhd_mean) / _mhd_std
+    # Shift only the MHD term; all other logit components (including noise) unchanged.
+    _true_logit_proton = true_mort_logit + b2_val * (_mhd_gen_proton - _mhd_gen_photon)
+    true_delta = (
+        1.0 / (1.0 + np.exp(-true_mort_logit))
+        - 1.0 / (1.0 + np.exp(-_true_logit_proton))
+    )
+
+else:  # SCEN_C — article formula, sqrt scale, coefficient 0.2635
+    _logit_proton_c = (
+        true_mort_logit
+        + 0.2635 * (np.sqrt(mhd_proton) - np.sqrt(mean_heart_dose))
+    )
+    true_delta = (
+        1.0 / (1.0 + np.exp(-true_mort_logit))
+        - 1.0 / (1.0 + np.exp(-_logit_proton_c))
+    )
+
+# Experimental override: replaces the causal true delta with an artificial term.
+_override_active = apply_true_proton and proton_effect_strength > 0
+if _override_active:
+    _mhd_diff              = mean_heart_dose - mhd_proton
+    _override_logit_proton = true_mort_logit - proton_effect_strength * _mhd_diff
+    true_delta = (
+        1.0 / (1.0 + np.exp(-true_mort_logit))
+        - 1.0 / (1.0 + np.exp(-_override_logit_proton))
+    )
 
 # Aggregate NNT metrics
 _mean_pred_delta = delta_model.mean()
 _pred_nnt_mean   = (1.0 / _mean_pred_delta) if _mean_pred_delta > 0 else float("nan")
 
-if true_delta is not None:
-    _mean_true_delta = true_delta.mean()
-    _true_nnt_mean   = (1.0 / _mean_true_delta) if _mean_true_delta > 0 else float("nan")
-    _nnt_inflation   = (
-        _true_nnt_mean / _pred_nnt_mean
-        if (not np.isnan(_true_nnt_mean) and not np.isnan(_pred_nnt_mean) and _pred_nnt_mean > 0)
-        else float("nan")
-    )
-else:
-    _mean_true_delta = 0.0
-    _true_nnt_mean   = float("nan")
-    _nnt_inflation   = float("nan")
+_mean_true_delta = true_delta.mean()
+_true_nnt_mean   = (1.0 / _mean_true_delta) if _mean_true_delta > 0 else float("nan")
+_nnt_inflation   = (
+    _true_nnt_mean / _pred_nnt_mean
+    if (not np.isnan(_true_nnt_mean) and not np.isnan(_pred_nnt_mean) and _pred_nnt_mean > 0)
+    else float("nan")
+)
 
 # ── noise impact helper ───────────────────────────────────────────────────────
 
@@ -1219,11 +1266,18 @@ with tab_proton:
             f"(fixed reduction per patient, min. 0 Gy)"
         )
 
+    st.markdown(
+        "A regression model may predict larger treatment benefit than truly exists if the "
+        "fitted MHD coefficient partly reflects surrogate prognostic information rather than "
+        "pure causal treatment sensitivity."
+    )
+
     # ── Section A: Model-predicted benefit ────────────────────────────────────
     st.subheader("A. Model-predicted proton benefit")
     st.caption(
-        "Calculated from the fitted model after substituting reduced MHD. "
-        "This is what the model says — not necessarily what would happen in reality."
+        "Calculated from the **fitted regression model** after substituting reduced MHD. "
+        "This is what the model says — it may overstate the true benefit when MHD acts "
+        "partly as a surrogate marker."
     )
 
     pm1, pm2, pm3, pm4 = st.columns(4)
@@ -1232,61 +1286,70 @@ with tab_proton:
     pm3.metric("Mean predicted Δ",          f"{_mean_pred_delta*100:.2f}%")
     pm4.metric("Predicted NNT (1/mean Δ)", fmt_f(_pred_nnt_mean))
 
-    # ── Section B: True simulated benefit ─────────────────────────────────────
-    st.subheader("B. True simulated proton benefit")
+    # ── Section B: True causal benefit ────────────────────────────────────────
+    st.subheader("B. True causal proton benefit")
+    st.caption(
+        "Derived directly from the **data-generating causal model**, not the fitted regression. "
+        "Only the MHD term changes; all other patient-level factors (including noise) are fixed."
+    )
 
-    if not apply_true_proton:
-        if survival_scenario == SCEN_A:
-            st.warning(
-                "**Scenario A — no forced true treatment effect.**  \n"
-                "MHD is not causal in this simulation. Proton MHD reduction only changes "
-                "model-predicted risk. The true simulated mortality does not improve.  \n"
-                "Expected true benefit ≈ 0. If the model predicts benefit, it is "
-                "**model-predicted benefit only** — not a real outcome improvement."
-            )
-        elif survival_scenario == SCEN_B:
-            st.info(
-                "**Scenario B — MHD is causal, but forced true treatment effect is off.**  \n"
-                "MHD has a true causal effect (b2 > 0), but the true proton benefit is not "
-                "separately computed here because 'Enable forced true treatment effect' is off. "
-                "Enable it in Advanced controls to quantify the true benefit."
-            )
-        else:
-            st.info(
-                "**Scenario C — article formula.**  \n"
-                "MHD is causal in the article formula. Enable the forced true treatment effect "
-                "in Advanced controls to quantify the true simulated benefit."
-            )
+    if _override_active:
+        st.warning(
+            f"⚠️ **Experimental override is ON** (strength = {proton_effect_strength:.2f}). "
+            "The true delta shown below is an artificial injection, not the causal model value."
+        )
+
+    if survival_scenario == SCEN_A:
+        st.error(
+            "**Scenario A — MHD is not causal.**  \n"
+            "The true causal model has b2 = 0, so reducing MHD produces **zero true mortality "
+            "benefit** for every patient. Any model-predicted benefit above is an artefact of "
+            f"GTV-MHD correlation (r = {pearson_r:.2f}) — not a real treatment effect."
+        )
         pt1, pt2 = st.columns(2)
-        pt1.metric("Mean true Δ", "0 % (no true effect active)")
-        pt2.metric("True causal NNT", "No true benefit")
-    else:
+        pt1.metric("Mean true causal Δ", "0.00%  (MHD non-causal)")
+        pt2.metric("True causal NNT", "∞  (no true benefit)")
+    elif survival_scenario == SCEN_B:
         st.success(
-            f"**Forced true treatment effect is ON** (strength = {proton_effect_strength:.2f}).  \n"
-            "The true simulated mortality is reduced proportionally to MHD reduction. "
-            "This applies regardless of the scenario causal structure — it is a manual override."
+            f"**Scenario B — MHD is causal** (b2 = {b2_val:.4f}).  \n"
+            "True benefit computed from the same logit used to generate the data, "
+            "replacing photon MHD with proton MHD."
         )
         pt1, pt2, pt3, pt4 = st.columns(4)
-        pt1.metric("Mean true Δ",      f"{_mean_true_delta*100:.2f}%")
-        pt2.metric("True causal NNT",  fmt_f(_true_nnt_mean))
-        pt3.metric("Mean predicted Δ", f"{_mean_pred_delta*100:.2f}%")
-        pt4.metric("Predicted NNT",    fmt_f(_pred_nnt_mean))
+        pt1.metric("Mean true causal Δ", f"{_mean_true_delta*100:.2f}%")
+        pt2.metric("True causal NNT",    fmt_f(_true_nnt_mean))
+        pt3.metric("Mean predicted Δ",   f"{_mean_pred_delta*100:.2f}%")
+        pt4.metric("Predicted NNT",      fmt_f(_pred_nnt_mean))
+    else:  # SCEN_C
+        st.success(
+            "**Scenario C — article formula** (MHD coefficient = 0.2635).  \n"
+            "True benefit computed from the article logit: "
+            "logit = intercept + 0.059·√GTV + 0.2635·√MHD."
+        )
+        pt1, pt2, pt3, pt4 = st.columns(4)
+        pt1.metric("Mean true causal Δ", f"{_mean_true_delta*100:.2f}%")
+        pt2.metric("True causal NNT",    fmt_f(_true_nnt_mean))
+        pt3.metric("Mean predicted Δ",   f"{_mean_pred_delta*100:.2f}%")
+        pt4.metric("Predicted NNT",      fmt_f(_pred_nnt_mean))
 
     # ── NNT inflation ─────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("NNT inflation factor")
+    st.subheader("NNT inflation factor  (true NNT / predicted NNT)")
 
-    if true_delta is None:
-        st.markdown(
-            "**NNT inflation factor:** not computable — no true treatment effect is active.  \n"
-            "Enable the forced true treatment effect in Advanced controls to see inflation."
+    if survival_scenario == SCEN_A:
+        st.error(
+            "**Scenario A — NNT inflation is infinite.**  \n"
+            f"Predicted NNT = {fmt_f(_pred_nnt_mean)} (model predicts real benefit).  \n"
+            "True causal NNT = ∞ (no true benefit because MHD is non-causal).  \n"
+            "This is the central demonstration: the model overstates proton benefit "
+            "because it cannot distinguish correlation from causation."
         )
     else:
         ni1, ni2, ni3 = st.columns(3)
         ni1.metric("Predicted NNT",   fmt_f(_pred_nnt_mean))
         ni2.metric("True causal NNT", fmt_f(_true_nnt_mean))
         ni3.metric(
-            "NNT inflation factor  (true NNT / predicted NNT)",
+            "NNT inflation factor",
             fmt_f(_nnt_inflation),
             help="1.0 = no inflation. >1 = true NNT is higher than model predicts.",
         )
@@ -1294,37 +1357,49 @@ with tab_proton:
         if not np.isnan(_nnt_inflation):
             if _nnt_inflation > 3:
                 st.error(
-                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
+                    f"**NNT inflation = {_nnt_inflation:.1f}×** — "
                     "the true NNT is much higher than the model-predicted NNT. "
-                    "The model may substantially overstate the treatment benefit."
+                    "The model substantially overstates the treatment benefit."
                 )
             elif _nnt_inflation > 1.5:
                 st.warning(
-                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
+                    f"**NNT inflation = {_nnt_inflation:.1f}×** — "
                     "the true NNT is higher than the model-predicted NNT."
                 )
             else:
                 st.success(
-                    f"**NNT inflation factor = {_nnt_inflation:.1f}** — "
-                    "model-predicted and true NNT are broadly consistent."
+                    f"**NNT inflation = {_nnt_inflation:.1f}×** — "
+                    "model-predicted and true causal NNT are broadly consistent."
                 )
 
     # ── Delta histogram ───────────────────────────────────────────────────────
     st.divider()
     st.subheader("Distribution of absolute mortality reduction per patient")
 
+    _true_label = (
+        "True causal Δ — artificial override"
+        if _override_active
+        else "True causal Δ (from data-generating model)"
+    )
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.hist(delta_model * 100, bins=40, color="#2980b9", edgecolor="none",
-            alpha=0.8, label="Model-predicted Δ")
-    if true_delta is not None:
-        ax.hist(true_delta * 100, bins=40, color="#e67e22", edgecolor="none",
-                alpha=0.6, label="True simulated Δ (forced effect)")
-        ax.legend(fontsize=9)
+            alpha=0.8, label="Model-predicted Δ (from fitted regression model)")
+    ax.hist(true_delta * 100, bins=40, color="#e67e22", edgecolor="none",
+            alpha=0.6, label=_true_label)
+    ax.legend(fontsize=9)
     ax.set_xlabel("Absolute mortality reduction Δ (percentage points)")
     ax.set_ylabel("Number of patients")
-    ax.set_title(f"Predicted Δ distribution  (MHD reduction: {_proton_label})")
+    ax.set_title(f"Δ distribution — model-predicted vs true causal  (MHD reduction: {_proton_label})")
     fig.tight_layout()
     centered(fig)
+
+    if survival_scenario == SCEN_A:
+        st.caption(
+            "Scenario A: the blue (model-predicted) distribution is shifted right because the "
+            "model fitted a positive MHD coefficient via GTV-MHD correlation. "
+            "The orange (true causal) distribution is a spike at Δ = 0 — no patient "
+            "actually benefits from MHD reduction."
+        )
 
     # ── NNT comparison table ──────────────────────────────────────────────────
     st.subheader("NNT table by predicted benefit bin")
@@ -1333,7 +1408,7 @@ with tab_proton:
     st.caption(
         "Binned on **predicted** Δ. "
         "Predicted NNT = 1 / mean predicted Δ within bin. "
-        "True causal NNT = 1 / mean true Δ within bin. "
+        "True causal NNT = 1 / mean true Δ within bin (∞ or NaN when true Δ = 0). "
         "NNT inflation = true NNT / predicted NNT — higher means the model overstates benefit."
     )
 
@@ -1348,13 +1423,6 @@ with tab_proton:
     ax.tick_params(axis="x", rotation=40, labelsize=7)
     fig.tight_layout()
     centered(fig)
-
-    if survival_scenario == SCEN_A and not apply_true_proton:
-        st.caption(
-            "Scenario A, no forced true effect: patients with high predicted Δ have large GTV "
-            "and correspondingly high MHD. The model sees MHD reduction as beneficial because "
-            "MHD carries GTV signal. No true outcome improvement occurs."
-        )
 
 
 # ── tab: Dose curves ──────────────────────────────────────────────────────────
