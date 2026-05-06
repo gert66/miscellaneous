@@ -270,14 +270,16 @@ def build_nnt_table(delta: np.ndarray, n_total: int) -> pd.DataFrame:
 
 st.set_page_config(page_title="Mortaliteitsmodel — Confounding Demo", layout="wide")
 
+# Read optimizer toggle from session state before the sidebar so that data
+# generation (which runs before tabs) can see whether it is active.
+fit_to_article = st.session_state.get("fit_to_article_toggle", False)
+
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Simulation settings")
 
-    # Read the fit-to-article toggle state before any widgets so "Overridden"
-    # captions can appear on sliders that are rendered earlier in the sidebar.
-    _fit_preview = st.session_state.get("fit_to_article_toggle", False)
+    _fit_preview = fit_to_article   # alias used by slider captions below
 
     # ── A. Patient population ─────────────────────────────────────────────────
     st.markdown("### 👥 A — Patient population")
@@ -494,50 +496,32 @@ with st.sidebar:
         help="Fraction of patients reserved for model validation.",
     )
 
-    # ── Advanced: fit to article ──────────────────────────────────────────────
-    with st.expander("🔬 Advanced: fit to article", expanded=False):
-        st.caption(
-            "Grid-searches the combination of correlation and noise that best reproduces "
-            "Van Loon et al.: β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortality ≈ 50.6 %."
+    # Article reproduction mode banner
+    if _fit_preview:
+        st.warning(
+            "⚠️ **Article reproduction mode active.**  \n"
+            "The optimizer is controlling the active simulation.  \n"
+            "Manual sliders below are **overridden**.  \n"
+            "See the **Article reproduction** tab.",
+            icon="🔬",
         )
-        _fit_eligible = (
-            dist_mode == DIST_ARTICLE
-            and survival_scenario in (SCEN_A, SCEN_B)
-            and gen_scale == SCALE_SQRT_RAW
-        )
-        if not _fit_eligible:
-            st.caption(
-                "Available when: article distribution + scenario A or B + scale √GTV/MHD unstandardised."
-            )
-            fit_to_article = False
-        else:
-            fit_to_article = st.toggle(
-                "Optimise parameters to article",
-                key="fit_to_article_toggle",
-                value=False,
-                help=(
-                    "Grid-searches the combination of GTV-MHD correlation and noise level that "
-                    "best reproduces Van Loon et al. results. "
-                    "Result is cached — first run ~5 s."
-                ),
-            )
-            if fit_to_article:
-                with st.spinner("Running grid search…"):
-                    _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
-                st.caption(
-                    f"✅ **Optimum found** — "
-                    f"copula ρ = **{_fit_result['rho']:.2f}**, noise σ = **{_fit_result['noise']:.2f}**  \n"
-                    f"β_√GTV = {_fit_result['beta_gtv']:.4f} (target 0.0590)  \n"
-                    f"β_√MHD = {_fit_result['beta_mhd']:.4f} (target 0.2635)  \n"
-                    f"AUC = {_fit_result['auc']:.3f} (target 0.640)  \n"
-                    f"Mortality = {_fit_result['mortality']*100:.1f} % (target 50.6 %)"
-                )
 
 
-# ── fit-to-article overrides ──────────────────────────────────────────────────
+# ── article-reproduction eligibility & overrides ─────────────────────────────
+# Runs before data generation so optimizer parameters feed into the simulation.
+
+_fit_eligible = (
+    dist_mode == DIST_ARTICLE
+    and survival_scenario in (SCEN_A, SCEN_B)
+    and gen_scale == SCALE_SQRT_RAW
+)
 
 _fit_overridden = False
+_fit_result: dict = {}
+
 if fit_to_article and _fit_eligible:
+    with st.spinner("Article reproduction: running grid search…"):
+        _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
     target_corr = _fit_result["rho"]
     surv_noise  = _fit_result["noise"]
     _fit_overridden = True
@@ -764,9 +748,9 @@ MS = {"A": ("#2980b9", "solid"), "B": ("#e67e22", "dashed"), "C": ("#27ae60", "d
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
-(tab_model, tab_roc, tab_hist, tab_dose, tab_proton, tab_data,
+(tab_model, tab_article, tab_roc, tab_hist, tab_dose, tab_proton, tab_data,
  tab_noise, tab_scatter, tab_corr, tab_cm, tab_raw) = st.tabs([
-    "Model results", "ROC vergelijking", "Histogrammen", "Dosis-effect",
+    "Model results", "🔬 Article reproduction", "ROC vergelijking", "Histogrammen", "Dosis-effect",
     "Proton benefit", "Data summary", "Ruis-impact",
     "Scatter GTV ↔ MHD", "Correlatiemat.", "Verwarringsmatrix", "Ruwe data",
 ])
@@ -818,25 +802,11 @@ with tab_model:
             )
 
     if _fit_overridden:
-        st.info(
-            f"**Fit-to-article actief** — parameters overschreven door grid search:  \n"
-            f"Copula ρ = **{_fit_result['rho']:.2f}** · "
-            f"Ruisniveau σ = **{_fit_result['noise']:.2f}**"
-        )
-        fa1, fa2, fa3, fa4 = st.columns(4)
-        fa1.metric("β_√GTV (gefitst)", f"{_fit_result['beta_gtv']:.4f}",
-                   delta=f"{_fit_result['beta_gtv']-0.059:+.4f} vs 0.059")
-        fa2.metric("β_√MHD (gefitst)", f"{_fit_result['beta_mhd']:.4f}",
-                   delta=f"{_fit_result['beta_mhd']-0.2635:+.4f} vs 0.264")
-        fa3.metric("AUC (gefitst)", f"{_fit_result['auc']:.3f}",
-                   delta=f"{_fit_result['auc']-0.64:+.3f} vs 0.640")
-        fa4.metric("Mortaliteit (gefitst)", f"{_fit_result['mortality']*100:.1f}%",
-                   delta=f"{(_fit_result['mortality']-0.506)*100:+.1f}pp vs 50.6%")
         st.warning(
-            "**Gelijke coëfficiënten bewijzen geen causaliteit.**  \n"
-            "Verschillende onderliggende data-genererende mechanismen kunnen hetzelfde "
-            "gefitte model produceren. Dezelfde β-waarden als Van Loon et al. betekenen "
-            "niet dat de causale structuur overeenkomt."
+            "⚠️ **Article reproduction mode active** — the optimizer is controlling "
+            "the active simulation. Manual sidebar sliders are overridden.  \n"
+            "→ See the **🔬 Article reproduction** tab for parameters, results, and caveats.",
+            icon="🔬",
         )
 
     with st.expander("Ware mortaliteitsgenererende formule", expanded=False):
@@ -962,6 +932,160 @@ with tab_model:
         "In scenario A heeft MHD geen direct pad naar mortaliteit. "
         "In scenario B en C heeft MHD ook een causaal effect."
     )
+
+# ── tab: Article reproduction experiment ─────────────────────────────────────
+
+with tab_article:
+    st.title("🔬 Article reproduction experiment")
+    st.markdown(
+        "**Scientific purpose:** Can alternative causal structures reproduce "
+        "article-like regression outputs?  \n\n"
+        "This is an **inverse parameter search** — the opposite of forward causal simulation. "
+        "The optimizer searches for combinations of GTV-MHD correlation and prognostic noise "
+        "that reproduce the regression coefficients, AUC, and mortality rate reported in "
+        "Van Loon et al.  \n\n"
+        'This workflow answers: *"Which causal worlds are consistent with the published numbers?"*'
+    )
+
+    st.divider()
+
+    # ── Toggle ────────────────────────────────────────────────────────────────
+    _art_eligible_msg = (
+        "**Requires:** Article-like distribution + Scenario A or B "
+        "+ Scale √GTV/MHD unstandardised."
+    )
+    if not _fit_eligible:
+        st.info(
+            "**Optimizer not available with current settings.**  \n" + _art_eligible_msg,
+            icon="ℹ️",
+        )
+        # Render a disabled-looking toggle that can't be activated
+        st.toggle(
+            "Run article reproduction optimizer",
+            key="fit_to_article_toggle",
+            value=False,
+            disabled=True,
+            help=_art_eligible_msg,
+        )
+    else:
+        _toggled = st.toggle(
+            "Run article reproduction optimizer",
+            key="fit_to_article_toggle",
+            value=False,
+            help=(
+                "Grid-searches GTV-MHD correlation and noise level to minimise the weighted "
+                "squared distance from article targets. Result is cached — first run ~5 s."
+            ),
+        )
+
+    st.divider()
+
+    if not _fit_overridden:
+        st.info(
+            "**Optimizer is OFF.** The forward causal simulation is running normally.  \n"
+            "Enable the toggle above to start an article reproduction experiment.",
+            icon="💡",
+        )
+    else:
+        # ── Active-mode banner ────────────────────────────────────────────────
+        st.error(
+            "### ⚠️ Article reproduction mode active\n\n"
+            "The optimizer is controlling the active simulation.  \n"
+            "**Manual sidebar sliders are not controlling the active simulation.**  \n"
+            "The parameters shown below are what is actually being used.",
+            icon="🔬",
+        )
+
+        # ── Parameters used by the optimizer ─────────────────────────────────
+        st.subheader("Parameters used by the optimizer")
+        st.caption(
+            "These values were chosen by grid search to best match article targets — "
+            "they are not your manual slider settings."
+        )
+
+        _obs_r = pearson_r  # computed after data generation
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric(
+            "True causal b1 (√GTV)",
+            f"{_FIT_TARGETS['beta_gtv']:.4f}",
+            help="Fixed to the article value (0.0590 · √GTV).",
+        )
+        p2.metric(
+            "True causal b2 (√MHD)",
+            f"{_FIT_TARGETS['beta_mhd']:.4f}",
+            help="Fixed to the article value (0.2635 · √MHD).",
+        )
+        p3.metric(
+            "GTV-MHD correlation (observed r)",
+            f"{_obs_r:.3f}",
+            help="Pearson r in the generated population with optimizer copula ρ.",
+        )
+        p4.metric(
+            "Prognostic noise (σ)",
+            f"{_fit_result['noise']:.2f}",
+            help="Logit-scale noise chosen by the optimizer.",
+        )
+
+        # ── Achieved vs target metrics ────────────────────────────────────────
+        st.subheader("Achieved vs. article targets")
+
+        _art_rows = [
+            ("β_√GTV (fitted)",  f"{_fit_result['beta_gtv']:.4f}",
+             f"{_FIT_TARGETS['beta_gtv']:.4f}",
+             f"{_fit_result['beta_gtv'] - _FIT_TARGETS['beta_gtv']:+.4f}"),
+            ("β_√MHD (fitted)",  f"{_fit_result['beta_mhd']:.4f}",
+             f"{_FIT_TARGETS['beta_mhd']:.4f}",
+             f"{_fit_result['beta_mhd'] - _FIT_TARGETS['beta_mhd']:+.4f}"),
+            ("AUC",              f"{_fit_result['auc']:.3f}",
+             f"{_FIT_TARGETS['auc']:.3f}",
+             f"{_fit_result['auc'] - _FIT_TARGETS['auc']:+.3f}"),
+            ("Mortality rate",   f"{_fit_result['mortality']*100:.1f} %",
+             f"{_FIT_TARGETS['mortality']*100:.1f} %",
+             f"{(_fit_result['mortality'] - _FIT_TARGETS['mortality'])*100:+.1f} pp"),
+        ]
+        st.dataframe(
+            pd.DataFrame(_art_rows, columns=["Metric", "Achieved", "Article target", "Δ"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("β_√GTV (fitted)",  f"{_fit_result['beta_gtv']:.4f}",
+                  delta=f"{_fit_result['beta_gtv'] - _FIT_TARGETS['beta_gtv']:+.4f} vs 0.059")
+        m2.metric("β_√MHD (fitted)",  f"{_fit_result['beta_mhd']:.4f}",
+                  delta=f"{_fit_result['beta_mhd'] - _FIT_TARGETS['beta_mhd']:+.4f} vs 0.264")
+        m3.metric("AUC",              f"{_fit_result['auc']:.3f}",
+                  delta=f"{_fit_result['auc'] - _FIT_TARGETS['auc']:+.3f} vs 0.640")
+        m4.metric("Mortality",        f"{_fit_result['mortality']*100:.1f} %",
+                  delta=f"{(_fit_result['mortality'] - _FIT_TARGETS['mortality'])*100:+.1f} pp vs 50.6 %")
+
+        st.divider()
+
+        # ── Scientific caveat ─────────────────────────────────────────────────
+        st.subheader("⚠️ Important scientific caveat")
+        st.warning(
+            "**Matching published regression coefficients does not prove the underlying "
+            "causal structure is correct.**  \n\n"
+            "The optimizer found a causal world that produces similar fitted β values, "
+            "AUC, and mortality rate. But many different causal structures can produce "
+            "the same regression output.  \n\n"
+            "Identical β values as Van Loon et al. do **not** mean:  \n"
+            "- the true b1 and b2 are those values  \n"
+            "- MHD is (or is not) causally linked to mortality  \n"
+            "- the correlation structure matches the real patient population  \n\n"
+            "This experiment demonstrates **observational equivalence**: published "
+            "regression results are consistent with multiple causal stories."
+        )
+
+        st.info(
+            "**What this optimizer does NOT do:**  \n"
+            "- It does not search over causal structures (b1, b2 are fixed to article values)  \n"
+            "- It does not test whether MHD is causal  \n"
+            "- It does not validate the article's conclusions  \n\n"
+            "It only searches over: *GTV-MHD correlation* and *prognostic noise*.",
+            icon="ℹ️",
+        )
 
 # ── tab: ROC vergelijking ─────────────────────────────────────────────────────
 
