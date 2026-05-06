@@ -98,11 +98,13 @@ def _fit_to_article(
     n: int = 500,
     test_size: float = 0.2,
     seed: int = 42,
+    true_b2: float = _FIT_TARGETS["beta_mhd"],
 ) -> dict:
     """Grid search over (copula rho, noise) to minimise loss vs article targets.
-    Generates data with SCEN_B causal structure + SCALE_SQRT_RAW, fits an
-    unstandardized logistic model on sqrt(GTV) and sqrt(MHD), and evaluates the
-    four target metrics. Returns the best parameter set and achieved metrics."""
+    Generates data with SCALE_SQRT_RAW, fits an unstandardized logistic model on
+    sqrt(GTV) and sqrt(MHD), and evaluates the four target metrics.
+    true_b2=0 for Scenario A (MHD non-causal), true_b2=0.2635 for Scenario B/C.
+    Returns the best parameter set and achieved metrics."""
     from sklearn.linear_model import LogisticRegression as _LR
     from sklearn.model_selection import train_test_split as _tts
     from sklearn.metrics import roc_curve as _roc, auc as _auc
@@ -125,10 +127,10 @@ def _fit_to_article(
             gtv = lognorm.ppf(U1, s=_GTV_SIGMA, scale=np.exp(_GTV_MU)).clip(0.0, 1800.0)
             mhd = sp_gamma.ppf(U2, a=_MHD_K, scale=_MHD_THETA).clip(0.0, 45.0)
 
-            # mortality via SCEN_B / SCALE_SQRT_RAW with b1=0.059, b2=0.2635
+            # mortality via SCALE_SQRT_RAW; true_b2=0 for Scenario A, 0.2635 for B/C
             tv_gen  = np.sqrt(gtv)
             mhd_gen = np.sqrt(mhd)
-            gen_sl  = _FIT_TARGETS["beta_gtv"] * tv_gen + _FIT_TARGETS["beta_mhd"] * mhd_gen
+            gen_sl  = _FIT_TARGETS["beta_gtv"] * tv_gen + true_b2 * mhd_gen
             target_mort = _FIT_TARGETS["mortality"]
             try:
                 def _mp(i): return (1/(1+np.exp(-(i+gen_sl)))).mean() - target_mort
@@ -459,7 +461,13 @@ with st.sidebar:
         )
         if fit_to_article:
             with st.spinner("Grid search uitvoeren…"):
-                _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
+                _true_b2_for_optimizer = (
+                    0.0 if survival_scenario == SCEN_A else _FIT_TARGETS["beta_mhd"]
+                )
+                _fit_result = _fit_to_article(
+                    n=n_patients, test_size=test_size, seed=int(seed),
+                    true_b2=_true_b2_for_optimizer,
+                )
             st.caption(
                 f"✅ **Optimum gevonden** — "
                 f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
@@ -661,6 +669,20 @@ interc_C   = _lr(pipe_C).intercept_[0]
 y_pred_C   = pipe_C.predict(X_test)
 accuracy_C = (y_pred_C == y_test).mean()
 
+# Unstandardized logistic regression on main dataset for article comparison.
+# Uses same X_train / X_test (already sqrt-transformed if use_sqrt=True).
+# Coefficients are directly comparable to article values (0.0590 / 0.2635).
+if use_sqrt and X_train.shape[1] == 2:
+    _lr_unstd = LogisticRegression(max_iter=1000, fit_intercept=True)
+    _lr_unstd.fit(X_train, y_train)
+    _beta_gtv_unstd   = float(_lr_unstd.coef_[0][0])
+    _beta_mhd_unstd   = float(_lr_unstd.coef_[0][1])
+    _intercept_unstd  = float(_lr_unstd.intercept_[0])
+    _fp_u, _tp_u, _   = roc_curve(y_test, _lr_unstd.predict_proba(X_test)[:, 1])
+    _auc_unstd        = float(auc(_fp_u, _tp_u))
+else:
+    _beta_gtv_unstd = _beta_mhd_unstd = _intercept_unstd = _auc_unstd = float("nan")
+
 coef_df = pd.DataFrame({
     "Feature":            fl,
     "Coëfficiënt (std.)": coefs_C.round(4),
@@ -793,17 +815,19 @@ with tab_model:
         st.info(
             f"**Fit-to-article actief** — parameters overschreven door grid search:  \n"
             f"Copula ρ = **{_fit_result['rho']:.2f}** · "
-            f"Ruisniveau σ = **{_fit_result['noise']:.2f}**"
+            f"Ruisniveau σ = **{_fit_result['noise']:.2f}**  \n"
+            f"Coëfficiënten hieronder zijn van het opnieuw gefitte model op de "
+            f"gegenereerde dataset (ongestandaardiseerd, √-schaal)."
         )
         fa1, fa2, fa3, fa4 = st.columns(4)
-        fa1.metric("β_√GTV (gefitst)", f"{_fit_result['beta_gtv']:.4f}",
-                   delta=f"{_fit_result['beta_gtv']-0.059:+.4f} vs 0.059")
-        fa2.metric("β_√MHD (gefitst)", f"{_fit_result['beta_mhd']:.4f}",
-                   delta=f"{_fit_result['beta_mhd']-0.2635:+.4f} vs 0.264")
-        fa3.metric("AUC (gefitst)", f"{_fit_result['auc']:.3f}",
-                   delta=f"{_fit_result['auc']-0.64:+.3f} vs 0.640")
-        fa4.metric("Mortaliteit (gefitst)", f"{_fit_result['mortality']*100:.1f}%",
-                   delta=f"{(_fit_result['mortality']-0.506)*100:+.1f}pp vs 50.6%")
+        fa1.metric("β_√GTV (gefitst, unstd.)", f"{_beta_gtv_unstd:.4f}",
+                   delta=f"{_beta_gtv_unstd-0.059:+.4f} vs 0.059")
+        fa2.metric("β_√MHD (gefitst, unstd.)", f"{_beta_mhd_unstd:.4f}",
+                   delta=f"{_beta_mhd_unstd-0.2635:+.4f} vs 0.264")
+        fa3.metric("AUC (testset)", f"{auc_C:.3f}",
+                   delta=f"{auc_C-0.64:+.3f} vs 0.640")
+        fa4.metric("Mortaliteit (gegenereerd)", f"{obs_mort_rate*100:.1f}%",
+                   delta=f"{(obs_mort_rate-0.506)*100:+.1f}pp vs 50.6%")
         st.warning(
             "**Gelijke coëfficiënten bewijzen geen causaliteit.**  \n"
             "Verschillende onderliggende data-genererende mechanismen kunnen hetzelfde "
@@ -926,6 +950,65 @@ with tab_model:
             "De kans volgt via p = 1 / (1 + exp(−logit)). "
             "Een logit-toename van +1 rondom logit = 0 verhoogt de kans van 50 % naar ~73 %."
         )
+
+    # ── sanity-check warning for Scenario A ──────────────────────────────────
+    if (
+        survival_scenario == SCEN_A
+        and use_sqrt
+        and not np.isnan(_beta_mhd_unstd)
+        and abs(pearson_r) < 0.05
+        and abs(_beta_mhd_unstd) > 0.05
+    ):
+        st.warning(
+            "⚠️ **Unexpected large MHD coefficient despite near-zero correlation "
+            "and no causal MHD effect.**  \n"
+            f"Observed Pearson r(GTV, MHD) = {pearson_r:.3f} · "
+            f"Fitted β_√MHD (unstd.) = {_beta_mhd_unstd:.4f}  \n"
+            "This may indicate leakage or optimizer inconsistency. "
+            "Check the Optimizer debug info expander below."
+        )
+
+    # ── optimizer debug info expander ────────────────────────────────────────
+    with st.expander("Optimizer debug info", expanded=False):
+        _opt_rho   = _fit_result["rho"]   if _fit_overridden else float(target_corr if dist_mode == DIST_ARTICLE else 0.0)
+        _opt_noise = _fit_result["noise"] if _fit_overridden else surv_noise
+        _debug_rows = [
+            ("Actief scenario",                survival_scenario),
+            ("Optimizer gebruikt b2=0 (Scenario A)?",
+             "Ja" if survival_scenario == SCEN_A else "Nee — b2 = 0.2635"),
+            ("Geoptimaliseerde copula ρ",       f"{_opt_rho:.4f}"),
+            ("Geoptimaliseerde mortaliteitsruis σ", f"{_opt_noise:.4f}"),
+            ("Ware b1 (√GTV-effect)",           f"{b1:.4f}"),
+            ("Ware b2 (√MHD-effect)",           f"{b2_val:.4f}"),
+            ("Obs. Pearson r(GTV, MHD)",        f"{pearson_r:.4f}"),
+            ("Gefitte β_√GTV (unstd.)",
+             f"{_beta_gtv_unstd:.4f}" if not np.isnan(_beta_gtv_unstd) else "n/a (use_sqrt=False)"),
+            ("Gefitte β_√MHD (unstd.)",
+             f"{_beta_mhd_unstd:.4f}" if not np.isnan(_beta_mhd_unstd) else "n/a (use_sqrt=False)"),
+            ("Gefitst intercept (unstd.)",
+             f"{_intercept_unstd:.4f}" if not np.isnan(_intercept_unstd) else "n/a"),
+            ("AUC (testset, gecombineerd model)", f"{auc_C:.4f}"),
+            ("Gesimuleerde mortaliteitsrate",    f"{obs_mort_rate*100:.2f} %"),
+        ]
+        if _fit_overridden:
+            _debug_rows += [
+                ("Optimizer interne β_√GTV (SCEN-specifiek)",  f"{_fit_result['beta_gtv']:.4f}"),
+                ("Optimizer interne β_√MHD (SCEN-specifiek)",  f"{_fit_result['beta_mhd']:.4f}"),
+                ("Optimizer interne AUC",                      f"{_fit_result['auc']:.4f}"),
+                ("Optimizer interne mortaliteit",              f"{_fit_result['mortality']*100:.2f} %"),
+                ("Optimizer verlies",                          f"{_fit_result.get('loss', float('nan')):.6f}"),
+            ]
+        st.dataframe(
+            pd.DataFrame(_debug_rows, columns=["Parameter", "Waarde"]),
+            use_container_width=True, hide_index=True,
+        )
+        if _fit_overridden and survival_scenario == SCEN_A:
+            st.info(
+                "**Scenario A — optimizer gebruikt b2 = 0.**  \n"
+                "Gefitte β_√MHD op de gegenereerde dataset kan enkel groter dan ~0 zijn "
+                "door confounding (positieve correlatie GTV ↔ MHD). "
+                "Met ρ ≈ 0 én b2 = 0 moet β_√MHD (unstd.) dicht bij 0 liggen."
+            )
 
     st.divider()
     st.caption(
