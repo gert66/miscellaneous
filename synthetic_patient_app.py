@@ -105,7 +105,8 @@ def _fit_to_article(
     """Grid search over (copula rho, noise) to minimise loss vs article targets.
     Generates data with SCALE_SQRT_RAW, fits an unstandardized logistic model on
     sqrt(GTV) and sqrt(MHD), and evaluates the four target metrics.
-    true_b2=0 for Scenario A (MHD non-causal), true_b2=0.2635 for Scenario B/C.
+    true_b2=0 for Scenario A (MHD non-causal); for Scenario B pass the
+    UI-selected b2_val so the optimizer reflects the actual causal structure.
     Returns the best parameter set and achieved metrics."""
     from sklearn.linear_model import LogisticRegression as _LR
     from sklearn.model_selection import train_test_split as _tts
@@ -551,15 +552,16 @@ with st.sidebar:
             )
             if fit_to_article:
                 with st.spinner("Running grid search…"):
-                    _true_b2_for_optimizer = (
-                        0.0 if survival_scenario == SCEN_A else _FIT_TARGETS["beta_mhd"]
-                    )
+                    # Use the UI slider value so Scenario B reflects the actual
+                    # causal structure chosen by the user, not the article target.
+                    _true_b2_for_optimizer = 0.0 if survival_scenario == SCEN_A else b2_val
                     _fit_result = _fit_to_article(
                         n=n_patients, test_size=test_size, seed=int(seed),
                         true_b2=_true_b2_for_optimizer,
                     )
                 st.caption(
                     f"✅ **Optimum found** — "
+                    f"true b1 = {b1:.4f}, true b2 used = {_true_b2_for_optimizer:.4f}  \n"
                     f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
                     f"β_√GTV = {_fit_result['beta_gtv']:.4f} (target 0.0590)  \n"
                     f"β_√MHD = {_fit_result['beta_mhd']:.4f} (target 0.2635)  \n"
@@ -569,6 +571,10 @@ with st.sidebar:
 
 
 # ── fit-to-article overrides ──────────────────────────────────────────────────
+
+# Ensure _true_b2_for_optimizer is always defined (may not be set if optimizer is off)
+if not (fit_to_article and _fit_eligible):
+    _true_b2_for_optimizer = 0.0 if survival_scenario == SCEN_A else b2_val
 
 _fit_overridden = False
 if fit_to_article and _fit_eligible:
@@ -1038,6 +1044,8 @@ with tab_article:
         st.success(
             f"Optimizer found: copula ρ = **{_fit_result['rho']:.2f}**, "
             f"noise σ = **{_fit_result['noise']:.2f}**  \n"
+            f"True b1 (GTV) used = **{b1:.4f}** · "
+            f"True b2 (MHD) used = **{_true_b2_for_optimizer:.4f}**  \n"
             f"Optimizer loss = {_fit_result.get('loss', float('nan')):.6f}"
         )
         st.warning(
@@ -1613,8 +1621,9 @@ with tab_adv:
              "Yes" if survival_scenario == SCEN_A else "No — b2 = 0.2635"),
             ("Optimised copula ρ",                  f"{_opt_rho:.4f}"),
             ("Optimised noise σ",                   f"{_opt_noise:.4f}"),
-            ("True b1 (GTV effect)",                f"{b1:.4f}"),
-            ("True b2 (MHD effect)",                f"{b2_val:.4f}"),
+            ("True b1 (GTV effect) — UI slider",    f"{b1:.4f}"),
+            ("True b2 (MHD effect) — UI slider",    f"{b2_val:.4f}"),
+            ("True b2 passed to optimizer",          f"{_true_b2_for_optimizer:.4f}"),
             ("Observed Pearson r(GTV, MHD)",        f"{pearson_r:.4f}"),
             ("Fitted β_√GTV (unstd.)",
              f"{_beta_gtv_unstd:.4f}" if not np.isnan(_beta_gtv_unstd) else "n/a (use_sqrt=False)"),
