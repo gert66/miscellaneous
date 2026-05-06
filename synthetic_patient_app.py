@@ -1428,92 +1428,189 @@ with tab_proton:
 # ── tab: Dose curves ──────────────────────────────────────────────────────────
 
 with tab_dose:
-    st.markdown("### Mortality vs dose — combined model")
-    st.caption("All curves show **mortality probability** predicted by the fitted combined model.")
+    st.markdown("### Dose-response curves — fitted model vs true causal relationships")
+    st.markdown(
+        "These are partial dependence-style curves: one variable changes while the other "
+        "is held fixed at its median. Under collinearity or hidden confounding, fitted "
+        "relationships may not reflect true causal effects."
+    )
 
-    if survival_scenario == SCEN_A:
-        st.info(
-            "Scenario A: the MHD curves below reflect GTV-MHD correlation, "
-            "not a direct causal effect of MHD on mortality."
-        )
+    # Helper: deterministic true causal logit for any (gtv, mhd) arrays (no noise)
+    def _true_causal_p(gtv_arr, mhd_arr):
+        if survival_scenario == SCEN_C:
+            logit = _display_int + 0.0590 * np.sqrt(gtv_arr) + 0.2635 * np.sqrt(mhd_arr)
+        elif gen_scale == SCALE_SQRT_RAW:
+            logit = _display_int + b1 * np.sqrt(gtv_arr) + b2_val * np.sqrt(mhd_arr)
+        elif gen_scale == SCALE_SQRT_Z:
+            _sq_gtv_ref = np.sqrt(tumor_volume)
+            _sq_mhd_ref = np.sqrt(mean_heart_dose)
+            f_gtv = (np.sqrt(gtv_arr) - _sq_gtv_ref.mean()) / _sq_gtv_ref.std()
+            g_mhd = (np.sqrt(mhd_arr) - _sq_mhd_ref.mean()) / _sq_mhd_ref.std()
+            logit = _display_int + b1 * f_gtv + b2_val * g_mhd
+        else:  # SCALE_Z_RAW
+            f_gtv = (gtv_arr  - tumor_volume.mean())    / tumor_volume.std()
+            g_mhd = (mhd_arr  - mean_heart_dose.mean()) / mean_heart_dose.std()
+            logit = _display_int + b1 * f_gtv + b2_val * g_mhd
+        return 1.0 / (1.0 + np.exp(-logit))
 
-    def _X(gtv_arr, mhd_arr):
+    # Helper: fitted model predictions
+    def _fitted_X(gtv_arr, mhd_arr):
         if use_sqrt:
             return np.column_stack([np.sqrt(gtv_arr), np.sqrt(mhd_arr)])
         return np.column_stack([gtv_arr, mhd_arr])
 
-    gtv_med              = np.median(tumor_volume)
-    mhd_med              = np.median(mean_heart_dose)
-    gtv_p10, gtv_p90     = np.percentile(tumor_volume,    [10, 90])
-    mhd_p10, mhd_p90     = np.percentile(mean_heart_dose, [10, 90])
+    # View toggle
+    _curve_view = st.radio(
+        "Show curves",
+        ["Both", "Fitted model only", "True causal only"],
+        horizontal=True,
+        index=0,
+    )
+    _show_fitted = _curve_view in ("Both", "Fitted model only")
+    _show_causal = _curve_view in ("Both", "True causal only")
+
+    # Scenario context box
+    if survival_scenario == SCEN_A:
+        st.error(
+            "**Scenario A:** MHD has no causal effect on mortality.  \n"
+            "The **true causal MHD curve must be flat** when GTV is fixed.  \n"
+            "Any rising fitted MHD curve is driven by GTV-MHD correlation "
+            f"(r = {pearson_r:.2f}), not a real dose-response relationship."
+        )
+    elif survival_scenario == SCEN_B:
+        st.success(
+            f"**Scenario B:** Both GTV (b1 = {b1:.4f}) and MHD (b2 = {b2_val:.4f}) are causal.  \n"
+            "True causal curves and fitted curves should broadly align."
+        )
+    else:
+        st.success(
+            "**Scenario C:** Article formula — true causal curves follow "
+            "logit = −1.3409 + 0.059·√GTV + 0.2635·√MHD."
+        )
+
+    gtv_med          = np.median(tumor_volume)
+    mhd_med          = np.median(mean_heart_dose)
+    gtv_p10, gtv_p90 = np.percentile(tumor_volume,    [10, 90])
+    mhd_p10, mhd_p90 = np.percentile(mean_heart_dose, [10, 90])
 
     tv_g  = np.linspace(tumor_volume.min(),    tumor_volume.max(),    300)
     mhd_g = np.linspace(mean_heart_dose.min(), mean_heart_dose.max(), 300)
 
-    mort_vs_gtv = pipe_C.predict_proba(_X(tv_g,  np.full_like(tv_g,  mhd_med)))[:, 1]
-    mort_vs_mhd = pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_med), mhd_g))[:, 1]
+    # Curve data
+    _fit_vs_gtv  = pipe_C.predict_proba(_fitted_X(tv_g,  np.full_like(tv_g,  mhd_med)))[:, 1]
+    _fit_vs_mhd  = pipe_C.predict_proba(_fitted_X(np.full_like(mhd_g, gtv_med), mhd_g))[:, 1]
+    _true_vs_gtv = _true_causal_p(tv_g,  np.full_like(tv_g,  mhd_med))
+    _true_vs_mhd = _true_causal_p(np.full_like(mhd_g, gtv_med), mhd_g)
+
+    _C_FIT  = "#2980b9"   # blue  — fitted
+    _C_TRUE = "#e74c3c"   # red   — true causal
 
     dc1, dc2 = st.columns(2)
+
     with dc1:
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(tv_g, mort_vs_gtv, color="#e74c3c", lw=2)
+        if _show_fitted:
+            ax.plot(tv_g, _fit_vs_gtv, color=_C_FIT, lw=2, linestyle="--",
+                    label="Fitted regression")
+        if _show_causal:
+            ax.plot(tv_g, _true_vs_gtv, color=_C_TRUE, lw=2, linestyle="-",
+                    label="True causal model")
         ax.axvline(gtv_med, color="gray", lw=1, linestyle=":",
                    label=f"Median GTV = {gtv_med:.0f} cc")
         ax.set_xlabel("GTV (cc)")
-        ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_ylabel("24-month mortality probability")
         ax.set_title(f"Mortality vs GTV\n(MHD fixed at median {mhd_med:.1f} Gy)")
         ax.set_ylim(0, 1); ax.legend(fontsize=8)
         fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
 
     with dc2:
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(mhd_g, mort_vs_mhd, color="#e74c3c", lw=2)
+        if _show_fitted:
+            ax.plot(mhd_g, _fit_vs_mhd, color=_C_FIT, lw=2, linestyle="--",
+                    label="Fitted regression")
+        if _show_causal:
+            ax.plot(mhd_g, _true_vs_mhd, color=_C_TRUE, lw=2, linestyle="-",
+                    label="True causal model")
         ax.axvline(mhd_med, color="gray", lw=1, linestyle=":",
                    label=f"Median MHD = {mhd_med:.1f} Gy")
         ax.set_xlabel("Mean Heart Dose (Gy)")
-        ax.set_ylabel("Predicted 24-month mortality")
+        ax.set_ylabel("24-month mortality probability")
         ax.set_title(f"Mortality vs MHD\n(GTV fixed at median {gtv_med:.0f} cc)")
         ax.set_ylim(0, 1); ax.legend(fontsize=8)
         fig.tight_layout(); st.pyplot(fig, use_container_width=True); plt.close(fig)
 
+    if survival_scenario == SCEN_A and _show_causal:
+        st.caption(
+            "The red (true causal) MHD curve is flat because b2 = 0 — MHD has no causal "
+            "path to mortality. The blue (fitted) curve rises only because MHD correlates "
+            "with GTV, which is the true driver."
+        )
+
+    st.caption(
+        "Dashed blue = fitted regression.  Solid red = true causal model.  "
+        "These are partial dependence curves: one variable varies, the other is fixed at its median."
+    )
+
+    # ── Stratified curves ─────────────────────────────────────────────────────
     show_stratified = st.checkbox("Show stratified curves (low / median / high)", value=False)
 
     if show_stratified:
+        _strat_colors = ["#1a9641", "#fdae61", "#d7191c"]
+
         st.markdown("#### Mortality vs GTV at low / median / high MHD")
         fig, ax = plt.subplots(figsize=(7, 4))
-        for mhd_val, label, color in [
-            (mhd_p10, f"MHD p10 = {mhd_p10:.1f} Gy",  "#1a9641"),
-            (mhd_med, f"MHD median = {mhd_med:.1f} Gy", "#fdae61"),
-            (mhd_p90, f"MHD p90 = {mhd_p90:.1f} Gy",   "#d7191c"),
-        ]:
-            ax.plot(tv_g,
-                    pipe_C.predict_proba(_X(tv_g, np.full_like(tv_g, mhd_val)))[:, 1],
-                    color=color, lw=2, label=label)
-        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("Predicted 24-month mortality")
-        ax.set_title("Mortality vs GTV — low / median / high MHD")
-        ax.set_ylim(0, 1); ax.legend(fontsize=8)
+        for (mhd_val, lbl), color in zip(
+            [(mhd_p10, f"MHD p10 = {mhd_p10:.1f} Gy"),
+             (mhd_med, f"MHD median = {mhd_med:.1f} Gy"),
+             (mhd_p90, f"MHD p90 = {mhd_p90:.1f} Gy")],
+            _strat_colors,
+        ):
+            if _show_fitted:
+                ax.plot(tv_g,
+                        pipe_C.predict_proba(_fitted_X(tv_g, np.full_like(tv_g, mhd_val)))[:, 1],
+                        color=color, lw=2, linestyle="--",
+                        label=f"Fitted — {lbl}")
+            if _show_causal:
+                ax.plot(tv_g,
+                        _true_causal_p(tv_g, np.full_like(tv_g, mhd_val)),
+                        color=color, lw=2, linestyle="-",
+                        label=f"True causal — {lbl}")
+        ax.set_xlabel("GTV (cc)"); ax.set_ylabel("24-month mortality probability")
+        ax.set_title("Mortality vs GTV — stratified by MHD level")
+        ax.set_ylim(0, 1); ax.legend(fontsize=7, ncol=2)
         fig.tight_layout(); centered(fig)
 
         st.markdown("#### Mortality vs MHD at low / median / high GTV")
         fig, ax = plt.subplots(figsize=(7, 4))
-        for gtv_val, label, color in [
-            (gtv_p10, f"GTV p10 = {gtv_p10:.0f} cc",   "#1a9641"),
-            (gtv_med, f"GTV median = {gtv_med:.0f} cc",  "#fdae61"),
-            (gtv_p90, f"GTV p90 = {gtv_p90:.0f} cc",   "#d7191c"),
-        ]:
-            ax.plot(mhd_g,
-                    pipe_C.predict_proba(_X(np.full_like(mhd_g, gtv_val), mhd_g))[:, 1],
-                    color=color, lw=2, label=label)
-        ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("Predicted 24-month mortality")
-        ax.set_title("Mortality vs MHD — low / median / high GTV")
-        ax.set_ylim(0, 1); ax.legend(fontsize=8)
+        for (gtv_val, lbl), color in zip(
+            [(gtv_p10, f"GTV p10 = {gtv_p10:.0f} cc"),
+             (gtv_med, f"GTV median = {gtv_med:.0f} cc"),
+             (gtv_p90, f"GTV p90 = {gtv_p90:.0f} cc")],
+            _strat_colors,
+        ):
+            if _show_fitted:
+                ax.plot(mhd_g,
+                        pipe_C.predict_proba(_fitted_X(np.full_like(mhd_g, gtv_val), mhd_g))[:, 1],
+                        color=color, lw=2, linestyle="--",
+                        label=f"Fitted — {lbl}")
+            if _show_causal:
+                ax.plot(mhd_g,
+                        _true_causal_p(np.full_like(mhd_g, gtv_val), mhd_g),
+                        color=color, lw=2, linestyle="-",
+                        label=f"True causal — {lbl}")
+        ax.set_xlabel("Mean Heart Dose (Gy)"); ax.set_ylabel("24-month mortality probability")
+        ax.set_title("Mortality vs MHD — stratified by GTV level")
+        ax.set_ylim(0, 1); ax.legend(fontsize=7, ncol=2)
         fig.tight_layout(); centered(fig)
 
-        if survival_scenario == SCEN_A:
+        if survival_scenario == SCEN_A and _show_causal:
             st.caption(
-                "The MHD curves show model-predicted associations driven by GTV-MHD "
-                "correlation — not a direct causal effect."
+                "Scenario A: the true causal MHD curves (solid) are flat for every GTV stratum — "
+                "MHD has no effect on mortality regardless of GTV. "
+                "The fitted curves (dashed) rise because high-MHD patients also tend to have "
+                "high GTV."
             )
+
 
 
 # ── tab: Data checks ──────────────────────────────────────────────────────────
