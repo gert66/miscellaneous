@@ -273,216 +273,192 @@ st.set_page_config(page_title="Mortaliteitsmodel — Confounding Demo", layout="
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("Simulatie-instellingen")
+    st.header("Simulation settings")
 
     # Read the fit-to-article toggle state before any widgets so "Overridden"
     # captions can appear on sliders that are rendered earlier in the sidebar.
     _fit_preview = st.session_state.get("fit_to_article_toggle", False)
 
+    # ── A. Patient population ─────────────────────────────────────────────────
+    st.markdown("### 👥 A — Patient population")
+    st.caption("How synthetic patients are generated")
+
     dist_mode = st.selectbox(
         "Distribution mode",
         [DIST_ARTICLE, DIST_SIMPLE],
         help=(
-            "**Artikel-achtig:** log-normale GTV en gamma-verdeelde MHD via Gaussian copula "
-            "(GTV gem.≈110 cc, med.≈69 cc; MHD gem.≈12 Gy, med.≈11 Gy). "
-            "**Eenvoudig:** normale verdelingen met instelbare parameters."
+            "**Article-like:** Log-normal GTV and gamma-distributed MHD "
+            "(GTV mean≈110 cc, median≈69 cc; MHD mean≈12 Gy, median≈11 Gy). "
+            "**Simple:** Normal distributions with adjustable parameters."
         ),
     )
 
-    st.subheader("Steekproef")
     n_patients = st.slider(
-        "Steekproefgrootte", 100, 3000, 500, step=50,
-        help="Aantal synthetische patiënten.",
+        "Sample size", 100, 3000, 500, step=50,
+        help="Number of synthetic patients.",
     )
     seed = st.number_input(
         "Random seed", value=42, step=1,
-        help="Startnummer voor de pseudo-random generator.",
+        help="Starting number for the pseudo-random generator.",
     )
 
     use_calibrated = False   # will be overridden in DIST_ARTICLE branch
 
     if dist_mode == DIST_SIMPLE:
-        st.subheader("Tumorvolume (GTV)")
-        tv_mu    = st.slider("Gemiddelde GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
-        tv_sigma = st.slider("Spreiding GTV (cc)",   5.0,  60.0, 15.0, step=1.0)
-        st.subheader("Mean Heart Dose = a·GTV + ruis")
-        corr_a       = st.slider("Correlatiecoëfficiënt a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05)
-        mhd_noise_sd = st.slider("Ruisniveau MHD (Gy)", 0.1, 10.0, 3.0, step=0.1)
+        st.markdown("**Tumor volume (GTV)**")
+        tv_mu    = st.slider("Mean GTV (cc)", 10.0, 200.0, 45.0, step=1.0)
+        tv_sigma = st.slider("SD GTV (cc)",   5.0,  60.0, 15.0, step=1.0)
+        st.markdown("**Mean Heart Dose = a·GTV + noise**")
+        corr_a       = st.slider("Correlation coefficient a (GTV → MHD)", 0.0, 1.0, 0.5, step=0.05)
+        mhd_noise_sd = st.slider("MHD noise level (Gy)", 0.1, 10.0, 3.0, step=0.1)
     else:
-        st.subheader("Correlatie (Gaussian copula)")
         use_calibrated = st.toggle(
-            "Kalibreer GTV-MHD correlatie naar artikelwaarde",
+            "Match GTV-MHD correlation to article value",
             value=False,
             help=(
-                "Zoekt automatisch de copula-correlatie die de Pearson r uit Van Loon et al. "
-                f"het best reproduceert (doel r ≈ {_ARTICLE_TARGET_R}). "
-                "Kalibratie wordt eenmalig berekend en gecached — eerste run duurt ~1 s."
+                "Automatically finds the correlation that best reproduces the Pearson r "
+                f"from Van Loon et al. (target r ≈ {_ARTICLE_TARGET_R}). "
+                "Calibration is computed once and cached — first run takes ~1 s."
             ),
         )
         if use_calibrated:
-            with st.spinner("Kalibratie berekenen…"):
+            with st.spinner("Calibrating…"):
                 _cal_rho, _cal_r = _calibrate_correlation()
             target_corr = _cal_rho
             st.caption(
-                f"✅ **Beste parametersets toegepast** — "
-                f"copula ρ = **{_cal_rho:.3f}** → Pearson r ≈ {_cal_r:.3f} "
-                f"(doel {_ARTICLE_TARGET_R}, Van Loon et al.)\n\n"
-                f"GTV: log-normaal (med. ≈ 69 cc, gem. ≈ 110 cc, SD ≈ 130 cc)\n\n"
-                f"MHD: gamma (gem. ≈ 12 Gy, SD ≈ 8.2 Gy)"
+                f"✅ **Best match applied** — "
+                f"achieved Pearson r ≈ {_cal_r:.3f} "
+                f"(target {_ARTICLE_TARGET_R}, Van Loon et al.)\n\n"
+                f"GTV: log-normal (median ≈ 69 cc, mean ≈ 110 cc, SD ≈ 130 cc)\n\n"
+                f"MHD: gamma (mean ≈ 12 Gy, SD ≈ 8.2 Gy)"
             )
         else:
             target_corr = st.slider(
-                "Target correlatie GTV ↔ MHD", 0.0, 0.9, 0.45, step=0.05,
-                help="Controls how strongly larger tumors also tend to receive higher mean heart dose.",
+                "Target GTV-MHD correlation (r)", 0.0, 0.9, 0.45, step=0.05,
+                help=(
+                    "This controls how strongly larger tumors tend to co-occur with higher heart dose. "
+                    "Higher values produce stronger GTV-MHD co-occurrence in the simulated population."
+                ),
             )
             if _fit_preview:
-                st.caption("⚙️ *Overschreven door optimalisatie*")
+                st.caption("⚙️ *Overridden by article optimisation*")
 
-    st.subheader("Mortaliteitsscenario")
+    # ── B. True causal mortality model ────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⚙️ B — True causal mortality model")
+    st.caption("What truly causes mortality in this simulation")
+
     survival_scenario = st.selectbox(
-        "Scenario",
+        "True causal mortality model",
         [SCEN_A, SCEN_B, SCEN_C],
         help=(
-            "**A:** Mortaliteit vanuit GTV alleen. MHD correleert met GTV maar heeft geen causaal effect. "
-            "**B:** GTV en MHD zijn beide causaal. "
-            "**C:** Artikel-formule met √GTV en √MHD."
+            "**A:** Mortality driven by GTV only. MHD correlates with GTV but has no causal effect. "
+            "**B:** Both GTV and MHD have true causal effects on mortality. "
+            "**C:** Article formula using √GTV and √MHD."
         ),
     )
     if survival_scenario in (SCEN_A, SCEN_B):
         _default_scale = SCALE_SQRT_RAW if dist_mode == DIST_ARTICLE else SCALE_Z_RAW
         gen_scale = st.selectbox(
-            "Schaal ware mortaliteitsformule",
+            "Scale of the true mortality formula",
             [SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z],
             index=[SCALE_Z_RAW, SCALE_SQRT_RAW, SCALE_SQRT_Z].index(_default_scale),
             key=f"gen_scale_{dist_mode}_{survival_scenario}",
             help=(
-                "**Gestand. ruw GTV/MHD:** b1/b2 zijn gestandaardiseerde logit-effecten van ruwe waarden. "
-                "**√GTV/MHD ongestand.:** b1/b2 op dezelfde schaal als het Van Loon artikel. "
-                "**√GTV/MHD gestand.:** b1/b2 zijn gestand. logit-effecten van √-getransf. waarden."
+                "**Standardised raw GTV/MHD:** b1/b2 are standardised logit effects of raw values. "
+                "**√GTV/MHD unstandardised:** b1/b2 on the same scale as the Van Loon article. "
+                "**√GTV/MHD standardised:** b1/b2 are standardised logit effects of √-transformed values."
             ),
         )
         if gen_scale == SCALE_SQRT_RAW:
-            _b1_label = "b1 — echt effect van √GTV op 24-maands mortaliteit"
-            _b2_label = "b2 — echt effect van √MHD op 24-maands mortaliteit"
+            _b1_label = "True causal √GTV effect on mortality"
+            _b2_label = "True causal √MHD effect on mortality"
             _b1_def, _b1_max, _b1_step = 0.0590, 0.5,  0.005
             _b2_def, _b2_max, _b2_step = 0.2635, 1.0,  0.005
         elif gen_scale == SCALE_SQRT_Z:
-            _b1_label = "b1 — echt effect van gestand. √GTV op 24-maands mortaliteit"
-            _b2_label = "b2 — echt effect van gestand. √MHD op 24-maands mortaliteit"
+            _b1_label = "True causal std. √GTV effect on mortality"
+            _b2_label = "True causal std. √MHD effect on mortality"
             _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
             _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
         else:  # SCALE_Z_RAW
-            _b1_label = "b1 — causaal effect GTV op mortaliteit (logit, gestand.)"
-            _b2_label = "b2 — causaal effect MHD op mortaliteit (logit, gestand.)"
+            _b1_label = "True causal GTV effect on mortality (logit, std.)"
+            _b2_label = "True causal MHD effect on mortality (logit, std.)"
             _b1_def, _b1_max, _b1_step = 2.0, 5.0, 0.1
             _b2_def, _b2_max, _b2_step = 1.0, 3.0, 0.1
         b1 = st.slider(_b1_label, 0.0, _b1_max, _b1_def, step=_b1_step,
                        key=f"b1_{gen_scale}",
-                       help="Werkelijk causaal effect van GTV op de logit-schaal.")
+                       help="True causal effect of GTV on the logit scale.")
         if survival_scenario == SCEN_B:
             b2_val = st.slider(_b2_label, 0.0, _b2_max, _b2_def, step=_b2_step,
-                               key=f"b2_{gen_scale}")
+                               key=f"b2_{gen_scale}",
+                               help="True causal effect of MHD on the logit scale.")
         else:
             b2_val = 0.0
         if gen_scale == SCALE_SQRT_RAW:
-            st.caption("Deze coëfficiënten zijn op dezelfde schaal als de Van Loon artikel-formule.")
+            st.caption("These coefficients are on the same scale as the Van Loon article formula.")
         surv_noise = st.slider(
-            "Mortaliteitsruisniveau", 0.0, 3.0, 1.0, step=0.1,
-            help="Willekeurige variatie op de logit-schaal niet verklaard door GTV of MHD.",
+            "Mortality complexity / noise", 0.0, 3.0, 1.0, step=0.1,
+            help=(
+                "Random variation on the logit scale not explained by GTV or MHD. "
+                "Higher values make mortality harder to predict — reduces AUC."
+            ),
         )
         if _fit_preview:
-            st.caption("⚙️ *Overschreven door optimalisatie*")
+            st.caption("⚙️ *Overridden by article optimisation*")
     else:
         gen_scale = SCALE_SQRT_RAW  # SCEN_C uses sqrt; gen_scale not used for generation
         b1, b2_val, surv_noise = 0.059, 0.2635, 0.0
         st.info(
-            "Mortaliteit via artikel-formule:\n\n"
+            "Mortality via article formula:\n\n"
             "`logit(p) = −1.3409 + 0.0590·√GTV + 0.2635·√MHD`\n\n"
-            "GTV én MHD zijn beide causaal."
+            "Both GTV and MHD are causally active."
         )
 
     mhd_is_causal = survival_scenario in (SCEN_B, SCEN_C)
 
-    st.subheader("Baseline mortaliteit")
+    st.markdown("**Baseline mortality**")
     baseline_survival = st.slider(
-        "Baseline 2-jaars overleving", 0.20, 0.90, 0.494, step=0.01,
+        "Baseline 2-year survival", 0.20, 0.90, 0.494, step=0.01,
         help=(
-            "Gemiddeld 2-jaars overlevingsniveau vóór individuele risicoverschillen. "
-            "Het artikel rapporteert ~49.4 % 2-jaars overleving (= 50.6 % mortaliteit)."
+            "Average 2-year survival level before individual risk differences. "
+            "The article reports ~49.4 % 2-year survival (= 50.6 % mortality)."
         ),
     )
     if survival_scenario == SCEN_C:
         calibrate_article = st.checkbox(
-            "Kalibreer artikel-model op geselecteerde baseline",
+            "Calibrate article model to selected baseline",
             value=use_calibrated,
-            help="Past alleen het intercept aan zodat de gemiddelde gesimuleerde mortaliteit overeenkomt "
-                 "met de geselecteerde baseline. De slopes (0.0590 en 0.2635) blijven ongewijzigd.",
+            help=(
+                "Adjusts only the intercept so that mean simulated mortality matches the selected baseline. "
+                "The slopes (0.0590 and 0.2635) remain unchanged."
+            ),
         )
     else:
         calibrate_article = False
 
-    st.subheader("Modelinstellingen")
-    use_sqrt = st.checkbox(
-        "Gebruik √-getransformeerde predictoren",
-        value=(dist_mode == DIST_ARTICLE),
-        key=f"use_sqrt_{dist_mode}",
-        help="Modellen gefit op √GTV en √MHD. Beïnvloedt alleen het model, niet de datagen.",
-    )
-    test_size = st.slider(
-        "Testset aandeel", 0.1, 0.5, 0.2, step=0.05,
-        help="Aandeel patiënten gereserveerd voor modelvalidatie.",
+    # ── C. Proton dose reduction model ────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⚛️ C — Proton dose reduction model")
+    st.caption("How proton therapy changes MHD — not mortality directly")
+
+    st.info(
+        "Proton therapy lowers MHD. True mortality benefit arises **only** through "
+        "the true causal mortality model above.",
+        icon="ℹ️",
     )
 
-    st.divider()
-    st.subheader("Fit to article")
-    _fit_eligible = (
-        dist_mode == DIST_ARTICLE
-        and survival_scenario in (SCEN_A, SCEN_B)
-        and gen_scale == SCALE_SQRT_RAW
-    )
-    if not _fit_eligible:
-        st.caption(
-            "Beschikbaar wanneer: artikel-verdeling + scenario A of B + schaal √GTV/MHD ongestand."
-        )
-        fit_to_article = False
-    else:
-        fit_to_article = st.toggle(
-            "Optimaliseer parameters naar artikel",
-            key="fit_to_article_toggle",
-            value=False,
-            help=(
-                "Zoekt via grid search de combinatie van copula-ρ en ruisniveau die de "
-                "Van Loon artikel-resultaten het best reproduceert: "
-                "β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortaliteit ≈ 50.6 %. "
-                "Resultaat wordt gecached — eerste run ~5 s."
-            ),
-        )
-        if fit_to_article:
-            with st.spinner("Grid search uitvoeren…"):
-                _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
-            st.caption(
-                f"✅ **Optimum gevonden** — "
-                f"ρ = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
-                f"β_√GTV = {_fit_result['beta_gtv']:.4f} (doel 0.0590)  \n"
-                f"β_√MHD = {_fit_result['beta_mhd']:.4f} (doel 0.2635)  \n"
-                f"AUC = {_fit_result['auc']:.3f} (doel 0.640)  \n"
-                f"Mortaliteit = {_fit_result['mortality']*100:.1f} % (doel 50.6 %)"
-            )
-
-    st.divider()
-    st.subheader("Protonentherapie")
     proton_reduction_mode = st.selectbox(
-        "Proton MHD reduction mode",
+        "Dose reduction mode",
         [PROTON_MULT, PROTON_ABS],
         help=(
-            "**A — Multiplicatief:** mhd_proton = mhd_photon × factor. "
-            "**B — Absoluut:** mhd_proton = mhd_photon − reductie (Gy), minimaal 0."
+            "**A — Multiplicative:** mhd_proton = mhd_photon × factor. "
+            "**B — Absolute:** mhd_proton = mhd_photon − reduction (Gy), minimum 0."
         ),
     )
     if proton_reduction_mode == PROTON_MULT:
         mhd_reduction_factor = st.slider(
             "MHD reduction factor", 0.0, 1.0, 0.6, step=0.05,
-            help="0.6 means proton therapy reduces MHD to 60% of the photon value.",
+            help="0.6 means proton therapy reduces MHD to 60 % of the photon value.",
         )
         mhd_absolute_reduction = 0.0
     else:
@@ -493,17 +469,80 @@ with st.sidebar:
         mhd_reduction_factor = 1.0
 
     apply_true_proton = st.toggle(
-        "Echte mortaliteitswinst van MHD-reductie",
+        "Apply true mortality benefit from MHD reduction",
         value=False,
-        help="Uit: protonreductie beïnvloedt alleen het model. "
-             "Aan: verlaagde MHD vermindert ook de werkelijke gesimuleerde mortaliteit.",
+        help=(
+            "Off: proton MHD reduction only affects the fitted model's predictions. "
+            "On: reduced MHD also lowers true simulated mortality via the causal model."
+        ),
     )
     if apply_true_proton:
         proton_effect_strength = st.slider(
-            "Sterkte echt MHD-reductieffect", 0.0, 1.0, 0.1, step=0.01,
+            "Strength of true MHD-reduction effect", 0.0, 1.0, 0.1, step=0.01,
         )
     else:
         proton_effect_strength = 0.0
+
+    # ── D. Statistical regression model ──────────────────────────────────────
+    st.divider()
+    st.markdown("### 📊 D — Statistical regression model")
+    st.caption("How the fitted prediction model is estimated")
+
+    st.markdown(
+        "<small>These settings affect fitted coefficients, predictions, and AUC. "
+        "They do **not** affect true causal mortality.</small>",
+        unsafe_allow_html=True,
+    )
+
+    use_sqrt = st.checkbox(
+        "Use √-transformed predictors",
+        value=(dist_mode == DIST_ARTICLE),
+        key=f"use_sqrt_{dist_mode}",
+        help="Fit models on √GTV and √MHD. Affects only the regression model, not data generation.",
+    )
+    test_size = st.slider(
+        "Test set fraction", 0.1, 0.5, 0.2, step=0.05,
+        help="Fraction of patients reserved for model validation.",
+    )
+
+    # ── Advanced: fit to article ──────────────────────────────────────────────
+    with st.expander("🔬 Advanced: fit to article", expanded=False):
+        st.caption(
+            "Grid-searches the combination of correlation and noise that best reproduces "
+            "Van Loon et al.: β_√GTV ≈ 0.059, β_√MHD ≈ 0.264, AUC ≈ 0.64, mortality ≈ 50.6 %."
+        )
+        _fit_eligible = (
+            dist_mode == DIST_ARTICLE
+            and survival_scenario in (SCEN_A, SCEN_B)
+            and gen_scale == SCALE_SQRT_RAW
+        )
+        if not _fit_eligible:
+            st.caption(
+                "Available when: article distribution + scenario A or B + scale √GTV/MHD unstandardised."
+            )
+            fit_to_article = False
+        else:
+            fit_to_article = st.toggle(
+                "Optimise parameters to article",
+                key="fit_to_article_toggle",
+                value=False,
+                help=(
+                    "Grid-searches the combination of GTV-MHD correlation and noise level that "
+                    "best reproduces Van Loon et al. results. "
+                    "Result is cached — first run ~5 s."
+                ),
+            )
+            if fit_to_article:
+                with st.spinner("Running grid search…"):
+                    _fit_result = _fit_to_article(n=n_patients, test_size=test_size, seed=int(seed))
+                st.caption(
+                    f"✅ **Optimum found** — "
+                    f"r = **{_fit_result['rho']:.2f}**, σ = **{_fit_result['noise']:.2f}**  \n"
+                    f"β_√GTV = {_fit_result['beta_gtv']:.4f} (target 0.0590)  \n"
+                    f"β_√MHD = {_fit_result['beta_mhd']:.4f} (target 0.2635)  \n"
+                    f"AUC = {_fit_result['auc']:.3f} (target 0.640)  \n"
+                    f"Mortality = {_fit_result['mortality']*100:.1f} % (target 50.6 %)"
+                )
 
 
 # ── fit-to-article overrides ──────────────────────────────────────────────────
