@@ -34,21 +34,34 @@ CACHE_DIR = Path("lusha_json_cache")
 
 # All columns added by enrichment (company-level firmographics only — no personal data)
 LUSHA_FIELDS = [
+    # ── Core firmographics ────────────────────────────────────────────────────
     "lusha_company_name",
     "lusha_domain",
     "lusha_industry",
     "lusha_sub_industry",
     "lusha_employee_count",
     "lusha_employee_range",
-    "lusha_country",
-    "lusha_city",
-    "lusha_state",
     "lusha_revenue",
     "lusha_description",
     "lusha_linkedin_url",
     "lusha_specialties",
     "lusha_technologies",
     "lusha_founded_year",
+    # ── HQ location (single values for easy filtering) ────────────────────────
+    "lusha_country",
+    "lusha_city",
+    "lusha_state",
+    "lusha_headquarters_country",
+    "lusha_headquarters_city",
+    # ── Full location footprint ───────────────────────────────────────────────
+    "lusha_location_count",
+    "lusha_location_countries",
+    "lusha_location_cities",
+    "lusha_location_continents",
+    "lusha_multi_country_presence",
+    "lusha_location_summary",
+    "lusha_international_footprint_score",
+    # ── Enrichment metadata ───────────────────────────────────────────────────
     "enrichment_status",
     "match_confidence",
     "needs_manual_review",
@@ -226,16 +239,61 @@ def extract_company_fields(raw: dict) -> dict:
             return ", ".join(str(x) for x in v if x)
         return str(v) if v else ""
 
-    # Location — companyLocations is an array; prefer the HQ entry
-    locations = data.get("companyLocations") or []
-    hq = {}
-    if isinstance(locations, list) and locations:
-        hq = next((loc for loc in locations if loc.get("isHeadquarters")), locations[0])
-        if not isinstance(hq, dict):
-            hq = {}
+    # ── Location extraction ───────────────────────────────────────────────────
+    # companyLocations is an array of dicts; first pick the HQ entry for single-
+    # value columns, then derive footprint metrics from the full array.
+    locations = [loc for loc in (data.get("companyLocations") or [])
+                 if isinstance(loc, dict)]
+    hq = next((loc for loc in locations if loc.get("isHeadquarters")), locations[0] if locations else {})
+
     country = hq.get("country") or hq.get("country_iso2") or data.get("country") or ""
     city    = hq.get("city")    or data.get("city")    or ""
     state   = hq.get("state")   or hq.get("state_code") or data.get("state") or ""
+
+    # Footprint — derived from the full locations list
+    loc_countries   = [str(loc.get("country") or loc.get("country_iso2") or "").strip()
+                       for loc in locations]
+    loc_countries   = [c for c in loc_countries if c]
+    loc_cities      = [str(loc.get("city") or "").strip() for loc in locations]
+    loc_cities      = [c for c in loc_cities if c]
+    loc_continents  = [str(loc.get("continent") or "").strip() for loc in locations]
+    loc_continents  = [c for c in loc_continents if c]
+
+    unique_countries  = list(dict.fromkeys(loc_countries))   # ordered, deduplicated
+    unique_cities     = list(dict.fromkeys(loc_cities))
+    unique_continents = list(dict.fromkeys(loc_continents))
+
+    loc_count       = len(locations)
+    multi_country   = "TRUE" if len(unique_countries) > 1 else ("FALSE" if unique_countries else "")
+
+    # Footprint score 0-5 based on country and continent spread
+    n_ctry = len(unique_countries)
+    n_cont = len(unique_continents)
+    if n_ctry == 0:
+        footprint_score = 0
+    elif n_ctry == 1 and loc_count == 1:
+        footprint_score = 1
+    elif n_ctry == 1:
+        footprint_score = 2
+    elif n_ctry <= 3:
+        footprint_score = 3
+    elif n_ctry <= 6 or n_cont >= 2:
+        footprint_score = 4
+    else:
+        footprint_score = 5
+
+    # Human-readable summary  e.g. "HQ: Amsterdam, Netherlands · 5 offices, 3 countries"
+    hq_part   = ", ".join(p for p in [city, country] if p) or "unknown"
+    loc_parts = []
+    if loc_count > 1:
+        loc_parts.append(f"{loc_count} offices")
+    if len(unique_countries) > 1:
+        loc_parts.append(f"{len(unique_countries)} countries")
+    if unique_continents:
+        loc_parts.append(f"{', '.join(unique_continents)}")
+    loc_summary = f"HQ: {hq_part}"
+    if loc_parts:
+        loc_summary += " · " + ", ".join(loc_parts)
 
     # Employee range — "employees" is a human-readable string like "201 - 500"
     employee_range = data.get("employees") or ""
@@ -275,21 +333,33 @@ def extract_company_fields(raw: dict) -> dict:
     specialties  = join_list(data.get("specialties")  or data.get("specialities"))
 
     return {
+        # Core firmographics
         "lusha_company_name":   data.get("name")        or data.get("companyName")  or "",
         "lusha_domain":         data.get("domain")       or data.get("fqdn")         or data.get("emailDomain") or "",
         "lusha_industry":       data.get("mainIndustry") or data.get("industry")     or "",
         "lusha_sub_industry":   data.get("subIndustry")  or "",
         "lusha_employee_count": str(employee_count) if employee_count else "",
         "lusha_employee_range": employee_range,
-        "lusha_country":        country,
-        "lusha_city":           city,
-        "lusha_state":          state,
         "lusha_revenue":        revenue,
         "lusha_description":    data.get("description") or "",
         "lusha_linkedin_url":   linkedin,
         "lusha_specialties":    specialties,
         "lusha_technologies":   technologies,
         "lusha_founded_year":   str(data.get("founded") or data.get("foundedYear") or ""),
+        # HQ location
+        "lusha_country":              country,
+        "lusha_city":                 city,
+        "lusha_state":                state,
+        "lusha_headquarters_country": country,
+        "lusha_headquarters_city":    city,
+        # Full location footprint
+        "lusha_location_count":                str(loc_count) if loc_count else "",
+        "lusha_location_countries":            ", ".join(unique_countries),
+        "lusha_location_cities":               ", ".join(unique_cities),
+        "lusha_location_continents":           ", ".join(unique_continents),
+        "lusha_multi_country_presence":        multi_country,
+        "lusha_location_summary":              loc_summary,
+        "lusha_international_footprint_score": str(footprint_score) if loc_count else "",
     }
 
 
@@ -530,6 +600,24 @@ def records_to_jsonl_bytes(records: list) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
+def make_log_df(debug_records: list) -> pd.DataFrame:
+    """Build the processing log DataFrame from per-row debug records."""
+    rows = []
+    for d in debug_records:
+        rows.append({
+            "input_company_name":  d.get("input_company_name", ""),
+            "input_domain":        d.get("input_domain", ""),
+            "lookup_method":       d.get("lookup_method", ""),
+            "http_status":         d.get("http_status", ""),
+            "enrichment_status":   d.get("enrichment_status", ""),
+            "match_confidence":    d.get("match_confidence", ""),
+            "needs_manual_review": d.get("needs_manual_review", ""),
+            "match_notes":         d.get("match_notes", ""),
+            "lusha_error_message": d.get("lusha_error_message", ""),
+        })
+    return pd.DataFrame(rows)
+
+
 def cache_to_zip_bytes() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -677,6 +765,10 @@ elif uploaded and df_raw is not None:
     st.success(
         f"**{ss('file_name')}** loaded — "
         f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
+    )
+    st.info(
+        "💡 For large batches, this may take time and use one Lusha credit per company lookup. "
+        "Start with a small test batch first."
     )
 
 # =============================================================================
@@ -925,40 +1017,74 @@ if ss("enrichment_done", False):
     with st.expander("Show all enriched columns"):
         st.dataframe(df_enriched, use_container_width=True)
 
-    # ── Normal downloads ──────────────────────────────────────────────────────
-    # [OUTPUT FILE LOCATION] — Excel and CSV created here
+    # =========================================================================
+    # DOWNLOADS — normal mode: all 4 files always available
+    # =========================================================================
     st.subheader("Download results")
+    st.caption(
+        "All four files are always available. "
+        "The JSONL file contains sanitized company-level data suitable for ICP analysis."
+    )
+
+    raw_jsons = [d.get("raw_json") for d in debug_records_done]
+    log_df    = make_log_df(debug_records_done)
+
     dl1, dl2 = st.columns(2)
+    dl3, dl4 = st.columns(2)
+
     with dl1:
         st.download_button(
-            "⬇ Download as Excel (.xlsx)",
+            "⬇ Enriched Excel (.xlsx)",
             data=df_to_excel_bytes(df_enriched),
             file_name="lusha_enriched.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            help="Original columns + all Lusha company fields + location footprint + review flags.",
         )
     with dl2:
         st.download_button(
-            "⬇ Download as CSV",
+            "⬇ Enriched CSV",
             data=df_to_csv_bytes(df_enriched),
             file_name="lusha_enriched.csv",
             mime="text/csv",
             use_container_width=True,
+            help="Same data as the Excel file, in CSV format.",
+        )
+    with dl3:
+        st.download_button(
+            "⬇ Raw Lusha JSONL",
+            data=records_to_jsonl_bytes(raw_jsons),
+            file_name="lusha_raw_responses.jsonl",
+            mime="application/jsonlines",
+            use_container_width=True,
+            help=(
+                "One sanitized JSON object per company. "
+                "Personal contact data is excluded. "
+                "Use this file for ICP analysis or further processing."
+            ),
+        )
+    with dl4:
+        st.download_button(
+            "⬇ Processing log CSV",
+            data=df_to_csv_bytes(log_df),
+            file_name="lusha_processing_log.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help=(
+                "One row per processed company showing lookup method, "
+                "HTTP status, enrichment outcome, and review flags."
+            ),
         )
 
     # =========================================================================
-    # DEBUG MODE — all sections below are hidden when debug mode is OFF
-    # [DEBUG MODE — RESULTS] request table, JSON viewer, cache viewer, JSON downloads
+    # DEBUG MODE — technical inspection tools, hidden when debug mode is OFF
     # =========================================================================
 
     if debug_mode and debug_records_done:
 
         st.divider()
         st.subheader("🐛 Debug — Request details")
-        st.caption(
-            "One row per processed company. Shows what was sent to Lusha "
-            "and what came back."
-        )
+        st.caption("One row per processed company. Shows exactly what was sent to Lusha and what came back.")
         debug_df = pd.DataFrame([
             {
                 "row":               i + 1,
@@ -977,16 +1103,11 @@ if ss("enrichment_done", False):
         ])
         st.dataframe(debug_df, use_container_width=True)
 
-        # ── Raw JSON response viewer ──────────────────────────────────────────
-        # [RAW JSON DISPLAY LOCATION] — st.json() is called here
+        # ── Raw JSON viewer ───────────────────────────────────────────────────
         st.subheader("🐛 Raw Lusha API responses")
-        st.caption(
-            "Select a processed company to view the raw JSON response "
-            "returned by the Lusha API."
-        )
+        st.caption("Select a processed company to inspect the raw JSON response.")
         company_labels = [
-            f"{i + 1}. {d.get('input_company_name') or '(empty)'} "
-            f"[{d.get('enrichment_status', '')}]"
+            f"{i + 1}. {d.get('input_company_name') or '(empty)'} [{d.get('enrichment_status', '')}]"
             for i, d in enumerate(debug_records_done)
         ]
         sel_idx = st.selectbox(
@@ -1000,49 +1121,27 @@ if ss("enrichment_done", False):
             if raw:
                 st.json(raw)
             else:
-                st.info(
-                    "No JSON response available for this row "
-                    "(network error or response could not be parsed)."
-                )
+                st.info("No JSON response available for this row (network error or unparseable response).")
 
-        # ── JSON downloads ────────────────────────────────────────────────────
-        # [RAW JSON SAVE LOCATION] — raw JSON stored in debug_records_done,
-        # written to JSONL / debug Excel / ZIP here
-        st.subheader("🐛 Download raw JSON responses")
-
-        # Build a debug copy of the DataFrame with the JSON preview column
+        # ── Debug Excel with JSON preview + cache ZIP ─────────────────────────
+        st.subheader("🐛 Additional debug downloads")
         debug_enriched = df_enriched.copy()
-        json_previews = []
-        for i in range(len(debug_enriched)):
-            if i < len(debug_records_done):
-                raw = debug_records_done[i].get("raw_json")
-                json_previews.append(json.dumps(raw, ensure_ascii=False)[:2000] if raw else "")
-            else:
-                json_previews.append("")
-        debug_enriched["lusha_raw_json_preview"] = json_previews
+        debug_enriched["lusha_raw_json_preview"] = [
+            (json.dumps(d.get("raw_json"), ensure_ascii=False)[:2000] if d.get("raw_json") else "")
+            for d in debug_records_done
+        ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
 
-        raw_jsons = [d.get("raw_json") for d in debug_records_done]
-
-        dj1, dj2, dj3 = st.columns(3)
-        with dj1:
-            st.download_button(
-                "⬇ All responses as JSONL",
-                data=records_to_jsonl_bytes(raw_jsons),
-                file_name="lusha_raw_responses.jsonl",
-                mime="application/jsonlines",
-                use_container_width=True,
-                help="One JSON object per line, one line per processed row.",
-            )
-        with dj2:
+        dbg_dl1, dbg_dl2 = st.columns(2)
+        with dbg_dl1:
             st.download_button(
                 "⬇ Debug Excel (with JSON preview column)",
                 data=df_to_excel_bytes(debug_enriched),
                 file_name="lusha_enriched_debug.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                help="Same as the normal Excel download, plus lusha_raw_json_preview column.",
+                help="Enriched Excel plus a lusha_raw_json_preview column (first 2000 chars of JSON).",
             )
-        with dj3:
+        with dbg_dl2:
             cc = get_cache_count()
             if cc > 0:
                 st.download_button(
@@ -1051,17 +1150,14 @@ if ss("enrichment_done", False):
                     file_name="lusha_cache.zip",
                     mime="application/zip",
                     use_container_width=True,
-                    help="All cached JSON files bundled into a ZIP archive.",
+                    help="All cached JSON files bundled into a single ZIP archive.",
                 )
             else:
                 st.info("Cache is empty — nothing to download.")
 
         # ── Cache viewer ──────────────────────────────────────────────────────
         st.subheader("🐛 Cache viewer")
-        st.caption(
-            f"Cache folder: `{CACHE_DIR.resolve()}` — "
-            f"{get_cache_count()} file(s)"
-        )
+        st.caption(f"Cache folder: `{CACHE_DIR.resolve()}` — {get_cache_count()} file(s)")
         cache_files = list_cache_files()
         if cache_files:
             sel_cache = st.selectbox(
@@ -1072,8 +1168,7 @@ if ss("enrichment_done", False):
             if sel_cache:
                 cache_path = CACHE_DIR / f"{sel_cache}.json"
                 try:
-                    cache_content = json.loads(cache_path.read_text(encoding="utf-8"))
-                    st.json(cache_content)
+                    st.json(json.loads(cache_path.read_text(encoding="utf-8")))
                 except Exception as exc:
                     st.error(f"Could not read cache file: {exc}")
         else:
