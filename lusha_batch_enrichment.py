@@ -21,7 +21,7 @@ import requests
 import streamlit as st
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-LUSHA_ENDPOINT = "https://api.lusha.com/company"
+LUSHA_ENDPOINT = "https://api.lusha.com/v2/company"
 CACHE_DIR = Path("lusha_json_cache")
 
 LUSHA_FIELDS = [
@@ -42,6 +42,13 @@ LUSHA_FIELDS = [
     "lusha_founded_year",
     "enrichment_status",
     "match_confidence",
+    "lusha_error_message",
+]
+
+# Substantive fields — if all empty we treat the row as no_data_returned
+LUSHA_DATA_FIELDS = [
+    "lusha_company_name", "lusha_domain", "lusha_industry",
+    "lusha_employee_range", "lusha_country", "lusha_description",
 ]
 
 COMPANY_NAME_HINTS = ["company", "bedrijf", "organisation", "organization", "naam", "name", "account"]
@@ -122,99 +129,203 @@ def get_cache_count() -> int:
 # ── Lusha API ─────────────────────────────────────────────────────────────────
 # [API CALL LOCATION] — _api_get / lusha_by_domain / lusha_by_name
 
-def _api_get(params: dict, api_key: str) -> dict:
+def _api_get(params: dict, api_key: str) -> tuple[dict, object]:
+    """
+    Returns (parsed_json, response_object).
+    Raises requests.HTTPError on 4xx/5xx.
+    Content-Type header is intentionally omitted for GET requests.
+    """
     resp = requests.get(
         LUSHA_ENDPOINT,
-        headers={"api_key": api_key, "Content-Type": "application/json"},
+        headers={"api_key": api_key},
         params=params,
         timeout=12,
     )
     resp.raise_for_status()
-    return resp.json()
+    return resp.json(), resp
 
 
-def lusha_by_domain(domain: str, api_key: str) -> dict:
+def lusha_by_domain(domain: str, api_key: str) -> tuple[dict, object]:
     return _api_get({"domain": domain}, api_key)
 
 
-def lusha_by_name(name: str, api_key: str) -> dict:
-    return _api_get({"name": name}, api_key)
+def lusha_by_name(name: str, api_key: str) -> tuple[dict, object]:
+    # v2: parameter is "company", NOT "name"
+    return _api_get({"company": name}, api_key)
 
 
 # ── Field extraction (firmographic only — no personal data) ───────────────────
 
 def extract_company_fields(raw: dict) -> dict:
-    company = raw.get("company", raw)
-    hq = company.get("headquarters") or company.get("location") or {}
-    if not isinstance(hq, dict):
-        hq = {}
+    """
+    Parse a Lusha v2 /company response.
+    v2 wraps all company data inside raw["data"].
+    Field names differ from v1: mainIndustry, companySize, revenueRange,
+    companyLocations (array), employees (string range), social (dict), etc.
+    """
+    # v2 wraps in "data"; fall back to root for forward-compat
+    data = raw.get("data") or raw
 
     def join_list(v):
         if isinstance(v, list):
-            return ", ".join(str(x) for x in v)
-        return v or ""
+            return ", ".join(str(x) for x in v if x)
+        return str(v) if v else ""
+
+    # ── Location ─────────────────────────────────────────────────────────────
+    # companyLocations is a list; take the first entry that looks like HQ
+    locations = data.get("companyLocations") or []
+    hq = {}
+    if isinstance(locations, list) and locations:
+        # prefer the entry flagged as headquarters, fall back to first
+        hq = next((loc for loc in locations if loc.get("isHeadquarters")), locations[0])
+        if not isinstance(hq, dict):
+            hq = {}
+
+    country = hq.get("country") or hq.get("country_iso2") or data.get("country") or ""
+    city    = hq.get("city")    or data.get("city")    or ""
+    state   = hq.get("state")   or hq.get("state_code") or data.get("state") or ""
+
+    # ── Employee count ────────────────────────────────────────────────────────
+    # "employees" is a string range like "201 - 500"; companySize has min/max ints
+    employee_range = data.get("employees") or ""
+    company_size   = data.get("companySize") or {}
+    if isinstance(company_size, dict) and not employee_range:
+        lo = company_size.get("min", "")
+        hi = company_size.get("max", "")
+        if lo or hi:
+            employee_range = f"{lo} - {hi}" if (lo and hi) else str(lo or hi)
+    employee_count = company_size.get("employeesInLinkedin") or ""
+
+    # ── Revenue ───────────────────────────────────────────────────────────────
+    revenue = join_list(data.get("revenueRange")) or data.get("revenue") or ""
+
+    # ── LinkedIn URL ──────────────────────────────────────────────────────────
+    social = data.get("social") or {}
+    if not isinstance(social, dict):
+        social = {}
+    linkedin = (
+        social.get("linkedin")
+        or social.get("linkedinUrl")
+        or data.get("linkedinUrl")
+        or data.get("linkedin")
+        or ""
+    )
+
+    # ── Technologies / specialties ────────────────────────────────────────────
+    technologies = join_list(data.get("technologies") or data.get("techStack"))
+    specialties  = join_list(data.get("specialties") or data.get("specialities"))
 
     return {
-        "lusha_company_name":  company.get("name") or company.get("companyName") or "",
-        "lusha_domain":        company.get("domain") or company.get("website") or "",
-        "lusha_industry":      company.get("industry") or "",
-        "lusha_sub_industry":  company.get("subIndustry") or "",
-        "lusha_employee_count": company.get("employeeCount") or "",
-        "lusha_employee_range": company.get("employeeCountRange") or "",
-        "lusha_country":       hq.get("country") or company.get("country") or "",
-        "lusha_city":          hq.get("city")    or company.get("city")    or "",
-        "lusha_state":         hq.get("state")   or company.get("state")   or "",
-        "lusha_revenue":       company.get("revenue") or company.get("revenueBand") or "",
-        "lusha_description":   company.get("description") or "",
-        "lusha_linkedin_url":  company.get("linkedinUrl") or company.get("linkedin") or "",
-        "lusha_specialties":   join_list(company.get("specialties") or company.get("specialities")),
-        "lusha_technologies":  join_list(company.get("technologies") or company.get("techStack")),
-        "lusha_founded_year":  company.get("foundedYear") or "",
+        "lusha_company_name":   data.get("name") or data.get("companyName") or "",
+        "lusha_domain":         data.get("domain") or data.get("fqdn") or data.get("emailDomain") or "",
+        "lusha_industry":       data.get("mainIndustry") or data.get("industry") or "",
+        "lusha_sub_industry":   data.get("subIndustry") or "",
+        "lusha_employee_count": str(employee_count) if employee_count else "",
+        "lusha_employee_range": employee_range,
+        "lusha_country":        country,
+        "lusha_city":           city,
+        "lusha_state":          state,
+        "lusha_revenue":        revenue,
+        "lusha_description":    data.get("description") or "",
+        "lusha_linkedin_url":   linkedin,
+        "lusha_specialties":    specialties,
+        "lusha_technologies":   technologies,
+        "lusha_founded_year":   str(data.get("founded") or data.get("foundedYear") or ""),
     }
 
 
-def empty_fields(status: str, confidence: str, note: str = "") -> dict:
+def empty_fields(status: str, confidence: str, error_msg: str = "") -> dict:
     fields = {k: "" for k in LUSHA_FIELDS}
-    fields["enrichment_status"] = status
-    fields["match_confidence"]  = confidence
-    if note:
-        fields["lusha_description"] = note
+    fields["enrichment_status"]   = status
+    fields["match_confidence"]    = confidence
+    fields["lusha_error_message"] = error_msg
     return fields
+
+
+def has_data(fields: dict) -> bool:
+    """Return True if at least one substantive Lusha field is non-empty."""
+    return any(fields.get(f, "") for f in LUSHA_DATA_FIELDS)
 
 
 # ── Per-row enrichment ────────────────────────────────────────────────────────
 # [ENRICHMENT LOGIC LOCATION] — enrich_one_row
 
-def enrich_one_row(company_name: str, raw_domain: str, api_key: str, delay: float) -> dict:
+def _http_error_msg(e: requests.HTTPError) -> str:
+    """Extract a readable message from an HTTPError, including the response body."""
+    code = e.response.status_code if e.response is not None else "?"
+    try:
+        body = e.response.json()
+        msg  = body.get("message") or body.get("error") or body.get("detail") or str(body)
+    except Exception:
+        msg = e.response.text[:300] if e.response is not None else str(e)
+    return f"HTTP {code}: {msg}"
+
+
+def enrich_one_row(
+    company_name: str,
+    raw_domain: str,
+    api_key: str,
+    delay: float,
+    debug_sink: list | None = None,
+) -> dict:
+    """
+    Enrich one row.  debug_sink, if provided, receives a dict with debug info
+    for the first row (URL, params, status, headers, raw JSON).
+    """
     domain       = clean_domain(raw_domain)
     company_name = str(company_name).strip() if company_name else ""
 
-    # 1 — domain path
+    def _debug(params, raw_json, resp_obj, error=None):
+        if debug_sink is not None and len(debug_sink) == 0:
+            entry = {
+                "url":    LUSHA_ENDPOINT,
+                "params": {k: v for k, v in params.items()},  # no api_key in params
+                "status": resp_obj.status_code if resp_obj else error,
+                "headers": {
+                    k: v for k, v in (resp_obj.headers.items() if resp_obj else {})
+                    if any(x in k.lower() for x in
+                           ["ratelimit", "x-credits", "x-lusha", "retry", "content-type"])
+                },
+                "response_json": raw_json,
+            }
+            debug_sink.append(entry)
+
+    # 1 ── domain path ─────────────────────────────────────────────────────────
     if domain:
         cache_key = f"domain_{domain}"
         cached = load_cache(cache_key)
         if cached is not None:
             fields = extract_company_fields(cached)
+            _debug({"domain": domain}, cached, None)
+            if not has_data(fields):
+                return empty_fields("no_data_returned", "no_match",
+                                    "Cache hit but all fields empty")
             fields["enrichment_status"] = "cached"
             fields["match_confidence"]  = "high"
             return fields
         try:
             time.sleep(delay)
-            raw = lusha_by_domain(domain, api_key)
-            save_cache(cache_key, raw)
-            fields = extract_company_fields(raw)
+            raw_json, resp_obj = lusha_by_domain(domain, api_key)
+            _debug({"domain": domain}, raw_json, resp_obj)
+            save_cache(cache_key, raw_json)
+            fields = extract_company_fields(raw_json)
+            if not has_data(fields):
+                return empty_fields("no_data_returned", "no_match",
+                                    f"Response OK but all fields empty. Raw: {str(raw_json)[:300]}")
             fields["enrichment_status"] = "enriched_by_domain"
             fields["match_confidence"]  = "high"
             return fields
         except requests.HTTPError as e:
+            _debug({"domain": domain}, None, e.response, error=str(e))
             code = e.response.status_code if e.response is not None else 0
-            if code != 404:
-                return empty_fields("api_error", "no_match", f"HTTP {code}")
-            # 404 → fall through to name lookup
+            if code == 404:
+                pass  # fall through to name lookup
+            else:
+                return empty_fields("api_error", "no_match", _http_error_msg(e))
         except Exception as e:
             return empty_fields("api_error", "no_match", str(e))
 
-    # 2 — name path
+    # 2 ── name path ───────────────────────────────────────────────────────────
     if not company_name:
         return empty_fields("no_match", "no_match")
 
@@ -222,25 +333,34 @@ def enrich_one_row(company_name: str, raw_domain: str, api_key: str, delay: floa
     cached = load_cache(cache_key)
     if cached is not None:
         fields = extract_company_fields(cached)
-        conf   = "medium" if str_similarity(company_name, fields.get("lusha_company_name", "")) >= 0.6 else "low"
+        _debug({"company": company_name}, cached, None)
+        if not has_data(fields):
+            return empty_fields("no_data_returned", "no_match",
+                                "Cache hit but all fields empty")
+        conf = "medium" if str_similarity(company_name, fields.get("lusha_company_name", "")) >= 0.6 else "low"
         fields["enrichment_status"] = "cached"
         fields["match_confidence"]  = conf
         return fields
 
     try:
         time.sleep(delay)
-        raw = lusha_by_name(company_name, api_key)
-        save_cache(cache_key, raw)
-        fields = extract_company_fields(raw)
-        conf   = "medium" if str_similarity(company_name, fields.get("lusha_company_name", "")) >= 0.6 else "low"
+        raw_json, resp_obj = lusha_by_name(company_name, api_key)
+        _debug({"company": company_name}, raw_json, resp_obj)
+        save_cache(cache_key, raw_json)
+        fields = extract_company_fields(raw_json)
+        if not has_data(fields):
+            return empty_fields("no_data_returned", "no_match",
+                                f"Response OK but all fields empty. Raw: {str(raw_json)[:300]}")
+        conf = "medium" if str_similarity(company_name, fields.get("lusha_company_name", "")) >= 0.6 else "low"
         fields["enrichment_status"] = "enriched_by_company_name"
         fields["match_confidence"]  = conf
         return fields
     except requests.HTTPError as e:
+        _debug({"company": company_name}, None, e.response, error=str(e))
         code = e.response.status_code if e.response is not None else 0
         if code == 404:
             return empty_fields("no_match", "no_match")
-        return empty_fields("api_error", "no_match", f"HTTP {code}")
+        return empty_fields("api_error", "no_match", _http_error_msg(e))
     except Exception as e:
         return empty_fields("api_error", "no_match", str(e))
 
@@ -313,6 +433,13 @@ with st.sidebar:
         "Vertraging tussen calls (sec)",
         min_value=0.0, max_value=3.0, value=0.5, step=0.1,
     )
+    st.divider()
+    debug_mode = st.checkbox(
+        "🐛 Debug mode",
+        value=False,
+        help="Toont de ruwe API-aanroep en JSON-response voor de eerste verwerkte rij.",
+    )
+
     st.divider()
     st.metric("Gecachede bedrijven", get_cache_count())
     if st.button("🗑 Cache wissen", use_container_width=True):
@@ -495,6 +622,8 @@ if start_btn and not blocking and not currently_processing:
         _n_to_process=n_to_process,
         _api_key=api_key,
         _delay=delay_sec,
+        _debug_mode=debug_mode,
+        _debug_sink=[],        # collects debug info for first row
     )
     st.rerun()
 
@@ -511,6 +640,8 @@ if ss("processing", False):
     _n          = ss("_n_to_process", 0)
     _api_key    = ss("_api_key", "")
     _delay      = ss("_delay", 0.5)
+    _debug_mode = ss("_debug_mode", False)
+    _debug_sink = ss("_debug_sink", [])
 
     # Stop button — rendered while processing; click triggers rerun with flag set
     if st.button("⏹ Stop after current row", key="stop_button"):
@@ -534,6 +665,20 @@ if ss("processing", False):
     m4.metric("Geen match",  cnt_nomatch)
     m5.metric("API-fout",    cnt_error)
 
+    # ── Debug panel ───────────────────────────────────────────────────────────
+    if _debug_mode and _debug_sink:
+        d = _debug_sink[0]
+        with st.expander("🐛 Debug — eerste API-aanroep", expanded=True):
+            st.markdown(f"**Endpoint:** `{d['url']}`")
+            st.markdown(f"**Parameters (zonder API-key):** `{d['params']}`")
+            st.markdown(f"**HTTP status:** `{d['status']}`")
+            if d["headers"]:
+                st.markdown("**Relevante response-headers:**")
+                for hk, hv in d["headers"].items():
+                    st.markdown(f"- `{hk}`: `{hv}`")
+            st.markdown("**Ruwe JSON-response:**")
+            st.json(d["response_json"] or {})
+
     if ss("stop_requested", False) or idx >= _n:
         # All rows done OR user pressed Stop → build result and finish
         build_and_finish(results, df_work)
@@ -544,9 +689,12 @@ if ss("processing", False):
         raw_domain   = str(row.get(_domain_col, "")).strip() if _domain_col else ""
         st.caption(f"⏳ Verwerken: rij {idx + 1}/{_n} — **{company_name or '(leeg)'}**")
 
-        enriched = enrich_one_row(company_name, raw_domain, _api_key, _delay)
+        enriched = enrich_one_row(
+            company_name, raw_domain, _api_key, _delay,
+            debug_sink=_debug_sink if _debug_mode else None,
+        )
         results.append(enriched)
-        ss_set(results=results, process_index=idx + 1)
+        ss_set(results=results, process_index=idx + 1, _debug_sink=_debug_sink)
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -557,6 +705,19 @@ if ss("processing", False):
 if ss("enrichment_done", False):
     df_enriched: pd.DataFrame = ss("df_enriched")
     processed = len(df_enriched)
+
+    # Show debug info if mode was active
+    _debug_sink_post = ss("_debug_sink", [])
+    if ss("_debug_mode", False) and _debug_sink_post:
+        d = _debug_sink_post[0]
+        with st.expander("🐛 Debug — eerste API-aanroep (resultaten)", expanded=False):
+            st.markdown(f"**Endpoint:** `{d['url']}`")
+            st.markdown(f"**Parameters:** `{d['params']}`")
+            st.markdown(f"**HTTP status:** `{d['status']}`")
+            if d["headers"]:
+                for hk, hv in d["headers"].items():
+                    st.markdown(f"- `{hk}`: `{hv}`")
+            st.json(d["response_json"] or {})
 
     st.divider()
     stopped_early = ss("stop_requested", False)
