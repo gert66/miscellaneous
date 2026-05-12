@@ -51,6 +51,8 @@ LUSHA_FIELDS = [
     "lusha_founded_year",
     "enrichment_status",
     "match_confidence",
+    "needs_manual_review",
+    "match_notes",
     "lusha_error_message",
 ]
 
@@ -244,14 +246,29 @@ def extract_company_fields(raw: dict) -> dict:
             employee_range = f"{lo} - {hi}" if (lo and hi) else str(lo or hi)
     employee_count = company_size.get("employeesInLinkedin") or ""
 
-    # Revenue — revenueRange is an array in v2
-    revenue = join_list(data.get("revenueRange")) or data.get("revenue") or ""
+    # Revenue — revenueRange is an array of strings like ["$10M", "$50M"];
+    # format as "$10M – $50M" when two bounds are present, otherwise join as-is.
+    raw_rev = data.get("revenueRange") or data.get("revenue") or ""
+    if isinstance(raw_rev, list):
+        parts = [str(x).strip() for x in raw_rev if x]
+        revenue = f"{parts[0]} – {parts[1]}" if len(parts) >= 2 else (parts[0] if parts else "")
+    else:
+        revenue = str(raw_rev).strip() if raw_rev else ""
 
-    # LinkedIn URL — lives inside the "social" dict in v2
+    # LinkedIn URL — v2 returns it inside the "social" dict, sometimes as a
+    # plain string and sometimes as {"url": "https://..."}.  Unwrap both forms.
+    def _extract_url(v) -> str:
+        if isinstance(v, dict):
+            return str(v.get("url") or v.get("href") or "").strip()
+        return str(v).strip() if v else ""
+
     social = data.get("social") if isinstance(data.get("social"), dict) else {}
     linkedin = (
-        social.get("linkedin") or social.get("linkedinUrl")
-        or data.get("linkedinUrl") or data.get("linkedin") or ""
+        _extract_url(social.get("linkedin"))
+        or _extract_url(social.get("linkedinUrl"))
+        or _extract_url(data.get("linkedinUrl"))
+        or _extract_url(data.get("linkedin"))
+        or ""
     )
 
     technologies = join_list(data.get("technologies") or data.get("techStack"))
@@ -281,11 +298,47 @@ def _empty(status: str, confidence: str, error_msg: str = "") -> dict:
     fields["enrichment_status"]   = status
     fields["match_confidence"]    = confidence
     fields["lusha_error_message"] = error_msg
+    fields["needs_manual_review"] = ""
+    fields["match_notes"]         = ""
     return fields
 
 
 def has_data(fields: dict) -> bool:
     return any(fields.get(f, "") for f in LUSHA_DATA_FIELDS)
+
+
+def flag_review(fields: dict, input_company_name: str) -> dict:
+    """
+    Populate needs_manual_review (True/False) and match_notes.
+    Called after enrichment_status and match_confidence are set.
+    Rules:
+      - match_confidence == "low"
+      - enrichment_status in (no_match, api_error, no_data_returned)
+      - returned Lusha company name is materially different from the input name
+        (similarity < 0.55, ignoring case/punctuation)
+    """
+    reasons: list[str] = []
+    status     = fields.get("enrichment_status", "")
+    confidence = fields.get("match_confidence", "")
+    returned   = fields.get("lusha_company_name", "")
+
+    if status in ("no_match", "api_error", "no_data_returned"):
+        reasons.append(f"enrichment_status is {status}")
+
+    if confidence == "low":
+        reasons.append("match confidence is low")
+
+    if returned and input_company_name:
+        sim = str_similarity(input_company_name, returned)
+        if sim < 0.55:
+            reasons.append(
+                f"returned name '{returned}' differs from input '{input_company_name}' "
+                f"(similarity {sim:.0%})"
+            )
+
+    fields["needs_manual_review"] = "TRUE" if reasons else "FALSE"
+    fields["match_notes"]         = "; ".join(reasons) if reasons else ""
+    return fields
 
 
 def _http_error_msg(e: requests.HTTPError) -> str:
@@ -350,6 +403,7 @@ def enrich_one_row(
     }
 
     def _done(fields: dict) -> tuple:
+        flag_review(fields, company_name)        # sets needs_manual_review + match_notes
         dbg["enrichment_status"]   = fields.get("enrichment_status", "")
         dbg["match_confidence"]    = fields.get("match_confidence",  "")
         dbg["lusha_error_message"] = fields.get("lusha_error_message", "")
@@ -842,11 +896,15 @@ if ss("enrichment_done", False):
         st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
 
     # ── Summary metrics ───────────────────────────────────────────────────────
-    status_counts = df_enriched["enrichment_status"].value_counts().to_dict()
-    if status_counts:
-        rcols = st.columns(min(len(status_counts), 6))
-        for i, (s, c) in enumerate(status_counts.items()):
-            rcols[i % len(rcols)].metric(_STATUS_LABELS.get(s, s), c)
+    status_counts  = df_enriched["enrichment_status"].value_counts().to_dict()
+    needs_review_n = int((df_enriched.get("needs_manual_review", "") == "TRUE").sum())
+    all_metric_cols = list(status_counts.items())
+    n_cols = min(len(all_metric_cols) + 1, 7)
+    if all_metric_cols:
+        rcols = st.columns(n_cols)
+        for i, (s, c) in enumerate(all_metric_cols):
+            rcols[i % n_cols].metric(_STATUS_LABELS.get(s, s), c)
+        rcols[len(all_metric_cols) % n_cols].metric("⚑ Needs review", needs_review_n)
 
     # ── Results table (normal mode) ───────────────────────────────────────────
     # [NORMAL MODE — RESULTS TABLE]
@@ -855,6 +913,7 @@ if ss("enrichment_done", False):
     summary_cols = orig_cols + [
         c for c in [
             "enrichment_status", "match_confidence",
+            "needs_manual_review", "match_notes",
             "lusha_company_name", "lusha_domain", "lusha_industry",
             "lusha_country", "lusha_employee_range", "lusha_revenue",
             "lusha_error_message",
