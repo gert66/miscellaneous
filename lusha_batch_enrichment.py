@@ -131,6 +131,32 @@ def str_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+# Legal-entity suffix helpers used by flag_review()
+_LEGAL_RE = re.compile(
+    r"[\s,\-\.]*\b("
+    r"b\.?v\.?|n\.?v\.?|s\.?a\.?s?\.?|s\.?p\.?a\.?|a\.?/\.?s\.?|a\.?s\.?"
+    r"|g\.?m\.?b\.?h\.?|ag|ltd\.?|limited|inc\.?|corp\.?|llc|llp|plc"
+    r"|oy|ab|s\.?r\.?l\.?|s\.?n\.?c\.?|kft|s\.?r\.?o\.?|o\.?[üu]\.?"
+    r"|pte\.?|pty\.?|cv|vof|gg"
+    r")\b\.?",
+    re.IGNORECASE,
+)
+
+def _strip_legal(name: str) -> str:
+    """Remove legal-entity suffixes for cleaner name comparison."""
+    return _LEGAL_RE.sub(" ", name).strip(" .,/-")
+
+def _legal_suffix(name: str) -> str:
+    """Return the last legal-entity suffix found, normalised (no dots/slashes/spaces)."""
+    hits = _LEGAL_RE.findall(name)
+    return re.sub(r"[^a-z0-9]", "", hits[-1].lower()) if hits else ""
+
+def _domain_root(domain: str) -> str:
+    """'falconvvemanagement.nl' → 'falconvvemanagement' (strip TLD and www)."""
+    d = re.sub(r"^www\.", "", domain.lower().strip())
+    return d.split(".")[0] if d else ""
+
+
 def detect_columns(df: pd.DataFrame) -> tuple:
     """Return (name_col, domain_col); domain_col may be None."""
     cols      = df.columns.tolist()
@@ -379,32 +405,63 @@ def has_data(fields: dict) -> bool:
 
 def flag_review(fields: dict, input_company_name: str) -> dict:
     """
-    Populate needs_manual_review (True/False) and match_notes.
-    Called after enrichment_status and match_confidence are set.
-    Rules:
-      - match_confidence == "low"
-      - enrichment_status in (no_match, api_error, no_data_returned)
-      - returned Lusha company name is materially different from the input name
-        (similarity < 0.55, ignoring case/punctuation)
+    Populate needs_manual_review and match_notes.
+    Five conditions, each adds a distinct note:
+      1. enrichment_status is no_match / api_error / no_data_returned
+      2. match_confidence is low
+      3. Returned company name has low similarity to input (threshold 0.70,
+         compared after stripping legal-entity suffixes to reduce noise)
+      4. Legal-entity suffix mismatch (e.g. S.p.A. vs A/S → different country/entity)
+      5. Returned domain root has low similarity to input name
+         (only when lookup was not domain-based, so domain was chosen by Lusha)
     """
     reasons: list[str] = []
     status     = fields.get("enrichment_status", "")
     confidence = fields.get("match_confidence", "")
     returned   = fields.get("lusha_company_name", "")
+    ret_domain = fields.get("lusha_domain", "")
+    inp        = (input_company_name or "").strip()
 
+    # 1. Bad enrichment status
     if status in ("no_match", "api_error", "no_data_returned"):
         reasons.append(f"enrichment_status is {status}")
 
+    # 2. Low confidence score
     if confidence == "low":
         reasons.append("match confidence is low")
 
-    if returned and input_company_name:
-        sim = str_similarity(input_company_name, returned)
-        if sim < 0.55:
+    # 3. Name similarity — strip legal suffixes so "A-Leasing BV" vs "A-Leasing Ltd"
+    #    scores on the core name only; mismatch is caught separately by rule 4.
+    if returned and inp:
+        inp_core = _strip_legal(inp).strip() or inp
+        ret_core = _strip_legal(returned).strip() or returned
+        sim = str_similarity(inp_core, ret_core)
+        if sim < 0.70:
             reasons.append(
-                f"returned name '{returned}' differs from input '{input_company_name}' "
+                f"Returned company name '{returned}' differs from input '{inp}' "
                 f"(similarity {sim:.0%})"
             )
+
+    # 4. Legal-entity suffix mismatch (e.g. S.p.A. ≠ A/S → Italian vs Danish entity)
+    if inp and returned:
+        inp_sfx = _legal_suffix(inp)
+        ret_sfx = _legal_suffix(returned)
+        if inp_sfx and ret_sfx and inp_sfx != ret_sfx:
+            reasons.append(
+                f"Legal entity type mismatch: input has '{inp_sfx.upper()}' "
+                f"but returned '{ret_sfx.upper()}' — may be a different legal entity or country"
+            )
+
+    # 5. Returned domain root vs input company name
+    #    Skip when the lookup was domain-based (domain is what we supplied, not Lusha's choice).
+    if ret_domain and inp and status not in ("enriched_by_domain",):
+        root = _domain_root(ret_domain)
+        if root:
+            dom_sim = str_similarity(root, _strip_legal(inp).strip() or inp)
+            if dom_sim < 0.35:
+                reasons.append(
+                    f"Returned domain '{ret_domain}' appears unrelated to input company name '{inp}'"
+                )
 
     fields["needs_manual_review"] = "TRUE" if reasons else "FALSE"
     fields["match_notes"]         = "; ".join(reasons) if reasons else ""
@@ -487,15 +544,15 @@ def enrich_one_row(
         cached = load_cache(cache_key)
 
         if cached is not None:
-            dbg["http_status"] = "cached"
-            dbg["raw_json"]    = cached
             fields = extract_company_fields(cached)
-            if not has_data(fields):
-                return _done(_empty("no_data_returned", "no_match",
-                                    "Cache hit but all company fields are empty"))
-            fields["enrichment_status"] = "cached"
-            fields["match_confidence"]  = "high"
-            return _done(fields)
+            if has_data(fields):
+                dbg["http_status"] = "cached"
+                dbg["raw_json"]    = cached
+                fields["enrichment_status"] = "cached"
+                fields["match_confidence"]  = "high"
+                return _done(fields)
+            # Cached response has no usable company data — discard and retry via API.
+            (CACHE_DIR / f"{safe_filename(cache_key)}.json").unlink(missing_ok=True)
 
         try:
             time.sleep(delay)
@@ -537,17 +594,17 @@ def enrich_one_row(
     cached = load_cache(cache_key)
 
     if cached is not None:
-        dbg["http_status"] = "cached"
-        dbg["raw_json"]    = cached
         fields = extract_company_fields(cached)
-        if not has_data(fields):
-            return _done(_empty("no_data_returned", "no_match",
-                                "Cache hit but all company fields are empty"))
-        conf = "medium" if str_similarity(company_name,
-                                          fields.get("lusha_company_name", "")) >= 0.6 else "low"
-        fields["enrichment_status"] = "cached"
-        fields["match_confidence"]  = conf
-        return _done(fields)
+        if has_data(fields):
+            dbg["http_status"] = "cached"
+            dbg["raw_json"]    = cached
+            conf = "medium" if str_similarity(company_name,
+                                              fields.get("lusha_company_name", "")) >= 0.6 else "low"
+            fields["enrichment_status"] = "cached"
+            fields["match_confidence"]  = conf
+            return _done(fields)
+        # Cached response has no usable company data — discard and retry via API.
+        (CACHE_DIR / f"{safe_filename(cache_key)}.json").unlink(missing_ok=True)
 
     try:
         time.sleep(delay)
