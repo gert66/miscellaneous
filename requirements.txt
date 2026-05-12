@@ -3,3 +3,8 @@ numpy
 matplotlib
 plotly
 scikit-learn
+streamlit
+requests
+pandas
+openpyxl
+xlsxwriter
