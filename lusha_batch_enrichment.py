@@ -711,7 +711,7 @@ with st.sidebar:
         st.subheader("Debug settings")
         delay_sec = st.slider(
             "Delay between API calls (sec)",
-            min_value=0.0, max_value=3.0, value=0.5, step=0.1,
+            min_value=0.0, max_value=3.0, value=1.0, step=0.1,
             help="Small pause between calls to reduce rate-limit risk.",
         )
         st.divider()
@@ -724,7 +724,7 @@ with st.sidebar:
             st.success("Cache cleared.")
             st.rerun()
     else:
-        delay_sec = 0.5  # default, hidden in normal mode
+        delay_sec = 1.0  # default, hidden in normal mode
 
 # =============================================================================
 # STEP 1 — Upload file
@@ -930,7 +930,7 @@ if ss("processing", False):
     _domain_col   = ss("_domain_col")
     _n            = ss("_n_to_process", 0)
     _api_key      = ss("_api_key", "")
-    _delay        = ss("_delay", 0.5)
+    _delay        = ss("_delay", 1.0)
 
     # Stop button
     if st.button("⏹ Stop after current row", key="stop_button"):
