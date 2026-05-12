@@ -1,10 +1,9 @@
-streamlit>=1.31
+streamlit>=1.32
+requests>=2.31
+pandas>=2.0
+openpyxl>=3.1
+xlsxwriter>=3.1
 numpy
 matplotlib
 plotly
 scikit-learn
-streamlit
-requests
-pandas
-openpyxl
-xlsxwriter
