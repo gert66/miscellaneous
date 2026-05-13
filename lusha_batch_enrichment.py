@@ -468,6 +468,20 @@ def flag_review(fields: dict, input_company_name: str) -> dict:
     return fields
 
 
+def _lusha_body_error(raw_json: dict) -> str:
+    """
+    Return an error message if the Lusha response body signals a known failure,
+    e.g. {"errors": {"message": "Company was not found."}}.
+    Returns '' when the body looks like a normal data response.
+    """
+    errors = raw_json.get("errors") or raw_json.get("error")
+    if isinstance(errors, dict):
+        return str(errors.get("message") or errors.get("detail") or errors).strip()
+    if isinstance(errors, str) and errors:
+        return errors.strip()
+    return ""
+
+
 def _http_error_msg(e: requests.HTTPError) -> str:
     code = e.response.status_code if e.response is not None else "?"
     try:
@@ -534,6 +548,8 @@ def enrich_one_row(
         dbg["enrichment_status"]   = fields.get("enrichment_status", "")
         dbg["match_confidence"]    = fields.get("match_confidence",  "")
         dbg["lusha_error_message"] = fields.get("lusha_error_message", "")
+        dbg["needs_manual_review"] = fields.get("needs_manual_review", "")
+        dbg["match_notes"]         = fields.get("match_notes", "")
         return fields, dbg
 
     # ── 1. Domain path ────────────────────────────────────────────────────────
@@ -562,6 +578,9 @@ def enrich_one_row(
             dbg["raw_json"]         = strip_personal_keys(raw_json)
             save_cache(cache_key, raw_json)
             fields = extract_company_fields(raw_json)
+            body_err = _lusha_body_error(raw_json)
+            if body_err and "not found" in body_err.lower():
+                return _done(_empty("no_match", "no_match", body_err))
             if not has_data(fields):
                 return _done(_empty(
                     "no_data_returned", "no_match",
@@ -614,6 +633,9 @@ def enrich_one_row(
         dbg["raw_json"]         = strip_personal_keys(raw_json)
         save_cache(cache_key, raw_json)
         fields = extract_company_fields(raw_json)
+        body_err = _lusha_body_error(raw_json)
+        if body_err and "not found" in body_err.lower():
+            return _done(_empty("no_match", "no_match", body_err))
         if not has_data(fields):
             return _done(_empty(
                 "no_data_returned", "no_match",
