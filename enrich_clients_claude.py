@@ -1621,7 +1621,7 @@ if ss("processing", False):
         _n_done     = len(_partial_df)
         _stamp      = ts()
         with st.expander(
-            f"⬇ Download intermediate results ({_n_done} rows so far)", expanded=False
+            f"⬇ Download intermediate results ({_n_done} rows so far)", expanded=True
         ):
             _xl_bytes  = df_to_excel_bytes(_partial_df)
             _csv_bytes = df_to_csv_bytes(_partial_df)
@@ -1769,9 +1769,20 @@ if ss("enrichment_done", False):
     _final_xl_path  = ss("_final_save_path", "")
     _final_xl_error = ss("_final_save_error", "")
     if _final_xl_path:
-        st.info(f"📥 Results saved to **{_final_xl_path}**")
+        st.info(f"📥 Results also saved locally to **{_final_xl_path}**")
     elif _final_xl_error:
-        st.warning(f"⚠ Auto-save failed: {_final_xl_error}. Use the download buttons below.")
+        st.warning(f"⚠ Local auto-save failed: {_final_xl_error}")
+
+    # ── Primary browser download ──────────────────────────────────────────────
+    _fname_prefix_dl = "elm_results" if _elm_done else "claude_enriched"
+    st.download_button(
+        label="⬇ Download results to your local Downloads folder",
+        data=df_to_excel_bytes(df_enriched),
+        file_name=f"{_fname_prefix_dl}_{ts()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
 
     # ── Status summary ────────────────────────────────────────────────────────
     status_counts  = (
