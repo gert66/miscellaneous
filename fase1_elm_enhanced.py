@@ -579,6 +579,7 @@ elif df_raw is not None:
     st.success(
         f"**{_ss('_elm2_file_name')}** — {len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
+    st.dataframe(df_raw.head(), use_container_width=True)
 
 # =============================================================================
 # Column detection + Start button
@@ -593,12 +594,13 @@ if df_raw is not None:
     name_col = auto_name
     url_col  = auto_url
 
-    if name_col or url_col:
-        parts = []
-        if name_col:
-            parts.append(f"company name → **{name_col}**")
-        if url_col:
-            parts.append(f"URL → **{url_col}**")
+    parts = []
+    if name_col:
+        parts.append(f"company name → **{name_col}**")
+    if url_col:
+        parts.append(f"URL → **{url_col}**")
+
+    if parts:
         st.info("Auto-detected columns: " + ",  ".join(parts))
     else:
         st.warning("Could not auto-detect columns. Make sure your CSV has recognisable headers.")
@@ -609,7 +611,7 @@ st.divider()
 currently_running = _ss("_elm2_running", False)
 
 blocking: list = []
-if uploaded is None:
+if df_raw is None and not file_error:
     blocking.append("No file uploaded yet.")
 if file_error:
     blocking.append(f"File could not be read: {file_error}")
