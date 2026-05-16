@@ -90,19 +90,43 @@ def search_company_info(url: str) -> dict:
             break
         messages.append({"role": "user", "content": tool_results})
 
-    raw = next((b.text for b in response.content if hasattr(b, "type") and b.type == "text"), "")
+    result = _parse_json_from_response(response.content)
+    if result is not None:
+        return result
 
-    # Strip optional markdown code fences just in case
-    fence = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
-    candidate = fence.group(1).strip() if fence else raw.strip()
+    # Ask Claude again with a stricter prompt
+    messages.append({"role": "assistant", "content": response.content})
+    messages.append({
+        "role": "user",
+        "content": "Reply with ONLY a raw JSON object, no explanation, no markdown, no backticks.",
+    })
+    retry = client.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        tools=[WEB_SEARCH_TOOL],
+        messages=messages,
+    )
+    result = _parse_json_from_response(retry.content)
+    if result is not None:
+        return result
+    raise json.JSONDecodeError("No JSON object found in Claude's response", "", 0)
 
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        obj_match = re.search(r"\{.*\}", candidate, re.DOTALL)
-        if obj_match:
+
+def _parse_json_from_response(content: list) -> dict | None:
+    """Search all text blocks for the first valid JSON object."""
+    for block in content:
+        if not (hasattr(block, "type") and block.type == "text"):
+            continue
+        text = block.text
+        obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not obj_match:
+            continue
+        try:
             return json.loads(obj_match.group(0))
-        raise
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
