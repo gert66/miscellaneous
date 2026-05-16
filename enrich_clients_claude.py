@@ -276,24 +276,69 @@ def list_cache_files() -> list:
 # Jina AI  ← page / search fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_via_jina_reader(url: str) -> str:
-    resp = requests.get(
-        f"{JINA_READER_URL}{url}",
-        headers={"Accept": "text/plain", "X-Return-Format": "text"},
-        timeout=30,
-    )
+_JINA_HEADERS = {
+    "Accept": "text/plain",
+    "X-Return-Format": "text",
+    "x-respond-with": "text",
+}
+_JINA_CHAR_LIMIT = 8_000   # about pages are compact; cap here to save tokens
+_JINA_ABOUT_SLUGS = ("/about-us", "/about")
+
+
+def _jina_get(url: str) -> str:
+    """
+    GET a single URL via Jina Reader with exponential backoff on 429.
+    Returns the first _JINA_CHAR_LIMIT characters of the response text.
+    Raises requests.HTTPError on non-429 failures after retries.
+    """
+    for attempt in range(4):          # 0, 1, 2, 3
+        resp = requests.get(
+            f"{JINA_READER_URL}{url}",
+            headers=_JINA_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            wait = 60 * (2 ** attempt)   # 60 s, 120 s, 240 s, 480 s
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.text[:_JINA_CHAR_LIMIT]
+    # exhausted retries
     resp.raise_for_status()
-    return resp.text
+    return resp.text[:_JINA_CHAR_LIMIT]
+
+
+def fetch_via_jina_reader(url: str) -> str:
+    """
+    Try {url}/about-us then {url}/about first; fall back to the homepage.
+    Returns the first _JINA_CHAR_LIMIT characters of whichever succeeds.
+    """
+    base = url.rstrip("/")
+    for slug in _JINA_ABOUT_SLUGS:
+        try:
+            return _jina_get(base + slug)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            if code not in (403, 404):
+                raise          # unexpected error — propagate
+            # 403/404 on about page → try next slug / fall back to homepage
+    return _jina_get(url)      # homepage fallback
 
 
 def fetch_via_jina_search(query: str) -> str:
-    resp = requests.get(
-        f"{JINA_SEARCH_URL}{quote(query)}",
-        headers={"Accept": "text/plain"},
-        timeout=30,
-    )
+    for attempt in range(4):
+        resp = requests.get(
+            f"{JINA_SEARCH_URL}{quote(query)}",
+            headers=_JINA_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            time.sleep(60 * (2 ** attempt))
+            continue
+        resp.raise_for_status()
+        return resp.text[:_JINA_CHAR_LIMIT]
     resp.raise_for_status()
-    return resp.text
+    return resp.text[:_JINA_CHAR_LIMIT]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,7 +351,7 @@ def _claude_extract(webpage_text: str, api_key: str) -> tuple:
     Returns (raw_fields_dict, input_tokens, output_tokens).
     """
     client    = anthropic.Anthropic(api_key=api_key)
-    truncated = webpage_text[:50_000]
+    truncated = webpage_text[:_JINA_CHAR_LIMIT]
     msg = client.messages.create(
         model=MODEL_ID,
         max_tokens=1024,
@@ -570,8 +615,8 @@ def enrich_one_row(
 
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
 
-    # 3-second pause between companies to stay under the 50k token/min rate limit
-    time.sleep(3)
+    # 5-second pause between companies to stay under the 50k token/min rate limit
+    time.sleep(5)
 
     # ── Step 1 ────────────────────────────────────────────────────────────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
