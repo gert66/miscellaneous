@@ -56,10 +56,12 @@ def search_company_info(url: str) -> dict:
         {
             "role": "user",
             "content": (
-                f"Find the following information about the company at {url}: "
-                "founder name, company description, address, phone, and email. "
-                "Search the website and any other relevant sources. "
-                "Return your answer as the JSON object described in the system prompt."
+                f"Research the company at {url}. Use web search to explore the website "
+                "thoroughly — including any about, team, or contact pages you find. "
+                "Find the founder or key person behind the company, a description of what "
+                "they do, their address, phone, and email. Return ONLY a JSON object with "
+                "fields: founder, description, address, phone, email, and for each a "
+                "source_text field showing where you found it."
             ),
         }
     ]
