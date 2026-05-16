@@ -45,10 +45,11 @@ FIELD_LABELS = {
 
 # ── Claude search + extraction ────────────────────────────────────────────────
 
-def search_company_info(url: str) -> dict:
+def search_company_info(url: str) -> tuple[dict, anthropic.types.Usage]:
     """
     Single-turn API call with web_search enabled. Claude searches autonomously
     and returns a text response; we extract the JSON from the text blocks.
+    Returns the parsed info dict and the API usage object.
     """
     client = anthropic.Anthropic()
 
@@ -61,12 +62,14 @@ def search_company_info(url: str) -> dict:
             {
                 "role": "user",
                 "content": (
-                    f"Research the company at {url}. Use web search to explore the website "
-                    "thoroughly — including any about, team, or contact pages you find. "
-                    "Find the founder or key person behind the company, a description of what "
-                    "they do, their address, phone, and email. Return ONLY a JSON object with "
-                    "fields: founder, description, address, phone, email, and for each a "
-                    "source_text field showing where you found it."
+                    f'Search for information about the company at {url}. '
+                    f'You MUST search specifically for the founder or creator. '
+                    f'Search for: "{url} founder", "{url} about us", "{url} team". '
+                    f'The founder is a person\'s name that appears near words like '
+                    f'founder, creator, CEO, or director. '
+                    f'Return ONLY a raw JSON object with no markdown, no backticks, '
+                    f'just pure JSON with fields: founder, description, address, phone, email, '
+                    f'each with a source_text field.'
                 ),
             }
         ],
@@ -74,7 +77,7 @@ def search_company_info(url: str) -> dict:
 
     result = _parse_json_from_response(response.content)
     if result is not None:
-        return result
+        return result, response.usage
     raise json.JSONDecodeError("No JSON object found in Claude's response", "", 0)
 
 
@@ -133,9 +136,14 @@ if st.button("Get Company Info"):
 
         try:
             with st.spinner("Searching with Claude..."):
-                info = search_company_info(url)
+                info, usage = search_company_info(url)
 
             st.success("Done!")
+
+            input_tokens = usage.input_tokens
+            output_tokens = usage.output_tokens
+            cost = (input_tokens / 1_000_000 * 3) + (output_tokens / 1_000_000 * 15)
+            st.caption(f"🔢 Tokens gebruikt: {input_tokens} input / {output_tokens} output | Geschatte kosten: ${cost:.4f}")
 
             st.header("Extracted Company Information")
             for field in FIELDS:
