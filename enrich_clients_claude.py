@@ -1267,7 +1267,7 @@ with st.sidebar:
     enrichment_mode = st.radio(
         "Enrichment mode",
         options=["Full Claude enrichment", "Extreme Light Mode (no API)"],
-        index=0,
+        index=1,
         key="enrichment_mode_radio",
         help=(
             "**Full Claude**: Jina AI + Claude API — requires ANTHROPIC_API_KEY.\n\n"
