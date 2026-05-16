@@ -22,6 +22,7 @@ import re
 import time
 import unicodedata
 import zipfile
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote
@@ -39,6 +40,7 @@ JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
 AUTOSAVE_PATH    = "/tmp/enrichment_autosave.csv"
+LOCAL_SAVE_EVERY = 5   # write to user's local folder every N companies
 MODEL_ID         = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
@@ -825,6 +827,42 @@ def cache_to_zip_bytes() -> bytes:
     return buf.getvalue()
 
 
+def build_partial_df(results: list, df_work: pd.DataFrame) -> pd.DataFrame:
+    """Build an enriched DataFrame from however many rows have been processed so far."""
+    df_out      = df_work.head(len(results)).copy().reset_index(drop=True)
+    enriched_df = pd.DataFrame(results)
+    for col in ALL_ENRICHMENT_FIELDS:
+        df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
+    return df_out
+
+
+def ts() -> str:
+    """Compact UTC timestamp for filenames: 20250516_143022"""
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+
+def save_to_local_folder(df: pd.DataFrame, folder: str) -> tuple[str, str]:
+    """
+    Write Excel + CSV to *folder* with timestamped filenames.
+    Returns (excel_path, csv_path). Raises OSError on permission / path errors.
+    Only usable when the app runs locally — not on Streamlit Cloud.
+    """
+    folder_path = Path(folder.strip())
+    folder_path.mkdir(parents=True, exist_ok=True)
+    stamp      = ts()
+    excel_path = folder_path / f"enriched_results_{stamp}.xlsx"
+    csv_path   = folder_path / f"enriched_results_{stamp}.csv"
+    df_to_excel_bytes_write(df, str(excel_path))
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return str(excel_path), str(csv_path)
+
+
+def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
+    """Write DataFrame to an Excel file at *path* on disk."""
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Enriched")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto-save helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -970,6 +1008,9 @@ with st.sidebar:
     if ss("processing", False) and _last_name:
         st.divider()
         st.caption(f"💾 Auto-save active — last saved: **{_last_name}**")
+        _last_local = ss("_last_local_save", "")
+        if _last_local:
+            st.caption(f"📁 Local save: {_last_local}")
     elif os.path.exists(AUTOSAVE_PATH):
         _saved_df = autosave_load()
         if _saved_df is not None:
@@ -986,6 +1027,27 @@ with st.sidebar:
                 autosave_clear()
                 ss_set(_resume_mode=False)
                 st.rerun()
+
+    # ── Local save folder ─────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📁 Local auto-save")
+    st.caption(
+        f"Saves an Excel snapshot every {LOCAL_SAVE_EVERY} companies to a folder "
+        "on this machine. Only works when the app runs locally."
+    )
+    local_save_enabled = st.checkbox("Enable local folder save", value=False,
+                                     key="local_save_enabled")
+    local_save_path = st.text_input(
+        "Folder path",
+        value=ss("_local_save_path", ""),
+        placeholder=r"e.g. C:\Users\Gert\Downloads\ or /home/user/Downloads/",
+        key="local_save_path_input",
+        disabled=not local_save_enabled,
+    )
+    if local_save_enabled and local_save_path:
+        ss_set(_local_save_path=local_save_path)
+    elif not local_save_enabled:
+        ss_set(_local_save_path="")
 
     if debug_mode:
         st.divider()
@@ -1216,6 +1278,36 @@ if ss("processing", False):
     mc4.metric("Errors",          cnt_error)
     mc5.metric("Est. cost",       f"${total_cost:.4f}")
 
+    # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
+    if results:
+        _partial_df = build_partial_df(results, df_work)
+        _n_done     = len(_partial_df)
+        _stamp      = ts()
+        with st.expander(
+            f"⬇ Download intermediate results ({_n_done} rows so far)", expanded=False
+        ):
+            _xl_bytes  = df_to_excel_bytes(_partial_df)
+            _csv_bytes = df_to_csv_bytes(_partial_df)
+            _xl_kb  = len(_xl_bytes)  // 1024 or 1
+            _csv_kb = len(_csv_bytes) // 1024 or 1
+            _ic1, _ic2 = st.columns(2)
+            _ic1.download_button(
+                f"⬇ Excel ({_n_done} rows, ~{_xl_kb} KB)",
+                data=_xl_bytes,
+                file_name=f"enriched_results_{_stamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"dl_xl_{_n_done}",
+            )
+            _ic2.download_button(
+                f"⬇ CSV ({_n_done} rows, ~{_csv_kb} KB)",
+                data=_csv_bytes,
+                file_name=f"enriched_results_{_stamp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"dl_csv_{_n_done}",
+            )
+
     _resume_mode = ss("_resume_mode", False)
     _saved_df    = autosave_load() if _resume_mode else None
 
@@ -1260,12 +1352,23 @@ if ss("processing", False):
         results.append(fields)
         debug_records.append(dbg)
 
-        # ── Auto-save ─────────────────────────────────────────────────────────
+        # ── Auto-save (crash recovery) ────────────────────────────────────────
         try:
             autosave_append(fields, input_row)
             ss_set(autosave_last_name=company_name or raw_url or f"row {idx + 1}")
         except Exception:
             pass  # never let autosave failure abort processing
+
+        # ── Local folder save every N companies ───────────────────────────────
+        _local_path = ss("_local_save_path", "")
+        _new_idx    = len(results)  # results already includes the row appended above
+        if _local_path and _new_idx % LOCAL_SAVE_EVERY == 0:
+            try:
+                _snap_df = build_partial_df(results, df_work)
+                _xl, _csv = save_to_local_folder(_snap_df, _local_path)
+                ss_set(_last_local_save=f"{_new_idx} rows → {Path(_xl).name}")
+            except Exception as _e:
+                ss_set(_last_local_save=f"⚠ Save failed: {_e}")
 
         try:
             total_in   += int(fields.get("total_tokens_in",  0) or 0)
