@@ -1666,10 +1666,10 @@ if ss("processing", False):
                 status_box.write("⚡ Extreme Light Mode — fetching pages…")
                 fields, dbg = enrich_one_row_light(company_name, raw_url)
                 _fetch_status = fields.get("elm_fetch_status", "?")
-                _chars        = fields.get("elm_total_chars", 0)
                 status_box.write(
                     f"✅ Done — fetch: {_fetch_status} | "
-                    f"{_chars:,} chars | score: {fields.get('elm_score_overall_icp', '?')}/10"
+                    f"{int(fields.get('elm_total_chars', 0) or 0):,} chars | "
+                    f"score: {fields.get('elm_score_overall_icp', '?')}/10"
                 )
                 row_cost = 0.0
             else:
