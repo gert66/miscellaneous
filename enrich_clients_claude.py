@@ -150,13 +150,18 @@ _COMPANY_HINTS = ["company", "account", "organisation", "organization", "name", 
 _DOMAIN_HINTS  = ["domain", "website", "url", "web", "site", "domein"]
 
 _STATUS_LABELS = {
-    "enriched":          "Enriched (both steps)",
-    "step1_only":        "Step 1 only",
-    "no_data":           "No data returned",
-    "api_error":         "API error",
-    "jina_error":        "Page fetch error",
-    "web_search_fallback": "Enriched via web search fallback",
-    "cached_fallback":   "From cache (web search fallback)",
+    "enriched_jina":                 "Enriched via Jina",
+    "enriched_search":               "Enriched via Google",
+    "enriched_jina_step1_only":      "Jina — Step 1 only",
+    "enriched_search_step1_only":    "Google — Step 1 only",
+    "enriched":                      "Enriched (both steps)",
+    "step1_only":                    "Step 1 only",
+    "no_data":                       "No data returned",
+    "api_error":                     "API error",
+    "jina_error":                    "Page fetch error",
+    "web_search_fallback":           "Enriched via web search fallback",
+    "cached_fallback":               "From cache (web search fallback)",
+    "skipped_resume":                "Skipped (resumed)",
 }
 
 
@@ -299,62 +304,107 @@ _JINA_HEADERS = {
     "X-Return-Format": "text",
     "x-respond-with": "text",
 }
-_JINA_CHAR_LIMIT = 8_000   # about pages are compact; cap here to save tokens
-_JINA_ABOUT_SLUGS = ("/about-us", "/about")
+_JINA_CHAR_LIMIT = 6_000   # cap Jina content to save tokens
+_JINA_ABOUT_SLUGS  = ("/about-us", "/about")
+_JINA_MIN_CONTENT  = 500   # fewer chars than this → treat as failed Jina fetch
+_JINA_RETRY_WAITS  = (30, 60, 120)  # backoff seconds on 429
 
 
-def _jina_get(url: str) -> str:
+class JinaRateLimitRetry(Exception):
+    """Raised to signal the UI that we're waiting on a 429 before retrying."""
+    def __init__(self, wait: int, company: str):
+        self.wait    = wait
+        self.company = company
+        super().__init__(f"Rate limited — waiting {wait}s for {company}")
+
+
+def _jina_get(url: str, company_hint: str = "") -> str:
     """
-    GET a single URL via Jina Reader with exponential backoff on 429.
-    Returns the first _JINA_CHAR_LIMIT characters of the response text.
-    Raises requests.HTTPError on non-429 failures after retries.
+    GET a single URL via Jina Reader.
+    On 429: waits 30 s → 60 s → 120 s (3 retries).
+    Raises JinaRateLimitRetry to let the UI display the wait message.
+    Raises requests.HTTPError on non-429 failures.
+    Returns up to _JINA_CHAR_LIMIT characters.
     """
-    for attempt in range(4):          # 0, 1, 2, 3
+    for attempt, wait in enumerate(_JINA_RETRY_WAITS):
         resp = requests.get(
             f"{JINA_READER_URL}{url}",
             headers=_JINA_HEADERS,
             timeout=30,
         )
-        if resp.status_code == 429:
-            wait = 60 * (2 ** attempt)   # 60 s, 120 s, 240 s, 480 s
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.text[:_JINA_CHAR_LIMIT]
-    # exhausted retries
+        if resp.status_code != 429:
+            break
+        raise JinaRateLimitRetry(wait, company_hint)
     resp.raise_for_status()
     return resp.text[:_JINA_CHAR_LIMIT]
 
 
-def fetch_via_jina_reader(url: str) -> str:
+def _jina_get_with_retry(url: str, company_hint: str = "") -> str:
+    """Wrap _jina_get to actually sleep and retry when JinaRateLimitRetry is raised."""
+    for attempt, wait in enumerate(_JINA_RETRY_WAITS):
+        try:
+            return _jina_get(url, company_hint)
+        except JinaRateLimitRetry as exc:
+            # Track retry count for the live counter
+            st.session_state["_jina_retry_count"] = (
+                st.session_state.get("_jina_retry_count", 0) + 1
+            )
+            st.session_state["_last_retry_msg"] = (
+                f"⏳ Rate limit — waiting {exc.wait}s for {company_hint or url}…"
+            )
+            time.sleep(wait)
+    # Final attempt — let HTTPError propagate
+    return _jina_get(url, company_hint)
+
+
+def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
     """
-    Try {url}/about-us then {url}/about first; fall back to the homepage.
-    Returns the first _JINA_CHAR_LIMIT characters of whichever succeeds.
+    Fetch the homepage AND about-us page; return whichever has more content.
+    Both must be ≥ _JINA_MIN_CONTENT chars to count — shorter responses are
+    treated as blocked/empty and raise requests.HTTPError so the caller can
+    fall through to the Google tier.
     """
-    base = url.rstrip("/")
+    base    = url.rstrip("/")
+    best    = ""
+
+    # Try homepage
+    try:
+        text = _jina_get_with_retry(url, company_hint)
+        if len(text) > len(best):
+            best = text
+    except requests.HTTPError:
+        pass
+
+    # Try about-us slugs
     for slug in _JINA_ABOUT_SLUGS:
         try:
-            return _jina_get(base + slug)
+            text = _jina_get_with_retry(base + slug, company_hint)
+            if len(text) > len(best):
+                best = text
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
             if code not in (403, 404):
-                raise          # unexpected error — propagate
-            # 403/404 on about page → try next slug / fall back to homepage
-    return _jina_get(url)      # homepage fallback
+                raise
+
+    if len(best) < _JINA_MIN_CONTENT:
+        # Simulate a 404 so the caller falls through to the search tier
+        raise requests.HTTPError(
+            f"Jina returned only {len(best)} chars (< {_JINA_MIN_CONTENT})",
+            response=None,
+        )
+    return best
 
 
 def fetch_via_jina_search(query: str) -> str:
-    for attempt in range(4):
+    for attempt, wait in enumerate(_JINA_RETRY_WAITS):
         resp = requests.get(
             f"{JINA_SEARCH_URL}{quote(query)}",
             headers=_JINA_HEADERS,
             timeout=30,
         )
-        if resp.status_code == 429:
-            time.sleep(60 * (2 ** attempt))
-            continue
-        resp.raise_for_status()
-        return resp.text[:_JINA_CHAR_LIMIT]
+        if resp.status_code != 429:
+            break
+        time.sleep(wait)
     resp.raise_for_status()
     return resp.text[:_JINA_CHAR_LIMIT]
 
@@ -422,122 +472,106 @@ def _step1_has_data(fields: dict) -> bool:
     return any(fields.get(f, "") for f in _STEP1_DATA_FIELDS)
 
 
-def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
-    """
-    Fetch page via Jina AI and extract basic firmographics with Claude.
-    Returns (step1_fields, raw_json_for_cache, in_tok, out_tok, status, error_msg).
-    Falls back to Jina Search when URL fetch fails (403/404).
-    """
-    source_url = normalize_url(url) if url else ""
-
-    def _try_fetch_and_extract(fetch_fn, fetch_arg, cache_key_prefix):
-        ck = f"{cache_key_prefix}_{fetch_arg}"
-        cached = load_cache(ck)
-        if cached is not None:
-            f = _map_step1_fields(cached.get("claude_data", {}), source_url)
-            if _step1_has_data(f):
-                in_t  = int(cached.get("tokens_in", 0) or 0)
-                out_t = int(cached.get("tokens_out", 0) or 0)
-                return f, cached, in_t, out_t, "cached", ""
-            _delete_cache(ck)
-
-        time.sleep(delay)
-        text = fetch_fn(fetch_arg)
-        raw_fields, in_t, out_t = _claude_extract(text, api_key)
-        payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
-        save_cache(ck, payload)
-        fields = _map_step1_fields(raw_fields, source_url)
-        return fields, payload, in_t, out_t, "ok", ""
-
-    # ── Try URL path ──────────────────────────────────────────────────────────
-    if source_url:
-        try:
-            return _try_fetch_and_extract(fetch_via_jina_reader, source_url, "step1_url")
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else 0
-            if code not in (403, 404, 429):
-                return ({}, {}, 0, 0, "jina_error",
-                        f"Jina HTTP {code}: {e.response.text[:200] if e.response else str(e)}")
-            # fall through to name search
-        except (json.JSONDecodeError, ValueError) as e:
-            return ({}, {}, 0, 0, "parse_error", f"Claude parse error: {e}")
-        except anthropic.APIError as e:
-            return ({}, {}, 0, 0, "api_error", f"Claude API: {e}")
-        except Exception as e:
-            return ({}, {}, 0, 0, "api_error", str(e))
-
-    # ── Fall back to Jina Search on company name ──────────────────────────────
-    if not company_name:
-        return ({}, {}, 0, 0, "no_input", "No URL or company name provided")
-
-    try:
-        return _try_fetch_and_extract(fetch_via_jina_search, company_name, "step1_name")
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else 0
-        return ({}, {}, 0, 0, "jina_error", f"Jina search HTTP {code}")
-    except (json.JSONDecodeError, ValueError) as e:
-        return ({}, {}, 0, 0, "parse_error", f"Claude parse error: {e}")
-    except anthropic.APIError as e:
-        return ({}, {}, 0, 0, "api_error", f"Claude API: {e}")
-    except Exception as e:
-        return ({}, {}, 0, 0, "api_error", str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1 fallback — web_search when Jina returns nothing
-# ─────────────────────────────────────────────────────────────────────────────
-
 _STEP1_FALLBACK_PROMPT_TMPL = (
     "Find company information about {company_name} ({url}). "
     "Extract: industry, employee count, founding year, headquarters location, "
     "description, international presence, specialties. "
     "Return ONLY JSON with fields: company_name, description, main_industry, "
     "sub_industry, employee_range, revenue_range, founded_year, company_type, "
-    "country, city, linkedin_url, specialties."
+    "country, city, linkedin_url, specialties, continent, technologies, "
+    "total_funding_amount, total_funding_rounds, last_round_type, last_round_amount, "
+    "last_round_date, ipo_status. Use empty string for any field not found."
 )
 
 
-def run_step1_web_search_fallback(
-    company_name: str,
-    url: str,
-    api_key: str,
-) -> tuple:
+def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
     """
-    Called when Jina fetching returns no usable data.
-    Uses Claude web_search to find basic firmographics directly.
+    Three-tier Step 1 enrichment:
+      Tier 1 — Jina direct scrape       → status 'enriched_jina'
+      Tier 2 — Claude web_search        → status 'enriched_search'
+      Tier 3 — Both failed              → status 'no_data'
     Returns (step1_fields, raw_json, in_tok, out_tok, status, error_msg).
     """
-    target = normalize_url(url) if url else company_name
-    if not target and not company_name:
-        return ({}, {}, 0, 0, "no_input", "No URL or company name for fallback")
+    source_url = normalize_url(url) if url else ""
+    jina_err   = ""
+    total_in   = total_out = 0
 
-    ck = f"step1_fallback_{target or company_name}"
+    # ── Tier 1: Jina direct scrape ────────────────────────────────────────────
+    if source_url:
+        ck = f"step1_url_{source_url}"
+        cached = load_cache(ck)
+        if cached is not None:
+            fields = _map_step1_fields(cached.get("claude_data", {}), source_url)
+            if _step1_has_data(fields):
+                return (fields, cached,
+                        int(cached.get("tokens_in",  0) or 0),
+                        int(cached.get("tokens_out", 0) or 0),
+                        "enriched_jina", "")
+            _delete_cache(ck)
+
+        try:
+            time.sleep(delay)
+            text = fetch_via_jina_reader(source_url, company_hint=company_name)
+            raw_fields, in_t, out_t = _claude_extract(text, api_key)
+            total_in  += in_t
+            total_out += out_t
+            payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
+            save_cache(ck, payload)
+            fields = _map_step1_fields(raw_fields, source_url)
+            if _step1_has_data(fields):
+                return (fields, payload, total_in, total_out, "enriched_jina", "")
+            jina_err = "Jina page fetched but Claude found no usable data"
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            jina_err = f"Jina HTTP {code}: {str(e)[:120]}"
+        except (json.JSONDecodeError, ValueError) as e:
+            jina_err = f"Jina parse error: {e}"
+        except anthropic.APIError as e:
+            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
+        except Exception as e:
+            jina_err = str(e)
+
+    # ── Tier 2: Claude web_search fallback ────────────────────────────────────
+    target = source_url or company_name
+    if not target:
+        return ({}, {}, total_in, total_out, "no_data", "No URL or company name provided")
+
+    ck = f"step1_fallback_{target}"
     cached = load_cache(ck)
     if cached is not None:
         fields = _map_step1_fields(cached.get("claude_data", {}), url)
         if _step1_has_data(fields):
-            in_t  = int(cached.get("tokens_in", 0) or 0)
-            out_t = int(cached.get("tokens_out", 0) or 0)
-            return (fields, cached, in_t, out_t, "cached_fallback", "")
+            return (fields, cached,
+                    int(cached.get("tokens_in",  0) or 0),
+                    int(cached.get("tokens_out", 0) or 0),
+                    "enriched_search", "")
         _delete_cache(ck)
 
     try:
-        prompt   = _STEP1_FALLBACK_PROMPT_TMPL.format(
+        prompt = _STEP1_FALLBACK_PROMPT_TMPL.format(
             company_name=company_name or target,
-            url=target or company_name,
+            url=target,
         )
         raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        total_in  += in_t
+        total_out += out_t
         raw_fields = _parse_json_response(raw_text)
         payload    = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
         fields = _map_step1_fields(raw_fields, url)
-        return (fields, payload, in_t, out_t, "web_search_fallback", "")
+        if _step1_has_data(fields):
+            return (fields, payload, total_in, total_out, "enriched_search", "")
+        # Tier 3 — web search returned data but nothing useful
+        return ({}, {}, total_in, total_out, "no_data",
+                f"Google search returned no usable data. Jina: {jina_err}")
     except (json.JSONDecodeError, ValueError) as e:
-        return ({}, {}, 0, 0, "parse_error", f"Fallback parse error: {e}")
+        return ({}, {}, total_in, total_out, "no_data",
+                f"Search parse error: {e}. Jina: {jina_err}")
     except anthropic.APIError as e:
-        return ({}, {}, 0, 0, "api_error", f"Fallback Claude API: {e}")
+        return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
     except Exception as e:
-        return ({}, {}, 0, 0, "api_error", f"Fallback error: {e}")
+        return ({}, {}, total_in, total_out, "no_data",
+                f"Search error: {e}. Jina: {jina_err}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -661,7 +695,8 @@ def flag_review(row: dict, input_company_name: str) -> dict:
     returned = row.get("lusha_company_name", "")
     inp      = (input_company_name or "").strip()
 
-    if status in ("no_data", "api_error", "jina_error", "parse_error", "no_input"):
+    _bad_statuses = ("no_data", "api_error", "jina_error", "parse_error", "no_input")
+    if status in _bad_statuses or any(status.endswith(s) for s in _bad_statuses):
         reasons.append(f"enrichment status: {status}")
 
     if returned and inp:
@@ -705,23 +740,13 @@ def enrich_one_row(
 
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
 
-    # 5-second pause between companies to stay under the 50k token/min rate limit
-    time.sleep(5)
+    # 8-second pause between companies to stay under the token/min rate limit
+    time.sleep(8)
 
-    # ── Step 1 ────────────────────────────────────────────────────────────────
+    # ── Step 1 (three-tier: Jina → web_search → no_data) ─────────────────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
         url, company_name, api_key, delay
     )
-    # ── Step 1 web_search fallback (fires when Jina returned no usable data) ──
-    if not _step1_has_data(s1_fields):
-        fb_fields, fb_raw, fb_in, fb_out, fb_status, fb_err = \
-            run_step1_web_search_fallback(company_name, url, api_key)
-        if _step1_has_data(fb_fields):
-            s1_fields, s1_raw  = fb_fields, fb_raw
-            s1_err = fb_err
-        s1_status  = fb_status
-        s1_in  += fb_in
-        s1_out += fb_out
 
     row.update(s1_fields)
     row["step1_status"]     = s1_status
@@ -749,10 +774,9 @@ def enrich_one_row(
     has_s1 = _step1_has_data(s1_fields)
     has_s2 = any(s2_fields.get(f, "") for f in ICP_FIELDS[:3])
 
-    if has_s1 and has_s2:
-        row["enrichment_status"] = "enriched"
-    elif has_s1:
-        row["enrichment_status"] = "step1_only"
+    if has_s1:
+        # Preserve tier status (enriched_jina / enriched_search); append _step1_only if no ICP
+        row["enrichment_status"] = s1_status if has_s2 else f"{s1_status}_step1_only"
     else:
         row["enrichment_status"] = "no_data"
 
@@ -933,6 +957,7 @@ def reset_processing(clear_autosave: bool = False):
         enrichment_done=False, df_enriched=None,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
         autosave_last_name="",
+        _jina_retry_count=0, _last_retry_msg="",
     )
 
 
@@ -1265,18 +1290,28 @@ if ss("processing", False):
 
     st.progress(idx / _n if _n else 1.0, text=f"Row {idx} of {_n}")
 
-    cnt_full    = sum(1 for r in results if r.get("enrichment_status") == "enriched")
-    cnt_partial = sum(1 for r in results if r.get("enrichment_status") == "step1_only")
-    cnt_nodata  = sum(1 for r in results if r.get("enrichment_status") == "no_data")
-    cnt_error   = sum(1 for r in results
-                      if r.get("enrichment_status") not in ("enriched", "step1_only", "no_data", ""))
+    cnt_jina   = sum(1 for r in results if "enriched_jina"   in r.get("enrichment_status", ""))
+    cnt_google = sum(1 for r in results if "enriched_search" in r.get("enrichment_status", ""))
+    cnt_nodata = sum(1 for r in results if r.get("enrichment_status") == "no_data")
+    cnt_error  = sum(1 for r in results
+                     if r.get("enrichment_status") not in
+                     ("enriched_jina", "enriched_search",
+                      "enriched_jina_step1_only", "enriched_search_step1_only",
+                      "no_data", "skipped_resume", ""))
+    cnt_retries = ss("_jina_retry_count", 0)
 
-    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-    mc1.metric("Enriched (both)", cnt_full)
-    mc2.metric("Step 1 only",     cnt_partial)
-    mc3.metric("No data",         cnt_nodata)
-    mc4.metric("Errors",          cnt_error)
-    mc5.metric("Est. cost",       f"${total_cost:.4f}")
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+    mc1.metric("Enriched (Jina)",   cnt_jina)
+    mc2.metric("Enriched (Google)", cnt_google)
+    mc3.metric("429 Retries",       cnt_retries)
+    mc4.metric("No data",           cnt_nodata)
+    mc5.metric("Errors",            cnt_error)
+    mc6.metric("Est. cost",         f"${total_cost:.4f}")
+
+    # Show last rate-limit message if one occurred
+    _retry_msg = ss("_last_retry_msg", "")
+    if _retry_msg:
+        st.info(_retry_msg)
 
     # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
     if results:
@@ -1344,9 +1379,14 @@ if ss("processing", False):
             s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
             s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
             row_cost = float(fields.get("total_cost_usd", 0) or 0)
+            _retry_note = ""
+            if "enriched_search" in fields.get("enrichment_status", ""):
+                _retry_note = " | ⚡ Google fallback used"
+            elif ss("_last_retry_msg", ""):
+                _retry_note = f" | ⏳ Had Jina 429 retry"
             status_box.write(
                 f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
-                f"Row cost: ${row_cost:.5f}"
+                f"Row cost: ${row_cost:.5f}{_retry_note}"
             )
 
         results.append(fields)
