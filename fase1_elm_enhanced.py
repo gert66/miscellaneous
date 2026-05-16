@@ -557,35 +557,40 @@ st.caption(
 # Upload
 # =============================================================================
 
-def _handle_file_upload():
-    f = st.session_state.get("elm2_uploader")
-    if f is not None:
-        try:
-            if f.name.lower().endswith(".xlsx"):
-                st.session_state["uploaded_df"] = pd.read_excel(f)
-            else:
-                st.session_state["uploaded_df"] = pd.read_csv(f)
-            st.session_state["uploaded_filename"] = f.name
-        except Exception as exc:
-            st.session_state["uploaded_df"] = None
-            st.session_state["uploaded_filename"] = None
-            st.session_state["upload_error"] = str(exc)
-
-st.file_uploader(
-    "Upload your CSV or Excel file",
-    type=["csv", "xlsx"],
-    key="elm2_uploader",
-    on_change=_handle_file_upload,
+uploaded = st.file_uploader(
+    "Upload your CSV or Excel file (.xlsx · .csv)",
+    type=["xlsx", "csv"],
 )
 
-if st.session_state.get("upload_error"):
-    st.error(f"Could not read file: {st.session_state['upload_error']}")
+new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
+if new_file_key != _ss("_elm2_file_key"):
+    _ss_set(
+        _elm2_file_key=new_file_key,
+        uploaded_df=None,
+        uploaded_filename=None,
+        upload_error=None,
+    )
+    _reset_run()
+    if uploaded is not None:
+        try:
+            fname = uploaded.name
+            df_loaded = (
+                pd.read_csv(uploaded)
+                if fname.lower().endswith(".csv")
+                else pd.read_excel(uploaded)
+            )
+            _ss_set(uploaded_df=df_loaded, uploaded_filename=fname)
+        except Exception as exc:
+            _ss_set(upload_error=str(exc))
 
-df_raw = st.session_state.get("uploaded_df", None)
+df_raw = _ss("uploaded_df", None)
+
+if _ss("upload_error"):
+    st.error(f"Could not read file: {_ss('upload_error')}")
 
 if df_raw is not None:
     st.success(
-        f"**{st.session_state.get('uploaded_filename', '')}** — "
+        f"**{_ss('uploaded_filename')}** — "
         f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
     st.dataframe(df_raw.head(), use_container_width=True)
