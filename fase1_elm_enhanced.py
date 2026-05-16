@@ -557,27 +557,35 @@ st.caption(
 # Upload
 # =============================================================================
 
-uploaded = st.file_uploader("Upload your CSV file", type=["csv"])
+if "uploaded_df" not in st.session_state:
+    st.session_state.uploaded_df = None
+if "uploaded_filename" not in st.session_state:
+    st.session_state.uploaded_filename = None
 
-new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
-if new_file_key != _ss("_elm2_file_key"):
-    _ss_set(_elm2_file_key=new_file_key, _elm2_df_raw=None,
-            _elm2_file_name=None, _elm2_file_error=None)
-    _reset_run()
-    if uploaded is not None:
-        try:
-            _ss_set(_elm2_df_raw=pd.read_csv(uploaded), _elm2_file_name=uploaded.name)
-        except Exception as exc:
-            _ss_set(_elm2_file_error=str(exc))
+uploaded_file = st.file_uploader(
+    "Upload your CSV or Excel file",
+    type=["csv", "xlsx"],
+)
 
-df_raw: pd.DataFrame | None = _ss("_elm2_df_raw")
-file_error: str | None      = _ss("_elm2_file_error")
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.lower().endswith(".xlsx"):
+            st.session_state.uploaded_df = pd.read_excel(uploaded_file)
+        else:
+            st.session_state.uploaded_df = pd.read_csv(uploaded_file)
+        st.session_state.uploaded_filename = uploaded_file.name
+        _reset_run()
+    except Exception as exc:
+        st.error(f"Could not read the file: {exc}")
+        st.session_state.uploaded_df = None
+        st.session_state.uploaded_filename = None
 
-if file_error:
-    st.error(f"Could not read the file: {file_error}")
-elif df_raw is not None:
+df_raw: pd.DataFrame | None = st.session_state.uploaded_df
+
+if df_raw is not None:
     st.success(
-        f"**{_ss('_elm2_file_name')}** — {len(df_raw):,} rows, {len(df_raw.columns)} columns"
+        f"**{st.session_state.uploaded_filename}** — "
+        f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
     st.dataframe(df_raw.head(), use_container_width=True)
 
@@ -611,10 +619,8 @@ st.divider()
 currently_running = _ss("_elm2_running", False)
 
 blocking: list = []
-if df_raw is None and not file_error:
+if df_raw is None:
     blocking.append("No file uploaded yet.")
-if file_error:
-    blocking.append(f"File could not be read: {file_error}")
 if df_raw is not None and name_col is None:
     blocking.append("Could not detect a company name column.")
 if df_raw is not None and url_col is None:
