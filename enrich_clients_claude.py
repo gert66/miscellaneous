@@ -31,6 +31,7 @@ import anthropic
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -139,6 +140,82 @@ META_FIELDS = [
 ]
 
 ALL_ENRICHMENT_FIELDS = STEP1_FIELDS + ICP_FIELDS + META_FIELDS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extreme Light Mode (ELM) — zero-token, no API key, keyword-only extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ELM_SLUGS = ["", "/about", "/about-us", "/careers", "/jobs", "/locations", "/contact"]
+
+_ELM_UA = "Mozilla/5.0 (compatible; CompanyResearchBot/1.0)"
+
+_ELM_KW_INTERNATIONAL = [
+    "international", "global", "worldwide", "multinational", "cross-border",
+    "offices in", "presence in", "emea", "apac", "latam", "global team",
+    "international team", "countries", "regions",
+]
+_ELM_KW_LANGUAGES = [
+    "english", "french", "german", "spanish", "portuguese", "dutch", "italian",
+    "chinese", "mandarin", "japanese", "korean", "arabic", "russian", "polish",
+    "turkish", "swedish", "norwegian", "danish", "finnish", "hebrew",
+]
+_ELM_KW_HIRING = [
+    "careers", "jobs", "hiring", "join us", "join our team", "open positions",
+    "vacancies", "we're growing", "recruitment", "apply now", "job openings",
+    "we are hiring", "current openings",
+]
+_ELM_KW_GROWTH = [
+    "funding", "raised", "series a", "series b", "series c", "ipo",
+    "acquisition", "acquired", "merger", "expansion", "hypergrowth",
+    "fast-growing", "scaling",
+]
+_ELM_KW_TRAINING = [
+    "training", "learning", "development", "upskilling", "reskilling",
+    "e-learning", "coaching", "mentoring", "academy", "bootcamp",
+    "certification", "corporate training", "language training",
+]
+_ELM_KW_OFFICES = [
+    "offices", "headquarters", "locations", "branches", "regional office",
+    "hub", "campus", "sites", "hq",
+]
+_ELM_KW_TECHNOLOGY = [
+    "saas", "cloud", "platform", "software", "machine learning", "artificial intelligence",
+    "automation", "digital", "engineering", "devops", "api", "data-driven",
+]
+_ELM_COUNTRIES = [
+    "united states", "usa", "united kingdom", "uk", "germany", "france",
+    "netherlands", "spain", "italy", "portugal", "belgium", "switzerland",
+    "sweden", "norway", "denmark", "finland", "poland", "czech republic",
+    "australia", "canada", "india", "china", "japan", "singapore", "brazil",
+    "mexico", "south africa", "uae", "israel", "ireland", "austria",
+]
+
+ELM_STATUS_FIELDS = [
+    "elm_fetch_status",   # "ok" / "partial" / "failed"
+    "elm_pages_fetched",  # comma-separated slugs that returned 200
+    "elm_pages_failed",   # comma-separated slugs that failed/non-200
+    "elm_total_chars",    # total chars fetched across all pages
+    "elm_error",          # any fetch-level error message
+]
+ELM_KEYWORD_FIELDS = [
+    "elm_kw_international",
+    "elm_kw_languages",
+    "elm_kw_hiring",
+    "elm_kw_growth",
+    "elm_kw_training",
+    "elm_kw_offices",
+    "elm_kw_technology",
+    "elm_kw_countries_found",
+]
+ELM_SCORE_FIELDS = [
+    "elm_score_international",
+    "elm_score_hiring",
+    "elm_score_growth",
+    "elm_score_training",
+    "elm_score_technology",
+    "elm_score_overall_icp",
+]
+ELM_ALL_FIELDS = ELM_STATUS_FIELDS + ELM_KEYWORD_FIELDS + ELM_SCORE_FIELDS
 
 # Fields checked to decide if Step 1 returned usable data
 _STEP1_DATA_FIELDS = [
@@ -407,6 +484,163 @@ def fetch_via_jina_search(query: str) -> str:
         time.sleep(wait)
     resp.raise_for_status()
     return resp.text[:_JINA_CHAR_LIMIT]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extreme Light Mode — page fetching and keyword extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _elm_fetch_pages(base_url: str, domain: str) -> tuple[dict, list, list]:
+    """
+    Fetch _ELM_SLUGS pages via requests + BeautifulSoup.
+    Returns (pages_dict, fetched_slugs, failed_slugs).
+    Caches by domain so repeated runs skip HTTP calls.
+    """
+    ck = f"elm_{domain}"
+    cached = load_cache(ck)
+    if cached and "pages" in cached:
+        return (
+            cached["pages"],
+            cached.get("fetched", []),
+            cached.get("failed", []),
+        )
+
+    base    = base_url.rstrip("/")
+    headers = {"User-Agent": _ELM_UA}
+    pages: dict   = {}
+    fetched: list = []
+    failed: list  = []
+
+    for slug in _ELM_SLUGS:
+        target = base if slug == "" else f"{base}{slug}"
+        label  = slug if slug else "/"
+        try:
+            resp = requests.get(target, headers=headers, timeout=12, allow_redirects=True)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ", strip=True)
+                pages[label] = text[:8_000]
+                fetched.append(label)
+            else:
+                failed.append(f"{label}({resp.status_code})")
+        except Exception as exc:
+            failed.append(f"{label}(err:{type(exc).__name__})")
+
+    save_cache(ck, {"pages": pages, "fetched": fetched, "failed": failed})
+    return pages, fetched, failed
+
+
+def _elm_count(text: str, keywords: list) -> int:
+    tl = text.lower()
+    return sum(1 for kw in keywords if kw in tl)
+
+
+def _elm_find(text: str, keywords: list) -> list:
+    tl = text.lower()
+    return [kw for kw in keywords if kw in tl]
+
+
+def _elm_score(count: int, per_point: float = 2.0) -> int:
+    """Convert raw keyword count to 0–10 score."""
+    return min(round(count / per_point * 10), 10)
+
+
+def _elm_extract_signals(pages: dict, fetched: list, failed: list) -> dict:
+    all_text = " ".join(pages.values())
+
+    kw_intl     = _elm_count(all_text, _ELM_KW_INTERNATIONAL)
+    langs       = _elm_find(all_text, _ELM_KW_LANGUAGES)
+    kw_hiring   = _elm_count(all_text, _ELM_KW_HIRING)
+    kw_growth   = _elm_count(all_text, _ELM_KW_GROWTH)
+    kw_training = _elm_count(all_text, _ELM_KW_TRAINING)
+    kw_offices  = _elm_count(all_text, _ELM_KW_OFFICES)
+    kw_tech     = _elm_count(all_text, _ELM_KW_TECHNOLOGY)
+    countries   = _elm_find(all_text, _ELM_COUNTRIES)
+
+    s_intl     = min(_elm_score(kw_intl, 1.5) + min(len(countries), 4), 10)
+    s_hiring   = _elm_score(kw_hiring,   1.5)
+    s_growth   = _elm_score(kw_growth,   1.5)
+    s_training = _elm_score(kw_training, 1.5)
+    s_tech     = _elm_score(kw_tech,     2.0)
+    s_overall  = round(
+        s_intl     * 0.30
+        + s_hiring   * 0.20
+        + s_training * 0.30
+        + s_growth   * 0.10
+        + s_tech     * 0.10,
+        1,
+    )
+
+    n_fetched = len(fetched)
+    n_failed  = len(failed)
+    if n_fetched == 0:
+        fetch_status = "failed"
+    elif n_failed > n_fetched:
+        fetch_status = "partial"
+    else:
+        fetch_status = "ok"
+
+    return {
+        # Status
+        "elm_fetch_status":  fetch_status,
+        "elm_pages_fetched": ", ".join(fetched),
+        "elm_pages_failed":  ", ".join(failed),
+        "elm_total_chars":   sum(len(v) for v in pages.values()),
+        "elm_error":         "",
+        # Keywords
+        "elm_kw_international":  kw_intl,
+        "elm_kw_languages":      ", ".join(sorted(set(langs))),
+        "elm_kw_hiring":         kw_hiring,
+        "elm_kw_growth":         kw_growth,
+        "elm_kw_training":       kw_training,
+        "elm_kw_offices":        kw_offices,
+        "elm_kw_technology":     kw_tech,
+        "elm_kw_countries_found": ", ".join(sorted(set(countries))),
+        # Scores
+        "elm_score_international": s_intl,
+        "elm_score_hiring":        s_hiring,
+        "elm_score_growth":        s_growth,
+        "elm_score_training":      s_training,
+        "elm_score_technology":    s_tech,
+        "elm_score_overall_icp":   s_overall,
+    }
+
+
+def enrich_one_row_light(company_name: str, raw_url: str) -> tuple:
+    """
+    Extreme Light Mode row enrichment — no Claude API, no tokens.
+    Returns (elm_fields_dict, debug_record_dict).
+    """
+    empty = {f: "" for f in ELM_ALL_FIELDS}
+    url   = normalize_url(raw_url) if raw_url else ""
+
+    if not url:
+        row = {**empty,
+               "elm_fetch_status": "failed",
+               "elm_error": "No URL provided"}
+        return row, {"company": company_name, "url": raw_url, "status": "no_url"}
+
+    domain = clean_domain(url)
+    try:
+        pages, fetched, failed = _elm_fetch_pages(url, domain)
+    except Exception as exc:
+        row = {**empty,
+               "elm_fetch_status": "failed",
+               "elm_error": str(exc)[:200]}
+        return row, {"company": company_name, "url": url, "status": "fetch_error", "error": str(exc)}
+
+    signals = _elm_extract_signals(pages, fetched, failed)
+    dbg = {
+        "company":       company_name,
+        "url":           url,
+        "domain":        domain,
+        "status":        signals["elm_fetch_status"],
+        "pages_fetched": signals["elm_pages_fetched"],
+        "total_chars":   signals["elm_total_chars"],
+    }
+    return signals, dbg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -851,11 +1085,13 @@ def cache_to_zip_bytes() -> bytes:
     return buf.getvalue()
 
 
-def build_partial_df(results: list, df_work: pd.DataFrame) -> pd.DataFrame:
+def build_partial_df(results: list, df_work: pd.DataFrame,
+                     field_list: list | None = None) -> pd.DataFrame:
     """Build an enriched DataFrame from however many rows have been processed so far."""
+    flist       = field_list if field_list is not None else ALL_ENRICHMENT_FIELDS
     df_out      = df_work.head(len(results)).copy().reset_index(drop=True)
     enriched_df = pd.DataFrame(results)
-    for col in ALL_ENRICHMENT_FIELDS:
+    for col in flist:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
     return df_out
 
@@ -961,10 +1197,12 @@ def reset_processing(clear_autosave: bool = False):
     )
 
 
-def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame) -> None:
+def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
+                     field_list: list | None = None) -> None:
+    flist       = field_list if field_list is not None else ALL_ENRICHMENT_FIELDS
     df_out      = df_work.head(len(results)).copy().reset_index(drop=True)
     enriched_df = pd.DataFrame(results)
-    for col in ALL_ENRICHMENT_FIELDS:
+    for col in flist:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
     ss_set(
         processing=False, stop_requested=False,
@@ -1013,6 +1251,21 @@ if not api_key:
 # =============================================================================
 
 with st.sidebar:
+    # ── Enrichment mode ───────────────────────────────────────────────────────
+    enrichment_mode = st.radio(
+        "Enrichment mode",
+        options=["Full Claude enrichment", "Extreme Light Mode (no API)"],
+        index=0,
+        key="enrichment_mode_radio",
+        help=(
+            "**Full Claude**: Jina AI + Claude API — requires ANTHROPIC_API_KEY.\n\n"
+            "**Extreme Light Mode**: fetches company pages with requests/BeautifulSoup, "
+            "extracts keyword signals and normalized scores — no API key, zero tokens."
+        ),
+    )
+    _elm_mode = enrichment_mode == "Extreme Light Mode (no API)"
+    st.divider()
+
     st.header("Settings")
 
     if api_key:
@@ -1129,10 +1382,16 @@ elif uploaded and df_raw is not None:
         f"**{ss('file_name')}** loaded — "
         f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
-    st.info(
-        "💡 Each row makes **two** Claude API calls (Step 1 + Step 2). "
-        "Use the row limiter below to test with a small batch first."
-    )
+    if _elm_mode:
+        st.info(
+            "💡 **Extreme Light Mode** — no API calls. "
+            "Fetches company pages with requests/BeautifulSoup and extracts keyword signals."
+        )
+    else:
+        st.info(
+            "💡 Each row makes **two** Claude API calls (Step 1 + Step 2). "
+            "Use the row limiter below to test with a small batch first."
+        )
 
 # =============================================================================
 # STEP 2 — Preview
@@ -1221,7 +1480,7 @@ currently_processing = ss("processing", False)
 enrichment_done      = ss("enrichment_done", False)
 
 blocking: list = []
-if _api_key_error:
+if _api_key_error and not _elm_mode:
     blocking.append(_api_key_error)
 if uploaded is None:
     blocking.append("No file uploaded yet.")
@@ -1263,6 +1522,8 @@ if start_btn and not blocking and not currently_processing:
         _n_to_process=n_to_process, _api_key=api_key, _delay=delay_sec,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
         _resume_mode=resume_mode, autosave_last_name="",
+        _elm_mode=_elm_mode,
+        _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
     )
     st.rerun()
 
@@ -1280,6 +1541,8 @@ if ss("processing", False):
     _n            = ss("_n_to_process", 0)
     _api_key      = ss("_api_key", "")
     _delay        = ss("_delay", 1.0)
+    _elm_mode_run = ss("_elm_mode", False)
+    _active_fields = ss("_active_fields", ALL_ENRICHMENT_FIELDS)
     total_in      = ss("total_tokens_in", 0)
     total_out     = ss("total_tokens_out", 0)
     total_cost    = ss("total_cost_usd", 0.0)
@@ -1290,32 +1553,46 @@ if ss("processing", False):
 
     st.progress(idx / _n if _n else 1.0, text=f"Row {idx} of {_n}")
 
-    cnt_jina   = sum(1 for r in results if "enriched_jina"   in r.get("enrichment_status", ""))
-    cnt_google = sum(1 for r in results if "enriched_search" in r.get("enrichment_status", ""))
-    cnt_nodata = sum(1 for r in results if r.get("enrichment_status") == "no_data")
-    cnt_error  = sum(1 for r in results
-                     if r.get("enrichment_status") not in
-                     ("enriched_jina", "enriched_search",
-                      "enriched_jina_step1_only", "enriched_search_step1_only",
-                      "no_data", "skipped_resume", ""))
-    cnt_retries = ss("_jina_retry_count", 0)
+    if _elm_mode_run:
+        cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
+        cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
+        cnt_failed  = sum(1 for r in results if r.get("elm_fetch_status") == "failed")
+        avg_score   = (
+            sum(float(r.get("elm_score_overall_icp", 0) or 0) for r in results) / len(results)
+            if results else 0.0
+        )
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        mc1.metric("Fetched OK",  cnt_ok)
+        mc2.metric("Partial",     cnt_partial)
+        mc3.metric("Failed",      cnt_failed)
+        mc4.metric("Processed",   len(results))
+        mc5.metric("Avg ICP score", f"{avg_score:.1f}/10")
+    else:
+        cnt_jina   = sum(1 for r in results if "enriched_jina"   in r.get("enrichment_status", ""))
+        cnt_google = sum(1 for r in results if "enriched_search" in r.get("enrichment_status", ""))
+        cnt_nodata = sum(1 for r in results if r.get("enrichment_status") == "no_data")
+        cnt_error  = sum(1 for r in results
+                         if r.get("enrichment_status") not in
+                         ("enriched_jina", "enriched_search",
+                          "enriched_jina_step1_only", "enriched_search_step1_only",
+                          "no_data", "skipped_resume", ""))
+        cnt_retries = ss("_jina_retry_count", 0)
 
-    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-    mc1.metric("Enriched (Jina)",   cnt_jina)
-    mc2.metric("Enriched (Google)", cnt_google)
-    mc3.metric("429 Retries",       cnt_retries)
-    mc4.metric("No data",           cnt_nodata)
-    mc5.metric("Errors",            cnt_error)
-    mc6.metric("Est. cost",         f"${total_cost:.4f}")
+        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+        mc1.metric("Enriched (Jina)",   cnt_jina)
+        mc2.metric("Enriched (Google)", cnt_google)
+        mc3.metric("429 Retries",       cnt_retries)
+        mc4.metric("No data",           cnt_nodata)
+        mc5.metric("Errors",            cnt_error)
+        mc6.metric("Est. cost",         f"${total_cost:.4f}")
 
-    # Show last rate-limit message if one occurred
-    _retry_msg = ss("_last_retry_msg", "")
-    if _retry_msg:
-        st.info(_retry_msg)
+        _retry_msg = ss("_last_retry_msg", "")
+        if _retry_msg:
+            st.info(_retry_msg)
 
     # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
     if results:
-        _partial_df = build_partial_df(results, df_work)
+        _partial_df = build_partial_df(results, df_work, _active_fields)
         _n_done     = len(_partial_df)
         _stamp      = ts()
         with st.expander(
@@ -1347,7 +1624,7 @@ if ss("processing", False):
     _saved_df    = autosave_load() if _resume_mode else None
 
     if ss("stop_requested", False) or idx >= _n:
-        build_and_finish(results, debug_records, df_work)
+        build_and_finish(results, debug_records, df_work, _active_fields)
     else:
         input_row    = df_work.iloc[idx]
         company_name = str(input_row.get(_name_col, "")).strip()
@@ -1363,8 +1640,9 @@ if ss("processing", False):
             )
             # Represent the skipped row with a minimal placeholder so build_and_finish
             # still has the right row count; the full data lives in the autosave CSV.
-            skip_fields = {f: "" for f in ALL_ENRICHMENT_FIELDS}
-            skip_fields["enrichment_status"] = "skipped_resume"
+            skip_fields = {f: "" for f in _active_fields}
+            if not _elm_mode_run:
+                skip_fields["enrichment_status"] = "skipped_resume"
             results.append(skip_fields)
             debug_records.append({"input_company_name": company_name, "skipped": True})
             ss_set(results=results, debug_records=debug_records, process_index=idx + 1)
@@ -1374,20 +1652,31 @@ if ss("processing", False):
             f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}**",
             expanded=False,
         ) as status_box:
-            status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
-            fields, dbg = enrich_one_row(company_name, raw_url, _api_key, _delay)
-            s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
-            s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
-            row_cost = float(fields.get("total_cost_usd", 0) or 0)
-            _retry_note = ""
-            if "enriched_search" in fields.get("enrichment_status", ""):
-                _retry_note = " | ⚡ Google fallback used"
-            elif ss("_last_retry_msg", ""):
-                _retry_note = f" | ⏳ Had Jina 429 retry"
-            status_box.write(
-                f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
-                f"Row cost: ${row_cost:.5f}{_retry_note}"
-            )
+            if _elm_mode_run:
+                status_box.write("⚡ Extreme Light Mode — fetching pages…")
+                fields, dbg = enrich_one_row_light(company_name, raw_url)
+                _fetch_status = fields.get("elm_fetch_status", "?")
+                _chars        = fields.get("elm_total_chars", 0)
+                status_box.write(
+                    f"✅ Done — fetch: {_fetch_status} | "
+                    f"{_chars:,} chars | score: {fields.get('elm_score_overall_icp', '?')}/10"
+                )
+                row_cost = 0.0
+            else:
+                status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
+                fields, dbg = enrich_one_row(company_name, raw_url, _api_key, _delay)
+                s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
+                s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
+                row_cost = float(fields.get("total_cost_usd", 0) or 0)
+                _retry_note = ""
+                if "enriched_search" in fields.get("enrichment_status", ""):
+                    _retry_note = " | ⚡ Google fallback used"
+                elif ss("_last_retry_msg", ""):
+                    _retry_note = " | ⏳ Had Jina 429 retry"
+                status_box.write(
+                    f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
+                    f"Row cost: ${row_cost:.5f}{_retry_note}"
+                )
 
         results.append(fields)
         debug_records.append(dbg)
@@ -1404,7 +1693,7 @@ if ss("processing", False):
         _new_idx    = len(results)  # results already includes the row appended above
         if _local_path and _new_idx % LOCAL_SAVE_EVERY == 0:
             try:
-                _snap_df = build_partial_df(results, df_work)
+                _snap_df = build_partial_df(results, df_work, _active_fields)
                 _xl, _csv = save_to_local_folder(_snap_df, _local_path)
                 ss_set(_last_local_save=f"{_new_idx} rows → {Path(_xl).name}")
             except Exception as _e:
@@ -1431,6 +1720,8 @@ if ss("enrichment_done", False):
     df_enriched: pd.DataFrame = ss("df_enriched")
     debug_records_done: list  = ss("debug_records", [])
     processed = len(df_enriched)
+    _elm_done = ss("_elm_mode", False)
+    _done_fields = ELM_ALL_FIELDS if _elm_done else ALL_ENRICHMENT_FIELDS
 
     st.divider()
     if ss("stop_requested", False):
@@ -1439,7 +1730,11 @@ if ss("enrichment_done", False):
         st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
 
     # ── Status summary ────────────────────────────────────────────────────────
-    status_counts  = df_enriched["enrichment_status"].value_counts().to_dict()
+    status_counts  = (
+        df_enriched["elm_fetch_status"].value_counts().to_dict()
+        if _elm_done and "elm_fetch_status" in df_enriched.columns
+        else df_enriched.get("enrichment_status", pd.Series(dtype=str)).value_counts().to_dict()
+    )
     needs_review_n = int((df_enriched.get("needs_manual_review", "") == "TRUE").sum())
     all_sc = list(status_counts.items())
     n_cols = min(len(all_sc) + 1, 6)
@@ -1454,55 +1749,80 @@ if ss("enrichment_done", False):
     t_out  = ss("total_tokens_out", 0)
     t_cost = ss("total_cost_usd", 0.0)
 
-    with st.expander("💰 Token usage & cost", expanded=True):
-        tc1, tc2, tc3 = st.columns(3)
-        tc1.metric("Total input tokens",  f"{t_in:,}")
-        tc2.metric("Total output tokens", f"{t_out:,}")
-        tc3.metric("Estimated total cost", f"${t_cost:.4f}")
-        st.caption(
-            f"Model: `{MODEL_ID}` · "
-            f"${_COST_INPUT_PER_M}/M input · ${_COST_OUTPUT_PER_M}/M output. "
-            "Two API calls per row (Step 1 + Step 2). "
-            "Verify charges in your Anthropic dashboard."
-        )
+    if not _elm_done:
+        with st.expander("💰 Token usage & cost", expanded=True):
+            tc1, tc2, tc3 = st.columns(3)
+            tc1.metric("Total input tokens",  f"{t_in:,}")
+            tc2.metric("Total output tokens", f"{t_out:,}")
+            tc3.metric("Estimated total cost", f"${t_cost:.4f}")
+            st.caption(
+                f"Model: `{MODEL_ID}` · "
+                f"${_COST_INPUT_PER_M}/M input · ${_COST_OUTPUT_PER_M}/M output. "
+                "Two API calls per row (Step 1 + Step 2). "
+                "Verify charges in your Anthropic dashboard."
+            )
+    else:
+        st.info("⚡ Extreme Light Mode — no API calls, no tokens, no cost.")
 
     # ── Results table ─────────────────────────────────────────────────────────
     st.subheader("Results")
-    orig_cols = [c for c in df_enriched.columns if c not in ALL_ENRICHMENT_FIELDS]
-    summary_cols = orig_cols + [
-        c for c in [
-            # Metadata
-            "enrichment_status", "step1_status", "step2_status",
-            "needs_manual_review", "match_notes",
-            # Step 1 — firmographics
-            "lusha_company_name", "lusha_domain", "lusha_industry", "lusha_sub_industry",
-            "lusha_company_type", "lusha_employee_range", "lusha_revenue",
-            "lusha_country", "lusha_city", "lusha_continent",
-            "lusha_founded_year", "lusha_description",
-            "lusha_linkedin_url", "lusha_specialties", "lusha_technologies",
-            "lusha_total_funding_amount", "lusha_total_funding_rounds",
-            "lusha_last_round_type", "lusha_last_round_amount", "lusha_last_round_date",
-            "lusha_ipo_status",
-            # Step 2 — ICP signals
-            "icp_language_training_fit_score",
-            "icp_international_presence", "icp_languages_mentioned",
-            "icp_hiring_activity", "icp_recent_funding", "icp_recent_news",
-            "icp_global_team_signals", "icp_training_signals", "icp_multi_office",
-            # Cost
-            "total_tokens_in", "total_tokens_out", "total_cost_usd",
-            "error_message",
-        ]
-        if c in df_enriched.columns
-    ]
-    st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
+    orig_cols = [c for c in df_enriched.columns if c not in _done_fields]
 
-    tab1, tab2 = st.tabs(["Step 1 — All firmographic columns", "Step 2 — All ICP columns"])
-    with tab1:
-        st.dataframe(df_enriched[[c for c in STEP1_FIELDS if c in df_enriched.columns]],
-                     use_container_width=True)
-    with tab2:
-        st.dataframe(df_enriched[[c for c in ICP_FIELDS if c in df_enriched.columns]],
-                     use_container_width=True)
+    if _elm_done:
+        summary_cols = orig_cols + [c for c in ELM_ALL_FIELDS if c in df_enriched.columns]
+        st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
+        tab1, tab2, tab3 = st.tabs(
+            ["Status & fetch info", "Keyword counts", "Normalized scores"]
+        )
+        with tab1:
+            st.dataframe(
+                df_enriched[[c for c in ELM_STATUS_FIELDS if c in df_enriched.columns]],
+                use_container_width=True,
+            )
+        with tab2:
+            st.dataframe(
+                df_enriched[[c for c in ELM_KEYWORD_FIELDS if c in df_enriched.columns]],
+                use_container_width=True,
+            )
+        with tab3:
+            st.dataframe(
+                df_enriched[[c for c in ELM_SCORE_FIELDS if c in df_enriched.columns]],
+                use_container_width=True,
+            )
+    else:
+        summary_cols = orig_cols + [
+            c for c in [
+                # Metadata
+                "enrichment_status", "step1_status", "step2_status",
+                "needs_manual_review", "match_notes",
+                # Step 1 — firmographics
+                "lusha_company_name", "lusha_domain", "lusha_industry", "lusha_sub_industry",
+                "lusha_company_type", "lusha_employee_range", "lusha_revenue",
+                "lusha_country", "lusha_city", "lusha_continent",
+                "lusha_founded_year", "lusha_description",
+                "lusha_linkedin_url", "lusha_specialties", "lusha_technologies",
+                "lusha_total_funding_amount", "lusha_total_funding_rounds",
+                "lusha_last_round_type", "lusha_last_round_amount", "lusha_last_round_date",
+                "lusha_ipo_status",
+                # Step 2 — ICP signals
+                "icp_language_training_fit_score",
+                "icp_international_presence", "icp_languages_mentioned",
+                "icp_hiring_activity", "icp_recent_funding", "icp_recent_news",
+                "icp_global_team_signals", "icp_training_signals", "icp_multi_office",
+                # Cost
+                "total_tokens_in", "total_tokens_out", "total_cost_usd",
+                "error_message",
+            ]
+            if c in df_enriched.columns
+        ]
+        st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
+        tab1, tab2 = st.tabs(["Step 1 — All firmographic columns", "Step 2 — All ICP columns"])
+        with tab1:
+            st.dataframe(df_enriched[[c for c in STEP1_FIELDS if c in df_enriched.columns]],
+                         use_container_width=True)
+        with tab2:
+            st.dataframe(df_enriched[[c for c in ICP_FIELDS if c in df_enriched.columns]],
+                         use_container_width=True)
 
     # ── Downloads ─────────────────────────────────────────────────────────────
     st.subheader("Download results")
