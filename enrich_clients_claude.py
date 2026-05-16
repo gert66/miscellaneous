@@ -1056,24 +1056,34 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def make_log_df(debug_records: list) -> pd.DataFrame:
+def make_log_df(debug_records: list, elm_mode: bool = False) -> pd.DataFrame:
     rows = []
     for d in debug_records:
-        rows.append({
-            "input_company_name":  d.get("input_company_name", ""),
-            "input_url":           d.get("input_url", ""),
-            "step1_status":        d.get("step1_status", ""),
-            "step2_status":        d.get("step2_status", ""),
-            "enrichment_status":   d.get("enrichment_status", ""),
-            "step1_tokens_in":     d.get("step1_tokens_in", ""),
-            "step1_tokens_out":    d.get("step1_tokens_out", ""),
-            "step2_tokens_in":     d.get("step2_tokens_in", ""),
-            "step2_tokens_out":    d.get("step2_tokens_out", ""),
-            "total_cost_usd":      f"{d.get('total_cost', 0):.6f}",
-            "needs_manual_review": d.get("needs_manual_review", ""),
-            "match_notes":         d.get("match_notes", ""),
-            "error_message":       d.get("error_message", ""),
-        })
+        if elm_mode:
+            rows.append({
+                "company":        d.get("company", d.get("input_company_name", "")),
+                "url":            d.get("url", d.get("input_url", "")),
+                "domain":         d.get("domain", ""),
+                "fetch_status":   d.get("status", ""),
+                "pages_fetched":  d.get("pages_fetched", ""),
+                "total_chars":    d.get("total_chars", ""),
+            })
+        else:
+            rows.append({
+                "input_company_name":  d.get("input_company_name", ""),
+                "input_url":           d.get("input_url", ""),
+                "step1_status":        d.get("step1_status", ""),
+                "step2_status":        d.get("step2_status", ""),
+                "enrichment_status":   d.get("enrichment_status", ""),
+                "step1_tokens_in":     d.get("step1_tokens_in", ""),
+                "step1_tokens_out":    d.get("step1_tokens_out", ""),
+                "step2_tokens_in":     d.get("step2_tokens_in", ""),
+                "step2_tokens_out":    d.get("step2_tokens_out", ""),
+                "total_cost_usd":      f"{d.get('total_cost', 0):.6f}",
+                "needs_manual_review": d.get("needs_manual_review", ""),
+                "match_notes":         d.get("match_notes", ""),
+                "error_message":       d.get("error_message", ""),
+            })
     return pd.DataFrame(rows)
 
 
@@ -1735,14 +1745,20 @@ if ss("enrichment_done", False):
         if _elm_done and "elm_fetch_status" in df_enriched.columns
         else df_enriched.get("enrichment_status", pd.Series(dtype=str)).value_counts().to_dict()
     )
-    needs_review_n = int((df_enriched["needs_manual_review"] == "TRUE").sum()) if "needs_manual_review" in df_enriched.columns else 0
+    needs_review_n = (
+        int((df_enriched["needs_manual_review"] == "TRUE").sum())
+        if "needs_manual_review" in df_enriched.columns else 0
+    )
     all_sc = list(status_counts.items())
-    n_cols = min(len(all_sc) + 1, 6)
+    # In ELM mode there is no "Needs review" concept
+    extra_metrics = [] if _elm_done else [("⚑ Needs review", needs_review_n)]
+    n_cols = min(len(all_sc) + len(extra_metrics), 6)
     if all_sc:
-        rcols = st.columns(n_cols)
+        rcols = st.columns(max(n_cols, 1))
         for i, (s, c) in enumerate(all_sc):
-            rcols[i % n_cols].metric(_STATUS_LABELS.get(s, s), c)
-        rcols[len(all_sc) % n_cols].metric("⚑ Needs review", needs_review_n)
+            rcols[i % len(rcols)].metric(_STATUS_LABELS.get(s, s), c)
+        for j, (label, val) in enumerate(extra_metrics):
+            rcols[(len(all_sc) + j) % len(rcols)].metric(label, val)
 
     # ── Token usage ───────────────────────────────────────────────────────────
     t_in   = ss("total_tokens_in", 0)
@@ -1826,23 +1842,36 @@ if ss("enrichment_done", False):
 
     # ── Downloads ─────────────────────────────────────────────────────────────
     st.subheader("Download results")
-    log_df = make_log_df(debug_records_done)
+    log_df = make_log_df(debug_records_done, elm_mode=_elm_done)
+
+    _fname_prefix = "elm_results" if _elm_done else "claude_enriched"
+    _log_fname    = "elm_fetch_log.csv" if _elm_done else "claude_processing_log.csv"
+    _xl_help      = (
+        "All original columns + keyword counts + normalized scores."
+        if _elm_done else
+        "All original columns + Step 1 firmographics + Step 2 ICP signals + metadata."
+    )
+    _log_help     = (
+        "One row per company: fetch status, pages fetched, total chars."
+        if _elm_done else
+        "One row per company: step statuses, token counts, costs, review flags."
+    )
 
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button(
-            "⬇ Enriched Excel (.xlsx)",
+            "⬇ Results Excel (.xlsx)",
             data=df_to_excel_bytes(df_enriched),
-            file_name="claude_enriched.xlsx",
+            file_name=f"{_fname_prefix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            help="All original columns + Step 1 firmographics + Step 2 ICP signals + metadata.",
+            help=_xl_help,
         )
     with dl2:
         st.download_button(
-            "⬇ Enriched CSV",
+            "⬇ Results CSV",
             data=df_to_csv_bytes(df_enriched),
-            file_name="claude_enriched.csv",
+            file_name=f"{_fname_prefix}.csv",
             mime="text/csv",
             use_container_width=True,
             help="Same data as Excel, in CSV format.",
@@ -1851,10 +1880,10 @@ if ss("enrichment_done", False):
         st.download_button(
             "⬇ Processing log CSV",
             data=df_to_csv_bytes(log_df),
-            file_name="claude_processing_log.csv",
+            file_name=_log_fname,
             mime="text/csv",
             use_container_width=True,
-            help="One row per company: step statuses, token counts, costs, review flags.",
+            help=_log_help,
         )
 
     # ── Debug section ─────────────────────────────────────────────────────────
@@ -1862,70 +1891,87 @@ if ss("enrichment_done", False):
         st.divider()
         st.subheader("🐛 Per-row debug details")
 
-        debug_df = pd.DataFrame([
-            {
-                "row":               i + 1,
-                "company":           d.get("input_company_name", ""),
-                "url":               d.get("input_url", ""),
-                "step1_status":      d.get("step1_status", ""),
-                "step2_status":      d.get("step2_status", ""),
-                "enrichment_status": d.get("enrichment_status", ""),
-                "step1_tok_in":      d.get("step1_tokens_in", ""),
-                "step1_tok_out":     d.get("step1_tokens_out", ""),
-                "step2_tok_in":      d.get("step2_tokens_in", ""),
-                "step2_tok_out":     d.get("step2_tokens_out", ""),
-                "row_cost":          f"${d.get('total_cost', 0):.5f}",
-                "error":             d.get("error_message", ""),
-            }
-            for i, d in enumerate(debug_records_done)
-        ])
+        if _elm_done:
+            debug_df = pd.DataFrame([
+                {
+                    "row":          i + 1,
+                    "company":      d.get("company", ""),
+                    "url":          d.get("url", ""),
+                    "domain":       d.get("domain", ""),
+                    "fetch_status": d.get("status", ""),
+                    "pages_fetched": d.get("pages_fetched", ""),
+                    "total_chars":  d.get("total_chars", ""),
+                }
+                for i, d in enumerate(debug_records_done)
+            ])
+        else:
+            debug_df = pd.DataFrame([
+                {
+                    "row":               i + 1,
+                    "company":           d.get("input_company_name", ""),
+                    "url":               d.get("input_url", ""),
+                    "step1_status":      d.get("step1_status", ""),
+                    "step2_status":      d.get("step2_status", ""),
+                    "enrichment_status": d.get("enrichment_status", ""),
+                    "step1_tok_in":      d.get("step1_tokens_in", ""),
+                    "step1_tok_out":     d.get("step1_tokens_out", ""),
+                    "step2_tok_in":      d.get("step2_tokens_in", ""),
+                    "step2_tok_out":     d.get("step2_tokens_out", ""),
+                    "row_cost":          f"${d.get('total_cost', 0):.5f}",
+                    "error":             d.get("error_message", ""),
+                }
+                for i, d in enumerate(debug_records_done)
+            ])
         st.dataframe(debug_df, use_container_width=True)
 
-        st.subheader("🐛 Raw JSON responses")
-        company_labels = [
-            f"{i + 1}. {d.get('input_company_name') or '(empty)'} [{d.get('enrichment_status', '')}]"
-            for i, d in enumerate(debug_records_done)
-        ]
-        sel_idx = st.selectbox(
-            "Select a company:",
-            options=range(len(company_labels)),
-            format_func=lambda i: company_labels[i],
-            key="raw_json_selector",
-        )
-        if sel_idx is not None:
-            d = debug_records_done[sel_idx]
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Step 1 — Jina + Claude extraction**")
-                if d.get("step1_raw_json"):
-                    st.json(d["step1_raw_json"])
-                else:
-                    st.info("No Step 1 response.")
-            with col_b:
-                st.markdown("**Step 2 — Claude web_search ICP signals**")
-                if d.get("step2_raw_json"):
-                    st.json(d["step2_raw_json"])
-                else:
-                    st.info("No Step 2 response.")
+        if not _elm_done:
+            st.subheader("🐛 Raw JSON responses")
+            company_labels = [
+                f"{i + 1}. {d.get('input_company_name') or '(empty)'} [{d.get('enrichment_status', '')}]"
+                for i, d in enumerate(debug_records_done)
+            ]
+            sel_idx = st.selectbox(
+                "Select a company:",
+                options=range(len(company_labels)),
+                format_func=lambda i: company_labels[i],
+                key="raw_json_selector",
+            )
+            if sel_idx is not None:
+                d = debug_records_done[sel_idx]
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**Step 1 — Jina + Claude extraction**")
+                    if d.get("step1_raw_json"):
+                        st.json(d["step1_raw_json"])
+                    else:
+                        st.info("No Step 1 response.")
+                with col_b:
+                    st.markdown("**Step 2 — Claude web_search ICP signals**")
+                    if d.get("step2_raw_json"):
+                        st.json(d["step2_raw_json"])
+                    else:
+                        st.info("No Step 2 response.")
 
         st.subheader("🐛 Additional debug downloads")
         dbg_dl1, dbg_dl2 = st.columns(2)
         with dbg_dl1:
             debug_enriched = df_enriched.copy()
-            debug_enriched["step1_json_preview"] = [
-                json.dumps(d.get("step1_raw_json"), ensure_ascii=False)[:1500]
-                if d.get("step1_raw_json") else ""
-                for d in debug_records_done
-            ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
-            debug_enriched["step2_json_preview"] = [
-                json.dumps(d.get("step2_raw_json"), ensure_ascii=False)[:1500]
-                if d.get("step2_raw_json") else ""
-                for d in debug_records_done
-            ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
+            if not _elm_done:
+                debug_enriched["step1_json_preview"] = [
+                    json.dumps(d.get("step1_raw_json"), ensure_ascii=False)[:1500]
+                    if d.get("step1_raw_json") else ""
+                    for d in debug_records_done
+                ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
+                debug_enriched["step2_json_preview"] = [
+                    json.dumps(d.get("step2_raw_json"), ensure_ascii=False)[:1500]
+                    if d.get("step2_raw_json") else ""
+                    for d in debug_records_done
+                ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
+            _dbg_fname = "elm_debug.xlsx" if _elm_done else "claude_enriched_debug.xlsx"
             st.download_button(
-                "⬇ Debug Excel (+ JSON preview columns)",
+                "⬇ Debug Excel",
                 data=df_to_excel_bytes(debug_enriched),
-                file_name="claude_enriched_debug.xlsx",
+                file_name=_dbg_fname,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
