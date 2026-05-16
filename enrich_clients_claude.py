@@ -40,8 +40,9 @@ from bs4 import BeautifulSoup
 JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
-AUTOSAVE_PATH    = "/tmp/enrichment_autosave.csv"
-LOCAL_SAVE_EVERY = 5   # write to user's local folder every N companies
+AUTOSAVE_PATH        = "/tmp/enrichment_autosave.csv"
+LOCAL_SAVE_EVERY     = 5   # write to user's local folder every N companies
+_DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 MODEL_ID         = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
@@ -1204,6 +1205,7 @@ def reset_processing(clear_autosave: bool = False):
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
         autosave_last_name="",
         _jina_retry_count=0, _last_retry_msg="",
+        _local_save_enabled=False, _final_auto_saved=False,
     )
 
 
@@ -1296,9 +1298,6 @@ with st.sidebar:
     if ss("processing", False) and _last_name:
         st.divider()
         st.caption(f"💾 Auto-save active — last saved: **{_last_name}**")
-        _last_local = ss("_last_local_save", "")
-        if _last_local:
-            st.caption(f"📁 Local save: {_last_local}")
     elif os.path.exists(AUTOSAVE_PATH):
         _saved_df = autosave_load()
         if _saved_df is not None:
@@ -1316,26 +1315,40 @@ with st.sidebar:
                 ss_set(_resume_mode=False)
                 st.rerun()
 
-    # ── Local save folder ─────────────────────────────────────────────────────
+    # ── Local auto-save ───────────────────────────────────────────────────────
     st.divider()
     st.subheader("📁 Local auto-save")
-    st.caption(
-        f"Saves an Excel snapshot every {LOCAL_SAVE_EVERY} companies to a folder "
-        "on this machine. Only works when the app runs locally."
+    local_save_enabled = st.checkbox(
+        "Enable local auto-save",
+        value=ss("local_save_enabled", False),
+        key="local_save_enabled",
+        help=(
+            f"Saves an Excel snapshot every {LOCAL_SAVE_EVERY} companies and once more "
+            "on completion. Only works when the app runs locally."
+        ),
     )
-    local_save_enabled = st.checkbox("Enable local folder save", value=False,
-                                     key="local_save_enabled")
-    local_save_path = st.text_input(
-        "Folder path",
-        value=ss("_local_save_path", ""),
-        placeholder=r"e.g. C:\Users\Gert\Downloads\ or /home/user/Downloads/",
-        key="local_save_path_input",
-        disabled=not local_save_enabled,
-    )
-    if local_save_enabled and local_save_path:
-        ss_set(_local_save_path=local_save_path)
-    elif not local_save_enabled:
-        ss_set(_local_save_path="")
+    if local_save_enabled:
+        _default_dir = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
+        local_save_path = st.text_input(
+            "Download directory",
+            value=_default_dir,
+            placeholder=_DEFAULT_DOWNLOAD_DIR,
+            key="local_save_path_input",
+        )
+        _eff_path = (local_save_path or "").strip() or _DEFAULT_DOWNLOAD_DIR
+        ss_set(_local_save_path=_eff_path, _local_save_enabled=True)
+        _last_local = ss("_last_local_save", "")
+        if _last_local:
+            st.caption(f"📁 Local auto-save active — saving to: **{_eff_path}**")
+            st.caption(f"Last snapshot: {_last_local}")
+        else:
+            st.caption(f"Will save to: **{_eff_path}**")
+    else:
+        ss_set(_local_save_path="", _local_save_enabled=False)
+        st.caption(
+            f"When disabled, the final results file is automatically saved to "
+            f"**{_DEFAULT_DOWNLOAD_DIR}** when processing completes."
+        )
 
     if debug_mode:
         st.divider()
@@ -1534,6 +1547,8 @@ if start_btn and not blocking and not currently_processing:
         _resume_mode=resume_mode, autosave_last_name="",
         _elm_mode=_elm_mode,
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
+        _local_save_enabled=ss("_local_save_enabled", False),
+        _final_auto_saved=False,
     )
     st.rerun()
 
@@ -1698,10 +1713,10 @@ if ss("processing", False):
         except Exception:
             pass  # never let autosave failure abort processing
 
-        # ── Local folder save every N companies ───────────────────────────────
-        _local_path = ss("_local_save_path", "")
-        _new_idx    = len(results)  # results already includes the row appended above
-        if _local_path and _new_idx % LOCAL_SAVE_EVERY == 0:
+        # ── Intermediate local folder save every N companies ─────────────────
+        _new_idx = len(results)  # results already includes the row appended above
+        if ss("_local_save_enabled", False) and _new_idx % LOCAL_SAVE_EVERY == 0:
+            _local_path = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
             try:
                 _snap_df = build_partial_df(results, df_work, _active_fields)
                 _xl, _csv = save_to_local_folder(_snap_df, _local_path)
@@ -1738,6 +1753,25 @@ if ss("enrichment_done", False):
         st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
     else:
         st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
+
+    # ── Auto-save final file (runs exactly once per completed run) ────────────
+    if not ss("_final_auto_saved", False):
+        _save_enabled = ss("_local_save_enabled", False)
+        _save_dir     = ss("_local_save_path", "") if _save_enabled else _DEFAULT_DOWNLOAD_DIR
+        _save_dir     = _save_dir or _DEFAULT_DOWNLOAD_DIR
+        try:
+            _final_xl, _ = save_to_local_folder(df_enriched, _save_dir)
+            ss_set(_final_auto_saved=True, _final_save_path=_final_xl)
+        except Exception as _save_err:
+            ss_set(_final_auto_saved=True, _final_save_path="",
+                   _final_save_error=str(_save_err))
+
+    _final_xl_path  = ss("_final_save_path", "")
+    _final_xl_error = ss("_final_save_error", "")
+    if _final_xl_path:
+        st.info(f"📥 Results saved to **{_final_xl_path}**")
+    elif _final_xl_error:
+        st.warning(f"⚠ Auto-save failed: {_final_xl_error}. Use the download buttons below.")
 
     # ── Status summary ────────────────────────────────────────────────────────
     status_counts  = (
