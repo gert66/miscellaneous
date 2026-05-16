@@ -1735,7 +1735,7 @@ if ss("enrichment_done", False):
         if _elm_done and "elm_fetch_status" in df_enriched.columns
         else df_enriched.get("enrichment_status", pd.Series(dtype=str)).value_counts().to_dict()
     )
-    needs_review_n = int((df_enriched.get("needs_manual_review", "") == "TRUE").sum())
+    needs_review_n = int((df_enriched["needs_manual_review"] == "TRUE").sum()) if "needs_manual_review" in df_enriched.columns else 0
     all_sc = list(status_counts.items())
     n_cols = min(len(all_sc) + 1, 6)
     if all_sc:
