@@ -505,6 +505,52 @@ st.set_page_config(
     page_icon="⚡",
     layout="wide",
 )
+
+# =============================================================================
+# Sidebar
+# =============================================================================
+
+with st.sidebar:
+    st.header("List type")
+    _list_type_label = st.radio(
+        "What are you enriching?",
+        options=["Customers", "Prospects"],
+        index=0,
+        key="elm2_list_type_radio",
+    )
+    sidebar_list_type = "customer" if _list_type_label == "Customers" else "prospect"
+
+    st.divider()
+    st.header("Column mapping")
+    sidebar_name_col = st.text_input(
+        "Company name column",
+        value="",
+        placeholder="leave empty to auto-detect",
+        key="elm2_sidebar_name_col",
+    ).strip() or None
+    sidebar_url_col = st.text_input(
+        "URL column",
+        value="",
+        placeholder="leave empty to auto-detect",
+        key="elm2_sidebar_url_col",
+    ).strip() or None
+
+    st.divider()
+    st.header("Settings")
+    sidebar_delay = st.slider(
+        "Delay between requests (seconds)",
+        min_value=0.5, max_value=5.0, value=1.5, step=0.5,
+        key="elm2_sidebar_delay",
+    )
+
+    st.divider()
+    st.header("About ELM")
+    st.markdown(
+        "**Extreme Light Mode** fetches company pages "
+        "and extracts signals without any API or token costs. "
+        "Signals: hreflang, keywords, sector, sitemap."
+    )
+
 st.title("Fase 1 — Enhanced ELM Enrichment")
 st.caption(
     "Upload a CSV with company names and URLs. "
@@ -560,35 +606,40 @@ if df_raw is not None:
     st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
 
     st.divider()
-    st.subheader("Step 3 · Select columns")
+    st.subheader("Step 3 · Column mapping")
 
     auto_name_col, auto_url_col = detect_columns(df_raw)
     cols = df_raw.columns.tolist()
 
-    if auto_name_col or auto_url_col:
-        parts = []
-        if auto_name_col:
-            parts.append(f"company name → **{auto_name_col}**")
-        if auto_url_col:
-            parts.append(f"URL → **{auto_url_col}**")
-        st.info("Auto-detected: " + ",  ".join(parts))
-    else:
-        st.warning("Could not auto-detect columns — please select them manually.")
+    # Sidebar overrides take priority; fall back to auto-detection
+    name_col = sidebar_name_col if sidebar_name_col in cols else auto_name_col
+    url_col  = sidebar_url_col  if sidebar_url_col  in cols else auto_url_col
 
-    sel_l, sel_r = st.columns(2)
-    with sel_l:
-        name_col = st.selectbox(
-            "Company name column *",
-            options=cols,
-            index=cols.index(auto_name_col) if auto_name_col in cols else 0,
-            help="Column containing the company name.",
+    info_parts = []
+    if sidebar_name_col:
+        label = f"company name → **{name_col}**" + (
+            " *(sidebar override)*" if sidebar_name_col == name_col else
+            f" *(sidebar value '{sidebar_name_col}' not found — using auto-detect)*"
         )
-    with sel_r:
-        url_col = st.selectbox(
-            "Website / URL column *",
-            options=cols,
-            index=cols.index(auto_url_col) if auto_url_col in cols else 0,
-            help="Column containing the company website or domain.",
+        info_parts.append(label)
+    elif name_col:
+        info_parts.append(f"company name → **{name_col}** *(auto-detected)*")
+
+    if sidebar_url_col:
+        label = f"URL → **{url_col}**" + (
+            " *(sidebar override)*" if sidebar_url_col == url_col else
+            f" *(sidebar value '{sidebar_url_col}' not found — using auto-detect)*"
+        )
+        info_parts.append(label)
+    elif url_col:
+        info_parts.append(f"URL → **{url_col}** *(auto-detected)*")
+
+    if info_parts:
+        st.info("  \n".join(info_parts))
+    else:
+        st.warning(
+            "Could not detect columns. Enter column names in the sidebar "
+            "under **Column mapping**."
         )
 
     st.divider()
@@ -650,6 +701,8 @@ if start_btn and not blocking and not currently_running:
         _elm2_name_col=name_col,
         _elm2_url_col=url_col,
         _elm2_n=n_to_process,
+        _elm2_list_type=sidebar_list_type,
+        _elm2_delay=sidebar_delay,
     )
     st.rerun()
 
@@ -658,12 +711,14 @@ if start_btn and not blocking and not currently_running:
 # =============================================================================
 
 if _ss("_elm2_running", False):
-    idx      = _ss("_elm2_idx", 0)
-    results  = _ss("_elm2_results", [])
-    df_work  = _ss("_elm2_df_work")
-    _nc      = _ss("_elm2_name_col")
-    _uc      = _ss("_elm2_url_col")
-    _n       = _ss("_elm2_n", 0)
+    idx         = _ss("_elm2_idx", 0)
+    results     = _ss("_elm2_results", [])
+    df_work     = _ss("_elm2_df_work")
+    _nc         = _ss("_elm2_name_col")
+    _uc         = _ss("_elm2_url_col")
+    _n          = _ss("_elm2_n", 0)
+    _list_type  = _ss("_elm2_list_type", "customer")
+    _delay      = _ss("_elm2_delay", 1.5)
 
     # Stop button
     if st.button("⏹ Stop after current row", key="elm2_stop_btn"):
@@ -748,8 +803,10 @@ if _ss("_elm2_running", False):
                 f"sector: {fields.get('elm_sector_cluster', '?')}"
             )
 
+        fields["list_type"] = _list_type
         results.append(fields)
         _ss_set(_elm2_results=results, _elm2_idx=idx + 1)
+        time.sleep(_delay)
         st.rerun()
 
 # =============================================================================
