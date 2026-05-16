@@ -8,11 +8,14 @@ Extends the ELM pipeline from enrich_clients_claude.py with:
 - LinkedIn company link detection
 - Careers/jobs link detection
 - A language-complexity score derived from the above
+- Sitemap scan for relevant company paths
+- Workforce keyword signals and sector-cluster detection
 
 Only utility functions and constants are imported from the original file;
 the fetch/extract/enrich pipeline is fully re-implemented here.
 """
 
+import re
 import requests
 from bs4 import BeautifulSoup
 
@@ -35,6 +38,39 @@ from enrich_clients_claude import (
     _elm_find,
     _elm_score,
 )
+
+
+_ELM_KW_WORKFORCE = [
+    "global team", "customer service", "sales", "support", "operations",
+    "engineers", "consultants", "client-facing", "communication",
+    "remote team", "distributed team", "customer-facing", "field team",
+]
+
+_ELM_KW_SECTOR = {
+    "financial_services": ["financial services", "banking", "insurance",
+                           "fintech", "wealth management"],
+    "manufacturing":      ["manufacturing", "industrial", "production",
+                           "factory", "supply chain"],
+    "technology":         ["saas", "software", "cloud", "platform",
+                           "machine learning", "artificial intelligence"],
+    "healthcare":         ["healthcare", "pharma", "pharmaceutical",
+                           "medical", "biotech", "life sciences"],
+    "logistics":          ["logistics", "transport", "freight",
+                           "shipping", "warehousing"],
+    "consulting":         ["consulting", "advisory",
+                           "management consulting", "professional services"],
+    "education":          ["education", "university",
+                           "e-learning", "edtech"],
+    "hospitality":        ["hospitality", "hotel", "travel", "tourism"],
+    "engineering":        ["engineering", "construction", "infrastructure"],
+    "retail":             ["retail", "e-commerce", "ecommerce",
+                           "consumer goods"],
+}
+
+_SITEMAP_KEYWORDS = [
+    "about", "company", "careers", "jobs", "locations", "offices", "global",
+    "international", "academy", "training", "learning", "contact",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +147,35 @@ def fetch_page_with_metadata(url: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sitemap scan
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_sitemap(base_url: str) -> dict:
+    """Fetch /sitemap.xml and return relevant URL paths."""
+    try:
+        headers = {"User-Agent": _ELM_UA}
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/sitemap.xml",
+            headers=headers,
+            timeout=12,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return {"sitemap_found": False, "sitemap_relevant_paths": ""}
+        locs = re.findall(r"<loc>(.*?)</loc>", resp.text)
+        matching = [
+            url for url in locs
+            if any(kw in url.lower() for kw in _SITEMAP_KEYWORDS)
+        ]
+        return {
+            "sitemap_found": True,
+            "sitemap_relevant_paths": ", ".join(matching[:10]),
+        }
+    except Exception:
+        return {"sitemap_found": False, "sitemap_relevant_paths": ""}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Function 2 — multi-page fetch with caching
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,6 +215,9 @@ def fetch_company_enhanced(base_url: str, domain: str) -> dict:
         else:
             failed.append(f"{label}({result['status_code']})")
 
+    sitemap = fetch_sitemap(base)
+    metadata.update(sitemap)
+
     out = {"pages": pages, "fetched": fetched, "failed": failed, "metadata": metadata}
     save_cache(ck, out)
     return out
@@ -167,14 +235,22 @@ def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
 
     all_text = " ".join(pages.values())
 
-    kw_intl     = _elm_count(all_text, _ELM_KW_INTERNATIONAL)
-    langs       = _elm_find(all_text, _ELM_KW_LANGUAGES)
-    kw_hiring   = _elm_count(all_text, _ELM_KW_HIRING)
-    kw_growth   = _elm_count(all_text, _ELM_KW_GROWTH)
-    kw_training = _elm_count(all_text, _ELM_KW_TRAINING)
-    kw_offices  = _elm_count(all_text, _ELM_KW_OFFICES)
-    kw_tech     = _elm_count(all_text, _ELM_KW_TECHNOLOGY)
-    countries   = _elm_find(all_text, _ELM_COUNTRIES)
+    kw_intl      = _elm_count(all_text, _ELM_KW_INTERNATIONAL)
+    langs        = _elm_find(all_text, _ELM_KW_LANGUAGES)
+    kw_hiring    = _elm_count(all_text, _ELM_KW_HIRING)
+    kw_growth    = _elm_count(all_text, _ELM_KW_GROWTH)
+    kw_training  = _elm_count(all_text, _ELM_KW_TRAINING)
+    kw_offices   = _elm_count(all_text, _ELM_KW_OFFICES)
+    kw_tech      = _elm_count(all_text, _ELM_KW_TECHNOLOGY)
+    countries    = _elm_find(all_text, _ELM_COUNTRIES)
+    kw_workforce = _elm_count(all_text, _ELM_KW_WORKFORCE)
+
+    sector_scores = {
+        sector: _elm_count(all_text, kws)
+        for sector, kws in _ELM_KW_SECTOR.items()
+    }
+    best_sector = max(sector_scores, key=sector_scores.get)
+    elm_sector_cluster = best_sector if sector_scores[best_sector] > 0 else "unknown"
 
     s_intl     = min(_elm_score(kw_intl, 1.5) + min(len(countries), 4), 10)
     s_hiring   = _elm_score(kw_hiring,   1.5)
@@ -250,6 +326,13 @@ def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
         "elm_careers_link_found":     metadata.get("careers_link_found", False),
         # New score
         "elm_score_language_complexity": score,
+        # Workforce and sector
+        "elm_kw_workforce":               kw_workforce,
+        "elm_score_workforce":            _elm_score(kw_workforce, 1.5),
+        "elm_sector_cluster":             elm_sector_cluster,
+        # Sitemap
+        "elm_sitemap_found":              metadata.get("sitemap_found", False),
+        "elm_sitemap_relevant_paths":     metadata.get("sitemap_relevant_paths", ""),
     }
 
 
@@ -306,3 +389,13 @@ if __name__ == "__main__":
     result, debug = enrich_one_row_enhanced("Test Company", "https://www.example.com")
     import json
     print(json.dumps(result, indent=2))
+    new_fields = [
+        "elm_kw_workforce",
+        "elm_score_workforce",
+        "elm_sector_cluster",
+        "elm_sitemap_found",
+        "elm_sitemap_relevant_paths",
+    ]
+    print("\n--- New fields ---")
+    for f in new_fields:
+        print(f"  {f}: {result.get(f)}")
