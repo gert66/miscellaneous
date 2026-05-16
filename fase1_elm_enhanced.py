@@ -546,51 +546,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# =============================================================================
-# Sidebar
-# =============================================================================
-
-with st.sidebar:
-    st.header("List type")
-    _list_type_label = st.radio(
-        "What are you enriching?",
-        options=["Customers", "Prospects"],
-        index=0,
-        key="elm2_list_type_radio",
-    )
-    sidebar_list_type = "customer" if _list_type_label == "Customers" else "prospect"
-
-    st.divider()
-    st.header("Column mapping")
-    sidebar_name_col = st.text_input(
-        "Company name column",
-        value="",
-        placeholder="leave empty to auto-detect",
-        key="elm2_sidebar_name_col",
-    ).strip() or None
-    sidebar_url_col = st.text_input(
-        "URL column",
-        value="",
-        placeholder="leave empty to auto-detect",
-        key="elm2_sidebar_url_col",
-    ).strip() or None
-
-    st.divider()
-    st.header("Settings")
-    sidebar_delay = st.slider(
-        "Delay between requests (seconds)",
-        min_value=0.5, max_value=5.0, value=1.5, step=0.5,
-        key="elm2_sidebar_delay",
-    )
-
-    st.divider()
-    st.header("About ELM")
-    st.markdown(
-        "**Extreme Light Mode** fetches company pages "
-        "and extracts signals without any API or token costs. "
-        "Signals: hreflang, keywords, sector, sitemap."
-    )
-
 st.title("Fase 1 — Enhanced ELM Enrichment")
 st.caption(
     "Upload a CSV with company names and URLs. "
@@ -598,461 +553,224 @@ st.caption(
     "page fetch, metadata extraction, keyword signals, sitemap scan, and sector detection."
 )
 
-tab1, tab2 = st.tabs(["Enrichment", "Comparison Analysis"])
+# =============================================================================
+# Upload
+# =============================================================================
 
-# tab1 content is rendered via _render_enrichment_tab() below
-# tab2 content is rendered via _render_comparison_tab() below
+uploaded = st.file_uploader("Upload your CSV file", type=["csv"])
 
+new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
+if new_file_key != _ss("_elm2_file_key"):
+    _ss_set(_elm2_file_key=new_file_key, _elm2_df_raw=None,
+            _elm2_file_name=None, _elm2_file_error=None)
+    _reset_run()
+    if uploaded is not None:
+        try:
+            _ss_set(_elm2_df_raw=pd.read_csv(uploaded), _elm2_file_name=uploaded.name)
+        except Exception as exc:
+            _ss_set(_elm2_file_error=str(exc))
 
-def _render_enrichment_tab():
-    # =============================================================================
-    # Step 1 — Upload
-    # =============================================================================
+df_raw: pd.DataFrame | None = _ss("_elm2_df_raw")
+file_error: str | None      = _ss("_elm2_file_error")
 
-    st.subheader("Step 1 · Upload your file")
-    uploaded = st.file_uploader(
-        "Drag and drop here, or click to browse  (.csv)",
-        type=["csv"],
+if file_error:
+    st.error(f"Could not read the file: {file_error}")
+elif df_raw is not None:
+    st.success(
+        f"**{_ss('_elm2_file_name')}** — {len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
 
-    new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
-    if new_file_key != _ss("_elm2_file_key"):
-        _ss_set(_elm2_file_key=new_file_key, _elm2_df_raw=None,
-                _elm2_file_name=None, _elm2_file_error=None)
-        _reset_run()
-        if uploaded is not None:
-            try:
-                df_loaded = pd.read_csv(uploaded)
-                _ss_set(_elm2_df_raw=df_loaded, _elm2_file_name=uploaded.name)
-            except Exception as exc:
-                _ss_set(_elm2_file_error=str(exc))
+# =============================================================================
+# Column detection + Start button
+# =============================================================================
 
-    df_raw: pd.DataFrame | None = _ss("_elm2_df_raw")
-    file_error: str | None      = _ss("_elm2_file_error")
+name_col     = None
+url_col      = None
+n_to_process = 0
 
-    if file_error:
-        st.error(f"Could not read the file: {file_error}")
-    elif uploaded and df_raw is not None:
-        st.success(
-            f"**{_ss('_elm2_file_name')}** loaded — "
-            f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
-        )
+if df_raw is not None:
+    auto_name, auto_url = detect_columns(df_raw)
+    name_col = auto_name
+    url_col  = auto_url
 
-    # =============================================================================
-    # Step 2 — Preview & column selection
-    # =============================================================================
+    if name_col or url_col:
+        parts = []
+        if name_col:
+            parts.append(f"company name → **{name_col}**")
+        if url_col:
+            parts.append(f"URL → **{url_col}**")
+        st.info("Auto-detected columns: " + ",  ".join(parts))
+    else:
+        st.warning("Could not auto-detect columns. Make sure your CSV has recognisable headers.")
 
-    name_col = None
-    url_col  = None
-    n_to_process = 0
+    n_to_process = len(df_raw)
 
-    if df_raw is not None:
-        st.divider()
-        st.subheader("Step 2 · Preview")
-        st.dataframe(df_raw.head(), use_container_width=True)
-        st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
+st.divider()
+currently_running = _ss("_elm2_running", False)
 
-        st.divider()
-        st.subheader("Step 3 · Column mapping")
+blocking: list = []
+if uploaded is None:
+    blocking.append("No file uploaded yet.")
+if file_error:
+    blocking.append(f"File could not be read: {file_error}")
+if df_raw is not None and name_col is None:
+    blocking.append("Could not detect a company name column.")
+if df_raw is not None and url_col is None:
+    blocking.append("Could not detect a URL column.")
 
-        auto_name_col, auto_url_col = detect_columns(df_raw)
-        cols = df_raw.columns.tolist()
+if blocking and not currently_running:
+    for reason in blocking:
+        st.warning(f"⚠️ {reason}")
 
-        # Sidebar overrides take priority; fall back to auto-detection
-        name_col = sidebar_name_col if sidebar_name_col in cols else auto_name_col
-        url_col  = sidebar_url_col  if sidebar_url_col  in cols else auto_url_col
+start_btn = st.button(
+    "▶ Start enrichment",
+    type="primary",
+    use_container_width=True,
+    disabled=(bool(blocking) or currently_running),
+    key="elm2_start_btn",
+)
 
-        info_parts = []
-        if sidebar_name_col:
-            label = f"company name → **{name_col}**" + (
-                " *(sidebar override)*" if sidebar_name_col == name_col else
-                f" *(sidebar value '{sidebar_name_col}' not found — using auto-detect)*"
-            )
-            info_parts.append(label)
-        elif name_col:
-            info_parts.append(f"company name → **{name_col}** *(auto-detected)*")
-
-        if sidebar_url_col:
-            label = f"URL → **{url_col}**" + (
-                " *(sidebar override)*" if sidebar_url_col == url_col else
-                f" *(sidebar value '{sidebar_url_col}' not found — using auto-detect)*"
-            )
-            info_parts.append(label)
-        elif url_col:
-            info_parts.append(f"URL → **{url_col}** *(auto-detected)*")
-
-        if info_parts:
-            st.info("  \n".join(info_parts))
-        else:
-            st.warning(
-                "Could not detect columns. Enter column names in the sidebar "
-                "under **Column mapping**."
-            )
-
-        st.divider()
-        st.subheader("Step 4 · Processing scope")
-
-        limit_rows = st.checkbox("Limit rows for testing", value=False)
-        if limit_rows:
-            row_limit = st.number_input(
-                "Number of rows to process",
-                min_value=1, max_value=len(df_raw),
-                value=min(5, len(df_raw)), step=1,
-            )
-            n_to_process = int(row_limit)
-            st.caption(f"Will process the first **{n_to_process}** of {len(df_raw):,} rows.")
-        else:
-            n_to_process = len(df_raw)
-            st.info(f"All **{n_to_process:,}** rows will be processed.")
-
-    # =============================================================================
-    # Step 5 — Start / Stop
-    # =============================================================================
-
-    st.divider()
-    currently_running = _ss("_elm2_running", False)
-    run_done          = _ss("_elm2_done", False)
-
-    blocking: list = []
-    if uploaded is None:
-        blocking.append("No file uploaded yet.")
-    if file_error:
-        blocking.append(f"File could not be read: {file_error}")
-    if df_raw is not None and name_col is None:
-        blocking.append("No company name column selected.")
-    if df_raw is not None and n_to_process == 0:
-        blocking.append("Zero rows selected.")
-
-    if blocking and not currently_running:
-        for reason in blocking:
-            st.warning(f"⚠️ {reason}")
-
-    start_btn = st.button(
-        "▶ Start enrichment",
-        type="primary",
-        use_container_width=True,
-        disabled=(bool(blocking) or currently_running),
-        key="elm2_start_btn",
+if start_btn and not blocking and not currently_running:
+    _ss_set(
+        _elm2_running=True,
+        _elm2_stop=False,
+        _elm2_idx=0,
+        _elm2_results=[],
+        _elm2_done=False,
+        _elm2_df_out=None,
+        _elm2_df_work=df_raw.copy().reset_index(drop=True),
+        _elm2_name_col=name_col,
+        _elm2_url_col=url_col,
+        _elm2_n=n_to_process,
     )
+    st.rerun()
 
-    if start_btn and not blocking and not currently_running:
-        df_work = df_raw.head(n_to_process).copy().reset_index(drop=True)
-        _ss_set(
-            _elm2_running=True,
-            _elm2_stop=False,
-            _elm2_idx=0,
-            _elm2_results=[],
-            _elm2_done=False,
-            _elm2_df_out=None,
-            _elm2_df_work=df_work,
-            _elm2_name_col=name_col,
-            _elm2_url_col=url_col,
-            _elm2_n=n_to_process,
-            _elm2_list_type=sidebar_list_type,
-            _elm2_delay=sidebar_delay,
-        )
+# =============================================================================
+# Processing loop — one row per Streamlit rerun
+# =============================================================================
+
+if _ss("_elm2_running", False):
+    idx     = _ss("_elm2_idx", 0)
+    results = _ss("_elm2_results", [])
+    df_work = _ss("_elm2_df_work")
+    _nc     = _ss("_elm2_name_col")
+    _uc     = _ss("_elm2_url_col")
+    _n      = _ss("_elm2_n", 0)
+
+    if st.button("⏹ Stop after current row", key="elm2_stop_btn"):
+        _ss_set(_elm2_stop=True)
         st.rerun()
 
-    # =============================================================================
-    # Processing loop — one row per Streamlit rerun
-    # =============================================================================
+    st.progress(idx / _n if _n else 1.0, text=f"Row {idx} of {_n}")
 
-    if _ss("_elm2_running", False):
-        idx         = _ss("_elm2_idx", 0)
-        results     = _ss("_elm2_results", [])
-        df_work     = _ss("_elm2_df_work")
-        _nc         = _ss("_elm2_name_col")
-        _uc         = _ss("_elm2_url_col")
-        _n          = _ss("_elm2_n", 0)
-        _list_type  = _ss("_elm2_list_type", "customer")
-        _delay      = _ss("_elm2_delay", 1.5)
+    cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
+    cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
+    cnt_failed  = sum(1 for r in results if r.get("elm_fetch_status") == "failed")
+    avg_score   = (
+        sum(float(r.get("elm_score_overall_icp", 0) or 0) for r in results) / len(results)
+        if results else 0.0
+    )
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Fetched OK",    cnt_ok)
+    mc2.metric("Partial",       cnt_partial)
+    mc3.metric("Failed",        cnt_failed)
+    mc4.metric("Processed",     len(results))
+    mc5.metric("Avg ICP score", f"{avg_score:.1f}/10")
 
-        # Stop button
-        if st.button("⏹ Stop after current row", key="elm2_stop_btn"):
-            _ss_set(_elm2_stop=True)
-            st.rerun()
+    if results:
+        _preview_cols = [
+            _nc, _uc,
+            "elm_fetch_status", "elm_score_overall_icp",
+            "elm_sector_cluster", "elm_score_language_complexity",
+            "elm_hreflang_count", "elm_sitemap_found",
+            "elm_website_data_quality_score",
+        ]
+        partial_df = df_work.iloc[: len(results)].copy().reset_index(drop=True)
+        for col in _preview_cols[2:]:
+            partial_df[col] = [r.get(col, "") for r in results]
+        show_cols = [c for c in _preview_cols if c in partial_df.columns]
+        st.dataframe(partial_df[show_cols], use_container_width=True)
 
-        # Progress bar
-        st.progress(idx / _n if _n else 1.0, text=f"Row {idx} of {_n}")
-
-        # Running metrics
-        cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
-        cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
-        cnt_failed  = sum(1 for r in results if r.get("elm_fetch_status") == "failed")
-        avg_score   = (
-            sum(float(r.get("elm_score_overall_icp", 0) or 0) for r in results) / len(results)
-            if results else 0.0
-        )
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("Fetched OK",      cnt_ok)
-        mc2.metric("Partial",         cnt_partial)
-        mc3.metric("Failed",          cnt_failed)
-        mc4.metric("Processed",       len(results))
-        mc5.metric("Avg ICP score",   f"{avg_score:.1f}/10")
-
-        # Live results table
-        if results:
-            _preview_cols = [
-                _nc, _uc,
-                "elm_fetch_status", "elm_score_overall_icp",
-                "elm_sector_cluster", "elm_score_language_complexity",
-                "elm_hreflang_count", "elm_sitemap_found",
-            ]
-            partial_df = df_work.iloc[: len(results)].copy().reset_index(drop=True)
-            for col in _preview_cols[2:]:
-                partial_df[col] = [r.get(col, "") for r in results]
-            show_cols = [c for c in _preview_cols if c in partial_df.columns]
-            st.dataframe(partial_df[show_cols], use_container_width=True)
-
-            csv_partial = _df_to_csv_bytes(
+        st.download_button(
+            label=f"⬇ Download partial results ({len(results)} rows)",
+            data=_df_to_csv_bytes(
                 df_work.iloc[: len(results)].assign(
                     **{k: [r.get(k, "") for r in results] for k in results[0]}
                 )
-            )
-            st.download_button(
-                label=f"⬇ Download partial results ({len(results)} rows)",
-                data=csv_partial,
-                file_name=f"elm2_partial_{_ts()}.csv",
-                mime="text/csv",
-                key=f"elm2_dl_partial_{idx}",
-            )
-
-        # Termination check
-        if _ss("_elm2_stop", False) or idx >= _n:
-            # Build final output
-            df_out = df_work.iloc[: len(results)].copy().reset_index(drop=True)
-            for k in (results[0] if results else {}):
-                df_out[k] = [r.get(k, "") for r in results]
-            _ss_set(
-                _elm2_running=False,
-                _elm2_stop=False,
-                _elm2_done=True,
-                _elm2_df_out=df_out,
-            )
-            st.rerun()
-        else:
-            # Process next row
-            input_row    = df_work.iloc[idx]
-            company_name = str(input_row.get(_nc, "") or "").strip()
-            raw_url      = str(input_row.get(_uc, "") or "").strip()
-
-            with st.status(
-                f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}** — {raw_url}",
-                expanded=False,
-            ) as status_box:
-                status_box.write("⚡ Fetching pages and extracting signals…")
-                fields, dbg = enrich_one_row_enhanced(company_name, raw_url)
-                fetch_status = fields.get("elm_fetch_status", "?")
-                status_box.write(
-                    f"Done — fetch: **{fetch_status}** | "
-                    f"{int(fields.get('elm_total_chars', 0) or 0):,} chars | "
-                    f"ICP score: **{fields.get('elm_score_overall_icp', '?')}/10** | "
-                    f"sector: {fields.get('elm_sector_cluster', '?')}"
-                )
-
-            fields["list_type"] = _list_type
-            results.append(fields)
-            _ss_set(_elm2_results=results, _elm2_idx=idx + 1)
-            time.sleep(_delay)
-            st.rerun()
-
-    # =============================================================================
-    # Results
-    # =============================================================================
-
-    if _ss("_elm2_done", False):
-        df_out: pd.DataFrame = _ss("_elm2_df_out")
-        processed = len(df_out)
-
-        st.divider()
-        if _ss("_elm2_stop", False):
-            st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
-        else:
-            st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
-
-        # Download button
-        st.download_button(
-            label="⬇ Download enriched CSV",
-            data=_df_to_csv_bytes(df_out),
-            file_name=f"elm2_enriched_{_ts()}.csv",
+            ),
+            file_name=f"elm2_partial_{_ts()}.csv",
             mime="text/csv",
-            use_container_width=True,
-            type="primary",
-            key="elm2_dl_final",
+            key=f"elm2_dl_partial_{idx}",
         )
 
-        # Summary metrics
-        if "elm_fetch_status" in df_out.columns:
-            status_counts = df_out["elm_fetch_status"].value_counts()
-            cols_m = st.columns(len(status_counts) + 1)
-            for i, (status, count) in enumerate(status_counts.items()):
-                cols_m[i].metric(status.capitalize(), count)
-            avg_icp = df_out["elm_score_overall_icp"].apply(
-                lambda x: float(x) if str(x).replace(".", "").isdigit() else 0.0
-            ).mean()
-            cols_m[-1].metric("Avg ICP score", f"{avg_icp:.1f}/10")
-
-        # Full results table
-        st.divider()
-        st.subheader("Enriched results")
-        st.dataframe(df_out, use_container_width=True)
-
-        # Start-over button
-        st.divider()
-        if st.button("↺ Start over", use_container_width=True, key="elm2_restart"):
-            _reset_run()
-            _ss_set(_elm2_file_key=None, _elm2_df_raw=None)
-            st.rerun()
-
-
-# =============================================================================
-# Comparison Analysis tab
-# =============================================================================
-
-def _highlight_strong(row):
-    """Green background for strong-signal rows in the comparison table."""
-    if row.get("signal_strength") == "strong":
-        return ["background-color: #d4edda"] * len(row)
-    return [""] * len(row)
-
-
-def _render_comparison_tab():
-    st.subheader("Step 1 · Upload enriched CSV")
-    comp_uploaded = st.file_uploader(
-        "Upload the enriched CSV produced by the Enrichment tab",
-        type=["csv"],
-        key="comp_uploader",
-    )
-
-    comp_key = (
-        f"{comp_uploaded.name}___{comp_uploaded.size}" if comp_uploaded else "__none__"
-    )
-    if comp_key != _ss("_comp_file_key"):
-        _ss_set(
-            _comp_file_key=comp_key,
-            _comp_df=None,
-            _comp_error=None,
-            _comp_results=None,
-        )
-        if comp_uploaded is not None:
-            try:
-                _df = pd.read_csv(comp_uploaded)
-                if "list_type" not in _df.columns:
-                    _ss_set(_comp_error="No 'list_type' column found. Run Enrichment first.")
-                elif not {"customer", "prospect"}.intersection(_df["list_type"].unique()):
-                    _ss_set(_comp_error="'list_type' must contain 'customer' and/or 'prospect'.")
-                else:
-                    _ss_set(_comp_df=_df)
-            except Exception as exc:
-                _ss_set(_comp_error=str(exc))
-
-    comp_df: pd.DataFrame | None = _ss("_comp_df")
-    comp_error: str | None       = _ss("_comp_error")
-
-    if comp_error:
-        st.error(comp_error)
-        return
-
-    if comp_df is None:
-        return
-
-    n_cust = (comp_df["list_type"] == "customer").sum()
-    n_pros = (comp_df["list_type"] == "prospect").sum()
-    st.success(
-        f"**{comp_uploaded.name}** loaded — "
-        f"{n_cust} customers, {n_pros} prospects, {len(comp_df):,} rows total."
-    )
-
-    if n_cust == 0 or n_pros == 0:
-        st.warning("Need at least one customer row and one prospect row to run analysis.")
-        return
-
-    st.divider()
-    if st.button("▶ Run comparison analysis", type="primary", key="comp_run_btn"):
-        try:
-            from fase1_comparison import (
-                build_comparison_table,
-                compute_similarity_scores,
-                build_ranked_list,
-            )
-            from fase1_comparison import _detect_columns as _comp_detect_cols
-
-            comp_table   = build_comparison_table(comp_df)
-            scored_pros  = compute_similarity_scores(comp_df, comp_table)
-            name_col, url_col = _comp_detect_cols(comp_df)
-            name_col = name_col or comp_df.columns[0]
-            url_col  = url_col  or comp_df.columns[1]
-            ranked       = build_ranked_list(scored_pros, name_col, url_col)
-            _ss_set(_comp_results={
-                "comparison_table": comp_table,
-                "ranked":           ranked,
-            })
-        except Exception as exc:
-            st.error(f"Analysis failed: {exc}")
-            return
-
-    results = _ss("_comp_results")
-    if not results:
-        return
-
-    comp_table: pd.DataFrame = results["comparison_table"]
-    ranked:     pd.DataFrame = results["ranked"]
-
-    # ── Signal comparison table ───────────────────────────────────────────────
-    st.divider()
-    st.subheader("Which signals distinguish customers from prospects?")
-    styled = (
-        comp_table.sort_values("lift", ascending=False, na_position="last")
-        .style.apply(_highlight_strong, axis=1)
-    )
-    st.dataframe(styled, use_container_width=True)
-
-    # ── Top 5 strong signals ──────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Strongest signals")
-    strong = comp_table[comp_table["signal_strength"] == "strong"][
-        ["field", "pct_customers", "pct_prospects", "lift"]
-    ].sort_values("lift", ascending=False, na_position="last")
-    if strong.empty:
-        st.info("No strong signals found (lift ≥ 2.0). Try enriching more rows.")
+    if _ss("_elm2_stop", False) or idx >= _n:
+        df_out = df_work.iloc[: len(results)].copy().reset_index(drop=True)
+        for k in (results[0] if results else {}):
+            df_out[k] = [r.get(k, "") for r in results]
+        _ss_set(_elm2_running=False, _elm2_stop=False, _elm2_done=True, _elm2_df_out=df_out)
+        st.rerun()
     else:
-        st.table(strong.reset_index(drop=True))
+        input_row    = df_work.iloc[idx]
+        company_name = str(input_row.get(_nc, "") or "").strip()
+        raw_url      = str(input_row.get(_uc, "") or "").strip()
 
-    # ── Ranked prospect list ──────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Prospects ranked by customer similarity")
-    st.dataframe(
-        ranked.sort_values("customer_similarity_score", ascending=False),
-        use_container_width=True,
-    )
+        with st.status(
+            f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}**",
+            expanded=False,
+        ) as status_box:
+            status_box.write("⚡ Fetching pages and extracting signals…")
+            fields, _ = enrich_one_row_enhanced(company_name, raw_url)
+            status_box.write(
+                f"Done — fetch: **{fields.get('elm_fetch_status', '?')}** | "
+                f"{int(fields.get('elm_total_chars', 0) or 0):,} chars | "
+                f"ICP: **{fields.get('elm_score_overall_icp', '?')}/10** | "
+                f"sector: {fields.get('elm_sector_cluster', '?')}"
+            )
 
-    # ── Downloads ─────────────────────────────────────────────────────────────
-    st.divider()
-    dl_l, dl_r = st.columns(2)
-    dl_l.download_button(
-        label="⬇ Download signal comparison CSV",
-        data=_df_to_csv_bytes(comp_table),
-        file_name=f"signal_comparison_{_ts()}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="comp_dl_comparison",
-    )
-    dl_r.download_button(
-        label="⬇ Download ranked prospects CSV",
-        data=_df_to_csv_bytes(ranked),
-        file_name=f"ranked_prospects_{_ts()}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="comp_dl_ranked",
-    )
-
+        results.append(fields)
+        _ss_set(_elm2_results=results, _elm2_idx=idx + 1)
+        st.rerun()
 
 # =============================================================================
-# Tab dispatch
+# Results
 # =============================================================================
 
-with tab1:
-    _render_enrichment_tab()
+if _ss("_elm2_done", False):
+    df_out: pd.DataFrame = _ss("_elm2_df_out")
+    processed = len(df_out)
 
-with tab2:
-    _render_comparison_tab()
+    st.divider()
+    if _ss("_elm2_stop", False):
+        st.warning(f"Stopped after **{processed}** rows.")
+    else:
+        st.success(f"✅ Done — **{processed:,}** rows enriched.")
+
+    st.download_button(
+        label="⬇ Download enriched CSV",
+        data=_df_to_csv_bytes(df_out),
+        file_name=f"elm2_enriched_{_ts()}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        type="primary",
+        key="elm2_dl_final",
+    )
+
+    if "elm_fetch_status" in df_out.columns:
+        status_counts = df_out["elm_fetch_status"].value_counts()
+        cols_m = st.columns(len(status_counts) + 1)
+        for i, (status, count) in enumerate(status_counts.items()):
+            cols_m[i].metric(status.capitalize(), count)
+        avg_icp = df_out["elm_score_overall_icp"].apply(
+            lambda x: float(x) if str(x).replace(".", "").isdigit() else 0.0
+        ).mean()
+        cols_m[-1].metric("Avg ICP score", f"{avg_icp:.1f}/10")
+
+    st.divider()
+    st.dataframe(df_out, use_container_width=True)
+
+    st.divider()
+    if st.button("↺ Start over", use_container_width=True, key="elm2_restart"):
+        _reset_run()
+        _ss_set(_elm2_file_key=None, _elm2_df_raw=None)
+        st.rerun()
+
