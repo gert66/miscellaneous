@@ -149,7 +149,7 @@ ALL_ENRICHMENT_FIELDS = STEP1_FIELDS + ICP_FIELDS + META_FIELDS
 # Extreme Light Mode (ELM) — zero-token, no API key, keyword-only extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ELM_SLUGS = ["", "/about", "/about-us", "/careers", "/jobs", "/locations", "/contact"]
+_ELM_SLUGS = ["", "/about", "/about-us", "/company", "/careers", "/jobs", "/locations", "/contact"]
 
 _ELM_UA = "Mozilla/5.0 (compatible; CompanyResearchBot/1.0)"
 
@@ -692,10 +692,12 @@ def fetch_company_enhanced(base_url: str, domain: str) -> dict:
     return out
 
 
-def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
+def extract_signals_enhanced(pages: dict, metadata: dict, fetched: list = None, failed: list = None) -> dict:
     """Extract keyword signals plus metadata fields and derived scores."""
-    fetched = list(pages.keys())
-    failed: list = []
+    if fetched is None:
+        fetched = list(pages.keys())
+    if failed is None:
+        failed = []
 
     all_text = " ".join(pages.values())
 
@@ -734,7 +736,7 @@ def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
     n_failed  = len(failed)
     if n_fetched == 0:
         fetch_status = "failed"
-    elif n_failed > n_fetched:
+    elif n_failed > 0:
         fetch_status = "partial"
     else:
         fetch_status = "ok"
@@ -840,7 +842,9 @@ def enrich_one_row_enhanced(company_name: str, raw_url: str) -> tuple:
 
     pages    = result.get("pages", {})
     metadata = result.get("metadata", {})
-    signals  = extract_signals_enhanced(pages, metadata)
+    fetched  = result.get("fetched", [])
+    failed   = result.get("failed", [])
+    signals  = extract_signals_enhanced(pages, metadata, fetched, failed)
 
     dbg = {
         "company":       company_name,
@@ -1702,7 +1706,9 @@ with st.sidebar:
 
     st.header("Settings")
 
-    if api_key:
+    if _elm_mode:
+        st.info("🔓 No API key needed in Extreme Light Mode")
+    elif api_key:
         st.success("✓ Anthropic API key loaded")
     else:
         st.error("⚠ API key missing")
@@ -1943,11 +1949,17 @@ if blocking and not currently_processing:
     for reason in blocking:
         st.warning(f"⚠️ {reason}")
 elif not blocking and not currently_processing and not enrichment_done:
-    est = n_to_process * 0.002  # rough: ~$0.002/row for 2 calls
-    st.info(
-        f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
-        f"Rough estimated cost: ~${est:.2f}."
-    )
+    if _elm_mode:
+        st.info(
+            f"Ready to process **{n_to_process:,}** rows in Extreme Light Mode. "
+            "No API calls, no tokens, no cost."
+        )
+    else:
+        est = n_to_process * 0.002  # rough: ~$0.002/row for 2 calls
+        st.info(
+            f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
+            f"Rough estimated cost: ~${est:.2f}."
+        )
 
 start_btn = st.button(
     "▶ Start enrichment",
