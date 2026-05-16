@@ -219,10 +219,23 @@ def calc_cost(in_tok: int, out_tok: int) -> float:
 
 
 def _parse_json_response(text: str) -> dict:
-    """Strip markdown fences and parse JSON; raises ValueError on failure."""
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    text = re.sub(r"\s*```$", "", text.strip())
-    return json.loads(text)
+    """
+    Extract and parse JSON from Claude's response.
+    1. Try stripping markdown fences and parsing directly.
+    2. Fall back to pulling the first {...} block via regex.
+    Raises ValueError/JSONDecodeError when no valid JSON is found.
+    """
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Extract first {...} block from raw text (handles prose wrappers)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        return json.loads(m.group())
+    raise ValueError(f"No JSON object found in response (first 200 chars): {text[:200]!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -462,12 +475,23 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
             return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "")
         _delete_cache(ck)
 
+    _STRICT_SUFFIX = (
+        "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
+    )
     try:
         time.sleep(delay)
-        prompt    = _STEP2_PROMPT_TMPL.format(url=target)
+        prompt   = _STEP2_PROMPT_TMPL.format(url=target)
         raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
-        icp_raw   = _parse_json_response(raw_text)
-        payload   = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        try:
+            icp_raw = _parse_json_response(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            # Retry once with a stricter prompt appended
+            time.sleep(delay)
+            raw_text2, in_t2, out_t2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key)
+            in_t  += in_t2
+            out_t += out_t2
+            icp_raw = _parse_json_response(raw_text2)   # raises if still bad
+        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
         return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "")
     except (json.JSONDecodeError, ValueError) as e:
@@ -545,6 +569,9 @@ def enrich_one_row(
     company_name = company_name.strip() if company_name else ""
 
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
+
+    # 3-second pause between companies to stay under the 50k token/min rate limit
+    time.sleep(3)
 
     # ── Step 1 ────────────────────────────────────────────────────────────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
