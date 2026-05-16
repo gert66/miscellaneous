@@ -749,7 +749,7 @@ def reset_processing():
 
 
 def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame) -> None:
-    df_out      = df_work.copy().reset_index(drop=True)
+    df_out      = df_work.head(len(results)).copy().reset_index(drop=True)
     enriched_df = pd.DataFrame(results)
     for col in ALL_ENRICHMENT_FIELDS:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
