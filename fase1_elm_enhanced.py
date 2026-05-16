@@ -557,27 +557,38 @@ st.caption(
 # Upload
 # =============================================================================
 
-uploaded_file = st.file_uploader(
+def _handle_file_upload():
+    f = st.session_state.get("elm2_uploader")
+    if f is not None:
+        try:
+            if f.name.lower().endswith(".xlsx"):
+                st.session_state["uploaded_df"] = pd.read_excel(f)
+            else:
+                st.session_state["uploaded_df"] = pd.read_csv(f)
+            st.session_state["uploaded_filename"] = f.name
+        except Exception as exc:
+            st.session_state["uploaded_df"] = None
+            st.session_state["uploaded_filename"] = None
+            st.session_state["upload_error"] = str(exc)
+
+st.file_uploader(
     "Upload your CSV or Excel file",
     type=["csv", "xlsx"],
+    key="elm2_uploader",
+    on_change=_handle_file_upload,
 )
 
-df_raw = None
+if st.session_state.get("upload_error"):
+    st.error(f"Could not read file: {st.session_state['upload_error']}")
 
-if uploaded_file is not None:
-    try:
-        if uploaded_file.name.lower().endswith(".xlsx"):
-            df_raw = pd.read_excel(uploaded_file)
-        else:
-            df_raw = pd.read_csv(uploaded_file)
-        st.success(
-            f"**{uploaded_file.name}** — "
-            f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
-        )
-        st.dataframe(df_raw.head(), use_container_width=True)
-    except Exception as exc:
-        st.error(f"Could not read file: {exc}")
-        df_raw = None
+df_raw = st.session_state.get("uploaded_df", None)
+
+if df_raw is not None:
+    st.success(
+        f"**{st.session_state.get('uploaded_filename', '')}** — "
+        f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
+    )
+    st.dataframe(df_raw.head(), use_container_width=True)
 
 # =============================================================================
 # Column detection + Start button
