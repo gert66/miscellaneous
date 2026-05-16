@@ -1,331 +1,95 @@
 # Install dependencies:
-#   pip install streamlit selenium requests
-#   Chrome or Chromium must be installed on the system.
-#   Selenium 4.6+ includes selenium-manager which downloads chromedriver automatically.
-#   If auto-download fails, install manually: pip install webdriver-manager
-#   and replace make_driver() with the webdriver-manager variant shown in the comment there.
+#   pip install streamlit requests anthropic
+#
+# Set your API key:
+#   export ANTHROPIC_API_KEY=your-key-here
 #
 # Run the app:
 #   streamlit run company_scraper.py
 
+import json
 import re
-import time
 from urllib.parse import urljoin, urlparse
 
+import anthropic
 import requests
 import streamlit as st
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-PERSON_ROLE_RE = re.compile(
-    r"\b(founder|co-founder|ceo|chief executive|president|cto|coo|cfo|"
-    r"director|chairman|chairwoman|managing partner|partner|head of)\b",
-    re.I,
-)
-NAME_RE = re.compile(r"\b([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})\b")
-
-# JS that walks the live DOM and returns the most-specific element whose
-# textContent includes the given string, plus its tag, attributes, and context.
-_JS_FIND_EVIDENCE = """
-(function(searchText) {
-    var skip = {SCRIPT:1, STYLE:1, NOSCRIPT:1, HEAD:1, META:1, LINK:1};
-    var root = document.body || document.documentElement;
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-        acceptNode: function(n) {
-            return skip[n.tagName] ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-        }
-    });
-    var best = null, bestLen = Infinity, node;
-    while ((node = walker.nextNode())) {
-        var txt = node.textContent || '';
-        if (txt.indexOf(searchText) !== -1 && txt.length < bestLen && txt.length > 0) {
-            best = node; bestLen = txt.length;
-        }
-    }
-    if (!best) return null;
-    var attrs = {};
-    for (var i = 0; i < (best.attributes || []).length; i++) {
-        var a = best.attributes[i];
-        if (a.name === 'class' || a.name === 'id' || a.name === 'name' || a.name === 'itemtype') {
-            attrs[a.name] = a.value;
-        }
-    }
-    var ctx = best.textContent.trim();
-    return {
-        tag: best.tagName.toLowerCase(),
-        attrs: attrs,
-        context: ctx.length > 300 ? ctx.substring(0, 300) + '...' : ctx
-    };
-})(arguments[0])
-"""
-
-# ── Driver ───────────────────────────────────────────────────────────────────
-
-def make_driver() -> webdriver.Chrome:
-    # webdriver-manager alternative:
-    #   from webdriver_manager.chrome import ChromeDriverManager
-    #   from selenium.webdriver.chrome.service import Service
-    #   return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+# Realistic browser headers so sites don't block the request
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    return webdriver.Chrome(options=opts)
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+MODEL = "claude-sonnet-4-20250514"
+
+# Exact system prompt requested by the user
+SYSTEM_PROMPT = (
+    "You are a web scraping assistant. Extract key company information from this HTML. "
+    "Return a JSON object with fields: founder, description, address, phone, email. "
+    "For each field also include a source_text field showing the exact sentence from the "
+    "HTML where you found it."
+)
+
+# Strip scripts/styles then cap HTML size before sending to Claude
+MAX_HTML_CHARS = 80_000
+
+FIELDS = ["founder", "description", "address", "phone", "email"]
+FIELD_LABELS = {
+    "founder": "Founder",
+    "description": "Description",
+    "address": "Address",
+    "phone": "Phone",
+    "email": "Email",
+}
 
 
-def load_page(driver: webdriver.Chrome, url: str, timeout: int = 20) -> None:
-    driver.get(url)
-    # Wait for the DOM to reach readyState=complete
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-    # Wait for any post-load JS (lazy rendering, SPA hydration, etc.) to settle
-    time.sleep(5)
+# ── HTML fetching ─────────────────────────────────────────────────────────────
+
+def fetch_html(url: str) -> str | None:
+    """Fetch a URL with browser headers. Returns HTML text or None on failure."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        resp.raise_for_status()
+        return resp.text
+    except Exception:
+        return None
 
 
-# ── Element / evidence helpers ───────────────────────────────────────────────
-
-def _el_tag(el) -> str:
-    """Build a '<tag attr="val">' string from a Selenium WebElement."""
-    parts = []
-    for attr in ("class", "id", "name", "itemtype"):
-        val = el.get_attribute(attr)
-        if val:
-            parts.append(f'{attr}="{val}"')
-    suffix = (" " + " ".join(parts)) if parts else ""
-    return f"<{el.tag_name}{suffix}>"
+def clean_html(html: str) -> str:
+    """Remove script/style/comment noise and trim to MAX_HTML_CHARS."""
+    html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.I)
+    html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.I)
+    html = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    html = re.sub(r"\s{3,}", " ", html)
+    return html[:MAX_HTML_CHARS]
 
 
-def _el_evidence(el, source_url: str) -> dict:
-    ctx = (el.text or "").strip()
-    if len(ctx) > 300:
-        ctx = ctx[:300] + "..."
-    return {"tag": _el_tag(el), "context": ctx, "url": source_url}
-
-
-def _js_evidence(driver: webdriver.Chrome, search_text: str, source_url: str) -> dict:
-    """Use JS DOM traversal to locate the tightest element containing search_text."""
-    result = driver.execute_script(_JS_FIND_EVIDENCE, search_text)
-    if not result:
-        return {"tag": "unknown", "context": "", "url": source_url}
-    attr_str = " ".join(f'{k}="{v}"' for k, v in result["attrs"].items() if v)
-    tag = f'<{result["tag"]}' + (f" {attr_str}" if attr_str else "") + ">"
-    return {"tag": tag, "context": result["context"], "url": source_url}
-
-
-def item(value: str, evidence: dict) -> dict:
-    return {"value": value, "evidence": evidence}
-
-
-# ── Extractors ───────────────────────────────────────────────────────────────
-
-def extract_contact(driver: webdriver.Chrome, source_url: str) -> list[dict]:
-    results: list[dict] = []
-    seen: set[str] = set()
-
-    def add(value: str, evidence: dict) -> None:
-        if value not in seen:
-            seen.add(value)
-            results.append(item(value, evidence))
-
-    page_source = driver.page_source
-
-    # Emails — search page source so we catch mailto: and hidden attributes too
-    for email in re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", page_source):
-        add(f"Email: {email}", _js_evidence(driver, email, source_url))
-
-    # Phone numbers — search visible body text only (not raw HTML) to avoid
-    # matching script variables and IDs.
-    # Reject bare digit strings: a valid number must either start with '+'
-    # (international) or contain at least 2 separator characters (spaces /
-    # dashes / dots) between digit groups. This filters garbage like 826908230545.
-    body_text = driver.find_element(By.TAG_NAME, "body").text
-    for phone in re.findall(r"(?:\+?\d[\d\s\-().]{7,}\d)", body_text)[:10]:
-        cleaned = phone.strip()
-        digits = re.sub(r"\D", "", cleaned)
-        if not (7 <= len(digits) <= 15):
-            continue
-        is_international = cleaned.startswith("+")
-        sep_count = len(re.findall(r"[\s\-.]", cleaned))
-        if not is_international and sep_count < 2:
-            continue
-        add(f"Phone: {cleaned}", _js_evidence(driver, cleaned[:12], source_url))
-
-    # <address> tags
-    for el in driver.find_elements(By.TAG_NAME, "address"):
-        text = el.text.strip()
-        if text:
-            add(f"Address: {text}", _el_evidence(el, source_url))
-
-    # Elements whose class or id contains address / location / contact
-    for sel in (
-        "[class*='address']", "[class*='location']", "[class*='contact']",
-        "[id*='address']",    "[id*='location']",    "[id*='contact']",
-    ):
-        for el in driver.find_elements(By.CSS_SELECTOR, sel):
-            text = el.text.strip()
-            if text and len(text) < 300:
-                add(f"Contact block: {text}", _el_evidence(el, source_url))
-
-    return results
-
-
-def extract_people(driver: webdriver.Chrome, source_url: str) -> list[dict]:
-    results: list[dict] = []
-    seen: set[str] = set()
-
-    def add_person(name: str, role: str, evidence: dict) -> None:
-        key = name.lower().strip()
-        if not name or key in seen:
-            return
-        seen.add(key)
-        label = name + (f" — {role}" if role else "")
-        results.append(item(label, evidence))
-
-    # 1. schema.org Person items (structured markup)
-    schema_people = driver.execute_script("""
-        var people = [];
-        document.querySelectorAll('[itemtype*="schema.org/Person"]').forEach(function(el) {
-            var nameEl = el.querySelector('[itemprop="name"]');
-            var roleEl = el.querySelector('[itemprop="jobTitle"],[itemprop="role"]');
-            if (nameEl) {
-                var attrs = {};
-                ['class','id'].forEach(function(a) { if (el.getAttribute(a)) attrs[a] = el.getAttribute(a); });
-                var ctx = el.textContent.trim();
-                people.push({
-                    name: nameEl.textContent.trim(),
-                    role: roleEl ? roleEl.textContent.trim() : '',
-                    tag: el.tagName.toLowerCase(),
-                    attrs: attrs,
-                    context: ctx.length > 300 ? ctx.substring(0,300)+'...' : ctx
-                });
-            }
-        });
-        return people;
-    """) or []
-    for p in schema_people:
-        attr_str = " ".join(f'{k}="{v}"' for k, v in p["attrs"].items() if v)
-        tag = f'<{p["tag"]}' + (f" {attr_str}" if attr_str else "") + ">"
-        ev = {"tag": tag, "context": p["context"], "url": source_url}
-        add_person(p["name"], p["role"], ev)
-
-    # 2. Team / bio card patterns — look for container elements with telling class names
-    card_selectors = [
-        "[class*='team-member']", "[class*='team_member']",
-        "[class*='founder']",     "[class*='leadership']",
-        "[class*='staff']",       "[class*='bio']",
-        "[class*='person']",      "[class*='people']",
-        "[class*='team-card']",   "[class*='member-card']",
-    ]
-    for sel in card_selectors:
-        for card in driver.find_elements(By.CSS_SELECTOR, sel):
-            heading = None
-            for h_tag in ("h1", "h2", "h3", "h4", "h5", "strong", "b"):
-                try:
-                    heading = card.find_element(By.TAG_NAME, h_tag)
-                    break
-                except NoSuchElementException:
-                    pass
-            if not heading:
-                continue
-            name = heading.text.strip()
-            if not NAME_RE.match(name) or len(name.split()) > 5:
-                continue
-            role = ""
-            for role_sel in (
-                "[class*='role']", "[class*='title']",
-                "[class*='position']", "[class*='job']",
-            ):
-                try:
-                    role = card.find_element(By.CSS_SELECTOR, role_sel).text.strip()
-                    break
-                except NoSuchElementException:
-                    pass
-            add_person(name, role, _el_evidence(card, source_url))
-
-    # 3. Full-text sentence scan — always runs so structural selectors above can't
-    # suppress it. Fetches all visible body text, splits into sentences (on .!? or
-    # newlines), and searches each sentence for a role keyword + adjacent name.
-    # This catches prose like "Marina Tognetti, founder of…" that tag-based
-    # selectors miss entirely.
-    body_text = driver.find_element(By.TAG_NAME, "body").text
-    sentences = re.split(r"(?<=[.!?])\s+|\n", body_text)
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence or not PERSON_ROLE_RE.search(sentence):
-            continue
-        role_m = PERSON_ROLE_RE.search(sentence)
-        role = role_m.group(0).title() if role_m else ""
-        for name in NAME_RE.findall(sentence):
-            if len(name.split()) >= 2:
-                add_person(name, role, _js_evidence(driver, name, source_url))
-
-    return results
-
-
-# ── Page-level scraping ──────────────────────────────────────────────────────
-
-def scrape_loaded_page(driver: webdriver.Chrome, url: str) -> dict:
-    """Extract all data from the page currently loaded in driver."""
-    title = (driver.title or "Not found").strip()
-
-    meta_desc = ""
-    meta_evidence = None
-    for sel in ('meta[name="description"]', 'meta[property="og:description"]'):
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            content = el.get_attribute("content") or ""
-            if content.strip():
-                meta_desc = content.strip()
-                meta_evidence = {
-                    "tag": _el_tag(el),
-                    "context": f'content="{meta_desc}"',
-                    "url": url,
-                }
-                break
-        except NoSuchElementException:
-            pass
-
-    return {
-        "title": title,
-        "meta_description": meta_desc or "Not found",
-        "meta_evidence": meta_evidence,
-        "contact_info": extract_contact(driver, url),
-        "people": extract_people(driver, url),
-        "url": url,
-    }
-
-
-def find_about_url(driver: webdriver.Chrome, base_url: str) -> str | None:
-    """Find an /about or /about-us URL from links on the currently loaded page."""
+def find_about_url(base_url: str, html: str) -> str | None:
+    """Return the /about or /about-us URL if one exists, else None."""
     about_re = re.compile(r"/about(?:-us)?/?$", re.I)
 
-    # Check anchor tags on the page
-    for el in driver.find_elements(By.TAG_NAME, "a"):
-        href = el.get_attribute("href") or ""
-        if href and about_re.search(urlparse(href).path):
-            return href
+    # Look for links already on the page
+    for match in re.finditer(r'href=["\']([^"\']+)["\']', html, re.I):
+        full = urljoin(base_url, match.group(1).strip())
+        if about_re.search(urlparse(full).path):
+            return full
 
-    # Fall back to probing common paths directly
+    # Probe common paths directly
     parsed = urlparse(base_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
-    ua = "Mozilla/5.0 (compatible; CompanyScraper/1.0)"
     for candidate in ("/about", "/about-us"):
         try:
-            r = requests.head(root + candidate, headers={"User-Agent": ua},
-                              timeout=6, allow_redirects=True)
+            r = requests.head(root + candidate, headers=HEADERS, timeout=6, allow_redirects=True)
             if r.status_code < 400:
                 return root + candidate
         except Exception:
@@ -333,43 +97,103 @@ def find_about_url(driver: webdriver.Chrome, base_url: str) -> str | None:
     return None
 
 
-def merge_items(a: list[dict], b: list[dict]) -> list[dict]:
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for it in a + b:
-        k = it["value"].lower().strip()
-        if k not in seen:
-            seen.add(k)
-            merged.append(it)
+# ── Claude extraction ─────────────────────────────────────────────────────────
+
+def extract_info(html: str, source_url: str) -> dict:
+    """
+    Send cleaned HTML to Claude and return a dict where each key maps to
+    {"value": "...", "source_text": "..."}.
+    """
+    client = anthropic.Anthropic()
+
+    user_message = (
+        f"Here is the HTML from {source_url}.\n\n"
+        "Return your answer as a JSON object. For each of the five fields "
+        "(founder, description, address, phone, email) use this exact nested structure:\n"
+        '  "<field>": {"value": "<extracted text>", "source_text": "<exact snippet from HTML>"}\n'
+        "Set both sub-fields to null if the information is not present.\n\n"
+        f"HTML:\n{html}"
+    )
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "")
+
+    # Strip optional markdown code fences
+    fence = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
+    candidate = fence.group(1) if fence else raw
+
+    # Fall back to the first {...} block if the whole string isn't valid JSON
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        obj_match = re.search(r"\{.*\}", candidate, re.DOTALL)
+        if obj_match:
+            return json.loads(obj_match.group(0))
+        raise
+
+
+# ── Result merging ────────────────────────────────────────────────────────────
+
+def merge_results(main: dict, main_url: str, about: dict, about_url: str | None) -> dict:
+    """
+    Merge extractions from two pages.  For each field, prefer the about-page
+    value if it is non-null, otherwise fall back to the main-page value.
+    Returns {field: {"value": ..., "source_text": ..., "source_url": ...}}.
+    """
+    merged: dict = {}
+    for field in FIELDS:
+        about_entry = about.get(field) if about else None
+        main_entry = main.get(field)
+
+        if _has_value(about_entry):
+            merged[field] = {**about_entry, "source_url": about_url}
+        elif _has_value(main_entry):
+            merged[field] = {**main_entry, "source_url": main_url}
+        else:
+            merged[field] = {"value": None, "source_text": None, "source_url": main_url}
     return merged
 
 
-# ── UI helpers ───────────────────────────────────────────────────────────────
-
-def render_evidence_expander(evidence: dict) -> None:
-    with st.expander("Source Evidence"):
-        st.markdown(f"**Source URL:** {evidence['url']}")
-        st.markdown(f"**HTML element:** `{evidence['tag']}`")
-        if evidence.get("context"):
-            st.markdown("**Surrounding text:**")
-            st.code(evidence["context"], language=None)
+def _has_value(entry: dict | None) -> bool:
+    return bool(entry and entry.get("value"))
 
 
-def render_items(items: list[dict]) -> None:
-    for it in items:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"- {it['value']}")
-        with col2:
-            render_evidence_expander(it["evidence"])
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def render_field(label: str, entry: dict) -> None:
+    """Render one extracted field plus its Source Evidence expander."""
+    value = entry.get("value")
+    source_text = entry.get("source_text")
+    source_url = entry.get("source_url", "")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if value:
+            st.markdown(f"**{label}:** {value}")
+        else:
+            st.markdown(f"**{label}:** *(not found)*")
+    with col2:
+        with st.expander("Source Evidence"):
+            st.markdown(f"**Source URL:** {source_url}")
+            if source_text:
+                st.markdown("**Exact text from page:**")
+                st.code(source_text, language=None)
+            else:
+                st.markdown("*(no matching text found)*")
 
 
-# ── App ──────────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 st.title("Company Info Scraper")
 st.write(
-    "Enter a company website URL. A headless Chrome browser will load the page "
-    "(including JavaScript-rendered content) before extracting info."
+    "Enter a company website URL. The page HTML is fetched with realistic browser headers, "
+    "then sent to Claude to extract structured company information."
 )
 
 url = st.text_input("Company Website URL", placeholder="https://example.com")
@@ -381,75 +205,77 @@ if st.button("Get Company Info"):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        driver: webdriver.Chrome | None = None
         try:
-            with st.spinner("Starting headless Chrome..."):
-                driver = make_driver()
+            # 1. Fetch main page HTML
+            with st.spinner("Fetching main page..."):
+                main_html = fetch_html(url)
+            if not main_html:
+                st.error("Could not fetch the page. Check the URL and try again.")
+                st.stop()
 
-            with st.spinner("Loading main page and waiting for JavaScript..."):
-                load_page(driver, url)
+            # 2. Find and fetch the about page
+            with st.spinner("Looking for About page..."):
+                about_url = find_about_url(url, main_html)
+                about_html = None
+                if about_url and about_url.rstrip("/") != url.rstrip("/"):
+                    about_html = fetch_html(about_url)
 
-            with st.spinner("Scraping main page..."):
-                about_url = find_about_url(driver, url)
-                main = scrape_loaded_page(driver, url)
+            # 3. Send to Claude for extraction
+            with st.spinner("Sending main page to Claude..."):
+                main_info = extract_info(clean_html(main_html), url)
 
-            about_data: dict = {}
-            if about_url and about_url.rstrip("/") != url.rstrip("/"):
-                with st.spinner(f"Loading About page ({about_url})..."):
-                    load_page(driver, about_url)
-                with st.spinner("Scraping About page..."):
-                    about_data = scrape_loaded_page(driver, about_url)
+            about_info: dict = {}
+            if about_html:
+                with st.spinner(f"Sending About page to Claude..."):
+                    about_info = extract_info(clean_html(about_html), about_url)
 
-            all_people  = merge_items(main.get("people", []),       about_data.get("people", []))
-            all_contact = merge_items(main.get("contact_info", []), about_data.get("contact_info", []))
+            # 4. Merge results (prefer about-page values)
+            merged = merge_results(main_info, url, about_info, about_url)
 
             st.success("Done!")
 
-            # ── Main page ──
-            st.header("Main Page")
-            st.subheader("Page Title")
-            st.write(main["title"])
-            st.subheader("Meta Description")
-            st.write(main["meta_description"])
-            if main.get("meta_evidence"):
-                render_evidence_expander(main["meta_evidence"])
+            # 5. Display
+            st.header("Extracted Company Information")
+            for field in FIELDS:
+                render_field(FIELD_LABELS[field], merged[field])
 
-            # ── About page ──
-            if about_data:
-                st.header("About Page")
-                st.caption(about_url)
-                st.subheader("Page Title")
-                st.write(about_data.get("title", "Not found"))
-                st.subheader("Meta Description")
-                st.write(about_data.get("meta_description", "Not found"))
-                if about_data.get("meta_evidence"):
-                    render_evidence_expander(about_data["meta_evidence"])
+            if all(not _has_value(merged[f]) for f in FIELDS):
+                st.info(
+                    "Claude could not find any of the requested fields on these pages. "
+                    "The site may require JavaScript to render content, "
+                    "or the information may not be publicly listed."
+                )
+
+            if about_url:
+                st.caption(f"Also checked: {about_url}")
             else:
-                st.info("No /about or /about-us page found (or it returned an error).")
+                st.caption("No /about or /about-us page found.")
 
-            # ── Key people ──
-            st.header("Key People")
-            if all_people:
-                render_items(all_people)
-            else:
-                st.write("No key people found on these pages.")
+            # Debug expander with raw Claude output
+            with st.expander("Raw Claude JSON (debug)"):
+                st.subheader("Main page extraction")
+                st.json(main_info)
+                if about_info:
+                    st.subheader("About page extraction")
+                    st.json(about_info)
 
-            # ── Contact info ──
-            st.header("Contact / Address Info")
-            if all_contact:
-                render_items(all_contact)
-            else:
-                st.write("No contact info found.")
-
-        except WebDriverException as e:
+        except json.JSONDecodeError:
             st.error(
-                f"Chrome could not start: {e}\n\n"
-                "Make sure Chrome or Chromium is installed and accessible in PATH."
+                "Claude returned a response that could not be parsed as JSON. "
+                "Try again — this can happen with unusually structured pages."
             )
-        except TimeoutException:
-            st.error("Timed out waiting for the page to load.")
+        except anthropic.AuthenticationError:
+            st.error(
+                "Invalid Anthropic API key. "
+                "Set the ANTHROPIC_API_KEY environment variable and restart the app."
+            )
+        except anthropic.APIStatusError as e:
+            st.error(f"Claude API error ({e.status_code}): {e.message}")
+        except requests.exceptions.MissingSchema:
+            st.error("Invalid URL. Make sure it starts with http:// or https://")
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to the URL. Check the address and try again.")
+        except requests.exceptions.HTTPError as e:
+            st.error(f"HTTP error fetching page: {e}")
         except Exception as e:
             st.error(f"Something went wrong: {e}")
-        finally:
-            if driver:
-                driver.quit()
