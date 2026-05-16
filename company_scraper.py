@@ -91,8 +91,8 @@ def load_page(driver: webdriver.Chrome, url: str, timeout: int = 20) -> None:
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") == "complete"
     )
-    # Brief pause to let any post-load JS settle (lazy-loaded content, etc.)
-    time.sleep(1.5)
+    # Wait for any post-load JS (lazy rendering, SPA hydration, etc.) to settle
+    time.sleep(5)
 
 
 # ── Element / evidence helpers ───────────────────────────────────────────────
@@ -146,12 +146,22 @@ def extract_contact(driver: webdriver.Chrome, source_url: str) -> list[dict]:
     for email in re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", page_source):
         add(f"Email: {email}", _js_evidence(driver, email, source_url))
 
-    # Phone numbers — search visible body text to avoid false positives from scripts
+    # Phone numbers — search visible body text only (not raw HTML) to avoid
+    # matching script variables and IDs.
+    # Reject bare digit strings: a valid number must either start with '+'
+    # (international) or contain at least 2 separator characters (spaces /
+    # dashes / dots) between digit groups. This filters garbage like 826908230545.
     body_text = driver.find_element(By.TAG_NAME, "body").text
-    for phone in re.findall(r"(?:\+?\d[\d\s\-().]{7,}\d)", body_text)[:5]:
+    for phone in re.findall(r"(?:\+?\d[\d\s\-().]{7,}\d)", body_text)[:10]:
         cleaned = phone.strip()
-        if len(re.sub(r"\D", "", cleaned)) >= 7:
-            add(f"Phone: {cleaned}", _js_evidence(driver, cleaned[:12], source_url))
+        digits = re.sub(r"\D", "", cleaned)
+        if not (7 <= len(digits) <= 15):
+            continue
+        is_international = cleaned.startswith("+")
+        sep_count = len(re.findall(r"[\s\-.]", cleaned))
+        if not is_international and sep_count < 2:
+            continue
+        add(f"Phone: {cleaned}", _js_evidence(driver, cleaned[:12], source_url))
 
     # <address> tags
     for el in driver.find_elements(By.TAG_NAME, "address"):
@@ -245,17 +255,22 @@ def extract_people(driver: webdriver.Chrome, source_url: str) -> list[dict]:
                     pass
             add_person(name, role, _el_evidence(card, source_url))
 
-    # 3. Keyword fallback — scan visible lines for role words near capitalised names
-    if not results:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        for line in body_text.splitlines():
-            if not PERSON_ROLE_RE.search(line):
-                continue
-            role_m = PERSON_ROLE_RE.search(line)
-            role = role_m.group(0).title() if role_m else ""
-            for name in NAME_RE.findall(line):
-                if len(name.split()) >= 2:
-                    add_person(name, role, _js_evidence(driver, name, source_url))
+    # 3. Full-text sentence scan — always runs so structural selectors above can't
+    # suppress it. Fetches all visible body text, splits into sentences (on .!? or
+    # newlines), and searches each sentence for a role keyword + adjacent name.
+    # This catches prose like "Marina Tognetti, founder of…" that tag-based
+    # selectors miss entirely.
+    body_text = driver.find_element(By.TAG_NAME, "body").text
+    sentences = re.split(r"(?<=[.!?])\s+|\n", body_text)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence or not PERSON_ROLE_RE.search(sentence):
+            continue
+        role_m = PERSON_ROLE_RE.search(sentence)
+        role = role_m.group(0).title() if role_m else ""
+        for name in NAME_RE.findall(sentence):
+            if len(name.split()) >= 2:
+                add_person(name, role, _js_evidence(driver, name, source_url))
 
     return results
 
