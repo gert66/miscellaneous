@@ -17,6 +17,7 @@ Architecture
 
 import io
 import json
+import os
 import re
 import time
 import unicodedata
@@ -37,6 +38,7 @@ import streamlit as st
 JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
+AUTOSAVE_PATH    = "/tmp/enrichment_autosave.csv"
 MODEL_ID         = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
@@ -824,6 +826,54 @@ def cache_to_zip_bytes() -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-save helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def autosave_append(row_fields: dict, input_row: pd.Series) -> None:
+    """Append one enriched row to the autosave CSV."""
+    record = {**input_row.to_dict(), **row_fields}
+    df_row = pd.DataFrame([record])
+    write_header = not os.path.exists(AUTOSAVE_PATH)
+    df_row.to_csv(AUTOSAVE_PATH, mode="a", header=write_header, index=False)
+
+
+def autosave_load() -> pd.DataFrame | None:
+    """Return the autosave DataFrame, or None if it doesn't exist / is unreadable."""
+    if not os.path.exists(AUTOSAVE_PATH):
+        return None
+    try:
+        df = pd.read_csv(AUTOSAVE_PATH)
+        return df if len(df) > 0 else None
+    except Exception:
+        return None
+
+
+def autosave_clear() -> None:
+    try:
+        os.remove(AUTOSAVE_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def autosave_already_done(df_saved: pd.DataFrame, name_col: str, domain_col: str | None,
+                          company_name: str, raw_url: str) -> bool:
+    """Return True if this company already appears in the autosave file."""
+    if df_saved is None or df_saved.empty:
+        return False
+    # Match by domain first (more reliable), fall back to company name
+    if domain_col and domain_col in df_saved.columns and raw_url:
+        url_clean = clean_domain(raw_url)
+        saved_domains = df_saved[domain_col].astype(str).apply(clean_domain)
+        if url_clean and (saved_domains == url_clean).any():
+            return True
+    if name_col in df_saved.columns and company_name:
+        saved_names = df_saved[name_col].astype(str).str.strip().str.lower()
+        if company_name.lower() in saved_names.values:
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Session-state helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -836,12 +886,15 @@ def ss_set(**kwargs):
         st.session_state[k] = v
 
 
-def reset_processing():
+def reset_processing(clear_autosave: bool = False):
+    if clear_autosave:
+        autosave_clear()
     ss_set(
         processing=False, stop_requested=False,
         process_index=0, results=[], debug_records=[],
         enrichment_done=False, df_enriched=None,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
+        autosave_last_name="",
     )
 
 
@@ -911,6 +964,28 @@ with st.sidebar:
         value=False,
         help="Shows per-row JSON responses, cache tools, and additional downloads.",
     )
+
+    # ── Auto-save status ──────────────────────────────────────────────────────
+    _last_name = ss("autosave_last_name", "")
+    if ss("processing", False) and _last_name:
+        st.divider()
+        st.caption(f"💾 Auto-save active — last saved: **{_last_name}**")
+    elif os.path.exists(AUTOSAVE_PATH):
+        _saved_df = autosave_load()
+        if _saved_df is not None:
+            st.divider()
+            st.info(
+                f"⚠️ Interrupted session found — "
+                f"**{len(_saved_df)}** companies already processed."
+            )
+            _rb, _fb = st.columns(2)
+            if _rb.button("▶ Resume", use_container_width=True, key="resume_btn"):
+                ss_set(_resume_mode=True)
+                st.rerun()
+            if _fb.button("✕ Start fresh", use_container_width=True, key="fresh_btn"):
+                autosave_clear()
+                ss_set(_resume_mode=False)
+                st.rerun()
 
     if debug_mode:
         st.divider()
@@ -1089,7 +1164,10 @@ start_btn = st.button(
 )
 
 if start_btn and not blocking and not currently_processing:
-    df_work = df_raw.head(n_to_process).copy()
+    df_work      = df_raw.head(n_to_process).copy()
+    resume_mode  = ss("_resume_mode", False)
+    if not resume_mode:
+        autosave_clear()   # wipe any previous autosave on a fresh start
     ss_set(
         processing=True, stop_requested=False,
         process_index=0, results=[], debug_records=[],
@@ -1097,6 +1175,7 @@ if start_btn and not blocking and not currently_processing:
         _df_work=df_work, _name_col=name_col, _domain_col=domain_col,
         _n_to_process=n_to_process, _api_key=api_key, _delay=delay_sec,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
+        _resume_mode=resume_mode, autosave_last_name="",
     )
     st.rerun()
 
@@ -1137,12 +1216,32 @@ if ss("processing", False):
     mc4.metric("Errors",          cnt_error)
     mc5.metric("Est. cost",       f"${total_cost:.4f}")
 
+    _resume_mode = ss("_resume_mode", False)
+    _saved_df    = autosave_load() if _resume_mode else None
+
     if ss("stop_requested", False) or idx >= _n:
         build_and_finish(results, debug_records, df_work)
     else:
-        row          = df_work.iloc[idx]
-        company_name = str(row.get(_name_col, "")).strip()
-        raw_url      = str(row.get(_domain_col, "")).strip() if _domain_col else ""
+        input_row    = df_work.iloc[idx]
+        company_name = str(input_row.get(_name_col, "")).strip()
+        raw_url      = str(input_row.get(_domain_col, "")).strip() if _domain_col else ""
+
+        # ── Resume: skip rows already in autosave ─────────────────────────────
+        if _resume_mode and autosave_already_done(
+            _saved_df, _name_col, _domain_col, company_name, raw_url
+        ):
+            st.caption(
+                f"⏭ Skipping row {idx + 1} / {_n}: "
+                f"**{company_name or '(empty)'}** — already in autosave"
+            )
+            # Represent the skipped row with a minimal placeholder so build_and_finish
+            # still has the right row count; the full data lives in the autosave CSV.
+            skip_fields = {f: "" for f in ALL_ENRICHMENT_FIELDS}
+            skip_fields["enrichment_status"] = "skipped_resume"
+            results.append(skip_fields)
+            debug_records.append({"input_company_name": company_name, "skipped": True})
+            ss_set(results=results, debug_records=debug_records, process_index=idx + 1)
+            st.rerun()
 
         with st.status(
             f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}**",
@@ -1150,8 +1249,8 @@ if ss("processing", False):
         ) as status_box:
             status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
             fields, dbg = enrich_one_row(company_name, raw_url, _api_key, _delay)
-            s1_tok = int(fields.get("step1_tokens_in", 0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
-            s2_tok = int(fields.get("step2_tokens_in", 0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
+            s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
+            s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
             row_cost = float(fields.get("total_cost_usd", 0) or 0)
             status_box.write(
                 f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
@@ -1160,6 +1259,13 @@ if ss("processing", False):
 
         results.append(fields)
         debug_records.append(dbg)
+
+        # ── Auto-save ─────────────────────────────────────────────────────────
+        try:
+            autosave_append(fields, input_row)
+            ss_set(autosave_last_name=company_name or raw_url or f"row {idx + 1}")
+        except Exception:
+            pass  # never let autosave failure abort processing
 
         try:
             total_in   += int(fields.get("total_tokens_in",  0) or 0)
@@ -1395,5 +1501,5 @@ if ss("enrichment_done", False):
     # ── Restart ───────────────────────────────────────────────────────────────
     st.divider()
     if st.button("↺ Start a new enrichment", use_container_width=True, key="restart_btn"):
-        reset_processing()
+        reset_processing(clear_autosave=True)
         st.rerun()
