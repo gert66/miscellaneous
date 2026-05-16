@@ -15,7 +15,7 @@ import streamlit as st
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-5"
+MODEL = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = (
     "You are a company research assistant. Use web search to find information "
