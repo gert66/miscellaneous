@@ -95,6 +95,8 @@ def fetch_page_with_metadata(url: str) -> dict:
         "og_tags_found": False,
         "linkedin_link_found": False,
         "careers_link_found": False,
+        "page_title": "",
+        "schema_org_found": False,
     }
     try:
         headers = {"User-Agent": _ELM_UA}
@@ -134,6 +136,12 @@ def fetch_page_with_metadata(url: str) -> dict:
             for tag in soup.find_all("a", href=True)
         )
 
+        page_title = soup.title.string.strip() if soup.title else ""
+
+        schema_org_found = bool(
+            soup.find("script", attrs={"type": "application/ld+json"})
+        )
+
         # ── Body text extraction ──────────────────────────────────────────────
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
@@ -148,6 +156,8 @@ def fetch_page_with_metadata(url: str) -> dict:
             "og_tags_found": og_tags_found,
             "linkedin_link_found": linkedin_link_found,
             "careers_link_found": careers_link_found,
+            "page_title": page_title,
+            "schema_org_found": schema_org_found,
         }
     except Exception:
         return empty
@@ -218,6 +228,8 @@ def fetch_company_enhanced(base_url: str, domain: str) -> dict:
                     "og_tags_found": result["og_tags_found"],
                     "linkedin_link_found": result["linkedin_link_found"],
                     "careers_link_found": result["careers_link_found"],
+                    "page_title": result["page_title"],
+                    "schema_org_found": result["schema_org_found"],
                 }
         else:
             failed.append(f"{label}({result['status_code']})")
@@ -282,6 +294,27 @@ def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
     else:
         fetch_status = "ok"
 
+    # ── Website data-quality score ────────────────────────────────────────────
+    website_access_ok    = fetch_status == "ok"
+    about_page_found     = any(s in fetched for s in ["/about", "/about-us"])
+    careers_page_found   = any(s in fetched for s in ["/careers", "/jobs"])
+    meta_desc_found      = bool(metadata.get("meta_description_found", False))
+    og_found             = bool(metadata.get("og_tags_found", False))
+    sitemap_found_flag   = bool(metadata.get("sitemap_found", False))
+    linkedin_found       = bool(metadata.get("linkedin_link_found", False))
+
+    website_data_quality_score = (
+        3 * int(website_access_ok)
+        + 2 * int(about_page_found)
+        + 1 * int(careers_page_found)
+        + 1 * int(meta_desc_found)
+        + 1 * int(og_found)
+        + 1 * int(sitemap_found_flag)
+        + 1 * int(linkedin_found)
+    )
+    data_found     = website_data_quality_score >= 3
+    metadata_found = meta_desc_found or og_found
+
     # ── Language-complexity score ─────────────────────────────────────────────
     n = len(metadata.get("hreflang_langs", []))
     if n == 0:
@@ -340,6 +373,13 @@ def extract_signals_enhanced(pages: dict, metadata: dict) -> dict:
         # Sitemap
         "elm_sitemap_found":              metadata.get("sitemap_found", False),
         "elm_sitemap_relevant_paths":     metadata.get("sitemap_relevant_paths", ""),
+        # Page identity
+        "elm_page_title":                 metadata.get("page_title", ""),
+        "elm_schema_org_found":           metadata.get("schema_org_found", False),
+        # Data quality
+        "elm_website_data_quality_score": website_data_quality_score,
+        "elm_data_found":                 data_found,
+        "elm_metadata_found":             metadata_found,
     }
 
 
