@@ -15,7 +15,15 @@ Only utility functions and constants are imported from the original file;
 the fetch/extract/enrich pipeline is fully re-implemented here.
 """
 
+import argparse
 import re
+import sys
+import time
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -382,20 +390,125 @@ def enrich_one_row_enhanced(company_name: str, raw_url: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick smoke-test
+# CLI helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NAME_HINTS = ["company", "account", "name", "naam", "bedrijf"]
+_URL_HINTS  = ["domain", "website", "url", "web", "site"]
+
+
+def detect_columns(df: pd.DataFrame):
+    """Return (name_col, url_col) by fuzzy-matching column headers."""
+    def best_match(hints, columns):
+        best_col, best_ratio = None, 0.0
+        for col in columns:
+            col_lower = col.lower()
+            for hint in hints:
+                ratio = SequenceMatcher(None, hint, col_lower).ratio()
+                if ratio > best_ratio:
+                    best_ratio, best_col = ratio, col
+        return best_col if best_ratio >= 0.45 else None
+
+    cols = list(df.columns)
+    return best_match(_NAME_HINTS, cols), best_match(_URL_HINTS, cols)
+
+
+def process_csv(
+    filepath: str,
+    list_type: str,
+    name_col,
+    url_col,
+    delay: float,
+) -> pd.DataFrame:
+    """Enrich every row in a CSV file. Returns a DataFrame with ELM fields appended."""
+    df = pd.read_csv(filepath)
+
+    if name_col is None or url_col is None:
+        auto_name, auto_url = detect_columns(df)
+        name_col = name_col or auto_name
+        url_col  = url_col  or auto_url
+
+    if name_col is None:
+        raise ValueError(
+            f"Could not detect a company-name column in {filepath}. "
+            "Pass --name-col explicitly."
+        )
+    if url_col is None:
+        raise ValueError(
+            f"Could not detect a URL column in {filepath}. "
+            "Pass --url-col explicitly."
+        )
+
+    total = len(df)
+    records = []
+
+    try:
+        for i, row in enumerate(df.itertuples(index=False), start=1):
+            company = str(getattr(row, name_col, "") or "")
+            raw_url = str(getattr(row, url_col,  "") or "")
+
+            signals, _ = enrich_one_row_enhanced(company, raw_url)
+            status_label = signals.get("elm_fetch_status", "failed")
+            print(f"[{i:>4}/{total}] {company[:50]:<50} — {status_label}")
+
+            combined = {col: getattr(row, col) for col in df.columns}
+            combined.update(signals)
+            combined["list_type"] = list_type
+            records.append(combined)
+
+            if i < total:
+                time.sleep(delay)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving partial results…")
+
+    return pd.DataFrame(records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    result, debug = enrich_one_row_enhanced("Test Company", "https://www.example.com")
-    import json
-    print(json.dumps(result, indent=2))
-    new_fields = [
-        "elm_kw_workforce",
-        "elm_score_workforce",
-        "elm_sector_cluster",
-        "elm_sitemap_found",
-        "elm_sitemap_relevant_paths",
-    ]
-    print("\n--- New fields ---")
-    for f in new_fields:
-        print(f"  {f}: {result.get(f)}")
+    parser = argparse.ArgumentParser(
+        description="ELM Enhanced — enrich customer and prospect CSV lists"
+    )
+    parser.add_argument("--customers",  required=True, help="Path to customers CSV")
+    parser.add_argument("--prospects",  required=True, help="Path to prospects CSV")
+    parser.add_argument("--output",     default="./output", help="Output directory (default: ./output)")
+    parser.add_argument("--name-col",   default=None, help="Column name for company name")
+    parser.add_argument("--url-col",    default=None, help="Column name for URL/domain")
+    parser.add_argument("--delay",      type=float, default=1.5, help="Seconds between requests (default: 1.5)")
+    args = parser.parse_args()
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.time()
+
+    print(f"\n=== Processing customers: {args.customers} ===")
+    df_customers = process_csv(
+        args.customers, "customer", args.name_col, args.url_col, args.delay
+    )
+
+    print(f"\n=== Processing prospects: {args.prospects} ===")
+    df_prospects = process_csv(
+        args.prospects, "prospect", args.name_col, args.url_col, args.delay
+    )
+
+    df_all = pd.concat([df_customers, df_prospects], ignore_index=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    out_path = out_dir / f"enriched_{timestamp}.csv"
+    df_all.to_csv(out_path, index=False)
+
+    elapsed = time.time() - t0
+    n_failed = (df_all.get("elm_fetch_status", pd.Series()) == "failed").sum()
+
+    print(f"\n{'='*55}")
+    print(f"  Customers : {len(df_customers)}")
+    print(f"  Prospects : {len(df_prospects)}")
+    print(f"  Failed    : {n_failed}")
+    print(f"  Elapsed   : {elapsed:.1f}s")
+    print(f"  Output    : {out_path}")
+    print(f"{'='*55}")
