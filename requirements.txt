@@ -6,3 +6,5 @@ scikit-learn
 streamlit
 requests
 beautifulsoup4
+selenium
+webdriver-manager
