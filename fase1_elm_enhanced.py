@@ -10,13 +10,12 @@ Extends the ELM pipeline from enrich_clients_claude.py with:
 - A language-complexity score derived from the above
 - Sitemap scan for relevant company paths
 - Workforce keyword signals and sector-cluster detection
-
-Only utility functions and constants are imported from the original file;
-the fetch/extract/enrich pipeline is fully re-implemented here.
 """
 
+import json
 import re
 import time
+import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -26,25 +25,115 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-from enrich_clients_claude import (
-    clean_domain,
-    normalize_url,
-    load_cache,
-    save_cache,
-    _ELM_SLUGS,
-    _ELM_UA,
-    _ELM_KW_INTERNATIONAL,
-    _ELM_KW_LANGUAGES,
-    _ELM_KW_HIRING,
-    _ELM_KW_GROWTH,
-    _ELM_KW_TRAINING,
-    _ELM_KW_OFFICES,
-    _ELM_KW_TECHNOLOGY,
-    _ELM_COUNTRIES,
-    _elm_count,
-    _elm_find,
-    _elm_score,
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants and utilities (copied from enrich_clients_claude.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CACHE_DIR = Path("claude_json_cache")
+
+
+def clean_domain(raw: str) -> str:
+    if not raw or not isinstance(raw, str):
+        return ""
+    d = raw.strip().lower()
+    d = re.sub(r"^https?://", "", d)
+    d = re.sub(r"^www\.", "", d)
+    d = d.split("/")[0].strip()
+    return "" if d in {"nan", "none", ""} or " " in d else d
+
+
+def normalize_url(raw: str) -> str:
+    if not raw or not isinstance(raw, str):
+        return ""
+    raw = raw.strip()
+    if raw.lower() in {"nan", "none", ""} or " " in raw:
+        return ""
+    return raw if raw.startswith(("http://", "https://")) else f"https://{raw}"
+
+
+def safe_filename(text: str) -> str:
+    text = unicodedata.normalize("NFKD", str(text))
+    text = re.sub(r"[^\w\s\-.]", "", text)
+    text = re.sub(r"\s+", "_", text).strip("_")
+    return text[:120] or "unknown"
+
+
+def load_cache(cache_key: str):
+    path = CACHE_DIR / f"{safe_filename(cache_key)}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def save_cache(cache_key: str, data: dict) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    (CACHE_DIR / f"{safe_filename(cache_key)}.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+_ELM_SLUGS = ["", "/about", "/about-us", "/careers", "/jobs", "/locations", "/contact"]
+
+_ELM_UA = "Mozilla/5.0 (compatible; CompanyResearchBot/1.0)"
+
+_ELM_KW_INTERNATIONAL = [
+    "international", "global", "worldwide", "multinational", "cross-border",
+    "offices in", "presence in", "emea", "apac", "latam", "global team",
+    "international team", "countries", "regions",
+]
+_ELM_KW_LANGUAGES = [
+    "english", "french", "german", "spanish", "portuguese", "dutch", "italian",
+    "chinese", "mandarin", "japanese", "korean", "arabic", "russian", "polish",
+    "turkish", "swedish", "norwegian", "danish", "finnish", "hebrew",
+]
+_ELM_KW_HIRING = [
+    "careers", "jobs", "hiring", "join us", "join our team", "open positions",
+    "vacancies", "we're growing", "recruitment", "apply now", "job openings",
+    "we are hiring", "current openings",
+]
+_ELM_KW_GROWTH = [
+    "funding", "raised", "series a", "series b", "series c", "ipo",
+    "acquisition", "acquired", "merger", "expansion", "hypergrowth",
+    "fast-growing", "scaling",
+]
+_ELM_KW_TRAINING = [
+    "training", "learning", "development", "upskilling", "reskilling",
+    "e-learning", "coaching", "mentoring", "academy", "bootcamp",
+    "certification", "corporate training", "language training",
+]
+_ELM_KW_OFFICES = [
+    "offices", "headquarters", "locations", "branches", "regional office",
+    "hub", "campus", "sites", "hq",
+]
+_ELM_KW_TECHNOLOGY = [
+    "saas", "cloud", "platform", "software", "machine learning", "artificial intelligence",
+    "automation", "digital", "engineering", "devops", "api", "data-driven",
+]
+_ELM_COUNTRIES = [
+    "united states", "usa", "united kingdom", "uk", "germany", "france",
+    "netherlands", "spain", "italy", "portugal", "belgium", "switzerland",
+    "sweden", "norway", "denmark", "finland", "poland", "czech republic",
+    "australia", "canada", "india", "china", "japan", "singapore", "brazil",
+    "mexico", "south africa", "uae", "israel", "ireland", "austria",
+]
+
+
+def _elm_count(text: str, keywords: list) -> int:
+    tl = text.lower()
+    return sum(1 for kw in keywords if kw in tl)
+
+
+def _elm_find(text: str, keywords: list) -> list:
+    tl = text.lower()
+    return [kw for kw in keywords if kw in tl]
+
+
+def _elm_score(count: int, per_point: float = 2.0) -> int:
+    """Convert raw keyword count to 0–10 score."""
+    return min(round(count / per_point * 10), 10)
 
 
 _ELM_KW_WORKFORCE = [
