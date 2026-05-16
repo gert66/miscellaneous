@@ -560,30 +560,22 @@ st.caption(
 uploaded_file = st.file_uploader(
     "Upload your CSV or Excel file",
     type=["csv", "xlsx"],
-    key="elm2_file_uploader",
+    key="elm2_file_uploader"
 )
 
-current_filename = st.session_state.get("uploaded_filename")
-
-if uploaded_file is not None and uploaded_file.name != current_filename:
-    try:
-        if uploaded_file.name.lower().endswith(".xlsx"):
-            df_new = pd.read_excel(uploaded_file)
-        else:
-            df_new = pd.read_csv(uploaded_file)
-        st.session_state.uploaded_df = df_new
-        st.session_state.uploaded_filename = uploaded_file.name
-        _reset_run()
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Could not read file: {exc}")
-        st.session_state.uploaded_df = None
-        st.session_state.uploaded_filename = None
-
-elif uploaded_file is None and current_filename is not None:
-    st.session_state.uploaded_df = None
-    st.session_state.uploaded_filename = None
-    _reset_run()
+if uploaded_file is not None:
+    current = st.session_state.get("uploaded_filename")
+    if uploaded_file.name != current:
+        try:
+            if uploaded_file.name.lower().endswith(".xlsx"):
+                df_new = pd.read_excel(uploaded_file)
+            else:
+                df_new = pd.read_csv(uploaded_file)
+            st.session_state["uploaded_df"] = df_new
+            st.session_state["uploaded_filename"] = uploaded_file.name
+            _reset_run()
+        except Exception as exc:
+            st.error(f"Could not read file: {exc}")
 
 df_raw = st.session_state.get("uploaded_df", None)
 
