@@ -47,69 +47,32 @@ FIELD_LABELS = {
 
 def search_company_info(url: str) -> dict:
     """
-    Ask Claude (with web search) to find company info for the given URL.
-    Runs the agentic loop until stop_reason is end_turn, then parses JSON.
+    Single-turn API call with web_search enabled. Claude searches autonomously
+    and returns a text response; we extract the JSON from the text blocks.
     """
     client = anthropic.Anthropic()
 
-    messages: list[dict] = [
-        {
-            "role": "user",
-            "content": (
-                f"Research the company at {url}. Use web search to explore the website "
-                "thoroughly — including any about, team, or contact pages you find. "
-                "Find the founder or key person behind the company, a description of what "
-                "they do, their address, phone, and email. Return ONLY a JSON object with "
-                "fields: founder, description, address, phone, email, and for each a "
-                "source_text field showing where you found it."
-            ),
-        }
-    ]
-
-    # Agentic loop — continues while Claude is still using tools
-    while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=[WEB_SEARCH_TOOL],
-            messages=messages,
-        )
-
-        if response.stop_reason == "end_turn":
-            break
-
-        # Append assistant turn and provide empty tool_results so the loop
-        # continues. The web_search tool is server-side, so Anthropic populates
-        # the search results automatically on the next turn.
-        messages.append({"role": "assistant", "content": response.content})
-        tool_results = [
-            {"type": "tool_result", "tool_use_id": block.id, "content": ""}
-            for block in response.content
-            if hasattr(block, "type") and block.type == "tool_use"
-        ]
-        if not tool_results:
-            break
-        messages.append({"role": "user", "content": tool_results})
-
-    result = _parse_json_from_response(response.content)
-    if result is not None:
-        return result
-
-    # Ask Claude again with a stricter prompt
-    messages.append({"role": "assistant", "content": response.content})
-    messages.append({
-        "role": "user",
-        "content": "Reply with ONLY a raw JSON object, no explanation, no markdown, no backticks.",
-    })
-    retry = client.messages.create(
+    response = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[WEB_SEARCH_TOOL],
-        messages=messages,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Research the company at {url}. Use web search to explore the website "
+                    "thoroughly — including any about, team, or contact pages you find. "
+                    "Find the founder or key person behind the company, a description of what "
+                    "they do, their address, phone, and email. Return ONLY a JSON object with "
+                    "fields: founder, description, address, phone, email, and for each a "
+                    "source_text field showing where you found it."
+                ),
+            }
+        ],
     )
-    result = _parse_json_from_response(retry.content)
+
+    result = _parse_json_from_response(response.content)
     if result is not None:
         return result
     raise json.JSONDecodeError("No JSON object found in Claude's response", "", 0)
