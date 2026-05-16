@@ -26,34 +26,40 @@ SYSTEM_PROMPT = (
     '  "name": "Full legal company name",\n'
     '  "description": "What the company does (1-2 sentences)",\n'
     '  "domain": "Primary website domain, e.g. example.com",\n'
-    '  "employees": "Employee count range, e.g. 11-50",\n'
+    '  "employees": "Employee count range exactly as Lusha shows it, e.g. 11-50, 51-200, 201-500, 501-1000, 1001-5000",\n'
+    '  "employeesInLinkedin": "Exact follower or employee count shown on LinkedIn, e.g. 312 or null",\n'
     '  "founded": "Year founded, e.g. 2012",\n'
-    '  "mainIndustry": "Top-level industry, e.g. Technology",\n'
-    '  "subIndustry": "More specific category, e.g. SaaS / HR Tech",\n'
-    '  "companyType": "One of: Public Company, Private, Startup, Non-Profit, Government",\n'
-    '  "address": "Full headquarters street address if available",\n'
+    '  "mainIndustry": "Lusha-style industry: one of Education, Manufacturing, Finance, Healthcare, Retail, Technology, Legal, Real Estate, Media, Transportation, Construction, Non-Profit, Government — pick the closest match",\n'
+    '  "subIndustry": "More specific category within that industry",\n'
+    '  "companyType": "One of: Public Company, Private Company, Startup, Non-Profit, Government",\n'
+    '  "revenueRange": "Estimated annual revenue range, e.g. $1M-$10M or null",\n'
+    '  "specialities": ["keyword1", "keyword2"],\n'
+    '  "address": "Full street address including street name, number, and postcode — search LinkedIn About, Google Maps, or the company contact page",\n'
     '  "location": {"city": "...", "state": "...", "country": "..."},\n'
     '  "website": "Full URL, e.g. https://example.com",\n'
     '  "linkedin": "LinkedIn company page URL or null"\n'
     '}\n'
-    "Set any unknown field to null."
+    "Set any unknown field to null. specialities must be a JSON array, never a string."
 )
 
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
 FIELDS = [
-    ("name",        "Company Name"),
-    ("description", "Description"),
-    ("domain",      "Domain"),
-    ("website",     "Website"),
-    ("linkedin",    "LinkedIn"),
-    ("employees",   "Employees"),
-    ("founded",     "Founded"),
-    ("mainIndustry","Industry"),
-    ("subIndustry", "Sub-Industry"),
-    ("companyType", "Company Type"),
-    ("address",     "Address"),
-    ("location",    "Location"),
+    ("name",                "Company Name"),
+    ("description",         "Description"),
+    ("domain",              "Domain"),
+    ("website",             "Website"),
+    ("linkedin",            "LinkedIn"),
+    ("employees",           "Employees"),
+    ("employeesInLinkedin", "LinkedIn Employees"),
+    ("founded",             "Founded"),
+    ("mainIndustry",        "Industry"),
+    ("subIndustry",         "Sub-Industry"),
+    ("companyType",         "Company Type"),
+    ("revenueRange",        "Revenue Range"),
+    ("specialities",        "Specialities"),
+    ("address",             "Address"),
+    ("location",            "Location"),
 ]
 
 
@@ -75,10 +81,14 @@ def lookup_company(query: str) -> tuple[dict, anthropic.types.Usage]:
                 "role": "user",
                 "content": (
                     f"Look up the company at or associated with: {query}\n"
-                    "Search for their official website, LinkedIn page, Crunchbase profile, "
-                    "or any reliable source to find: company name, description, industry, "
-                    "employee count, founding year, headquarters location, company type, "
-                    "and LinkedIn URL. Return ONLY the JSON object."
+                    "Search their LinkedIn company page, Crunchbase profile, official website "
+                    "contact/about page, and Google Maps listing to find:\n"
+                    "- Exact employee count range (use Lusha ranges: 11-50, 51-200, 201-500, etc.)\n"
+                    "- Exact LinkedIn employee/follower count\n"
+                    "- Industry using Lusha categories (Education, Manufacturing, Finance, etc.)\n"
+                    "- Full street address with street name, number, and postcode\n"
+                    "- Revenue range, specialities keywords, and company type.\n"
+                    "Return ONLY the JSON object."
                 ),
             }
         ],
@@ -145,9 +155,17 @@ def render_results(info: dict) -> None:
         st.markdown("**Founded**")
         st.write(info.get("founded") or "—")
 
+        st.markdown("**Company Type**")
+        st.write(info.get("companyType") or "—")
+
+        st.markdown("**Revenue Range**")
+        st.write(info.get("revenueRange") or "—")
+
     with col_b:
         st.markdown("**Employees**")
-        st.write(info.get("employees") or "—")
+        emp = info.get("employees") or "—"
+        emp_li = info.get("employeesInLinkedin")
+        st.write(f"{emp}" + (f" ({emp_li} on LinkedIn)" if emp_li else ""))
 
         st.markdown("**Industry**")
         main = info.get("mainIndustry") or "—"
@@ -159,6 +177,11 @@ def render_results(info: dict) -> None:
 
         st.markdown("**Address**")
         st.write(info.get("address") or "—")
+
+    specialities = info.get("specialities")
+    if specialities and isinstance(specialities, list):
+        st.markdown("**Specialities**")
+        st.write(" · ".join(specialities))
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
