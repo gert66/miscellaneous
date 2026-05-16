@@ -46,10 +46,14 @@ _COST_OUTPUT_PER_M = 4.00
 
 # Step 1 extraction prompt
 _STEP1_PROMPT = (
-    "Extract company information from this webpage. "
-    "Return ONLY raw JSON (no markdown, no code fences) with exactly these fields: "
-    "company_name, description, main_industry, sub_industry, employee_range, "
-    "revenue_range, founded_year, company_type, country, city, linkedin_url, specialties. "
+    "Extract company information from this webpage content. "
+    "Return ONLY a raw JSON object with these exact fields: "
+    "company_name, domain, description, founded_year, employee_range, revenue_range, "
+    "main_industry, sub_industry, company_type, country, city, continent, "
+    "linkedin_url, specialties (as comma-separated string), "
+    "technologies (as comma-separated string), "
+    "total_funding_amount, total_funding_rounds, last_round_type, last_round_amount, "
+    "last_round_date, ipo_status. "
     "Use empty string for any field not found."
 )
 
@@ -73,21 +77,29 @@ _STEP2_PROMPT_TMPL = (
 
 # ── Field lists ───────────────────────────────────────────────────────────────
 
-# Step 1: basic firmographics (same schema as original Lusha app for download compatibility)
+# Step 1: full Lusha-equivalent firmographics
 STEP1_FIELDS = [
     "lusha_company_name",
     "lusha_domain",
-    "lusha_industry",
-    "lusha_sub_industry",
+    "lusha_description",
+    "lusha_founded_year",
     "lusha_employee_range",
     "lusha_revenue",
-    "lusha_description",
-    "lusha_linkedin_url",
-    "lusha_specialties",
-    "lusha_founded_year",
+    "lusha_industry",
+    "lusha_sub_industry",
     "lusha_company_type",
     "lusha_country",
     "lusha_city",
+    "lusha_continent",
+    "lusha_linkedin_url",
+    "lusha_specialties",
+    "lusha_technologies",
+    "lusha_total_funding_amount",
+    "lusha_total_funding_rounds",
+    "lusha_last_round_type",
+    "lusha_last_round_amount",
+    "lusha_last_round_date",
+    "lusha_ipo_status",
 ]
 
 # Step 2: Mingle ICP signals
@@ -368,22 +380,37 @@ def _claude_extract(webpage_text: str, api_key: str) -> tuple:
 
 def _map_step1_fields(raw: dict, source_url: str) -> dict:
     domain  = clean_domain(source_url) if source_url else ""
-    country = str(raw.get("country") or "").strip()
-    city    = str(raw.get("city")    or "").strip()
+    # Prefer the domain Claude extracted over the source URL when available
+    if not domain:
+        domain = clean_domain(str(raw.get("domain") or ""))
+    country = str(raw.get("country")   or "").strip()
+    city    = str(raw.get("city")      or "").strip()
+
+    def s(key):
+        return str(raw.get(key) or "").strip()
+
     return {
-        "lusha_company_name": str(raw.get("company_name")  or "").strip(),
-        "lusha_domain":       domain,
-        "lusha_industry":     str(raw.get("main_industry") or "").strip(),
-        "lusha_sub_industry": str(raw.get("sub_industry")  or "").strip(),
-        "lusha_employee_range": str(raw.get("employee_range") or "").strip(),
-        "lusha_revenue":      str(raw.get("revenue_range") or "").strip(),
-        "lusha_description":  str(raw.get("description")   or "").strip(),
-        "lusha_linkedin_url": str(raw.get("linkedin_url")  or "").strip(),
-        "lusha_specialties":  str(raw.get("specialties")   or "").strip(),
-        "lusha_founded_year": str(raw.get("founded_year")  or "").strip(),
-        "lusha_company_type": str(raw.get("company_type")  or "").strip(),
-        "lusha_country":      country,
-        "lusha_city":         city,
+        "lusha_company_name":         s("company_name"),
+        "lusha_domain":               domain,
+        "lusha_description":          s("description"),
+        "lusha_founded_year":         s("founded_year"),
+        "lusha_employee_range":       s("employee_range"),
+        "lusha_revenue":              s("revenue_range"),
+        "lusha_industry":             s("main_industry"),
+        "lusha_sub_industry":         s("sub_industry"),
+        "lusha_company_type":         s("company_type"),
+        "lusha_country":              country,
+        "lusha_city":                 city,
+        "lusha_continent":            s("continent"),
+        "lusha_linkedin_url":         s("linkedin_url"),
+        "lusha_specialties":          s("specialties"),
+        "lusha_technologies":         s("technologies"),
+        "lusha_total_funding_amount": s("total_funding_amount"),
+        "lusha_total_funding_rounds": s("total_funding_rounds"),
+        "lusha_last_round_type":      s("last_round_type"),
+        "lusha_last_round_amount":    s("last_round_amount"),
+        "lusha_last_round_date":      s("last_round_date"),
+        "lusha_ipo_status":           s("ipo_status"),
     }
 
 
@@ -1198,14 +1225,20 @@ if ss("enrichment_done", False):
             # Metadata
             "enrichment_status", "step1_status", "step2_status",
             "needs_manual_review", "match_notes",
-            # Step 1 — basic firmographics
-            "lusha_company_name", "lusha_domain", "lusha_industry",
-            "lusha_country", "lusha_employee_range", "lusha_revenue",
+            # Step 1 — firmographics
+            "lusha_company_name", "lusha_domain", "lusha_industry", "lusha_sub_industry",
+            "lusha_company_type", "lusha_employee_range", "lusha_revenue",
+            "lusha_country", "lusha_city", "lusha_continent",
+            "lusha_founded_year", "lusha_description",
+            "lusha_linkedin_url", "lusha_specialties", "lusha_technologies",
+            "lusha_total_funding_amount", "lusha_total_funding_rounds",
+            "lusha_last_round_type", "lusha_last_round_amount", "lusha_last_round_date",
+            "lusha_ipo_status",
             # Step 2 — ICP signals
             "icp_language_training_fit_score",
             "icp_international_presence", "icp_languages_mentioned",
-            "icp_hiring_activity", "icp_recent_funding", "icp_global_team_signals",
-            "icp_training_signals", "icp_multi_office",
+            "icp_hiring_activity", "icp_recent_funding", "icp_recent_news",
+            "icp_global_team_signals", "icp_training_signals", "icp_multi_office",
             # Cost
             "total_tokens_in", "total_tokens_out", "total_cost_usd",
             "error_message",
