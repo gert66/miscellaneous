@@ -55,21 +55,17 @@ def search_company_info(url: str) -> tuple[dict, anthropic.types.Usage]:
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=1000,
         system=SYSTEM_PROMPT,
         tools=[WEB_SEARCH_TOOL],
         messages=[
             {
                 "role": "user",
                 "content": (
-                    f'Search for information about the company at {url}. '
-                    f'You MUST search specifically for the founder or creator. '
-                    f'Search for: "{url} founder", "{url} about us", "{url} team". '
-                    f'The founder is a person\'s name that appears near words like '
-                    f'founder, creator, CEO, or director. '
-                    f'Return ONLY a raw JSON object with no markdown, no backticks, '
-                    f'just pure JSON with fields: founder, description, address, phone, email, '
-                    f'each with a source_text field.'
+                    f"Please read the content at {url} and also at {url}/about-us. "
+                    f"Extract the founder name, description, address, phone and email. "
+                    f"Do NOT search Google or any search engine — only visit the exact URLs provided. "
+                    f"Return ONLY raw JSON."
                 ),
             }
         ],
