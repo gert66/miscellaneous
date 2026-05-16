@@ -1,5 +1,5 @@
 # Install dependencies:
-#   pip install streamlit anthropic
+#   pip install streamlit requests anthropic
 #
 # Set your API key:
 #   export ANTHROPIC_API_KEY=your-key-here
@@ -11,6 +11,7 @@ import json
 import re
 
 import anthropic
+import requests
 import streamlit as st
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -18,20 +19,20 @@ import streamlit as st
 MODEL = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = (
-    "You are a company research assistant. Use web search to find information "
-    "about the company at the given URL. Extract: founder name, company description, "
-    "address, phone number, and email address. "
-    "Return ONLY a JSON object with this exact structure — no prose, no markdown fences:\n"
-    '{"founder": {"value": "...", "source_url": "..."},\n'
-    ' "description": {"value": "...", "source_url": "..."},\n'
-    ' "address": {"value": "...", "source_url": "..."},\n'
-    ' "phone": {"value": "...", "source_url": "..."},\n'
-    ' "email": {"value": "...", "source_url": "..."}}\n'
-    "Set value to null for any field you cannot find. "
-    "source_url should be the page where you found the information."
+    "You are a company research assistant. Extract information from the provided "
+    "website text. Return ONLY a raw JSON object with no markdown and no backticks, "
+    "using this exact structure:\n"
+    '{"founder": {"value": "...", "source_text": "..."},\n'
+    ' "description": {"value": "...", "source_text": "..."},\n'
+    ' "address": {"value": "...", "source_text": "..."},\n'
+    ' "phone": {"value": "...", "source_text": "..."},\n'
+    ' "email": {"value": "...", "source_text": "..."}}\n'
+    "Set both sub-fields to null for any field you cannot find. "
+    "source_text should be the exact sentence or phrase where you found the value."
 )
 
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+JINA_BASE = "https://r.jina.ai/"
+MAX_CONTENT_CHARS = 40_000
 
 FIELDS = ["founder", "description", "address", "phone", "email"]
 FIELD_LABELS = {
@@ -43,29 +44,48 @@ FIELD_LABELS = {
 }
 
 
-# ── Claude search + extraction ────────────────────────────────────────────────
+# ── Jina fetching ─────────────────────────────────────────────────────────────
 
-def search_company_info(url: str) -> tuple[dict, anthropic.types.Usage]:
+def fetch_jina(url: str) -> str | None:
+    """Fetch clean readable text for a URL via Jina Reader."""
+    try:
+        resp = requests.get(JINA_BASE + url, timeout=20)
+        resp.raise_for_status()
+        return resp.text[:MAX_CONTENT_CHARS]
+    except Exception:
+        return None
+
+
+# ── Claude extraction ─────────────────────────────────────────────────────────
+
+def extract_company_info(url: str) -> tuple[dict, anthropic.types.Usage]:
     """
-    Single-turn API call with web_search enabled. Claude searches autonomously
-    and returns a text response; we extract the JSON from the text blocks.
-    Returns the parsed info dict and the API usage object.
+    Fetch main page and /about-us via Jina, send combined text to Claude,
+    return parsed info dict and API usage.
     """
+    main_text = fetch_jina(url) or ""
+    about_text = fetch_jina(url.rstrip("/") + "/about-us") or ""
+
+    combined = ""
+    if main_text:
+        combined += f"=== Content from {url} ===\n{main_text}\n\n"
+    if about_text:
+        combined += f"=== Content from {url}/about-us ===\n{about_text}\n"
+
+    if not combined:
+        raise RuntimeError("Could not fetch any content from the provided URL.")
+
     client = anthropic.Anthropic()
-
     response = client.messages.create(
         model=MODEL,
         max_tokens=1000,
         system=SYSTEM_PROMPT,
-        tools=[WEB_SEARCH_TOOL],
         messages=[
             {
                 "role": "user",
                 "content": (
-                    f"Please read the content at {url} and also at {url}/about-us. "
-                    f"Extract the founder name, description, address, phone and email. "
-                    f"Do NOT search Google or any search engine — only visit the exact URLs provided. "
-                    f"Return ONLY raw JSON."
+                    f"Extract the founder name, description, address, phone, and email "
+                    f"from the following website content:\n\n{combined}"
                 ),
             }
         ],
@@ -82,8 +102,7 @@ def _parse_json_from_response(content: list) -> dict | None:
     for block in content:
         if not (hasattr(block, "type") and block.type == "text"):
             continue
-        text = block.text
-        obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+        obj_match = re.search(r"\{.*\}", block.text, re.DOTALL)
         if not obj_match:
             continue
         try:
@@ -97,7 +116,7 @@ def _parse_json_from_response(content: list) -> dict | None:
 
 def render_field(label: str, entry: dict) -> None:
     value = entry.get("value")
-    source_url = entry.get("source_url") or ""
+    source_text = entry.get("source_text") or ""
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -107,8 +126,8 @@ def render_field(label: str, entry: dict) -> None:
             st.markdown(f"**{label}:** *(not found)*")
     with col2:
         with st.expander("Source"):
-            if source_url:
-                st.markdown(f"[{source_url}]({source_url})")
+            if source_text:
+                st.code(source_text, language=None)
             else:
                 st.markdown("*(no source)*")
 
@@ -117,8 +136,8 @@ def render_field(label: str, entry: dict) -> None:
 
 st.title("Company Info Scraper")
 st.write(
-    "Enter a company website URL. Claude will use web search to find the "
-    "founder, description, address, phone, and email."
+    "Enter a company website URL. The page content is fetched via Jina Reader "
+    "and sent to Claude to extract structured company information."
 )
 
 url = st.text_input("Company Website URL", placeholder="https://example.com")
@@ -131,23 +150,29 @@ if st.button("Get Company Info"):
             url = "https://" + url
 
         try:
-            with st.spinner("Searching with Claude..."):
-                info, usage = search_company_info(url)
+            with st.spinner("Fetching content via Jina and extracting with Claude..."):
+                info, usage = extract_company_info(url)
 
             st.success("Done!")
 
             input_tokens = usage.input_tokens
             output_tokens = usage.output_tokens
             cost = (input_tokens / 1_000_000 * 3) + (output_tokens / 1_000_000 * 15)
-            st.caption(f"🔢 Tokens gebruikt: {input_tokens} input / {output_tokens} output | Geschatte kosten: ${cost:.4f}")
+            st.caption(
+                f"🔢 Tokens gebruikt: {input_tokens} input / {output_tokens} output"
+                f" | Geschatte kosten: ${cost:.4f}"
+            )
 
             st.header("Extracted Company Information")
             for field in FIELDS:
-                entry = info.get(field) or {"value": None, "source_url": None}
+                entry = info.get(field) or {"value": None, "source_text": None}
                 render_field(FIELD_LABELS[field], entry)
 
             if all(not (info.get(f) or {}).get("value") for f in FIELDS):
-                st.info("Claude could not find any of the requested fields for this company.")
+                st.info(
+                    "Claude could not find any of the requested fields. "
+                    "The site may block Jina Reader or not publish this information."
+                )
 
             with st.expander("Raw Claude JSON (debug)"):
                 st.json(info)
@@ -164,5 +189,7 @@ if st.button("Get Company Info"):
             )
         except anthropic.APIStatusError as e:
             st.error(f"Claude API error ({e.status_code}): {e.message}")
+        except RuntimeError as e:
+            st.error(str(e))
         except Exception as e:
             st.error(f"Something went wrong: {e}")
