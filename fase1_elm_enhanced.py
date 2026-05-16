@@ -585,11 +585,11 @@ elif uploaded_file is None and current_filename is not None:
     st.session_state.uploaded_filename = None
     _reset_run()
 
-df_raw: pd.DataFrame | None = st.session_state.uploaded_df
+df_raw = st.session_state.get("uploaded_df", None)
 
 if df_raw is not None:
     st.success(
-        f"**{st.session_state.uploaded_filename}** — "
+        f"**{st.session_state.get('uploaded_filename', '')}** — "
         f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
     st.dataframe(df_raw.head(), use_container_width=True)
