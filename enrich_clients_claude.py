@@ -139,6 +139,8 @@ _STATUS_LABELS = {
     "no_data":           "No data returned",
     "api_error":         "API error",
     "jina_error":        "Page fetch error",
+    "web_search_fallback": "Enriched via web search fallback",
+    "cached_fallback":   "From cache (web search fallback)",
 }
 
 
@@ -451,6 +453,63 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 1 fallback — web_search when Jina returns nothing
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STEP1_FALLBACK_PROMPT_TMPL = (
+    "Find company information about {company_name} ({url}). "
+    "Extract: industry, employee count, founding year, headquarters location, "
+    "description, international presence, specialties. "
+    "Return ONLY JSON with fields: company_name, description, main_industry, "
+    "sub_industry, employee_range, revenue_range, founded_year, company_type, "
+    "country, city, linkedin_url, specialties."
+)
+
+
+def run_step1_web_search_fallback(
+    company_name: str,
+    url: str,
+    api_key: str,
+) -> tuple:
+    """
+    Called when Jina fetching returns no usable data.
+    Uses Claude web_search to find basic firmographics directly.
+    Returns (step1_fields, raw_json, in_tok, out_tok, status, error_msg).
+    """
+    target = normalize_url(url) if url else company_name
+    if not target and not company_name:
+        return ({}, {}, 0, 0, "no_input", "No URL or company name for fallback")
+
+    ck = f"step1_fallback_{target or company_name}"
+    cached = load_cache(ck)
+    if cached is not None:
+        fields = _map_step1_fields(cached.get("claude_data", {}), url)
+        if _step1_has_data(fields):
+            in_t  = int(cached.get("tokens_in", 0) or 0)
+            out_t = int(cached.get("tokens_out", 0) or 0)
+            return (fields, cached, in_t, out_t, "cached_fallback", "")
+        _delete_cache(ck)
+
+    try:
+        prompt   = _STEP1_FALLBACK_PROMPT_TMPL.format(
+            company_name=company_name or target,
+            url=target or company_name,
+        )
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        raw_fields = _parse_json_response(raw_text)
+        payload    = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
+        save_cache(ck, payload)
+        fields = _map_step1_fields(raw_fields, url)
+        return (fields, payload, in_t, out_t, "web_search_fallback", "")
+    except (json.JSONDecodeError, ValueError) as e:
+        return ({}, {}, 0, 0, "parse_error", f"Fallback parse error: {e}")
+    except anthropic.APIError as e:
+        return ({}, {}, 0, 0, "api_error", f"Fallback Claude API: {e}")
+    except Exception as e:
+        return ({}, {}, 0, 0, "api_error", f"Fallback error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 2 — ICP signals via Claude web_search
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -622,8 +681,19 @@ def enrich_one_row(
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
         url, company_name, api_key, delay
     )
+    # ── Step 1 web_search fallback (fires when Jina returned no usable data) ──
+    if not _step1_has_data(s1_fields):
+        fb_fields, fb_raw, fb_in, fb_out, fb_status, fb_err = \
+            run_step1_web_search_fallback(company_name, url, api_key)
+        if _step1_has_data(fb_fields):
+            s1_fields, s1_raw  = fb_fields, fb_raw
+            s1_err = fb_err
+        s1_status  = fb_status
+        s1_in  += fb_in
+        s1_out += fb_out
+
     row.update(s1_fields)
-    row["step1_status"]   = s1_status
+    row["step1_status"]     = s1_status
     row["step1_tokens_in"]  = str(s1_in)
     row["step1_tokens_out"] = str(s1_out)
     row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
