@@ -30,7 +30,7 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-5"
 
 # Exact system prompt requested by the user
 SYSTEM_PROMPT = (
