@@ -15,6 +15,7 @@ Architecture
 - Debug mode: toggled via sidebar checkbox.
 """
 
+import base64
 import io
 import json
 import os
@@ -31,6 +32,7 @@ import anthropic
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,8 +42,9 @@ from bs4 import BeautifulSoup
 JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
-AUTOSAVE_PATH        = "/tmp/enrichment_autosave.csv"
-LOCAL_SAVE_EVERY     = 5   # write to user's local folder every N companies
+AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
+LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
+_AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 MODEL_ID         = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
@@ -1057,6 +1060,61 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def _js_auto_download(df: pd.DataFrame, filename: str) -> None:
+    """
+    Inject a tiny JS snippet that silently downloads the DataFrame as Excel.
+    Executes inside a zero-height iframe — does NOT trigger a Streamlit rerun.
+    Note: browsers may prompt once to allow multiple automatic downloads.
+    """
+    b64 = base64.b64encode(df_to_excel_bytes(df)).decode()
+    components.html(
+        f"""<script>
+        (function(){{
+            var a = document.createElement('a');
+            a.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                     + ';base64,{b64}';
+            a.download = '{filename}';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }})();
+        </script>""",
+        height=1,   # must be ≥ 1; script still runs at 1px
+    )
+
+
+def _html_dl_buttons(partial_df: pd.DataFrame, n_done: int, stamp: str) -> None:
+    """
+    Render Excel + CSV download anchors as plain HTML — clicking them triggers
+    a browser download WITHOUT causing a Streamlit rerun, so the processing
+    loop is never interrupted.
+    """
+    xl_bytes  = df_to_excel_bytes(partial_df)
+    csv_bytes = df_to_csv_bytes(partial_df)
+    xl_b64    = base64.b64encode(xl_bytes).decode()
+    csv_b64   = base64.b64encode(csv_bytes).decode()
+    xl_kb     = max(len(xl_bytes)  // 1024, 1)
+    csv_kb    = max(len(csv_bytes) // 1024, 1)
+    _style = (
+        "display:inline-block;padding:7px 16px;border-radius:6px;"
+        "font-size:13px;font-family:sans-serif;font-weight:600;"
+        "text-decoration:none;color:#fff;background:#0068c9;"
+    )
+    components.html(
+        f"""<div style="display:flex;gap:10px;margin:2px 0;">
+            <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{xl_b64}"
+               download="enriched_partial_{stamp}.xlsx" style="{_style}">
+               ⬇ Excel ({n_done} rows, ~{xl_kb} KB)
+            </a>
+            <a href="data:text/csv;base64,{csv_b64}"
+               download="enriched_partial_{stamp}.csv" style="{_style}">
+               ⬇ CSV ({n_done} rows, ~{csv_kb} KB)
+            </a>
+        </div>""",
+        height=48,
+    )
+
+
 def make_log_df(debug_records: list, elm_mode: bool = False) -> pd.DataFrame:
     rows = []
     for d in debug_records:
@@ -1206,6 +1264,7 @@ def reset_processing(clear_autosave: bool = False):
         autosave_last_name="",
         _jina_retry_count=0, _last_retry_msg="",
         _local_save_enabled=False, _final_auto_saved=False,
+        _auto_dl_count=0, _auto_dl_last_msg="",
     )
 
 
@@ -1298,6 +1357,9 @@ with st.sidebar:
     if ss("processing", False) and _last_name:
         st.divider()
         st.caption(f"💾 Auto-save active — last saved: **{_last_name}**")
+        _auto_dl_msg = ss("_auto_dl_last_msg", "")
+        if _auto_dl_msg:
+            st.caption(f"📥 {_auto_dl_msg}")
     elif os.path.exists(AUTOSAVE_PATH):
         _saved_df = autosave_load()
         if _saved_df is not None:
@@ -1616,6 +1678,7 @@ if ss("processing", False):
             st.info(_retry_msg)
 
     # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
+    # Uses HTML anchors so clicking does NOT trigger a Streamlit rerun / freeze.
     if results:
         _partial_df = build_partial_df(results, df_work, _active_fields)
         _n_done     = len(_partial_df)
@@ -1623,27 +1686,8 @@ if ss("processing", False):
         with st.expander(
             f"⬇ Download intermediate results ({_n_done} rows so far)", expanded=True
         ):
-            _xl_bytes  = df_to_excel_bytes(_partial_df)
-            _csv_bytes = df_to_csv_bytes(_partial_df)
-            _xl_kb  = len(_xl_bytes)  // 1024 or 1
-            _csv_kb = len(_csv_bytes) // 1024 or 1
-            _ic1, _ic2 = st.columns(2)
-            _ic1.download_button(
-                f"⬇ Excel ({_n_done} rows, ~{_xl_kb} KB)",
-                data=_xl_bytes,
-                file_name=f"enriched_results_{_stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"dl_xl_{_n_done}",
-            )
-            _ic2.download_button(
-                f"⬇ CSV ({_n_done} rows, ~{_csv_kb} KB)",
-                data=_csv_bytes,
-                file_name=f"enriched_results_{_stamp}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key=f"dl_csv_{_n_done}",
-            )
+            st.caption("These links download via the browser without interrupting processing.")
+            _html_dl_buttons(_partial_df, _n_done, _stamp)
 
     _resume_mode = ss("_resume_mode", False)
     _saved_df    = autosave_load() if _resume_mode else None
@@ -1713,8 +1757,9 @@ if ss("processing", False):
         except Exception:
             pass  # never let autosave failure abort processing
 
-        # ── Intermediate local folder save every N companies ─────────────────
         _new_idx = len(results)  # results already includes the row appended above
+
+        # ── Filesystem snapshot every LOCAL_SAVE_EVERY companies (local runs) ─
         if ss("_local_save_enabled", False) and _new_idx % LOCAL_SAVE_EVERY == 0:
             _local_path = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
             try:
@@ -1723,6 +1768,17 @@ if ss("processing", False):
                 ss_set(_last_local_save=f"{_new_idx} rows → {Path(_xl).name}")
             except Exception as _e:
                 ss_set(_last_local_save=f"⚠ Save failed: {_e}")
+
+        # ── Auto browser-download every _AUTO_DL_EVERY companies ─────────────
+        _auto_dl_done = ss("_auto_dl_count", 0)
+        if _new_idx % _AUTO_DL_EVERY == 0 and _new_idx // _AUTO_DL_EVERY > _auto_dl_done:
+            _dl_snap = build_partial_df(results, df_work, _active_fields)
+            _dl_name = f"enriched_snapshot_{_new_idx}.xlsx"
+            _js_auto_download(_dl_snap, _dl_name)
+            ss_set(
+                _auto_dl_count=_new_idx // _AUTO_DL_EVERY,
+                _auto_dl_last_msg=f"Auto-downloaded at row {_new_idx} → {_dl_name}",
+            )
 
         try:
             total_in   += int(fields.get("total_tokens_in",  0) or 0)
