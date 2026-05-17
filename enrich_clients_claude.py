@@ -46,7 +46,8 @@ AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
-MODEL_ID         = "claude-haiku-4-5-20251001"
+MODEL_STEP1      = "claude-haiku-4-5-20251001"
+MODEL_STEP2      = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 # Pricing per million tokens (claude-haiku-4-5)
@@ -1036,7 +1037,7 @@ def enrich_one_row_light(company_name: str, raw_url: str) -> tuple:
 # Step 1 — Basic extraction via Claude (Jina page → Claude)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _claude_extract(webpage_text: str, api_key: str) -> tuple:
+def _claude_extract(webpage_text: str, api_key: str, model: str = MODEL_STEP1) -> tuple:
     """
     Send page text to Claude for structured extraction.
     Returns (raw_fields_dict, input_tokens, output_tokens).
@@ -1044,7 +1045,7 @@ def _claude_extract(webpage_text: str, api_key: str) -> tuple:
     client    = anthropic.Anthropic(api_key=api_key)
     truncated = webpage_text[:_JINA_CHAR_LIMIT]
     msg = client.messages.create(
-        model=MODEL_ID,
+        model=model,
         max_tokens=1024,
         messages=[{"role": "user", "content": f"{_STEP1_PROMPT}\n\n{truncated}"}],
     )
@@ -1107,7 +1108,7 @@ _STEP1_FALLBACK_PROMPT_TMPL = (
 )
 
 
-def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
+def run_step1(url: str, company_name: str, api_key: str, delay: float, model: str = MODEL_STEP1) -> tuple:
     """
     Three-tier Step 1 enrichment:
       Tier 1 — Jina direct scrape       → status 'enriched_jina'
@@ -1135,7 +1136,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
         try:
             time.sleep(delay)
             text = fetch_via_jina_reader(source_url, company_hint=company_name)
-            raw_fields, in_t, out_t = _claude_extract(text, api_key)
+            raw_fields, in_t, out_t = _claude_extract(text, api_key, model=model)
             total_in  += in_t
             total_out += out_t
             payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
@@ -1175,7 +1176,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
             company_name=company_name or target,
             url=target,
         )
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model=model)
         total_in  += in_t
         total_out += out_t
         raw_fields = _parse_json_response(raw_text)
@@ -1204,7 +1205,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2) -> tuple:
     """
     Run Claude with web_search_20250305 tool in an agentic loop.
     Returns (final_text, total_input_tokens, total_output_tokens).
@@ -1215,7 +1216,7 @@ def _claude_web_search_loop(prompt: str, api_key: str) -> tuple:
 
     for _iteration in range(10):
         resp = client.messages.create(
-            model=MODEL_ID,
+            model=model,
             max_tokens=2048,
             tools=[WEB_SEARCH_TOOL],
             messages=messages,
@@ -1248,7 +1249,7 @@ def _claude_web_search_loop(prompt: str, api_key: str) -> tuple:
     return "", total_in, total_out
 
 
-def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
+def run_step2(url: str, company_name: str, api_key: str, delay: float, model: str = MODEL_STEP2) -> tuple:
     """
     Research ICP signals using Claude with web_search.
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg).
@@ -1273,13 +1274,13 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
     try:
         time.sleep(delay)
         prompt   = _STEP2_PROMPT_TMPL.format(url=target)
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model=model)
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             # Retry once with a stricter prompt appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key)
+            raw_text2, in_t2, out_t2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key, model=model)
             in_t  += in_t2
             out_t += out_t2
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
@@ -1372,7 +1373,7 @@ def enrich_one_row(
 
     # ── Step 1 (three-tier: Jina → web_search → no_data) ─────────────────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
-        url, company_name, api_key, delay
+        url, company_name, api_key, delay, model=ss("_model_step1", MODEL_STEP1)
     )
 
     row.update(s1_fields)
@@ -1383,7 +1384,7 @@ def enrich_one_row(
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
     s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err = run_step2(
-        url, company_name, api_key, delay
+        url, company_name, api_key, delay, model=ss("_model_step2", MODEL_STEP2)
     )
     row.update(s2_fields)
     row["step2_status"]   = s2_status
@@ -1728,6 +1729,32 @@ with st.sidebar:
 
     st.header("Settings")
 
+    MODEL_OPTIONS = {
+        "Haiku 4.5 — fast, low cost (recommended for Step 1)": "claude-haiku-4-5-20251001",
+        "Sonnet 4.5 — smarter, better reasoning (recommended for Step 2)": "claude-sonnet-4-5-20250514",
+    }
+
+    st.subheader("Model selection")
+    step1_model = st.selectbox(
+        "Step 1 model (firmographic extraction)",
+        options=list(MODEL_OPTIONS.keys()),
+        index=0,
+        key="step1_model_select",
+        help="Step 1 extracts structured data from a scraped page. Haiku is fast and accurate enough for this.",
+    )
+    step2_model = st.selectbox(
+        "Step 2 model (ICP web search)",
+        options=list(MODEL_OPTIONS.keys()),
+        index=0,
+        key="step2_model_select",
+        help="Step 2 runs an agentic web search loop requiring judgment and synthesis. Sonnet gives better signal detection.",
+    )
+    st.caption(
+        f"Step 1: `{MODEL_OPTIONS[step1_model].split('-')[1]}` · "
+        f"Step 2: `{MODEL_OPTIONS[step2_model].split('-')[1]}`"
+    )
+    st.divider()
+
     if _elm_mode:
         st.info("🔓 No API key needed in Extreme Light Mode")
     elif api_key:
@@ -2008,6 +2035,8 @@ if start_btn and not blocking and not currently_processing:
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
         _local_save_enabled=ss("_local_save_enabled", False),
         _final_auto_saved=False,
+        _model_step1=MODEL_OPTIONS[step1_model],
+        _model_step2=MODEL_OPTIONS[step2_model],
     )
     st.rerun()
 
@@ -2270,7 +2299,7 @@ if ss("enrichment_done", False):
             tc2.metric("Total output tokens", f"{t_out:,}")
             tc3.metric("Estimated total cost", f"${t_cost:.4f}")
             st.caption(
-                f"Model: `{MODEL_ID}` · "
+                f"Step 1: `{ss('_model_step1', MODEL_STEP1)}` · Step 2: `{ss('_model_step2', MODEL_STEP2)}` · "
                 f"${_COST_INPUT_PER_M}/M input · ${_COST_OUTPUT_PER_M}/M output. "
                 "Two API calls per row (Step 1 + Step 2). "
                 "Verify charges in your Anthropic dashboard."
