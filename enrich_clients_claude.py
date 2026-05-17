@@ -2062,8 +2062,17 @@ if ss("enrichment_done", False):
         if "needs_manual_review" in df_enriched.columns else 0
     )
     all_sc = list(status_counts.items())
+    web_search_n = (
+        int((df_enriched["step2_status"] == "ok").sum())
+        if "step2_status" in df_enriched.columns else 0
+    )
+    competitor_n = (
+        int(df_enriched["icp_competitor_signal"].astype(str).str.strip().ne("").sum())
+        if "icp_competitor_signal" in df_enriched.columns else 0
+    )
     # In ELM mode there is no "Needs review" concept
     extra_metrics = [] if _elm_done else [("⚑ Needs review", needs_review_n)]
+    extra_metrics += [("🔍 Web search used", web_search_n), ("🏁 Competitor found", competitor_n)]
     n_cols = min(len(all_sc) + len(extra_metrics), 6)
     if all_sc:
         rcols = st.columns(max(n_cols, 1))
