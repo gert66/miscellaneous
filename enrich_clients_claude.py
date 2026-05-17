@@ -35,6 +35,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
+try:
+    from human_scraper import scrape_with_human_behaviour as _human_scrape
+    _HUMAN_SCRAPER_AVAILABLE = True
+except ImportError:
+    _HUMAN_SCRAPER_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,17 +450,23 @@ def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
     Both must be ≥ _JINA_MIN_CONTENT chars to count — shorter responses are
     treated as blocked/empty and raise requests.HTTPError so the caller can
     fall through to the Google tier.
+
+    Tier 1a — Jina direct scrape
+    Tier 1b — human Playwright scraper (fallback when Jina returns 403/503)
     """
-    base    = url.rstrip("/")
-    best    = ""
+    base             = url.rstrip("/")
+    best             = ""
+    jina_blocked     = False  # True if any request returned 403 or 503
 
     # Try homepage
     try:
         text = _jina_get_with_retry(url, company_hint)
         if len(text) > len(best):
             best = text
-    except requests.HTTPError:
-        pass
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        if code in (403, 503):
+            jina_blocked = True
 
     # Try about-us slugs
     for slug in _JINA_ABOUT_SLUGS:
@@ -464,8 +476,19 @@ def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
                 best = text
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
-            if code not in (403, 404):
+            if code in (403, 503):
+                jina_blocked = True
+            elif code not in (404,):
                 raise
+
+    # ── Tier 1b: human Playwright fallback on 403/503 ─────────────────────────
+    if len(best) < _JINA_MIN_CONTENT and jina_blocked and _HUMAN_SCRAPER_AVAILABLE:
+        try:
+            result = _human_scrape(url, max_chars=_JINA_CHAR_LIMIT)
+            if result.get("success") and len(result.get("text", "")) > 500:
+                return result["text"]
+        except Exception:
+            pass
 
     if len(best) < _JINA_MIN_CONTENT:
         # Simulate a 404 so the caller falls through to the search tier
