@@ -86,23 +86,120 @@ _STEP1_PROMPT = (
     "Use empty string for any field not found."
 )
 
-# Step 2 ICP research prompt
-_STEP2_PROMPT_TMPL = (
-    "Research the company at {url}. "
-    "Find signals that indicate whether this company would benefit from corporate language training. "
-    "Look for: international presence, languages used, global teams, hiring activity, "
-    "recent growth or funding. "
-    "Return ONLY raw JSON (no markdown, no code fences) with exactly these fields: "
-    "international_presence (number of countries with offices, e.g. '5' or 'global' or '1'), "
-    "languages_mentioned (comma-separated languages found on site, e.g. 'English, French, German'), "
-    "hiring_activity ('yes - [brief evidence]' or 'no'), "
-    "recent_funding ('yes - [amount]' or 'no'), "
-    "recent_news ('yes - [brief summary of expansion/acquisition/IPO in last 12 months]' or 'none'), "
-    "global_team_signals ('yes - [brief details]' or 'no'), "
-    "training_signals ('yes - [brief details about training/learning/upskilling mentions]' or 'no'), "
-    "multi_office ('yes - [count] offices' or 'no'), "
-    "language_training_fit_score (integer 1-10, where 10 = highest fit for language training)."
-)
+# ── Step 2 prompt — static cacheable prefix + dynamic per-company suffix ──────
+#
+# The static prefix is sent with cache_control so Anthropic caches it after the
+# first company.  Subsequent companies pay ~10 % of normal input cost for it.
+# Minimum cacheable size: 1 024 tokens (Sonnet) / 2 048 tokens (Haiku).
+# The web_search tool definition (~300 tokens) counts toward the threshold too.
+
+STEP2_STATIC_PREFIX = """\
+You are an expert ICP (Ideal Customer Profile) analyst specialising in identifying \
+companies that are strong candidates for corporate language training services.
+
+Your task is to research a given company URL and extract structured signals that \
+indicate whether this company would benefit from a corporate language training programme.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SIGNAL DEFINITIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+international_presence
+  Count the number of countries where the company has offices, employees, or active \
+operations. Check the About page, Contact / Locations page, and any "Global presence" \
+section. Use the string "global" when the company explicitly claims worldwide operations \
+without listing individual countries. Otherwise use a number: "1", "3", "12", etc.
+
+languages_mentioned
+  List every language referenced on the website or in job descriptions: navigation \
+languages, language-specific subdomains (e.g. .de, .fr), language requirements in job \
+ads, and languages mentioned as part of the product or service offering.
+  Format: comma-separated string, e.g. "English, Dutch, French, Spanish".
+
+hiring_activity
+  Determine whether the company is actively recruiting.
+  Strong signals: an active Careers or Jobs page with open roles, "We are hiring" \
+banners, recent LinkedIn job postings, references to team growth or headcount targets.
+  Format: "yes - <brief description of evidence>" or "no"
+
+recent_funding
+  Check for any investment or funding announcements.
+  Look for: press releases, news articles, Crunchbase mentions, About page references \
+to seed, Series A/B/C/D rounds, growth equity, venture debt, or IPO activity.
+  Format: "yes - <amount and round type if known>" or "no"
+
+recent_news
+  Identify major business events in the last 12 months that signal growth or change.
+  Events of interest: geographic expansion into new markets, acquisition of another \
+company, being acquired, IPO or public offering, major strategic partnership, new \
+product launch in a new market or language.
+  Format: "yes - <brief summary of the most significant event>" or "none"
+
+global_team_signals
+  Look for evidence of a multi-national or geographically distributed workforce.
+  Signals: job listings posted in multiple countries, team pages showing international \
+office locations, mentions of cross-border collaboration, engineering hubs on different \
+continents, remote-first policies that explicitly span multiple countries or time zones.
+  Format: "yes - <brief details>" or "no"
+
+training_signals
+  Identify any evidence that the company invests in employee learning and development.
+  Signals: a dedicated L&D or People Development team, a corporate academy or internal \
+university programme, upskilling or reskilling initiatives, coaching or mentoring \
+schemes, certification budgets, e-learning platforms, or references to training \
+investment in job descriptions or culture / values pages.
+  Format: "yes - <brief details about the training activity>" or "no"
+
+multi_office
+  Determine whether the company operates from more than one physical location.
+  Count distinct office addresses (ignore virtual offices and PO boxes).
+  Format: "yes - <N> offices" or "no"
+
+language_training_fit_score  (integer 1 – 10)
+  Your overall judgement of how well this company fits the buyer profile for a corporate \
+language training programme.
+
+  Scoring guide
+  ─────────────
+   9–10  Large multinational (500 + employees), active L&D culture explicitly mentioned,
+         multiple languages already in use, recent funding or expansion signal,
+         hiring internationally.
+   7–8   Mid-size company (100 – 500 employees), clear international presence in 3 +
+         countries, some L&D signals visible, growth trajectory evident.
+   5–6   Smaller company or primarily domestic but with meaningful international signals
+         (e.g. key clients abroad, bilingual website, cross-border hiring).
+   3–4   Little international presence; training culture unclear; flat or slow growth
+         signals; operations concentrated in one country.
+   1–2   Purely domestic, no evidence of training investment, no hiring activity,
+         no international footprint.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Return ONLY a raw JSON object. Do NOT wrap it in markdown code fences. Do NOT add any \
+explanation, preamble, or trailing commentary. The JSON must contain exactly these nine \
+fields and no others:
+
+{
+  "international_presence": "<string>",
+  "languages_mentioned": "<comma-separated string or empty string>",
+  "hiring_activity": "<'yes - ...' or 'no'>",
+  "recent_funding": "<'yes - ...' or 'no'>",
+  "recent_news": "<'yes - ...' or 'none'>",
+  "global_team_signals": "<'yes - ...' or 'no'>",
+  "training_signals": "<'yes - ...' or 'no'>",
+  "multi_office": "<'yes - N offices' or 'no'>",
+  "language_training_fit_score": <integer 1-10>
+}
+
+Use an empty string "" for any field where you cannot find reliable information. \
+Do not guess or fabricate data. If the company website is inaccessible, base your \
+answer on any publicly available knowledge you already have about the company.\
+"""
+
+# Kept for reference / cache-miss fallback (not used for API calls when caching is on)
+_STEP2_PROMPT_TMPL = STEP2_STATIC_PREFIX + "\n\nNow research this company: {url}"
 
 # ── Field lists ───────────────────────────────────────────────────────────────
 
@@ -879,7 +976,7 @@ def run_step1(
             company_name=company_name or target,
             url=target,
         )
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
+        raw_text, in_t, out_t, _, _ = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
         total_in  += in_t
         total_out += out_t
         raw_fields = _parse_json_response(raw_text)
@@ -907,16 +1004,47 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> tuple:
+def _claude_web_search_loop(
+    prompt: str,
+    api_key: str,
+    model_id: str = None,
+    cached_prefix: str = None,
+) -> tuple:
     """
     Run Claude with web_search_20250305 (server-side built-in tool).
     Anthropic executes the search automatically — no tool_result needed.
-    Returns (final_text, total_input_tokens, total_output_tokens).
+
+    When cached_prefix is supplied the message is split into two content blocks:
+    the static prefix (marked ephemeral for prompt caching) and the dynamic prompt.
+
+    Returns (text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens).
     """
     if model_id is None:
         model_id = MODEL_STEP2
 
     client = anthropic.Anthropic(api_key=api_key)
+
+    if cached_prefix is not None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": cached_prefix,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
+        extra_kwargs = {"betas": ["prompt-caching-2024-07-31"]}
+    else:
+        messages = [{"role": "user", "content": prompt}]
+        extra_kwargs = {}
 
     for attempt in range(3):
         try:
@@ -924,14 +1052,17 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
                 model=model_id,
                 max_tokens=2048,
                 tools=[WEB_SEARCH_TOOL],
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
+                **extra_kwargs,
             )
             text = "".join(
                 getattr(b, "text", "")
                 for b in resp.content
                 if getattr(b, "type", "") == "text"
             ).strip()
-            return text, resp.usage.input_tokens, resp.usage.output_tokens
+            cache_create = getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+            cache_read   = getattr(resp.usage, "cache_read_input_tokens",     0) or 0
+            return text, resp.usage.input_tokens, resp.usage.output_tokens, cache_create, cache_read
 
         except anthropic.RateLimitError as e:
             wait = 30
@@ -945,18 +1076,19 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
             else:
                 raise
 
-    return "", 0, 0
+    return "", 0, 0, 0, 0
 
 
 def run_step2(url: str, company_name: str, api_key: str, delay: float,
               model_step2: str = MODEL_STEP2) -> tuple:
     """
     Research ICP signals using Claude with web_search.
-    Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg).
+    Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg,
+             cache_creation_tokens, cache_read_tokens).
     """
     target = normalize_url(url) if url else company_name
     if not target:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", 0, 0)
 
     ck = f"step2_{target}"
     cached = load_cache(ck)
@@ -965,36 +1097,51 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
         if any(icp.get(f, "") for f in ICP_FIELDS[:3]):  # basic sanity check
             in_t  = int(cached.get("tokens_in", 0) or 0)
             out_t = int(cached.get("tokens_out", 0) or 0)
-            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "")
+            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", 0, 0)
         _delete_cache(ck)
 
     _STRICT_SUFFIX = (
         "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
     )
+    dynamic_prompt = f"Now research this company: {target}"
+
     try:
         time.sleep(delay)
-        prompt   = _STEP2_PROMPT_TMPL.format(url=target)
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step2)
+        raw_text, in_t, out_t, cc_t, cr_t = _claude_web_search_loop(
+            dynamic_prompt, api_key,
+            model_id=model_step2,
+            cached_prefix=STEP2_STATIC_PREFIX,
+        )
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
-            # Retry once with a stricter prompt appended
+            # Retry once with a stricter suffix appended to the dynamic part
             time.sleep(delay)
-            raw_text2, in_t2, out_t2 = _claude_web_search_loop(
-                prompt + _STRICT_SUFFIX, api_key, model_id=model_step2
+            raw_text2, in_t2, out_t2, cc_t2, cr_t2 = _claude_web_search_loop(
+                dynamic_prompt + _STRICT_SUFFIX, api_key,
+                model_id=model_step2,
+                cached_prefix=STEP2_STATIC_PREFIX,
             )
             in_t  += in_t2
             out_t += out_t2
+            cc_t  += cc_t2
+            cr_t  += cr_t2
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
-        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        payload = {
+            "icp_data": icp_raw,
+            "tokens_in": in_t,
+            "tokens_out": out_t,
+            "cache_creation_tokens": cc_t,
+            "cache_read_tokens": cr_t,
+        }
         save_cache(ck, payload)
-        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "")
+        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", cc_t, cr_t)
     except (json.JSONDecodeError, ValueError) as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}", 0, 0)
     except anthropic.APIError as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}", 0, 0)
     except Exception as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e))
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e), 0, 0)
 
 
 def _extract_icp_fields(raw: dict) -> dict:
@@ -1085,7 +1232,7 @@ def enrich_one_row(
     row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
-    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err = run_step2(
+    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
         url, company_name, api_key, delay, model_step2=model_step2,
     )
     row.update(s2_fields)
@@ -1126,11 +1273,13 @@ def enrich_one_row(
         "step1_tokens_out":         s1_out,
         "step1_playwright_attempted": s1_pw_dbg.get("playwright_attempted", False),
         "step1_playwright_result":    s1_pw_dbg.get("playwright_result", "skipped"),
-        "step2_status":             s2_status,
-        "step2_raw_json":           s2_raw,
-        "step2_tokens_in":          s2_in,
-        "step2_tokens_out":         s2_out,
-        "total_cost":               calc_cost(total_in, total_out),
+        "step2_status":                  s2_status,
+        "step2_raw_json":                s2_raw,
+        "step2_tokens_in":               s2_in,
+        "step2_tokens_out":              s2_out,
+        "step2_cache_creation_tokens":   s2_cache_create,
+        "step2_cache_read_tokens":       s2_cache_read,
+        "total_cost":                    calc_cost(total_in, total_out),
         "enrichment_status":        row["enrichment_status"],
         "error_message":            row["error_message"],
         "needs_manual_review":      row["needs_manual_review"],
@@ -1355,6 +1504,7 @@ def reset_processing(clear_autosave: bool = False):
         process_index=0, results=[], debug_records=[],
         enrichment_done=False, df_enriched=None,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
+        total_cache_read_tokens=0, total_cache_create_tokens=0,
         autosave_last_name="",
         _jina_retry_count=0, _last_retry_msg="",
         _local_save_enabled=False, _final_auto_saved=False,
@@ -1740,6 +1890,7 @@ if start_btn and not blocking and not currently_processing:
         _df_work=df_work, _name_col=name_col, _domain_col=domain_col,
         _n_to_process=n_to_process, _api_key=api_key, _delay=delay_sec,
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
+        total_cache_read_tokens=0, total_cache_create_tokens=0,
         _resume_mode=resume_mode, autosave_last_name="",
         _elm_mode=_elm_mode,
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
@@ -1770,9 +1921,11 @@ if ss("processing", False):
     _use_playwright_run = ss("_use_playwright", True)
     _model_step1_run    = ss("_model_step1", MODEL_STEP1)
     _model_step2_run    = ss("_model_step2", MODEL_STEP2)
-    total_in       = ss("total_tokens_in", 0)
-    total_out      = ss("total_tokens_out", 0)
-    total_cost     = ss("total_cost_usd", 0.0)
+    total_in          = ss("total_tokens_in", 0)
+    total_out         = ss("total_tokens_out", 0)
+    total_cost        = ss("total_cost_usd", 0.0)
+    total_cache_read  = ss("total_cache_read_tokens", 0)
+    total_cache_create = ss("total_cache_create_tokens", 0)
 
     if st.button("⏹ Stop after current row", key="stop_button"):
         ss_set(stop_requested=True)
@@ -1935,9 +2088,19 @@ if ss("processing", False):
         except (ValueError, TypeError):
             pass
 
+        # Accumulate cache token counts from the debug record of this row
+        _dbg_last = debug_records[-1] if debug_records else {}
+        try:
+            total_cache_read   += int(_dbg_last.get("step2_cache_read_tokens",   0) or 0)
+            total_cache_create += int(_dbg_last.get("step2_cache_creation_tokens", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+
         ss_set(
             results=results, debug_records=debug_records, process_index=idx + 1,
             total_tokens_in=total_in, total_tokens_out=total_out, total_cost_usd=total_cost,
+            total_cache_read_tokens=total_cache_read,
+            total_cache_create_tokens=total_cache_create,
         )
         st.rerun()
 
@@ -2017,9 +2180,10 @@ if ss("enrichment_done", False):
     if not _elm_done:
         with st.expander("💰 Token usage & cost", expanded=True):
             tc1, tc2, tc3 = st.columns(3)
-            tc1.metric("Total input tokens",  f"{t_in:,}")
-            tc2.metric("Total output tokens", f"{t_out:,}")
+            tc1.metric("Total input tokens",   f"{t_in:,}")
+            tc2.metric("Total output tokens",  f"{t_out:,}")
             tc3.metric("Estimated total cost", f"${t_cost:.4f}")
+
             _used_s1 = ss("_model_step1", MODEL_STEP1)
             _used_s2 = ss("_model_step2", MODEL_STEP2)
             st.caption(
@@ -2027,6 +2191,31 @@ if ss("enrichment_done", False):
                 "Two API calls per row (Step 1 + Step 2). "
                 "Verify charges in your Anthropic dashboard."
             )
+
+            _cache_read   = ss("total_cache_read_tokens",   0)
+            _cache_create = ss("total_cache_create_tokens", 0)
+            if _cache_read > 0 or _cache_create > 0:
+                st.divider()
+                # Input price per M for the Step 2 model (approximate)
+                _s2_input_price_per_m = (
+                    0.80 if "haiku"  in _used_s2 else
+                    3.00 if "sonnet" in _used_s2 else 1.00
+                )
+                # Cache reads cost 10 % of normal input price; savings = 90 %
+                _savings_usd = _cache_read * _s2_input_price_per_m * 0.90 / 1_000_000
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Cache write tokens (Step 2)",  f"{_cache_create:,}",
+                           help="Tokens written to Anthropic's prompt cache on the first company.")
+                cc2.metric("Cache read tokens (Step 2)",   f"{_cache_read:,}",
+                           help="Tokens served from cache at 10 % of normal input cost.")
+                cc3.metric("Est. prompt-cache savings",    f"${_savings_usd:.4f}",
+                           help="90 % discount on cache-read tokens vs full input price.")
+                st.caption(
+                    f"Prompt caching active on Step 2 ({_used_s2}). "
+                    f"Static prefix cached once; each subsequent company reads it at "
+                    f"~${_s2_input_price_per_m * 0.10:.3f}/M tokens instead of "
+                    f"${_s2_input_price_per_m:.2f}/M."
+                )
     else:
         st.info("⚡ Extreme Light Mode — no API calls, no tokens, no cost.")
 
