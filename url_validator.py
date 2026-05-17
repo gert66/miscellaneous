@@ -54,6 +54,7 @@ _STATUS_COLOR = {
     "ok":         "#1a7a3c",
     "redirected": "#b35c00",
     "corrected":  "#7a5c00",
+    "unverified": "#4a3a7a",  # purple — Claude found it but GET was blocked
     "dead":       "#8b1a1a",
 }
 
@@ -61,6 +62,7 @@ _STATUS_TEXT_COLOR = {
     "ok":         "#e6ffe6",
     "redirected": "#ffe8cc",
     "corrected":  "#fff4cc",
+    "unverified": "#ece6ff",
     "dead":       "#ffe6e6",
 }
 
@@ -205,13 +207,14 @@ def find_url_via_claude(company_name: str, api_key: str) -> dict:
     }
 
     prompt = (
-        f"Search for the official website of the company called '{company_name}'.\n"
-        "Return ONLY a raw JSON object with two fields:\n"
-        '- url: the full working website URL including https:// (e.g. https://www.abnamro.nl)\n'
-        "- notes: one short sentence explaining what you found "
-        "(e.g. 'official Dutch banking website', 'company dissolved in 2021 - no website')\n"
-        "Search by company name, not by URL. "
-        "If the company no longer exists or truly has no website, set url to empty string."
+        f"Search for the official website of '{company_name}'.\n"
+        "You MUST return a JSON object with exactly these two fields:\n"
+        "- url: the complete working URL you found, always starting with https:// "
+        "(example: https://www.abnamro.nl). This field must NEVER be empty if you found a website.\n"
+        "- notes: one short sentence describing what you found.\n"
+        "If and only if the company truly has no website or is dissolved, "
+        "set url to empty string and explain in notes.\n"
+        "Return ONLY raw JSON. No markdown, no explanation outside the JSON."
     )
 
     try:
@@ -256,6 +259,12 @@ def find_url_via_claude(company_name: str, api_key: str) -> dict:
         notes  = (parsed.get("notes") or "").strip()
         result["notes"] = notes or "Claude returned no explanation"
 
+        # Fallback: if url field is empty, try to extract one from the notes text
+        if not url and notes:
+            m = re.search(r'https?://[^\s\'"<>]+', notes)
+            if m:
+                url = m.group().rstrip(".,)")
+
         if url:
             url = _normalise_url(url)
             verify_resp, _ = _get(url)
@@ -264,7 +273,7 @@ def find_url_via_claude(company_name: str, api_key: str) -> dict:
                 result["verified"]    = True
                 result["http_status"] = verify_resp.status_code
             else:
-                # Return URL anyway — let caller decide
+                # URL not verified (bot-blocking etc.) — save it anyway
                 result["url"]         = url
                 result["verified"]    = False
                 result["http_status"] = getattr(verify_resp, "status_code", "")
@@ -376,15 +385,20 @@ def validate_url(
         result["tokens_in"]  = claude_res["tokens_in"]
         result["tokens_out"] = claude_res["tokens_out"]
 
-        if claude_res["url"] and claude_res["verified"]:
+        if claude_res["url"]:
             final = claude_res["url"]
             result["http_status_code"]  = claude_res["http_status"]
             result["final_url"]         = final
-            result["url_status"]        = "corrected"
             result["correction_source"] = "search_corrected"
             result["correction_notes"]  = f"Claude: {claude_res['notes']}"
             if _domain(final) != _domain(url_as_is):
                 result["redirect_target"] = final
+            if claude_res["verified"]:
+                result["url_status"] = "corrected"
+            else:
+                # Claude found a URL but our GET was blocked — mark unverified,
+                # not dead, so the user can decide rather than lose the lead
+                result["url_status"] = "unverified"
             return result
         elif claude_res["notes"]:
             result["correction_notes"] = f"Claude: {claude_res['notes']}"
@@ -595,12 +609,19 @@ if uploaded:
 
         st.subheader("Summary")
         counts = results_df["url_status"].value_counts()
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("✅ OK",         counts.get("ok", 0))
-        m2.metric("↩️ Redirected", counts.get("redirected", 0))
-        m3.metric("🔧 Corrected",  counts.get("corrected", 0))
-        m4.metric("💀 Dead",       counts.get("dead", 0))
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("✅ OK",           counts.get("ok", 0))
+        m2.metric("↩️ Redirected",   counts.get("redirected", 0))
+        m3.metric("🔧 Corrected",    counts.get("corrected", 0))
+        m4.metric("🔮 Unverified",   counts.get("unverified", 0))
+        m5.metric("💀 Dead",         counts.get("dead", 0))
 
+        unverified_count = counts.get("unverified", 0)
+        if unverified_count:
+            st.info(
+                f"🔮 {unverified_count} URL(s) were found by Claude but could not be verified "
+                "(site may block bots). Check them manually — they are likely correct."
+            )
         dead_count = counts.get("dead", 0)
         if dead_count:
             st.warning(
