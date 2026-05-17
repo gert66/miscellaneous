@@ -1532,6 +1532,15 @@ with st.sidebar:
         use_playwright = False
     st.session_state["_use_playwright"] = use_playwright
 
+    st.divider()
+    _cache_n = get_cache_count()
+    st.caption(f"Enrichment cache: **{_cache_n}** file(s)")
+    if st.button("Clear enrichment cache", use_container_width=True, key="clear_cache_always"):
+        if CACHE_DIR.exists():
+            for f in CACHE_DIR.glob("*.json"):
+                f.unlink(missing_ok=True)
+        st.rerun()
+
     # ── Auto-save status ──────────────────────────────────────────────────────
     _last_name = ss("autosave_last_name", "")
     if ss("processing", False) and _last_name:
