@@ -39,10 +39,17 @@ URL_FIELDS = [
 ]
 
 _STATUS_COLOR = {
-    "ok":         "#d4edda",  # green
-    "redirected": "#fff3cd",  # orange/yellow
-    "corrected":  "#fff3cd",
-    "dead":       "#f8d7da",  # red
+    "ok":         "#1a7a3c",  # deep green
+    "redirected": "#b35c00",  # burnt orange
+    "corrected":  "#7a5c00",  # dark amber
+    "dead":       "#8b1a1a",  # deep red
+}
+
+_STATUS_TEXT_COLOR = {
+    "ok":         "#e6ffe6",
+    "redirected": "#ffe8cc",
+    "corrected":  "#fff4cc",
+    "dead":       "#ffe6e6",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,8 +369,11 @@ if uploaded:
             _display_cols = [c for c in _display_cols if c in live_df.columns]
 
             def _row_style(row):
-                color = _STATUS_COLOR.get(row.get("url_status", ""), "")
-                return [f"background-color: {color}" if color else "" for _ in row]
+                status = row.get("url_status", "")
+                bg = _STATUS_COLOR.get(status, "")
+                fg = _STATUS_TEXT_COLOR.get(status, "")
+                style = f"background-color: {bg}; color: {fg}" if bg else ""
+                return [style for _ in row]
 
             st.dataframe(
                 live_df[_display_cols].style.apply(_row_style, axis=1),
@@ -400,8 +410,11 @@ if uploaded:
         display_cols = [c for c in display_cols if c in results_df.columns]
 
         def _row_style(row):
-            color = _STATUS_COLOR.get(row.get("url_status", ""), "")
-            return [f"background-color: {color}" if color else "" for _ in row]
+            status = row.get("url_status", "")
+            bg = _STATUS_COLOR.get(status, "")
+            fg = _STATUS_TEXT_COLOR.get(status, "")
+            style = f"background-color: {bg}; color: {fg}" if bg else ""
+            return [style for _ in row]
 
         st.dataframe(
             results_df[display_cols].style.apply(_row_style, axis=1),
