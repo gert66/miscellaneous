@@ -52,10 +52,22 @@ AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
-MODEL_ID         = "claude-haiku-4-5-20251001"
-MODEL_STEP1      = MODEL_ID
+MODEL_STEP1      = "claude-haiku-4-5-20251001"
 MODEL_STEP2      = "claude-haiku-4-5-20251001"
+MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
+
+AVAILABLE_MODELS = {
+    "Haiku 4.5 (fast, cheap)":                   "claude-haiku-4-5-20251001",
+    "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20250514",
+}
+# Per-row cost estimates for the pre-run info banner
+_COST_EST = {
+    ("claude-haiku-4-5-20251001",  "claude-haiku-4-5-20251001"):  0.01,
+    ("claude-haiku-4-5-20251001",  "claude-sonnet-4-5-20250514"): 0.05,
+    ("claude-sonnet-4-5-20250514", "claude-haiku-4-5-20251001"):  0.04,
+    ("claude-sonnet-4-5-20250514", "claude-sonnet-4-5-20250514"): 0.08,
+}
 
 # Pricing per million tokens (claude-haiku-4-5)
 _COST_INPUT_PER_M  = 0.80
@@ -667,7 +679,8 @@ def enrich_one_row_light(company_name: str, raw_url: str) -> tuple:
 # Step 1 — Basic extraction via Claude (Jina page → Claude)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _claude_extract(webpage_text: str, api_key: str) -> tuple:
+def _claude_extract(webpage_text: str, api_key: str,
+                    model_id: str = MODEL_STEP1) -> tuple:
     """
     Send page text to Claude for structured extraction.
     Returns (raw_fields_dict, input_tokens, output_tokens).
@@ -675,7 +688,7 @@ def _claude_extract(webpage_text: str, api_key: str) -> tuple:
     client    = anthropic.Anthropic(api_key=api_key)
     truncated = webpage_text[:_JINA_CHAR_LIMIT]
     msg = client.messages.create(
-        model=MODEL_ID,
+        model=model_id,
         max_tokens=1024,
         messages=[{"role": "user", "content": f"{_STEP1_PROMPT}\n\n{truncated}"}],
     )
@@ -747,6 +760,7 @@ def run_step1(
     api_key: str,
     delay: float,
     use_playwright: bool = True,
+    model_step1: str = MODEL_STEP1,
 ) -> tuple:
     """
     Three-tier Step 1 enrichment:
@@ -776,7 +790,7 @@ def run_step1(
         try:
             time.sleep(delay)
             text = fetch_via_jina_reader(source_url, company_hint=company_name)
-            raw_fields, in_t, out_t = _claude_extract(text, api_key)
+            raw_fields, in_t, out_t = _claude_extract(text, api_key, model_id=model_step1)
             total_in  += in_t
             total_out += out_t
             payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
@@ -822,7 +836,7 @@ def run_step1(
                     _pw_result = "blocked"
                     jina_err  += " | playwright: bot-detected"
                 else:
-                    raw_fields, in_t, out_t = _claude_extract(pw_text, api_key)
+                    raw_fields, in_t, out_t = _claude_extract(pw_text, api_key, model_id=model_step1)
                     total_in  += in_t
                     total_out += out_t
                     payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
@@ -893,7 +907,8 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3,
+                            model_id: str = MODEL_STEP2) -> tuple:
     """
     Run Claude with web_search_20250305 (server-side built-in tool).
     Anthropic executes the search automatically — no tool_result needed.
@@ -904,7 +919,7 @@ def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3) 
     for attempt in range(max_iterations):
         try:
             resp = client.messages.create(
-                model=MODEL_STEP2,
+                model=model_id,
                 max_tokens=2048,
                 tools=[WEB_SEARCH_TOOL],
                 messages=[{"role": "user", "content": prompt}],
@@ -931,7 +946,8 @@ def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3) 
     return "", 0, 0
 
 
-def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
+def run_step2(url: str, company_name: str, api_key: str, delay: float,
+              model_step2: str = MODEL_STEP2) -> tuple:
     """
     Research ICP signals using Claude with web_search.
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg).
@@ -956,13 +972,15 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
     try:
         time.sleep(delay)
         prompt   = _STEP2_PROMPT_TMPL.format(url=target)
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step2)
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             # Retry once with a stricter prompt appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key)
+            raw_text2, in_t2, out_t2 = _claude_web_search_loop(
+                prompt + _STRICT_SUFFIX, api_key, model_id=model_step2
+            )
             in_t  += in_t2
             out_t += out_t2
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
@@ -1037,6 +1055,8 @@ def enrich_one_row(
     api_key: str,
     delay: float,
     use_playwright: bool = True,
+    model_step1: str = MODEL_STEP1,
+    model_step2: str = MODEL_STEP2,
 ) -> tuple:
     """
     Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
@@ -1052,7 +1072,8 @@ def enrich_one_row(
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
-        url, company_name, api_key, delay, use_playwright=use_playwright
+        url, company_name, api_key, delay,
+        use_playwright=use_playwright, model_step1=model_step1,
     )
 
     row.update(s1_fields)
@@ -1063,7 +1084,7 @@ def enrich_one_row(
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
     s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err = run_step2(
-        url, company_name, api_key, delay
+        url, company_name, api_key, delay, model_step2=model_step2,
     )
     row.update(s2_fields)
     row["step2_status"]   = s2_status
@@ -1416,6 +1437,24 @@ with st.sidebar:
         st.error("⚠ API key missing")
 
     st.divider()
+    model_step1_label = st.selectbox(
+        "Model — Step 1 (firmographics)",
+        options=list(AVAILABLE_MODELS.keys()),
+        index=0,
+        help="Used for extracting structured company data from scraped pages. Haiku is sufficient here.",
+    )
+    model_step2_label = st.selectbox(
+        "Model — Step 2 (ICP web search)",
+        options=list(AVAILABLE_MODELS.keys()),
+        index=0,
+        help="Used for the agentic web search. Sonnet gives better signal detection but costs ~5x more.",
+    )
+    selected_model_step1 = AVAILABLE_MODELS[model_step1_label]
+    selected_model_step2 = AVAILABLE_MODELS[model_step2_label]
+    st.session_state["_model_step1"] = selected_model_step1
+    st.session_state["_model_step2"] = selected_model_step2
+
+    st.divider()
 
     debug_mode = st.checkbox(
         "Enable debug mode",
@@ -1669,10 +1708,14 @@ if blocking and not currently_processing:
     for reason in blocking:
         st.warning(f"⚠️ {reason}")
 elif not blocking and not currently_processing and not enrichment_done:
-    est = n_to_process * 0.002  # rough: ~$0.002/row for 2 calls
+    _s1 = ss("_model_step1", MODEL_STEP1)
+    _s2 = ss("_model_step2", MODEL_STEP2)
+    _cost_per_row = _COST_EST.get((_s1, _s2), 0.05)
+    est = n_to_process * _cost_per_row
     st.info(
         f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
-        f"Rough estimated cost: ~${est:.2f}."
+        f"Rough estimated cost: ~${est:.2f} "
+        f"(~${_cost_per_row:.2f}/company with current model selection)."
     )
 
 start_btn = st.button(
@@ -1701,6 +1744,8 @@ if start_btn and not blocking and not currently_processing:
         _local_save_enabled=ss("_local_save_enabled", False),
         _final_auto_saved=False,
         _use_playwright=ss("_use_playwright", True),
+        _model_step1=ss("_model_step1", MODEL_STEP1),
+        _model_step2=ss("_model_step2", MODEL_STEP2),
     )
     st.rerun()
 
@@ -1721,6 +1766,8 @@ if ss("processing", False):
     _elm_mode_run  = ss("_elm_mode", False)
     _active_fields = ss("_active_fields", ALL_ENRICHMENT_FIELDS)
     _use_playwright_run = ss("_use_playwright", True)
+    _model_step1_run    = ss("_model_step1", MODEL_STEP1)
+    _model_step2_run    = ss("_model_step2", MODEL_STEP2)
     total_in       = ss("total_tokens_in", 0)
     total_out      = ss("total_tokens_out", 0)
     total_cost     = ss("total_cost_usd", 0.0)
@@ -1830,6 +1877,8 @@ if ss("processing", False):
                 fields, dbg = enrich_one_row(
                     company_name, raw_url, _api_key, _delay,
                     use_playwright=_use_playwright_run,
+                    model_step1=_model_step1_run,
+                    model_step2=_model_step2_run,
                 )
                 s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
                 s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
@@ -1969,9 +2018,10 @@ if ss("enrichment_done", False):
             tc1.metric("Total input tokens",  f"{t_in:,}")
             tc2.metric("Total output tokens", f"{t_out:,}")
             tc3.metric("Estimated total cost", f"${t_cost:.4f}")
+            _used_s1 = ss("_model_step1", MODEL_STEP1)
+            _used_s2 = ss("_model_step2", MODEL_STEP2)
             st.caption(
-                f"Model: `{MODEL_ID}` · "
-                f"${_COST_INPUT_PER_M}/M input · ${_COST_OUTPUT_PER_M}/M output. "
+                f"Step 1 model: `{_used_s1}` · Step 2 model: `{_used_s2}`. "
                 "Two API calls per row (Step 1 + Step 2). "
                 "Verify charges in your Anthropic dashboard."
             )
