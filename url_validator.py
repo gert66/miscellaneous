@@ -5,15 +5,22 @@ Upload an Excel or CSV file with company names and URLs.
 The app validates each URL, attempts auto-correction, and produces a
 cleaned file with six new url_ columns ready for enrichment.
 
+Search order for dead/missing URLs:
+  1. URL as-is / https:// / www. variants  (no API)
+  2. DuckDuckGo instant answer API          (free)
+  3. Claude with web_search tool            (Anthropic API, last resort)
+
 Processing model: one row per Streamlit rerun so the Stop button works.
 """
 
 import io
+import json
 import re
 import time
 from difflib import SequenceMatcher
 from urllib.parse import urlparse, urlunparse
 
+import anthropic
 import pandas as pd
 import requests
 import streamlit as st
@@ -25,9 +32,14 @@ import streamlit as st
 _COMPANY_HINTS = ["company", "account", "organisation", "organization", "name", "naam", "bedrijf"]
 _DOMAIN_HINTS  = ["domain", "website", "url", "web", "site", "domein"]
 
-_UA = "Mozilla/5.0 (compatible; URLValidatorBot/1.0)"
+_UA      = "Mozilla/5.0 (compatible; URLValidatorBot/1.0)"
 _TIMEOUT = 10
-_DDGO_API = "https://api.duckduckgo.com/?q={query}+official+website&format=json&no_redirect=1"
+
+MODEL_ID         = "claude-haiku-4-5-20251001"
+WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
+
+_COST_INPUT_PER_M  = 0.80
+_COST_OUTPUT_PER_M = 4.00
 
 URL_FIELDS = [
     "url_status",
@@ -39,10 +51,10 @@ URL_FIELDS = [
 ]
 
 _STATUS_COLOR = {
-    "ok":         "#1a7a3c",  # deep green
-    "redirected": "#b35c00",  # burnt orange
-    "corrected":  "#7a5c00",  # dark amber
-    "dead":       "#8b1a1a",  # deep red
+    "ok":         "#1a7a3c",
+    "redirected": "#b35c00",
+    "corrected":  "#7a5c00",
+    "dead":       "#8b1a1a",
 }
 
 _STATUS_TEXT_COLOR = {
@@ -53,7 +65,7 @@ _STATUS_TEXT_COLOR = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Utility helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _similarity(a: str, b: str) -> float:
@@ -80,8 +92,11 @@ def detect_columns(df: pd.DataFrame):
     )
 
 
+def _calc_cost(in_tok: int, out_tok: int) -> float:
+    return (in_tok * _COST_INPUT_PER_M + out_tok * _COST_OUTPUT_PER_M) / 1_000_000
+
+
 def _normalise_url(raw: str) -> str:
-    """Ensure the URL has a scheme so requests can handle it."""
     raw = raw.strip()
     if not raw:
         return ""
@@ -108,7 +123,6 @@ def _get(url: str):
         )
         return resp, None
     except requests.exceptions.SSLError:
-        # retry without SSL verification as last resort
         try:
             resp = requests.get(
                 url,
@@ -124,8 +138,30 @@ def _get(url: str):
         return None, str(exc)
 
 
+def _parse_json(text: str) -> dict:
+    """Extract a JSON object from Claude's response text."""
+    text = text.strip()
+    # Strip markdown fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Try to extract the first {...} block
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Search steps
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _duckduckgo_url(company_name: str) -> str | None:
-    """Ask DuckDuckGo for the official website of company_name."""
+    """Ask DuckDuckGo instant-answer API for the official website."""
     try:
         query = requests.utils.quote(company_name)
         resp = requests.get(
@@ -136,11 +172,9 @@ def _duckduckgo_url(company_name: str) -> str | None:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        # AbstractURL is the best signal
         url = data.get("AbstractURL") or data.get("Redirect") or ""
         if url:
             return url
-        # Fall back to first RelatedTopic URL
         for topic in data.get("RelatedTopics", []):
             u = topic.get("FirstURL", "")
             if u and "duckduckgo.com" not in u:
@@ -150,10 +184,108 @@ def _duckduckgo_url(company_name: str) -> str | None:
         return None
 
 
-def validate_url(original_url: str, company_name: str) -> dict:
+def find_url_via_claude(company_name: str, api_key: str) -> dict:
     """
-    Validate one URL through the four-step waterfall.
-    Returns a dict with the six url_ fields.
+    Use Claude + web_search_20250305 to find the official website URL.
+
+    Returns:
+        url      – full working URL or empty string
+        notes    – one-sentence explanation
+        verified – whether we confirmed the URL with a GET request
+        http_status – HTTP status of the verified URL (or "")
+        tokens_in, tokens_out – usage for cost tracking
+    """
+    result = {
+        "url": "",
+        "notes": "",
+        "verified": False,
+        "http_status": "",
+        "tokens_in": 0,
+        "tokens_out": 0,
+    }
+
+    prompt = (
+        f"What is the official website URL of the company '{company_name}'?\n"
+        "Return ONLY a raw JSON object with two fields:\n"
+        '- url: the full working URL including https:// (e.g. https://www.example.com)\n'
+        "- notes: one sentence explaining what you found or why no URL exists "
+        "(e.g. 'company dissolved in 2021', 'rebranded to X', 'no website found')\n"
+        "If the company no longer exists or has no website, set url to empty string."
+    )
+
+    try:
+        client   = anthropic.Anthropic(api_key=api_key)
+        messages = [{"role": "user", "content": prompt}]
+        total_in = total_out = 0
+
+        for _ in range(6):  # cap agentic loop iterations
+            resp = client.messages.create(
+                model=MODEL_ID,
+                max_tokens=256,
+                tools=[WEB_SEARCH_TOOL],
+                messages=messages,
+            )
+            total_in  += resp.usage.input_tokens
+            total_out += resp.usage.output_tokens
+
+            if resp.stop_reason == "end_turn":
+                text = "".join(getattr(b, "text", "") for b in resp.content).strip()
+                break
+
+            if resp.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": resp.content})
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.id, "content": ""}
+                    for b in resp.content
+                    if getattr(b, "type", "") == "tool_use"
+                ]
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+            else:
+                text = "".join(getattr(b, "text", "") for b in resp.content).strip()
+                break
+        else:
+            text = ""
+
+        result["tokens_in"]  = total_in
+        result["tokens_out"] = total_out
+
+        parsed = _parse_json(text)
+        url    = (parsed.get("url") or "").strip()
+        notes  = (parsed.get("notes") or "").strip()
+        result["notes"] = notes or "Claude returned no explanation"
+
+        if url:
+            url = _normalise_url(url)
+            verify_resp, _ = _get(url)
+            if verify_resp is not None and verify_resp.status_code < 400:
+                result["url"]         = verify_resp.url
+                result["verified"]    = True
+                result["http_status"] = verify_resp.status_code
+            else:
+                # Return URL anyway — let caller decide
+                result["url"]         = url
+                result["verified"]    = False
+                result["http_status"] = getattr(verify_resp, "status_code", "")
+
+    except anthropic.APIError as exc:
+        result["notes"] = f"Claude API error: {exc}"
+
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main validation waterfall
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_url(
+    original_url: str,
+    company_name: str,
+    api_key: str = "",
+    use_claude: bool = False,
+) -> dict:
+    """
+    Validate one URL through the waterfall.
+    Returns the six url_ fields plus tokens_in / tokens_out.
     """
     result = {
         "url_status":       "dead",
@@ -162,6 +294,8 @@ def validate_url(original_url: str, company_name: str) -> dict:
         "http_status_code": "",
         "correction_source":"dead",
         "correction_notes": "",
+        "tokens_in":        0,
+        "tokens_out":       0,
     }
 
     raw = (original_url or "").strip()
@@ -169,77 +303,96 @@ def validate_url(original_url: str, company_name: str) -> dict:
         result["correction_notes"] = "no URL provided"
         return result
 
-    # ── Step 1: try URL as-is (normalised to have a scheme) ──────────────────
+    # ── Step 1a: URL as-is ────────────────────────────────────────────────────
     url_as_is = _normalise_url(raw)
-    resp, err = _get(url_as_is)
+    resp, _   = _get(url_as_is)
     if resp is not None and resp.status_code < 400:
-        final = resp.url
-        orig_dom = _domain(url_as_is)
+        final     = resp.url
+        orig_dom  = _domain(url_as_is)
         final_dom = _domain(final)
         result["http_status_code"] = resp.status_code
-        result["final_url"] = final
+        result["final_url"]        = final
         if orig_dom and final_dom and orig_dom != final_dom:
-            result["url_status"] = "redirected"
+            result["url_status"]      = "redirected"
             result["redirect_target"] = final
             result["correction_source"] = "original"
-            result["correction_notes"] = f"redirected to {final_dom}"
+            result["correction_notes"]  = f"redirected to {final_dom}"
         else:
-            result["url_status"] = "ok"
+            result["url_status"]        = "ok"
             result["correction_source"] = "original"
         return result
 
-    # ── Step 2: try adding https:// if it was missing ─────────────────────────
+    # ── Step 1b: add https:// if missing ─────────────────────────────────────
     if not re.match(r"^https?://", raw, re.IGNORECASE):
         url_https = "https://" + raw
-        resp, err = _get(url_https)
+        resp, _   = _get(url_https)
         if resp is not None and resp.status_code < 400:
             final = resp.url
-            result["http_status_code"] = resp.status_code
-            result["final_url"] = final
-            result["url_status"] = "corrected"
+            result["http_status_code"]  = resp.status_code
+            result["final_url"]         = final
+            result["url_status"]        = "corrected"
             result["correction_source"] = "https_added"
-            result["correction_notes"] = "added https:// prefix"
+            result["correction_notes"]  = "added https:// prefix"
             if _domain(url_https) != _domain(final):
                 result["redirect_target"] = final
             return result
 
-    # ── Step 3: try www. variant ──────────────────────────────────────────────
+    # ── Step 1c: www. variant ─────────────────────────────────────────────────
     parsed = urlparse(url_as_is)
     if not parsed.netloc.lower().startswith("www."):
-        www_netloc = "www." + parsed.netloc
-        url_www = urlunparse(parsed._replace(netloc=www_netloc))
-        resp, err = _get(url_www)
+        url_www = urlunparse(parsed._replace(netloc="www." + parsed.netloc))
+        resp, _ = _get(url_www)
         if resp is not None and resp.status_code < 400:
             final = resp.url
-            result["http_status_code"] = resp.status_code
-            result["final_url"] = final
-            result["url_status"] = "corrected"
+            result["http_status_code"]  = resp.status_code
+            result["final_url"]         = final
+            result["url_status"]        = "corrected"
             result["correction_source"] = "www_added"
-            result["correction_notes"] = "added www. prefix"
+            result["correction_notes"]  = "added www. prefix"
             if _domain(url_www) != _domain(final):
                 result["redirect_target"] = final
             return result
 
-    # ── Step 4: DuckDuckGo search ─────────────────────────────────────────────
+    # ── Step 2: DuckDuckGo instant answer (free) ──────────────────────────────
     if company_name:
         ddg_url = _duckduckgo_url(company_name)
         if ddg_url:
-            resp, err = _get(ddg_url)
+            resp, _ = _get(ddg_url)
             if resp is not None and resp.status_code < 400:
                 final = resp.url
-                result["http_status_code"] = resp.status_code
-                result["final_url"] = final
-                result["url_status"] = "corrected"
+                result["http_status_code"]  = resp.status_code
+                result["final_url"]         = final
+                result["url_status"]        = "corrected"
                 result["correction_source"] = "search_corrected"
-                result["correction_notes"] = f"found via DuckDuckGo: {_domain(final)}"
+                result["correction_notes"]  = f"found via DuckDuckGo: {_domain(final)}"
                 if _domain(ddg_url) != _domain(final):
                     result["redirect_target"] = final
                 return result
 
+    # ── Step 3: Claude web search (last resort, costs tokens) ─────────────────
+    if use_claude and api_key and company_name:
+        claude_res = find_url_via_claude(company_name, api_key)
+        result["tokens_in"]  = claude_res["tokens_in"]
+        result["tokens_out"] = claude_res["tokens_out"]
+
+        if claude_res["url"] and claude_res["verified"]:
+            final = claude_res["url"]
+            result["http_status_code"]  = claude_res["http_status"]
+            result["final_url"]         = final
+            result["url_status"]        = "corrected"
+            result["correction_source"] = "search_corrected"
+            result["correction_notes"]  = f"Claude: {claude_res['notes']}"
+            if _domain(final) != _domain(url_as_is):
+                result["redirect_target"] = final
+            return result
+        elif claude_res["notes"]:
+            result["correction_notes"] = f"Claude: {claude_res['notes']}"
+
     # ── All steps failed ──────────────────────────────────────────────────────
-    result["url_status"] = "dead"
+    result["url_status"]        = "dead"
     result["correction_source"] = "dead"
-    result["correction_notes"] = "no working URL found"
+    if not result["correction_notes"]:
+        result["correction_notes"] = "no working URL found"
     return result
 
 
@@ -251,15 +404,47 @@ st.set_page_config(page_title="URL Validator", page_icon="🔗", layout="wide")
 st.title("🔗 URL Validator & Auto-Corrector")
 st.caption("Validate and fix company URLs before enrichment.")
 
+# ── API key ───────────────────────────────────────────────────────────────────
+_api_key = ""
+try:
+    _api_key = st.secrets.get("ANTHROPIC_API_KEY", "") or ""
+except Exception:
+    pass
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Settings")
+
+    # API key status
+    if _api_key:
+        st.success("API key loaded", icon="✅")
+    else:
+        st.warning("ANTHROPIC_API_KEY not set in secrets", icon="⚠️")
+
+    use_claude = st.toggle(
+        "Use Claude web search for dead URLs",
+        value=bool(_api_key),
+        disabled=not bool(_api_key),
+        help="Uses claude-haiku-4-5 with web_search as a last resort. Costs ~$0.001 per lookup.",
+    )
+
+    st.divider()
+    st.subheader("Token usage")
+    tok_in_ph  = st.empty()
+    tok_out_ph = st.empty()
+    cost_ph    = st.empty()
+
 # ── Session-state initialisation ─────────────────────────────────────────────
 for key, default in {
     "_running":      False,
     "_stop":         False,
     "_current_idx":  0,
-    "_results":      [],   # list of dicts (one per processed row)
+    "_results":      [],
     "_df_raw":       None,
     "_name_col":     None,
     "_url_col":      None,
+    "_tokens_in":    0,
+    "_tokens_out":   0,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -270,7 +455,20 @@ def _reset():
     st.session_state["_stop"]        = False
     st.session_state["_current_idx"] = 0
     st.session_state["_results"]     = []
+    st.session_state["_tokens_in"]   = 0
+    st.session_state["_tokens_out"]  = 0
 
+
+def _render_token_sidebar():
+    ti = st.session_state["_tokens_in"]
+    to = st.session_state["_tokens_out"]
+    cost = _calc_cost(ti, to)
+    tok_in_ph.metric("Input tokens",  f"{ti:,}")
+    tok_out_ph.metric("Output tokens", f"{to:,}")
+    cost_ph.metric("Estimated cost",  f"${cost:.4f}")
+
+
+_render_token_sidebar()
 
 # ── File upload ───────────────────────────────────────────────────────────────
 uploaded = st.file_uploader("Upload Excel or CSV file", type=["xlsx", "xls", "csv"])
@@ -286,7 +484,6 @@ if uploaded:
         st.error(f"Could not read file: {exc}")
         st.stop()
 
-    # Reset if a new file is uploaded
     if st.session_state["_df_raw"] is None or not df_raw.equals(st.session_state["_df_raw"]):
         _reset()
         st.session_state["_df_raw"] = df_raw
@@ -348,19 +545,26 @@ if uploaded:
                 st.info(f"Stopped after {idx} row(s).")
             st.rerun()
 
-        # Progress
         st.progress(idx / total, text=f"Processing row {idx + 1} of {total}…")
 
-        # Process current row
-        row = df_raw.iloc[idx]
+        row     = df_raw.iloc[idx]
         company = str(row.get(name_col, "") or "")
-        url     = str(row.get(url_col, "")  or "")
+        url     = str(row.get(url_col,  "") or "")
 
-        url_result = validate_url(url, company)
+        url_result = validate_url(
+            url, company,
+            api_key=_api_key,
+            use_claude=use_claude,
+        )
+
+        # Accumulate token usage
+        st.session_state["_tokens_in"]  += url_result.pop("tokens_in",  0)
+        st.session_state["_tokens_out"] += url_result.pop("tokens_out", 0)
+        _render_token_sidebar()
+
         st.session_state["_results"].append({**row.to_dict(), **url_result})
         st.session_state["_current_idx"] += 1
 
-        # Live table
         if st.session_state["_results"]:
             live_df = pd.DataFrame(st.session_state["_results"])
             st.subheader(f"Live results ({len(live_df)} processed)")
@@ -383,12 +587,11 @@ if uploaded:
         time.sleep(0.05)
         st.rerun()
 
-    # ── Results panel (shown when not running and results exist) ──────────────
+    # ── Results panel ─────────────────────────────────────────────────────────
     results = st.session_state["_results"]
     if results and not st.session_state["_running"]:
         results_df = pd.DataFrame(results)
 
-        # Metrics
         st.subheader("Summary")
         counts = results_df["url_status"].value_counts()
         m1, m2, m3, m4 = st.columns(4)
@@ -404,7 +607,6 @@ if uploaded:
                 "These rows are highlighted in red — fix them manually before running enrichment."
             )
 
-        # Full results table
         st.subheader("Full results")
         display_cols = [name_col, url_col] + URL_FIELDS
         display_cols = [c for c in display_cols if c in results_df.columns]
@@ -422,7 +624,6 @@ if uploaded:
             height=500,
         )
 
-        # Dead URLs detail
         dead_df = results_df[results_df["url_status"] == "dead"]
         if not dead_df.empty:
             with st.expander(f"💀 Dead URLs ({len(dead_df)} rows) — needs manual fix"):
@@ -431,12 +632,14 @@ if uploaded:
                     use_container_width=True,
                 )
 
-        # Download
         st.subheader("Download")
-        # Preserve original column order; append url_ columns
         orig_cols = df_raw.columns.tolist()
         new_cols  = [c for c in URL_FIELDS if c not in orig_cols]
-        out_df    = results_df[orig_cols + new_cols] if all(c in results_df.columns for c in orig_cols) else results_df
+        out_df    = (
+            results_df[orig_cols + new_cols]
+            if all(c in results_df.columns for c in orig_cols)
+            else results_df
+        )
 
         buf = io.BytesIO()
         out_df.to_excel(buf, index=False, engine="openpyxl")
