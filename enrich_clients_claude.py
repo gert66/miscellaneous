@@ -59,14 +59,14 @@ WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 AVAILABLE_MODELS = {
     "Haiku 4.5 (fast, cheap)":                   "claude-haiku-4-5-20251001",
-    "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20250514",
+    "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20251001",
 }
 # Per-row cost estimates for the pre-run info banner
 _COST_EST = {
     ("claude-haiku-4-5-20251001",  "claude-haiku-4-5-20251001"):  0.01,
-    ("claude-haiku-4-5-20251001",  "claude-sonnet-4-5-20250514"): 0.05,
-    ("claude-sonnet-4-5-20250514", "claude-haiku-4-5-20251001"):  0.04,
-    ("claude-sonnet-4-5-20250514", "claude-sonnet-4-5-20250514"): 0.08,
+    ("claude-haiku-4-5-20251001",  "claude-sonnet-4-5-20251001"): 0.05,
+    ("claude-sonnet-4-5-20251001", "claude-haiku-4-5-20251001"):  0.04,
+    ("claude-sonnet-4-5-20251001", "claude-sonnet-4-5-20251001"): 0.08,
 }
 
 # Pricing per million tokens (claude-haiku-4-5)
