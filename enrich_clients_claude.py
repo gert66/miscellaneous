@@ -1151,7 +1151,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float, model: st
         except (json.JSONDecodeError, ValueError) as e:
             jina_err = f"Jina parse error: {e}"
         except anthropic.APIError as e:
-            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
+            jina_err = f"Claude API error on Jina extraction: {str(e)[:120]}"
         except Exception as e:
             jina_err = str(e)
 
@@ -1205,7 +1205,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float, model: st
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2, max_iterations: int = 3) -> tuple:
     """
     Run Claude with web_search_20250305 tool in an agentic loop.
     Returns (final_text, total_input_tokens, total_output_tokens, iteration_log).
@@ -1215,7 +1215,7 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2)
     total_in = total_out = 0
     iteration_log = []
 
-    for _iteration in range(10):
+    for _iteration in range(max_iterations):
         resp = client.messages.create(
             model=model,
             max_tokens=2048,
@@ -1269,7 +1269,7 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2)
     return "", total_in, total_out, iteration_log
 
 
-def run_step2(url: str, company_name: str, api_key: str, delay: float, model: str = MODEL_STEP2) -> tuple:
+def run_step2(url: str, company_name: str, api_key: str, delay: float, model: str = MODEL_STEP2, max_iterations: int = 3) -> tuple:
     """
     Research ICP signals using Claude with web_search.
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg, iteration_log).
@@ -1294,13 +1294,13 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float, model: st
     try:
         time.sleep(delay)
         prompt   = _STEP2_PROMPT_TMPL.format(url=target)
-        raw_text, in_t, out_t, iter_log = _claude_web_search_loop(prompt, api_key, model=model)
+        raw_text, in_t, out_t, iter_log = _claude_web_search_loop(prompt, api_key, model=model, max_iterations=max_iterations)
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             # Retry once with a stricter prompt appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2, iter_log2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key, model=model)
+            raw_text2, in_t2, out_t2, iter_log2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key, model=model, max_iterations=max_iterations)
             in_t  += in_t2
             out_t += out_t2
             iter_log = iter_log + iter_log2
@@ -1403,12 +1403,18 @@ def enrich_one_row(
     row["step1_tokens_out"] = str(s1_out)
     row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
 
-    # ── Step 2 ────────────────────────────────────────────────────────────────
-    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_iter_log = run_step2(
-        url, company_name, api_key, delay, model=ss("_model_step2", MODEL_STEP2)
-    )
+    # ── Step 2 (skipped when Step 1 found nothing) ────────────────────────────
+    if _step1_has_data(s1_fields):
+        s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_iter_log = run_step2(
+            url, company_name, api_key, delay,
+            model=ss("_model_step2", MODEL_STEP2),
+            max_iterations=ss("_max_search_iterations", 3),
+        )
+    else:
+        s2_fields, s2_raw, s2_in, s2_out = _ICP_EMPTY.copy(), {}, 0, 0
+        s2_status, s2_err, s2_iter_log   = "skipped_no_step1_data", "", []
     row.update(s2_fields)
-    row["step2_status"]   = s2_status
+    row["step2_status"]     = s2_status
     row["step2_tokens_in"]  = str(s2_in)
     row["step2_tokens_out"] = str(s2_out)
     row["step2_cost_usd"]   = f"{calc_cost(s2_in, s2_out):.6f}"
@@ -1776,6 +1782,14 @@ with st.sidebar:
         f"Step 1: `{MODEL_OPTIONS[step1_model].split('-')[1]}` · "
         f"Step 2: `{MODEL_OPTIONS[step2_model].split('-')[1]}`"
     )
+    max_search_iterations = st.slider(
+        "Max Step 2 search iterations",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1,
+        help="Lower = faster and cheaper. Higher = more thorough but more tokens. Default 3 keeps cost close to $0.01/company.",
+    )
     st.divider()
 
     if _elm_mode:
@@ -2027,10 +2041,14 @@ elif not blocking and not currently_processing and not enrichment_done:
             "No API calls, no tokens, no cost."
         )
     else:
-        est = n_to_process * 0.002  # rough: ~$0.002/row for 2 calls
+        _s2_is_sonnet = "sonnet" in MODEL_OPTIONS[step2_model].lower()
+        _cost_per_iter = 0.015 if _s2_is_sonnet else 0.003
+        _cost_per_row  = 0.001 + max_search_iterations * _cost_per_iter
+        est = n_to_process * _cost_per_row
         st.info(
             f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
-            f"Rough estimated cost: ~${est:.2f}."
+            f"Rough estimated cost: ~${est:.2f} total (~${_cost_per_row:.3f} per company) "
+            f"based on {max_search_iterations} search iteration(s)."
         )
 
 start_btn = st.button(
@@ -2060,6 +2078,7 @@ if start_btn and not blocking and not currently_processing:
         _final_auto_saved=False,
         _model_step1=MODEL_OPTIONS[step1_model],
         _model_step2=MODEL_OPTIONS[step2_model],
+        _max_search_iterations=max_search_iterations,
     )
     st.rerun()
 
