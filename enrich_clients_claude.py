@@ -1069,7 +1069,7 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
     _STRICT_SUFFIX = (
         "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
     )
-    prompt = _STEP2_PROMPT_TMPL.format(url=target)
+    prompt = STEP2_STATIC_PREFIX + f"\n\nNow research this company: {target}"
 
     try:
         time.sleep(delay)
