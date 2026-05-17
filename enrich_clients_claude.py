@@ -1039,11 +1039,11 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
         save_cache(ck, payload)
         return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
     except (json.JSONDecodeError, ValueError) as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}", 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {type(e).__name__}: {e}", 0, 0)
     except anthropic.APIError as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}", 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
     except Exception as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e), 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
 
 
 def _extract_icp_fields(raw: dict) -> dict:
@@ -1953,6 +1953,10 @@ if ss("processing", False):
                     _retry_note = " | ⚡ Google fallback used"
                 elif ss("_last_retry_msg", ""):
                     _retry_note = " | ⏳ Had Jina 429 retry"
+                if fields.get("step2_status") == "api_error":
+                    status_box.write(
+                        f"⚠️ Step 2 API error: {fields.get('error_message', '(no detail)')}"
+                    )
                 status_box.write(
                     f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
                     f"Row cost: ${row_cost:.5f}{_retry_note}"
