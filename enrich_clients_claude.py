@@ -959,7 +959,7 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
     Returns (final_text, total_input_tokens, total_output_tokens).
     """
     if model_id is None:
-        model_id = MODEL_STEP2
+        raise ValueError("model_id must be provided to _claude_web_search_loop")
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -1937,6 +1937,7 @@ if ss("processing", False):
                 )
                 row_cost = 0.0
             else:
+                status_box.write(f"🤖 Step 2 model: `{_model_step2_run}`")
                 status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
                 fields, dbg = enrich_one_row(
                     company_name, raw_url, _api_key, _delay,
