@@ -1176,7 +1176,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float, model: st
             company_name=company_name or target,
             url=target,
         )
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model=model)
+        raw_text, in_t, out_t, _ = _claude_web_search_loop(prompt, api_key, model=model)
         total_in  += in_t
         total_out += out_t
         raw_fields = _parse_json_response(raw_text)
@@ -1208,11 +1208,12 @@ _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2) -> tuple:
     """
     Run Claude with web_search_20250305 tool in an agentic loop.
-    Returns (final_text, total_input_tokens, total_output_tokens).
+    Returns (final_text, total_input_tokens, total_output_tokens, iteration_log).
     """
     client   = anthropic.Anthropic(api_key=api_key)
     messages = [{"role": "user", "content": prompt}]
     total_in = total_out = 0
+    iteration_log = []
 
     for _iteration in range(10):
         resp = client.messages.create(
@@ -1224,9 +1225,28 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2)
         total_in  += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
 
+        search_queries = [
+            getattr(b, "input", {}).get("query", "")
+            for b in resp.content
+            if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "web_search"
+        ]
+        text_snippets = [
+            getattr(b, "text", "")[:500]
+            for b in resp.content
+            if getattr(b, "type", "") == "text" and getattr(b, "text", "")
+        ]
+        iteration_log.append({
+            "iteration":      _iteration + 1,
+            "stop_reason":    resp.stop_reason,
+            "search_queries": search_queries,
+            "text_snippets":  text_snippets,
+            "tokens_in":      resp.usage.input_tokens,
+            "tokens_out":     resp.usage.output_tokens,
+        })
+
         if resp.stop_reason == "end_turn":
             text = "".join(getattr(b, "text", "") for b in resp.content).strip()
-            return text, total_in, total_out
+            return text, total_in, total_out, iteration_log
 
         if resp.stop_reason == "tool_use":
             # Add assistant turn; API executed the search server-side
@@ -1244,19 +1264,19 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2)
         else:
             # Unexpected stop — return whatever text exists
             text = "".join(getattr(b, "text", "") for b in resp.content).strip()
-            return text, total_in, total_out
+            return text, total_in, total_out, iteration_log
 
-    return "", total_in, total_out
+    return "", total_in, total_out, iteration_log
 
 
 def run_step2(url: str, company_name: str, api_key: str, delay: float, model: str = MODEL_STEP2) -> tuple:
     """
     Research ICP signals using Claude with web_search.
-    Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg).
+    Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg, iteration_log).
     """
     target = normalize_url(url) if url else company_name
     if not target:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", [])
 
     ck = f"step2_{target}"
     cached = load_cache(ck)
@@ -1265,7 +1285,7 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float, model: st
         if any(icp.get(f, "") for f in ICP_FIELDS[:3]):  # basic sanity check
             in_t  = int(cached.get("tokens_in", 0) or 0)
             out_t = int(cached.get("tokens_out", 0) or 0)
-            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "")
+            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", cached.get("iteration_log", []))
         _delete_cache(ck)
 
     _STRICT_SUFFIX = (
@@ -1274,25 +1294,26 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float, model: st
     try:
         time.sleep(delay)
         prompt   = _STEP2_PROMPT_TMPL.format(url=target)
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model=model)
+        raw_text, in_t, out_t, iter_log = _claude_web_search_loop(prompt, api_key, model=model)
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             # Retry once with a stricter prompt appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key, model=model)
+            raw_text2, in_t2, out_t2, iter_log2 = _claude_web_search_loop(prompt + _STRICT_SUFFIX, api_key, model=model)
             in_t  += in_t2
             out_t += out_t2
+            iter_log = iter_log + iter_log2
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
-        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t, "iteration_log": iter_log}
         save_cache(ck, payload)
-        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "")
+        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", iter_log)
     except (json.JSONDecodeError, ValueError) as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}", [])
     except anthropic.APIError as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}", [])
     except Exception as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e))
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e), [])
 
 
 def _extract_icp_fields(raw: dict) -> dict:
@@ -1383,7 +1404,7 @@ def enrich_one_row(
     row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
-    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err = run_step2(
+    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_iter_log = run_step2(
         url, company_name, api_key, delay, model=ss("_model_step2", MODEL_STEP2)
     )
     row.update(s2_fields)
@@ -1422,15 +1443,17 @@ def enrich_one_row(
         "step1_raw_json":     s1_raw,
         "step1_tokens_in":    s1_in,
         "step1_tokens_out":   s1_out,
-        "step2_status":       s2_status,
-        "step2_raw_json":     s2_raw,
-        "step2_tokens_in":    s2_in,
-        "step2_tokens_out":   s2_out,
-        "total_cost":         calc_cost(total_in, total_out),
-        "enrichment_status":  row["enrichment_status"],
-        "error_message":      row["error_message"],
+        "step2_status":        s2_status,
+        "step2_raw_json":      s2_raw,
+        "step2_tokens_in":     s2_in,
+        "step2_tokens_out":    s2_out,
+        "step2_iteration_log": s2_iter_log,
+        "step2_model_used":    ss("_model_step2", MODEL_STEP2),
+        "total_cost":          calc_cost(total_in, total_out),
+        "enrichment_status":   row["enrichment_status"],
+        "error_message":       row["error_message"],
         "needs_manual_review": row["needs_manual_review"],
-        "match_notes":        row["match_notes"],
+        "match_notes":         row["match_notes"],
     }
     return row, dbg
 
@@ -2484,8 +2507,37 @@ if ss("enrichment_done", False):
                     else:
                         st.info("No Step 2 response.")
 
+                trail = d.get("step2_iteration_log", [])
+                with st.expander(
+                    f"Step 2 search trail — {len(trail)} iteration(s)",
+                    expanded=False,
+                ):
+                    s2_model = d.get("step2_model_used", "unknown")
+                    s2_tok_in  = d.get("step2_tokens_in", 0)
+                    s2_tok_out = d.get("step2_tokens_out", 0)
+                    st.caption(
+                        f"Model: `{s2_model}` · "
+                        f"Total tokens in: {s2_tok_in:,} · out: {s2_tok_out:,} · "
+                        f"Cost: ${calc_cost(int(s2_tok_in or 0), int(s2_tok_out or 0)):.5f}"
+                    )
+                    if trail:
+                        for it in trail:
+                            st.markdown(
+                                f"**Iteration {it['iteration']}** — "
+                                f"`{it['stop_reason']}` · "
+                                f"in: {it['tokens_in']:,} · out: {it['tokens_out']:,}"
+                            )
+                            if it.get("search_queries"):
+                                for q in it["search_queries"]:
+                                    st.markdown(f"&nbsp;&nbsp;🔍 {q}")
+                            if it.get("text_snippets"):
+                                for snip in it["text_snippets"]:
+                                    st.text(snip)
+                    else:
+                        st.info("No iteration log available (cached or errored result).")
+
         st.subheader("🐛 Additional debug downloads")
-        dbg_dl1, dbg_dl2 = st.columns(2)
+        dbg_dl1, dbg_dl2, dbg_dl3 = st.columns(3)
         with dbg_dl1:
             debug_enriched = df_enriched.copy()
             if not _elm_done:
@@ -2519,6 +2571,18 @@ if ss("enrichment_done", False):
                 )
             else:
                 st.info("Cache is empty.")
+        with dbg_dl3:
+            _dbg_model = ss("_model_step2", MODEL_STEP2).replace("/", "-")
+            _dbg_ts    = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            _dbg_json  = json.dumps(debug_records_done, ensure_ascii=False, default=str, indent=2)
+            st.download_button(
+                "⬇ Full debug JSON",
+                data=_dbg_json.encode("utf-8"),
+                file_name=f"debug_{_dbg_model}_{_dbg_ts}.json",
+                mime="application/json",
+                use_container_width=True,
+                help="Exports all companies with complete Step 2 iteration logs as a single JSON file.",
+            )
 
         st.subheader("🐛 Cache viewer")
         st.caption(f"{CACHE_DIR.resolve()} — {get_cache_count()} file(s)")
