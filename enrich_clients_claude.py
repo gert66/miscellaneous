@@ -879,7 +879,7 @@ def run_step1(
             company_name=company_name or target,
             url=target,
         )
-        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key)
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
         total_in  += in_t
         total_out += out_t
         raw_fields = _parse_json_response(raw_text)
@@ -907,16 +907,18 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3,
-                            model_id: str = MODEL_STEP2) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> tuple:
     """
     Run Claude with web_search_20250305 (server-side built-in tool).
     Anthropic executes the search automatically — no tool_result needed.
     Returns (final_text, total_input_tokens, total_output_tokens).
     """
+    if model_id is None:
+        model_id = MODEL_STEP2
+
     client = anthropic.Anthropic(api_key=api_key)
 
-    for attempt in range(max_iterations):
+    for attempt in range(3):
         try:
             resp = client.messages.create(
                 model=model_id,
@@ -925,18 +927,18 @@ def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(
-                getattr(b, "text", "") for b in resp.content
+                getattr(b, "text", "")
+                for b in resp.content
                 if getattr(b, "type", "") == "text"
             ).strip()
             return text, resp.usage.input_tokens, resp.usage.output_tokens
 
         except anthropic.RateLimitError as e:
-            wait = (
-                int(e.response.headers.get("retry-after", 30))
-                if hasattr(e, "response") and e.response
-                else 30
-            )
+            wait = 30
+            if hasattr(e, "response") and e.response is not None:
+                wait = int(e.response.headers.get("retry-after", 30))
             time.sleep(wait)
+
         except anthropic.APIStatusError as e:
             if e.status_code == 529:
                 time.sleep(60)
