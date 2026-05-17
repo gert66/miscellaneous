@@ -81,7 +81,11 @@ _STEP2_PROMPT_TMPL = (
     "global_team_signals ('yes - [brief details]' or 'no'), "
     "training_signals ('yes - [brief details about training/learning/upskilling mentions]' or 'no'), "
     "multi_office ('yes - [count] offices' or 'no'), "
-    "language_training_fit_score (integer 1-10, where 10 = highest fit for language training)."
+    "language_training_fit_score (integer 1-10, where 10 = highest fit for language training), "
+    "competitor_partnerships (whether the company mentions partnerships, alliances, or integrations with other companies — look for partner pages, reseller networks, technology alliances, or co-branded offerings. Return 'yes - [brief description]' or 'no'), "
+    "merger_acquisition_signal (whether the company has recently merged, been acquired, acquired another company, joined a larger group, or is undergoing post-merger integration. Look for press releases, news mentions, 'now part of', 'recently acquired', 'joining forces', 'integration', 'new group structure', or similar language. Return 'yes - [brief description]' or 'no'), "
+    "international_customer_base (whether the company serves customers in multiple countries or mentions international clients, export markets, global customer support, international sales, account management, or cross-border consulting. Look on the website, case studies, client pages, and about pages. Return 'yes - [brief evidence]' or 'no'), "
+    "leadership_sales_roles (whether the company employs significant numbers of leadership, sales, account management, consulting, customer success, business development, or client-facing professionals. Look at the careers page, team pages, LinkedIn, and job ads for role types. Return 'yes - [brief evidence, e.g. \"large sales team, 30+ AE job ads\"]' or 'no')."
 )
 
 # ── Field lists ───────────────────────────────────────────────────────────────
@@ -122,6 +126,10 @@ ICP_FIELDS = [
     "icp_training_signals",
     "icp_multi_office",
     "icp_language_training_fit_score",
+    "icp_competitor_partnerships",
+    "icp_merger_acquisition_signal",
+    "icp_international_customer_base",
+    "icp_leadership_sales_roles",
 ]
 
 # Metadata added per row
@@ -1297,6 +1305,10 @@ def _extract_icp_fields(raw: dict) -> dict:
         "icp_training_signals":           str(raw.get("training_signals")           or "").strip(),
         "icp_multi_office":               str(raw.get("multi_office")               or "").strip(),
         "icp_language_training_fit_score": str(raw.get("language_training_fit_score") or "").strip(),
+        "icp_competitor_partnerships":      str(raw.get("competitor_partnerships")      or "").strip(),
+        "icp_merger_acquisition_signal":    str(raw.get("merger_acquisition_signal")    or "").strip(),
+        "icp_international_customer_base":  str(raw.get("international_customer_base")  or "").strip(),
+        "icp_leadership_sales_roles":       str(raw.get("leadership_sales_roles")       or "").strip(),
     }
 
 
