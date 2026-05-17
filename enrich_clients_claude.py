@@ -82,8 +82,8 @@ _STEP2_PROMPT_TMPL = (
     "global_team_signals ('yes - [brief details]' or 'no'), "
     "training_signals ('yes - [brief details about training/learning/upskilling mentions]' or 'no'), "
     "multi_office ('yes - [count] offices' or 'no'), "
-    "language_training_fit_score (integer 1-10, where 10 = highest fit for language training), "
-    "competitor_partnerships (whether the company mentions partnerships, alliances, or integrations with other companies — look for partner pages, reseller networks, technology alliances, or co-branded offerings. Return 'yes - [brief description]' or 'no'), "
+    "language_training_fit_score: integer 1-10 estimating how likely this company is to BUY corporate language training or communication training from an external provider. A score of 10 means very likely to purchase. Base the score on: international footprint, multilingual workforce, foreign HQ or parent company, post-merger integration needs, active hiring of client-facing roles, and explicit L&D investment. Score LOW (1-3) if the company IS a language training provider itself, or if there is no evidence of international work or training investment. Score HIGH (8-10) if multiple strong signals are present. "
+    "competitor_partnerships: Search specifically for any evidence that this company has worked with, purchased from, is mentioned alongside, or appears on the client list of ANY of these exact language training providers: GoFluent, Learnlight, Learnship, Voxy, Speexx, Preply, Fluentify, Twenix, Cambly, Berlitz, EF Corporate Solutions, Rosetta Stone, Babbel for Business, Busuu for Teams, italki for Business. This includes case studies, testimonials, supplier pages, procurement documents, press releases, job ads mentioning these tools, or any co-occurrence on a webpage. Do NOT return general technology partners, sports sponsors, fashion collaborations, or financial partners. ONLY return a match if one of the exact names above is found in connection with this company. Return 'yes - [exact competitor name] - [source type]' or 'no'. "
     "merger_acquisition_signal (whether the company has recently merged, been acquired, acquired another company, joined a larger group, or is undergoing post-merger integration. Look for press releases, news mentions, 'now part of', 'recently acquired', 'joining forces', 'integration', 'new group structure', or similar language. Return 'yes - [brief description]' or 'no'), "
     "international_customer_base (whether the company serves customers in multiple countries or mentions international clients, export markets, global customer support, international sales, account management, or cross-border consulting. Look on the website, case studies, client pages, and about pages. Return 'yes - [brief evidence]' or 'no'), "
     "leadership_sales_roles (whether the company employs significant numbers of leadership, sales, account management, consulting, customer success, business development, or client-facing professionals. Look at the careers page, team pages, LinkedIn, and job ads for role types. Return 'yes - [brief evidence, e.g. \"large sales team, 30+ AE job ads\"]' or 'no')."
@@ -1145,13 +1145,8 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float, model: st
             if _step1_has_data(fields):
                 return (fields, payload, total_in, total_out, "enriched_jina", "")
             jina_err = "Jina page fetched but Claude found no usable data"
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else 0
-            jina_err = f"Jina HTTP {code}: {str(e)[:120]}"
-        except (json.JSONDecodeError, ValueError) as e:
-            jina_err = f"Jina parse error: {e}"
         except anthropic.APIError as e:
-            jina_err = f"Claude API error on Jina extraction: {str(e)[:120]}"
+            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
         except Exception as e:
             jina_err = str(e)
 
@@ -1225,16 +1220,13 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2,
         total_in  += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
 
-        search_queries = [
-            getattr(b, "input", {}).get("query", "")
-            for b in resp.content
-            if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "web_search"
-        ]
-        text_snippets = [
-            getattr(b, "text", "")[:500]
-            for b in resp.content
-            if getattr(b, "type", "") == "text" and getattr(b, "text", "")
-        ]
+        search_queries = []
+        text_snippets  = []
+        for b in resp.content:
+            if b.type == "tool_use" and b.name == "web_search":
+                search_queries.append(b.input.get("query", ""))
+            elif b.type == "text" and b.text:
+                text_snippets.append(b.text[:500])
         iteration_log.append({
             "iteration":      _iteration + 1,
             "stop_reason":    resp.stop_reason,
@@ -1253,11 +1245,12 @@ def _claude_web_search_loop(prompt: str, api_key: str, model: str = MODEL_STEP2,
             messages.append({"role": "assistant", "content": resp.content})
             tool_results = []
             for b in resp.content:
-                if getattr(b, "type", "") == "tool_use":
+                if b.type == "tool_use":
+                    raw_content = str(getattr(b, "content", "") or "")
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": b.id,
-                        "content": "",
+                        "content": raw_content[:2000],
                     })
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
