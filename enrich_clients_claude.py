@@ -59,14 +59,14 @@ WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 AVAILABLE_MODELS = {
     "Haiku 4.5 (fast, cheap)":                   "claude-haiku-4-5-20251001",
-    "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20250514",
+    "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20250929",
 }
 # Per-row cost estimates for the pre-run info banner
 _COST_EST = {
     ("claude-haiku-4-5-20251001",  "claude-haiku-4-5-20251001"):  0.01,
-    ("claude-haiku-4-5-20251001",  "claude-sonnet-4-5-20250514"): 0.05,
-    ("claude-sonnet-4-5-20250514", "claude-haiku-4-5-20251001"):  0.04,
-    ("claude-sonnet-4-5-20250514", "claude-sonnet-4-5-20250514"): 0.08,
+    ("claude-haiku-4-5-20251001",  "claude-sonnet-4-5-20250929"): 0.05,
+    ("claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"):  0.04,
+    ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929"): 0.08,
 }
 
 # Pricing per million tokens (claude-haiku-4-5)
@@ -94,112 +94,62 @@ _STEP1_PROMPT = (
 # The web_search tool definition (~300 tokens) counts toward the threshold too.
 
 STEP2_STATIC_PREFIX = """\
-You are an expert ICP (Ideal Customer Profile) analyst specialising in identifying \
-companies that are strong candidates for corporate language training services.
+You are analyzing companies to identify whether they may have a potential interest in \
+language training, business English, communication training, leadership training, \
+negotiation training, team-building, onboarding, or broader employee development.
 
-Your task is to research a given company URL and extract structured signals that \
-indicate whether this company would benefit from a corporate language training programme.
+Your task is to evaluate each company based on the 10 buying signals below. \
+Prioritize the signals in this order:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SIGNAL DEFINITIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. International footprint - The company has offices, teams, subsidiaries, clients, \
+production sites, or operations in multiple countries or regions.
 
-international_presence
-  Count the number of countries where the company has offices, employees, or active \
-operations. Check the About page, Contact / Locations page, and any "Global presence" \
-section. Use the string "global" when the company explicitly claims worldwide operations \
-without listing individual countries. Otherwise use a number: "1", "3", "12", etc.
+2. Foreign headquarters, parent company, or group structure - The company operates in \
+one country but has its headquarters, parent company, group ownership, regional HQ, or \
+reporting lines in another country.
 
-languages_mentioned
-  List every language referenced on the website or in job descriptions: navigation \
-languages, language-specific subdomains (e.g. .de, .fr), language requirements in job \
-ads, and languages mentioned as part of the product or service offering.
-  Format: comma-separated string, e.g. "English, Dutch, French, Spanish".
+3. Competitor signal - Check whether the company is mentioned together with any of the \
+following competitors: GoFluent, Learnlight, Learnship, Voxy, Speexx, Preply, \
+Fluentify, Twenix, Cambly, Berlitz, EF. This includes mentions on the company website, \
+competitor case studies, testimonials, client lists, press releases, supplier pages, \
+training pages, procurement documents, webinars, articles, events, job ads, or any page \
+where the company name and competitor name appear together. If the company is mentioned \
+together with one of these competitors, this is a very strong signal.
 
-hiring_activity
-  Determine whether the company is actively recruiting.
-  Strong signals: an active Careers or Jobs page with open roles, "We are hiring" \
-banners, recent LinkedIn job postings, references to team growth or headcount targets.
-  Format: "yes - <brief description of evidence>" or "no"
+4. Merger, acquisition, integration, or new group ownership.
 
-recent_funding
-  Check for any investment or funding announcements.
-  Look for: press releases, news articles, Crunchbase mentions, About page references \
-to seed, Series A/B/C/D rounds, growth equity, venture debt, or IPO activity.
-  Format: "yes - <amount and round type if known>" or "no"
+5. Explicit learning and development focus.
 
-recent_news
-  Identify major business events in the last 12 months that signal growth or change.
-  Events of interest: geographic expansion into new markets, acquisition of another \
-company, being acquired, IPO or public offering, major strategic partnership, new \
-product launch in a new market or language.
-  Format: "yes - <brief summary of the most significant event>" or "none"
+6. International customer base or client-facing international work.
 
-global_team_signals
-  Look for evidence of a multi-national or geographically distributed workforce.
-  Signals: job listings posted in multiple countries, team pages showing international \
-office locations, mentions of cross-border collaboration, engineering hubs on different \
-continents, remote-first policies that explicitly span multiple countries or time zones.
-  Format: "yes - <brief details>" or "no"
+7. Multicultural or multilingual workforce.
 
-training_signals
-  Identify any evidence that the company invests in employee learning and development.
-  Signals: a dedicated L&D or People Development team, a corporate academy or internal \
-university programme, upskilling or reskilling initiatives, coaching or mentoring \
-schemes, certification budgets, e-learning platforms, or references to training \
-investment in job descriptions or culture / values pages.
-  Format: "yes - <brief details about the training activity>" or "no"
+8. Employer branding and employee satisfaction.
 
-multi_office
-  Determine whether the company operates from more than one physical location.
-  Count distinct office addresses (ignore virtual offices and PO boxes).
-  Format: "yes - <N> offices" or "no"
+9. Rapid growth, hiring, or expansion.
 
-language_training_fit_score  (integer 1 – 10)
-  Your overall judgement of how well this company fits the buyer profile for a corporate \
-language training programme.
+10. Leadership, management, sales, or negotiation-heavy roles.
 
-  Scoring guide
-  ─────────────
-   9–10  Large multinational (500 + employees), active L&D culture explicitly mentioned,
-         multiple languages already in use, recent funding or expansion signal,
-         hiring internationally.
-   7–8   Mid-size company (100 – 500 employees), clear international presence in 3 +
-         countries, some L&D signals visible, growth trajectory evident.
-   5–6   Smaller company or primarily domestic but with meaningful international signals
-         (e.g. key clients abroad, bilingual website, cross-border hiring).
-   3–4   Little international presence; training culture unclear; flat or slow growth
-         signals; operations concentrated in one country.
-   1–2   Purely domestic, no evidence of training investment, no hiring activity,
-         no international footprint.
+Return ONLY a raw JSON object with exactly these fields and no others:
+{"lead_score": "High or Medium or Low", \
+"buying_signals": "comma-separated list of signal names actually supported by evidence", \
+"competitor_signal": "name of competitor if found, otherwise empty string", \
+"evidence": "brief description of what was found and source types", \
+"likely_training_interest": \
+"comma-separated list from: Language training / Business English, \
+Intercultural communication, Leadership training, Negotiation training, \
+Sales or client communication, Team collaboration / team-building, \
+Onboarding / employee development, Broader professional training", \
+"why_relevant": "brief explanation", \
+"potential_buyer_function": \
+"most likely buyer such as HR, Learning and Development, Talent Development, \
+People and Culture, Leadership Development, Sales Enablement, Customer Success, \
+Operations, Procurement"}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return ONLY a raw JSON object. Do NOT wrap it in markdown code fences. Do NOT add any \
-explanation, preamble, or trailing commentary. The JSON must contain exactly these nine \
-fields and no others:
-
-{
-  "international_presence": "<string>",
-  "languages_mentioned": "<comma-separated string or empty string>",
-  "hiring_activity": "<'yes - ...' or 'no'>",
-  "recent_funding": "<'yes - ...' or 'no'>",
-  "recent_news": "<'yes - ...' or 'none'>",
-  "global_team_signals": "<'yes - ...' or 'no'>",
-  "training_signals": "<'yes - ...' or 'no'>",
-  "multi_office": "<'yes - N offices' or 'no'>",
-  "language_training_fit_score": <integer 1-10>
-}
-
-Use an empty string "" for any field where you cannot find reliable information. \
-Do not guess or fabricate data. If the company website is inaccessible, base your \
-answer on any publicly available knowledge you already have about the company.\
+Do not invent evidence. Do not wrap in markdown.\
 """
 
-# Kept for reference / cache-miss fallback (not used for API calls when caching is on)
-_STEP2_PROMPT_TMPL = STEP2_STATIC_PREFIX + "\n\nNow research this company: {url}"
+
 
 # ── Field lists ───────────────────────────────────────────────────────────────
 
@@ -228,17 +178,15 @@ STEP1_FIELDS = [
     "lusha_ipo_status",
 ]
 
-# Step 2: Mingle ICP signals
+# Step 2: Mingo ICP buying signals
 ICP_FIELDS = [
-    "icp_international_presence",
-    "icp_languages_mentioned",
-    "icp_hiring_activity",
-    "icp_recent_funding",
-    "icp_recent_news",
-    "icp_global_team_signals",
-    "icp_training_signals",
-    "icp_multi_office",
-    "icp_language_training_fit_score",
+    "icp_lead_score",
+    "icp_buying_signals",
+    "icp_competitor_signal",
+    "icp_evidence",
+    "icp_likely_training_interest",
+    "icp_why_relevant",
+    "icp_potential_buyer_function",
 ]
 
 # Metadata added per row
@@ -1011,7 +959,7 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
     Returns (final_text, total_input_tokens, total_output_tokens).
     """
     if model_id is None:
-        model_id = MODEL_STEP2
+        raise ValueError("model_id must be provided to _claude_web_search_loop")
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -1069,7 +1017,7 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
     _STRICT_SUFFIX = (
         "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
     )
-    prompt = _STEP2_PROMPT_TMPL.format(url=target)
+    prompt = STEP2_STATIC_PREFIX + f"\n\nNow research this company: {target}"
 
     try:
         time.sleep(delay)
@@ -1091,24 +1039,22 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
         save_cache(ck, payload)
         return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
     except (json.JSONDecodeError, ValueError) as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}", 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {type(e).__name__}: {e}", 0, 0)
     except anthropic.APIError as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API: {e}", 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
     except Exception as e:
-        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", str(e), 0, 0)
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
 
 
 def _extract_icp_fields(raw: dict) -> dict:
     return {
-        "icp_international_presence":     str(raw.get("international_presence")     or "").strip(),
-        "icp_languages_mentioned":        str(raw.get("languages_mentioned")        or "").strip(),
-        "icp_hiring_activity":            str(raw.get("hiring_activity")            or "").strip(),
-        "icp_recent_funding":             str(raw.get("recent_funding")             or "").strip(),
-        "icp_recent_news":                str(raw.get("recent_news")                or "").strip(),
-        "icp_global_team_signals":        str(raw.get("global_team_signals")        or "").strip(),
-        "icp_training_signals":           str(raw.get("training_signals")           or "").strip(),
-        "icp_multi_office":               str(raw.get("multi_office")               or "").strip(),
-        "icp_language_training_fit_score": str(raw.get("language_training_fit_score") or "").strip(),
+        "icp_lead_score":                str(raw.get("lead_score")                or "").strip(),
+        "icp_buying_signals":            str(raw.get("buying_signals")            or "").strip(),
+        "icp_competitor_signal":         str(raw.get("competitor_signal")         or "").strip(),
+        "icp_evidence":                  str(raw.get("evidence")                  or "").strip(),
+        "icp_likely_training_interest":  str(raw.get("likely_training_interest")  or "").strip(),
+        "icp_why_relevant":              str(raw.get("why_relevant")              or "").strip(),
+        "icp_potential_buyer_function":  str(raw.get("potential_buyer_function")  or "").strip(),
     }
 
 
@@ -1586,6 +1532,15 @@ with st.sidebar:
         use_playwright = False
     st.session_state["_use_playwright"] = use_playwright
 
+    st.divider()
+    _cache_n = get_cache_count()
+    st.caption(f"Enrichment cache: **{_cache_n}** file(s)")
+    if st.button("Clear enrichment cache", use_container_width=True, key="clear_cache_always"):
+        if CACHE_DIR.exists():
+            for f in CACHE_DIR.glob("*.json"):
+                f.unlink(missing_ok=True)
+        st.rerun()
+
     # ── Auto-save status ──────────────────────────────────────────────────────
     _last_name = ss("autosave_last_name", "")
     if ss("processing", False) and _last_name:
@@ -1982,6 +1937,7 @@ if ss("processing", False):
                 )
                 row_cost = 0.0
             else:
+                status_box.write(f"🤖 Step 2 model: `{_model_step2_run}`")
                 status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
                 fields, dbg = enrich_one_row(
                     company_name, raw_url, _api_key, _delay,
@@ -1997,6 +1953,10 @@ if ss("processing", False):
                     _retry_note = " | ⚡ Google fallback used"
                 elif ss("_last_retry_msg", ""):
                     _retry_note = " | ⏳ Had Jina 429 retry"
+                if fields.get("step2_status") == "api_error":
+                    status_box.write(
+                        f"⚠️ Step 2 API error: {fields.get('error_message', '(no detail)')}"
+                    )
                 status_box.write(
                     f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
                     f"Row cost: ${row_cost:.5f}{_retry_note}"
@@ -2116,8 +2076,17 @@ if ss("enrichment_done", False):
         if "needs_manual_review" in df_enriched.columns else 0
     )
     all_sc = list(status_counts.items())
+    web_search_n = (
+        int((df_enriched["step2_status"] == "ok").sum())
+        if "step2_status" in df_enriched.columns else 0
+    )
+    competitor_n = (
+        int(df_enriched["icp_competitor_signal"].astype(str).str.strip().ne("").sum())
+        if "icp_competitor_signal" in df_enriched.columns else 0
+    )
     # In ELM mode there is no "Needs review" concept
     extra_metrics = [] if _elm_done else [("⚑ Needs review", needs_review_n)]
+    extra_metrics += [("🔍 Web search used", web_search_n), ("🏁 Competitor found", competitor_n)]
     n_cols = min(len(all_sc) + len(extra_metrics), 6)
     if all_sc:
         rcols = st.columns(max(n_cols, 1))
@@ -2213,11 +2182,10 @@ if ss("enrichment_done", False):
                 "lusha_total_funding_amount", "lusha_total_funding_rounds",
                 "lusha_last_round_type", "lusha_last_round_amount", "lusha_last_round_date",
                 "lusha_ipo_status",
-                # Step 2 — ICP signals
-                "icp_language_training_fit_score",
-                "icp_international_presence", "icp_languages_mentioned",
-                "icp_hiring_activity", "icp_recent_funding", "icp_recent_news",
-                "icp_global_team_signals", "icp_training_signals", "icp_multi_office",
+                # Step 2 — ICP buying signals
+                "icp_lead_score", "icp_buying_signals", "icp_competitor_signal",
+                "icp_evidence", "icp_likely_training_interest",
+                "icp_why_relevant", "icp_potential_buyer_function",
                 # Cost
                 "total_tokens_in", "total_tokens_out", "total_cost_usd",
                 "error_message",
