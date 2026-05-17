@@ -18,6 +18,7 @@ import json
 import re
 import time
 from difflib import SequenceMatcher
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 import anthropic
@@ -412,6 +413,92 @@ def validate_url(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Excel builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_cleaned_excel(out_df: pd.DataFrame) -> bytes:
+    """Standard cleaned Excel — all original columns + url_ columns."""
+    buf = io.BytesIO()
+    out_df.to_excel(buf, index=False, engine="openpyxl")
+    return buf.getvalue()
+
+
+def _build_manual_excel(out_df: pd.DataFrame, url_col: str) -> bytes:
+    """
+    Manual-editing Excel:
+    - dead rows: Website URL column cleared + yellow highlight + comment
+    - unverified rows: final_url used + light-orange highlight
+    - ok/corrected/redirected: final_url used
+    - header row bolded, columns auto-fitted, A1 note added
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.comments import Comment
+
+    YELLOW      = PatternFill("solid", fgColor="FFFF00")
+    ORANGE      = PatternFill("solid", fgColor="FFE0B2")
+    HEADER_FONT = Font(bold=True)
+
+    df = out_df.copy()
+
+    # Resolve Website URL column: use final_url for non-dead rows
+    if "final_url" in df.columns and url_col in df.columns:
+        mask_good = df["url_status"].isin(["ok", "corrected", "redirected", "unverified"])
+        df.loc[mask_good, url_col] = df.loc[mask_good, "final_url"]
+        df.loc[df["url_status"] == "dead", url_col] = ""
+
+    wb = Workbook()
+    ws = wb.active
+
+    cols = df.columns.tolist()
+    ws.append(cols)
+
+    # Bold + centre header
+    for cell in ws[1]:
+        cell.font      = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+    # A1 legend comment
+    legend = Comment(
+        "Yellow = URL missing, fill manually. Orange = URL unverified (may be bot-blocked).",
+        "URL Validator",
+    )
+    legend.width  = 320
+    legend.height = 60
+    ws["A1"].comment = legend
+
+    url_col_idx = cols.index(url_col) + 1 if url_col in cols else None  # 1-based
+
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        status = row.get("url_status", "")
+        ws.append([row[c] for c in cols])
+
+        if status == "dead":
+            for cell in ws[row_idx]:
+                cell.fill = YELLOW
+            if url_col_idx:
+                url_cell = ws.cell(row=row_idx, column=url_col_idx)
+                url_cell.comment = Comment(
+                    "URL not found — please fill in manually",
+                    "URL Validator",
+                )
+        elif status == "unverified":
+            for cell in ws[row_idx]:
+                cell.fill = ORANGE
+
+    # Auto-fit column widths (cap at 60)
+    for col_cells in ws.columns:
+        max_len = max(
+            (len(str(c.value)) if c.value is not None else 0) for c in col_cells
+        )
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -663,15 +750,33 @@ if uploaded:
             else results_df
         )
 
-        buf = io.BytesIO()
-        out_df.to_excel(buf, index=False, engine="openpyxl")
-        buf.seek(0)
+        # Derive stem from uploaded filename
+        stem = Path(uploaded.name).stem
 
-        st.download_button(
-            label="⬇️ Download cleaned Excel",
-            data=buf,
-            file_name="validated_urls.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        dl_l, dl_r = st.columns(2)
+        with dl_l:
+            st.download_button(
+                label="⬇️ Download cleaned Excel",
+                data=_build_cleaned_excel(out_df),
+                file_name="validated_urls.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with dl_r:
+            st.download_button(
+                label="✏️ Download for manual editing",
+                data=_build_manual_excel(out_df, url_col),
+                file_name=f"{stem}_for_manual_editing.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # Summary line
+        n_ready      = counts.get("ok", 0) + counts.get("corrected", 0) + counts.get("redirected", 0)
+        n_dead       = counts.get("dead", 0)
+        n_unverified = counts.get("unverified", 0)
+        st.caption(
+            f"Ready to enrich: **{n_ready}** companies | "
+            f"Needs manual URL: **{n_dead}** companies | "
+            f"Unverified (likely ok): **{n_unverified}** companies"
         )
 
 else:
