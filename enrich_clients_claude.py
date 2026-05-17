@@ -162,6 +162,9 @@ _ELM_KW_LANGUAGES = [
     "english", "french", "german", "spanish", "portuguese", "dutch", "italian",
     "chinese", "mandarin", "japanese", "korean", "arabic", "russian", "polish",
     "turkish", "swedish", "norwegian", "danish", "finnish", "hebrew",
+    "multilingual", "multitaal", "language training", "business english",
+    "local language", "language skills", "taaltraining", "communication",
+    "language barrier", "native speaker",
 ]
 _ELM_KW_HIRING = [
     "careers", "jobs", "hiring", "join us", "join our team", "open positions",
@@ -238,6 +241,9 @@ ELM_METADATA_FIELDS = [
     "elm_sector_cluster",
     "elm_data_found",
     "elm_metadata_found",
+    "elm_homepage_found",
+    "elm_about_page_found",
+    "elm_careers_page_found",
 ]
 ELM_ALL_FIELDS = ELM_STATUS_FIELDS + ELM_KEYWORD_FIELDS + ELM_SCORE_FIELDS + ELM_METADATA_FIELDS
 
@@ -606,7 +612,7 @@ def fetch_page_with_metadata(url: str) -> dict:
 
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)[:8_000]
+        text = soup.get_text(separator=" ", strip=True)[:12_000]
 
         return {
             "text": text,
@@ -760,7 +766,8 @@ def extract_signals_enhanced(pages: dict, metadata: dict, fetched: list = None, 
         lang_score = min(lang_score + 1, 10)
 
     # Website data-quality score
-    about_page_found   = any(s in fetched for s in ["/about", "/about-us"])
+    homepage_found     = "/" in fetched
+    about_page_found   = any(s in fetched for s in ["/about", "/about-us", "/company"])
     careers_page_found = any(s in fetched for s in ["/careers", "/jobs"])
     meta_desc_found    = bool(metadata.get("meta_description_found", False))
     og_found           = bool(metadata.get("og_tags_found", False))
@@ -821,6 +828,9 @@ def extract_signals_enhanced(pages: dict, metadata: dict, fetched: list = None, 
         "elm_sector_cluster":         elm_sector_cluster,
         "elm_data_found":             data_found,
         "elm_metadata_found":         metadata_found,
+        "elm_homepage_found":         homepage_found,
+        "elm_about_page_found":       about_page_found,
+        "elm_careers_page_found":     careers_page_found,
     }
 
 
