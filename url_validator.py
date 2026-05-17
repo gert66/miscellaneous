@@ -16,6 +16,8 @@ Processing model: one row per Streamlit rerun so the Stop button works.
 import io
 import json
 import re
+import subprocess
+import sys
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -25,6 +27,25 @@ import anthropic
 import pandas as pd
 import requests
 import streamlit as st
+
+# ── Playwright availability ───────────────────────────────────────────────────
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_OK = True
+except ImportError:
+    _PLAYWRIGHT_OK = False
+
+
+def _ensure_playwright():
+    """Download the Chromium browser binary if not already present."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -52,19 +73,21 @@ URL_FIELDS = [
 ]
 
 _STATUS_COLOR = {
-    "ok":         "#1a7a3c",
-    "redirected": "#b35c00",
-    "corrected":  "#7a5c00",
-    "unverified": "#4a3a7a",  # purple — Claude found it but GET was blocked
-    "dead":       "#8b1a1a",
+    "ok":          "#1a7a3c",
+    "ok_headless": "#0d5c6e",  # teal — confirmed via headless Chrome
+    "redirected":  "#b35c00",
+    "corrected":   "#7a5c00",
+    "unverified":  "#4a3a7a",
+    "dead":        "#8b1a1a",
 }
 
 _STATUS_TEXT_COLOR = {
-    "ok":         "#e6ffe6",
-    "redirected": "#ffe8cc",
-    "corrected":  "#fff4cc",
-    "unverified": "#ece6ff",
-    "dead":       "#ffe6e6",
+    "ok":          "#e6ffe6",
+    "ok_headless": "#d6f5ff",
+    "redirected":  "#ffe8cc",
+    "corrected":   "#fff4cc",
+    "unverified":  "#ece6ff",
+    "dead":        "#ffe6e6",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +162,64 @@ def _get(url: str):
             return None, str(exc)
     except Exception as exc:
         return None, str(exc)
+
+
+def check_url_headless(url: str) -> dict:
+    """
+    Load url in a stealth headless Chromium browser.
+    Returns dict: success, status_code, final_url, page_title.
+    Never raises — all exceptions become success=False.
+    """
+    result = {"success": False, "status_code": None, "final_url": url, "page_title": ""}
+    if not _PLAYWRIGHT_OK:
+        return result
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                java_script_enabled=True,
+                ignore_https_errors=True,
+            )
+            page = ctx.new_page()
+            resp = page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            status = resp.status if resp else None
+            final  = page.url
+            title  = page.title()
+            browser.close()
+
+        if status is not None and status < 400:
+            result.update(success=True, status_code=status, final_url=final, page_title=title)
+        else:
+            result.update(status_code=status, final_url=final, page_title=title)
+    except Exception:
+        pass
+    return result
+
+
+def _get_or_headless(url: str, use_headless: bool):
+    """
+    Try _get(); if 403/503 and use_headless, retry with headless Chrome.
+    Returns (resp, headless_dict_or_None).
+    headless_dict is non-None only when headless succeeded.
+    """
+    resp, _ = _get(url)
+    if (
+        resp is not None
+        and resp.status_code in (403, 503)
+        and use_headless
+        and _PLAYWRIGHT_OK
+    ):
+        headless = check_url_headless(url)
+        if headless["success"]:
+            return resp, headless
+    return resp, None
 
 
 def _parse_json(text: str) -> dict:
@@ -293,6 +374,7 @@ def validate_url(
     company_name: str,
     api_key: str = "",
     use_claude: bool = False,
+    use_headless: bool = False,
 ) -> dict:
     """
     Validate one URL through the waterfall.
@@ -316,7 +398,16 @@ def validate_url(
 
     # ── Step 1a: URL as-is ────────────────────────────────────────────────────
     url_as_is = _normalise_url(raw)
-    resp, _   = _get(url_as_is)
+    resp, headless = _get_or_headless(url_as_is, use_headless)
+    if headless:
+        result.update(
+            url_status="ok_headless",
+            final_url=headless["final_url"],
+            http_status_code=headless["status_code"],
+            correction_source="headless_chrome",
+            correction_notes=f"bot-blocked ({resp.status_code}), confirmed via headless Chrome",
+        )
+        return result
     if resp is not None and resp.status_code < 400:
         final     = resp.url
         orig_dom  = _domain(url_as_is)
@@ -324,8 +415,8 @@ def validate_url(
         result["http_status_code"] = resp.status_code
         result["final_url"]        = final
         if orig_dom and final_dom and orig_dom != final_dom:
-            result["url_status"]      = "redirected"
-            result["redirect_target"] = final
+            result["url_status"]        = "redirected"
+            result["redirect_target"]   = final
             result["correction_source"] = "original"
             result["correction_notes"]  = f"redirected to {final_dom}"
         else:
@@ -336,7 +427,16 @@ def validate_url(
     # ── Step 1b: add https:// if missing ─────────────────────────────────────
     if not re.match(r"^https?://", raw, re.IGNORECASE):
         url_https = "https://" + raw
-        resp, _   = _get(url_https)
+        resp, headless = _get_or_headless(url_https, use_headless)
+        if headless:
+            result.update(
+                url_status="ok_headless",
+                final_url=headless["final_url"],
+                http_status_code=headless["status_code"],
+                correction_source="headless_chrome",
+                correction_notes=f"bot-blocked ({resp.status_code}), confirmed via headless Chrome",
+            )
+            return result
         if resp is not None and resp.status_code < 400:
             final = resp.url
             result["http_status_code"]  = resp.status_code
@@ -352,7 +452,16 @@ def validate_url(
     parsed = urlparse(url_as_is)
     if not parsed.netloc.lower().startswith("www."):
         url_www = urlunparse(parsed._replace(netloc="www." + parsed.netloc))
-        resp, _ = _get(url_www)
+        resp, headless = _get_or_headless(url_www, use_headless)
+        if headless:
+            result.update(
+                url_status="ok_headless",
+                final_url=headless["final_url"],
+                http_status_code=headless["status_code"],
+                correction_source="headless_chrome",
+                correction_notes=f"bot-blocked ({resp.status_code}), confirmed via headless Chrome",
+            )
+            return result
         if resp is not None and resp.status_code < 400:
             final = resp.url
             result["http_status_code"]  = resp.status_code
@@ -531,6 +640,19 @@ with st.sidebar:
     )
 
     st.divider()
+
+    if _PLAYWRIGHT_OK:
+        use_headless = st.toggle(
+            "Use headless Chrome for bot-blocked URLs",
+            value=True,
+            help="Retries 403/503 responses with a stealth Chromium browser.",
+        )
+        st.caption("⚠ First run may take 60s to install Chromium")
+    else:
+        use_headless = False
+        st.caption("Headless Chrome unavailable (playwright not installed)")
+
+    st.divider()
     st.subheader("Token usage")
     tok_in_ph  = st.empty()
     tok_out_ph = st.empty()
@@ -538,18 +660,24 @@ with st.sidebar:
 
 # ── Session-state initialisation ─────────────────────────────────────────────
 for key, default in {
-    "_running":      False,
-    "_stop":         False,
-    "_current_idx":  0,
-    "_results":      [],
-    "_df_raw":       None,
-    "_name_col":     None,
-    "_url_col":      None,
-    "_tokens_in":    0,
-    "_tokens_out":   0,
+    "_running":           False,
+    "_stop":              False,
+    "_current_idx":       0,
+    "_results":           [],
+    "_df_raw":            None,
+    "_name_col":          None,
+    "_url_col":           None,
+    "_tokens_in":         0,
+    "_tokens_out":        0,
+    "_playwright_ready":  False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Ensure Chromium binary is present (once per session)
+if _PLAYWRIGHT_OK and not st.session_state["_playwright_ready"]:
+    _ensure_playwright()
+    st.session_state["_playwright_ready"] = True
 
 
 def _reset():
@@ -559,6 +687,7 @@ def _reset():
     st.session_state["_results"]     = []
     st.session_state["_tokens_in"]   = 0
     st.session_state["_tokens_out"]  = 0
+    # keep _playwright_ready — no need to reinstall Chromium on data reset
 
 
 def _render_token_sidebar():
@@ -657,6 +786,7 @@ if uploaded:
             url, company,
             api_key=_api_key,
             use_claude=use_claude,
+            use_headless=use_headless,
         )
 
         # Accumulate token usage
@@ -696,12 +826,13 @@ if uploaded:
 
         st.subheader("Summary")
         counts = results_df["url_status"].value_counts()
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("✅ OK",           counts.get("ok", 0))
-        m2.metric("↩️ Redirected",   counts.get("redirected", 0))
-        m3.metric("🔧 Corrected",    counts.get("corrected", 0))
-        m4.metric("🔮 Unverified",   counts.get("unverified", 0))
-        m5.metric("💀 Dead",         counts.get("dead", 0))
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("✅ OK",             counts.get("ok", 0))
+        m2.metric("🌐 Headless OK",    counts.get("ok_headless", 0))
+        m3.metric("↩️ Redirected",     counts.get("redirected", 0))
+        m4.metric("🔧 Corrected",      counts.get("corrected", 0))
+        m5.metric("🔮 Unverified",     counts.get("unverified", 0))
+        m6.metric("💀 Dead",           counts.get("dead", 0))
 
         unverified_count = counts.get("unverified", 0)
         if unverified_count:
@@ -770,7 +901,8 @@ if uploaded:
             )
 
         # Summary line
-        n_ready      = counts.get("ok", 0) + counts.get("corrected", 0) + counts.get("redirected", 0)
+        n_ready      = (counts.get("ok", 0) + counts.get("ok_headless", 0)
+                        + counts.get("corrected", 0) + counts.get("redirected", 0))
         n_dead       = counts.get("dead", 0)
         n_unverified = counts.get("unverified", 0)
         st.caption(

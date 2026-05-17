@@ -8,3 +8,4 @@ beautifulsoup4
 anthropic
 openpyxl
 pandas
+playwright>=1.40.0
