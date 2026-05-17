@@ -53,6 +53,8 @@ LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 MODEL_ID         = "claude-haiku-4-5-20251001"
+MODEL_STEP1      = MODEL_ID
+MODEL_STEP2      = "claude-haiku-4-5-20251001"
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 # Pricing per million tokens (claude-haiku-4-5)
@@ -891,48 +893,42 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(prompt: str, api_key: str) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, max_iterations: int = 3) -> tuple:
     """
-    Run Claude with web_search_20250305 tool in an agentic loop.
+    Run Claude with web_search_20250305 (server-side built-in tool).
+    Anthropic executes the search automatically — no tool_result needed.
     Returns (final_text, total_input_tokens, total_output_tokens).
     """
-    client   = anthropic.Anthropic(api_key=api_key)
-    messages = [{"role": "user", "content": prompt}]
-    total_in = total_out = 0
+    client = anthropic.Anthropic(api_key=api_key)
 
-    for _iteration in range(10):
-        resp = client.messages.create(
-            model=MODEL_ID,
-            max_tokens=2048,
-            tools=[WEB_SEARCH_TOOL],
-            messages=messages,
-        )
-        total_in  += resp.usage.input_tokens
-        total_out += resp.usage.output_tokens
+    for attempt in range(max_iterations):
+        try:
+            resp = client.messages.create(
+                model=MODEL_STEP2,
+                max_tokens=2048,
+                tools=[WEB_SEARCH_TOOL],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(
+                getattr(b, "text", "") for b in resp.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            return text, resp.usage.input_tokens, resp.usage.output_tokens
 
-        if resp.stop_reason == "end_turn":
-            text = "".join(getattr(b, "text", "") for b in resp.content).strip()
-            return text, total_in, total_out
+        except anthropic.RateLimitError as e:
+            wait = (
+                int(e.response.headers.get("retry-after", 30))
+                if hasattr(e, "response") and e.response
+                else 30
+            )
+            time.sleep(wait)
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529:
+                time.sleep(60)
+            else:
+                raise
 
-        if resp.stop_reason == "tool_use":
-            # Add assistant turn; API executed the search server-side
-            messages.append({"role": "assistant", "content": resp.content})
-            tool_results = []
-            for b in resp.content:
-                if getattr(b, "type", "") == "tool_use":
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": b.id,
-                        "content": "",
-                    })
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
-        else:
-            # Unexpected stop — return whatever text exists
-            text = "".join(getattr(b, "text", "") for b in resp.content).strip()
-            return text, total_in, total_out
-
-    return "", total_in, total_out
+    return "", 0, 0
 
 
 def run_step2(url: str, company_name: str, api_key: str, delay: float) -> tuple:
