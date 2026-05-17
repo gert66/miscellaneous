@@ -36,10 +36,10 @@ import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 try:
-    from human_scraper import scrape_with_human_behaviour as _human_scrape
-    _HUMAN_SCRAPER_AVAILABLE = True
+    from human_scraper import scrape_with_human_behaviour
+    _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    _HUMAN_SCRAPER_AVAILABLE = False
+    _PLAYWRIGHT_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -249,6 +249,8 @@ _STATUS_LABELS = {
     "web_search_fallback":           "Enriched via web search fallback",
     "cached_fallback":               "From cache (web search fallback)",
     "skipped_resume":                "Skipped (resumed)",
+    "enriched_playwright":           "Enriched via browser scrape",
+    "playwright_blocked":            "Browser blocked (bot detection)",
 }
 
 
@@ -396,6 +398,11 @@ _JINA_ABOUT_SLUGS  = ("/about-us", "/about")
 _JINA_MIN_CONTENT  = 500   # fewer chars than this → treat as failed Jina fetch
 _JINA_RETRY_WAITS  = (30, 60, 120)  # backoff seconds on 429
 
+_BOT_DETECTION_KEYWORDS = (
+    "automatically identified", "security system", "bot", "captcha",
+    "cloudflare", "datadome",
+)
+
 
 class JinaRateLimitRetry(Exception):
     """Raised to signal the UI that we're waiting on a 429 before retrying."""
@@ -446,17 +453,12 @@ def _jina_get_with_retry(url: str, company_hint: str = "") -> str:
 
 def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
     """
-    Fetch the homepage AND about-us page; return whichever has more content.
-    Both must be ≥ _JINA_MIN_CONTENT chars to count — shorter responses are
-    treated as blocked/empty and raise requests.HTTPError so the caller can
-    fall through to the Google tier.
-
-    Tier 1a — Jina direct scrape
-    Tier 1b — human Playwright scraper (fallback when Jina returns 403/503)
+    Fetch the homepage AND about-us page via Jina Reader; return whichever has
+    more content.  Raises requests.HTTPError when content is below
+    _JINA_MIN_CONTENT so the caller can fall through to the next tier.
     """
-    base             = url.rstrip("/")
-    best             = ""
-    jina_blocked     = False  # True if any request returned 403 or 503
+    base = url.rstrip("/")
+    best = ""
 
     # Try homepage
     try:
@@ -465,8 +467,8 @@ def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
             best = text
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 0
-        if code in (403, 503):
-            jina_blocked = True
+        if code not in (403, 503):
+            raise
 
     # Try about-us slugs
     for slug in _JINA_ABOUT_SLUGS:
@@ -476,19 +478,8 @@ def fetch_via_jina_reader(url: str, company_hint: str = "") -> str:
                 best = text
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
-            if code in (403, 503):
-                jina_blocked = True
-            elif code not in (404,):
+            if code not in (403, 503, 404):
                 raise
-
-    # ── Tier 1b: human Playwright fallback on 403/503 ─────────────────────────
-    if len(best) < _JINA_MIN_CONTENT and jina_blocked and _HUMAN_SCRAPER_AVAILABLE:
-        try:
-            result = _human_scrape(url, max_chars=_JINA_CHAR_LIMIT)
-            if result.get("success") and len(result.get("text", "")) > 500:
-                return result["text"]
-        except Exception:
-            pass
 
     if len(best) < _JINA_MIN_CONTENT:
         # Simulate a 404 so the caller falls through to the search tier
@@ -745,19 +736,29 @@ _STEP1_FALLBACK_PROMPT_TMPL = (
 )
 
 
-def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
+_PW_DBG_SKIP = {"playwright_attempted": False, "playwright_result": "skipped"}
+
+
+def run_step1(
+    url: str,
+    company_name: str,
+    api_key: str,
+    delay: float,
+    use_playwright: bool = True,
+) -> tuple:
     """
     Three-tier Step 1 enrichment:
-      Tier 1 — Jina direct scrape       → status 'enriched_jina'
-      Tier 2 — Claude web_search        → status 'enriched_search'
-      Tier 3 — Both failed              → status 'no_data'
-    Returns (step1_fields, raw_json, in_tok, out_tok, status, error_msg).
+      Tier 1a — Jina direct scrape       → status 'enriched_jina'
+      Tier 1b — human Playwright scrape  → status 'enriched_playwright'
+      Tier 2  — Claude web_search        → status 'enriched_search'
+    Returns (step1_fields, raw_json, in_tok, out_tok, status, error_msg, pw_debug).
+    pw_debug: {"playwright_attempted": bool, "playwright_result": str}
     """
     source_url = normalize_url(url) if url else ""
     jina_err   = ""
     total_in   = total_out = 0
 
-    # ── Tier 1: Jina direct scrape ────────────────────────────────────────────
+    # ── Tier 1a: Jina direct scrape ───────────────────────────────────────────
     if source_url:
         ck = f"step1_url_{source_url}"
         cached = load_cache(ck)
@@ -767,7 +768,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
                 return (fields, cached,
                         int(cached.get("tokens_in",  0) or 0),
                         int(cached.get("tokens_out", 0) or 0),
-                        "enriched_jina", "")
+                        "enriched_jina", "", _PW_DBG_SKIP)
             _delete_cache(ck)
 
         try:
@@ -780,7 +781,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
             save_cache(ck, payload)
             fields = _map_step1_fields(raw_fields, source_url)
             if _step1_has_data(fields):
-                return (fields, payload, total_in, total_out, "enriched_jina", "")
+                return (fields, payload, total_in, total_out, "enriched_jina", "", _PW_DBG_SKIP)
             jina_err = "Jina page fetched but Claude found no usable data"
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
@@ -788,14 +789,63 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
         except (json.JSONDecodeError, ValueError) as e:
             jina_err = f"Jina parse error: {e}"
         except anthropic.APIError as e:
-            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
+            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}", _PW_DBG_SKIP)
         except Exception as e:
             jina_err = str(e)
+
+    # ── Tier 1b: Human Playwright scrape ──────────────────────────────────────
+    _pw_attempted = False
+    _pw_result    = "skipped"
+    if source_url and jina_err and use_playwright and _PLAYWRIGHT_AVAILABLE:
+        _pw_attempted = True
+        ck_pw  = f"step1_playwright_{source_url}"
+        cached_pw = load_cache(ck_pw)
+        if cached_pw is not None:
+            fields = _map_step1_fields(cached_pw.get("claude_data", {}), source_url)
+            if _step1_has_data(fields):
+                _pw_result = "success"
+                return (fields, cached_pw,
+                        int(cached_pw.get("tokens_in",  0) or 0),
+                        int(cached_pw.get("tokens_out", 0) or 0),
+                        "enriched_playwright", "",
+                        {"playwright_attempted": True, "playwright_result": "success"})
+            _delete_cache(ck_pw)
+
+        try:
+            pw_res = scrape_with_human_behaviour(source_url, max_chars=_JINA_CHAR_LIMIT)
+            if pw_res.get("success") and len(pw_res.get("text", "")) >= _JINA_MIN_CONTENT:
+                pw_text  = pw_res["text"]
+                pw_lower = pw_text[:2000].lower()
+                if any(kw in pw_lower for kw in _BOT_DETECTION_KEYWORDS):
+                    _pw_result = "blocked"
+                    jina_err  += " | playwright: bot-detected"
+                else:
+                    raw_fields, in_t, out_t = _claude_extract(pw_text, api_key)
+                    total_in  += in_t
+                    total_out += out_t
+                    payload = {"claude_data": raw_fields, "tokens_in": in_t, "tokens_out": out_t}
+                    save_cache(ck_pw, payload)
+                    fields = _map_step1_fields(raw_fields, source_url)
+                    if _step1_has_data(fields):
+                        _pw_result = "success"
+                        return (fields, payload, total_in, total_out, "enriched_playwright", "",
+                                {"playwright_attempted": True, "playwright_result": "success"})
+                    _pw_result = "failed"
+            else:
+                _pw_result = "failed"
+        except anthropic.APIError as e:
+            return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}",
+                    {"playwright_attempted": True, "playwright_result": "failed"})
+        except Exception as e:
+            _pw_result = "failed"
+            jina_err  += f" | playwright error: {str(e)[:80]}"
+
+    _pw_dbg = {"playwright_attempted": _pw_attempted, "playwright_result": _pw_result}
 
     # ── Tier 2: Claude web_search fallback ────────────────────────────────────
     target = source_url or company_name
     if not target:
-        return ({}, {}, total_in, total_out, "no_data", "No URL or company name provided")
+        return ({}, {}, total_in, total_out, "no_data", "No URL or company name provided", _pw_dbg)
 
     ck = f"step1_fallback_{target}"
     cached = load_cache(ck)
@@ -805,7 +855,7 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
             return (fields, cached,
                     int(cached.get("tokens_in",  0) or 0),
                     int(cached.get("tokens_out", 0) or 0),
-                    "enriched_search", "")
+                    "enriched_search", "", _pw_dbg)
         _delete_cache(ck)
 
     try:
@@ -821,18 +871,17 @@ def run_step1(url: str, company_name: str, api_key: str, delay: float) -> tuple:
         save_cache(ck, payload)
         fields = _map_step1_fields(raw_fields, url)
         if _step1_has_data(fields):
-            return (fields, payload, total_in, total_out, "enriched_search", "")
-        # Tier 3 — web search returned data but nothing useful
+            return (fields, payload, total_in, total_out, "enriched_search", "", _pw_dbg)
         return ({}, {}, total_in, total_out, "no_data",
-                f"Google search returned no usable data. Jina: {jina_err}")
+                f"Google search returned no usable data. Jina: {jina_err}", _pw_dbg)
     except (json.JSONDecodeError, ValueError) as e:
         return ({}, {}, total_in, total_out, "no_data",
-                f"Search parse error: {e}. Jina: {jina_err}")
+                f"Search parse error: {e}. Jina: {jina_err}", _pw_dbg)
     except anthropic.APIError as e:
-        return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}")
+        return ({}, {}, total_in, total_out, "api_error", f"Claude API: {e}", _pw_dbg)
     except Exception as e:
         return ({}, {}, total_in, total_out, "no_data",
-                f"Search error: {e}. Jina: {jina_err}")
+                f"Search error: {e}. Jina: {jina_err}", _pw_dbg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1040,7 @@ def enrich_one_row(
     raw_url: str,
     api_key: str,
     delay: float,
+    use_playwright: bool = True,
 ) -> tuple:
     """
     Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
@@ -1004,9 +1054,9 @@ def enrich_one_row(
     # 8-second pause between companies to stay under the token/min rate limit
     time.sleep(8)
 
-    # ── Step 1 (three-tier: Jina → web_search → no_data) ─────────────────────
-    s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err = run_step1(
-        url, company_name, api_key, delay
+    # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
+    s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
+        url, company_name, api_key, delay, use_playwright=use_playwright
     )
 
     row.update(s1_fields)
@@ -1048,22 +1098,24 @@ def enrich_one_row(
 
     # Debug record
     dbg = {
-        "input_company_name": company_name,
-        "input_url":          raw_url,
-        "normalized_url":     normalize_url(url),
-        "step1_status":       s1_status,
-        "step1_raw_json":     s1_raw,
-        "step1_tokens_in":    s1_in,
-        "step1_tokens_out":   s1_out,
-        "step2_status":       s2_status,
-        "step2_raw_json":     s2_raw,
-        "step2_tokens_in":    s2_in,
-        "step2_tokens_out":   s2_out,
-        "total_cost":         calc_cost(total_in, total_out),
-        "enrichment_status":  row["enrichment_status"],
-        "error_message":      row["error_message"],
-        "needs_manual_review": row["needs_manual_review"],
-        "match_notes":        row["match_notes"],
+        "input_company_name":       company_name,
+        "input_url":                raw_url,
+        "normalized_url":           normalize_url(url),
+        "step1_status":             s1_status,
+        "step1_raw_json":           s1_raw,
+        "step1_tokens_in":          s1_in,
+        "step1_tokens_out":         s1_out,
+        "step1_playwright_attempted": s1_pw_dbg.get("playwright_attempted", False),
+        "step1_playwright_result":    s1_pw_dbg.get("playwright_result", "skipped"),
+        "step2_status":             s2_status,
+        "step2_raw_json":           s2_raw,
+        "step2_tokens_in":          s2_in,
+        "step2_tokens_out":         s2_out,
+        "total_cost":               calc_cost(total_in, total_out),
+        "enrichment_status":        row["enrichment_status"],
+        "error_message":            row["error_message"],
+        "needs_manual_review":      row["needs_manual_review"],
+        "match_notes":              row["match_notes"],
     }
     return row, dbg
 
@@ -1375,6 +1427,24 @@ with st.sidebar:
         help="Shows per-row JSON responses, cache tools, and additional downloads.",
     )
 
+    st.divider()
+    if _PLAYWRIGHT_AVAILABLE:
+        use_playwright = st.checkbox(
+            "Use browser scraping for blocked sites",
+            value=True,
+            help=(
+                "Uses headless Chrome with human behaviour to scrape sites that block Jina. "
+                "Slower but more thorough."
+            ),
+        )
+    else:
+        st.caption(
+            "⚠ Browser scraping unavailable — run "
+            "`pip install playwright && playwright install chromium` to enable."
+        )
+        use_playwright = False
+    st.session_state["_use_playwright"] = use_playwright
+
     # ── Auto-save status ──────────────────────────────────────────────────────
     _last_name = ss("autosave_last_name", "")
     if ss("processing", False) and _last_name:
@@ -1634,6 +1704,7 @@ if start_btn and not blocking and not currently_processing:
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
         _local_save_enabled=ss("_local_save_enabled", False),
         _final_auto_saved=False,
+        _use_playwright=ss("_use_playwright", True),
     )
     st.rerun()
 
@@ -1651,11 +1722,12 @@ if ss("processing", False):
     _n            = ss("_n_to_process", 0)
     _api_key      = ss("_api_key", "")
     _delay        = ss("_delay", 1.0)
-    _elm_mode_run = ss("_elm_mode", False)
+    _elm_mode_run  = ss("_elm_mode", False)
     _active_fields = ss("_active_fields", ALL_ENRICHMENT_FIELDS)
-    total_in      = ss("total_tokens_in", 0)
-    total_out     = ss("total_tokens_out", 0)
-    total_cost    = ss("total_cost_usd", 0.0)
+    _use_playwright_run = ss("_use_playwright", True)
+    total_in       = ss("total_tokens_in", 0)
+    total_out      = ss("total_tokens_out", 0)
+    total_cost     = ss("total_cost_usd", 0.0)
 
     if st.button("⏹ Stop after current row", key="stop_button"):
         ss_set(stop_requested=True)
@@ -1678,23 +1750,26 @@ if ss("processing", False):
         mc4.metric("Processed",   len(results))
         mc5.metric("Avg ICP score", f"{avg_score:.1f}/10")
     else:
-        cnt_jina   = sum(1 for r in results if "enriched_jina"   in r.get("enrichment_status", ""))
-        cnt_google = sum(1 for r in results if "enriched_search" in r.get("enrichment_status", ""))
-        cnt_nodata = sum(1 for r in results if r.get("enrichment_status") == "no_data")
-        cnt_error  = sum(1 for r in results
-                         if r.get("enrichment_status") not in
-                         ("enriched_jina", "enriched_search",
-                          "enriched_jina_step1_only", "enriched_search_step1_only",
-                          "no_data", "skipped_resume", ""))
-        cnt_retries = ss("_jina_retry_count", 0)
+        cnt_jina       = sum(1 for r in results if "enriched_jina"       in r.get("enrichment_status", ""))
+        cnt_playwright = sum(1 for r in results if "enriched_playwright" in r.get("enrichment_status", ""))
+        cnt_google     = sum(1 for r in results if "enriched_search"     in r.get("enrichment_status", ""))
+        cnt_nodata     = sum(1 for r in results if r.get("enrichment_status") == "no_data")
+        cnt_error      = sum(1 for r in results
+                             if r.get("enrichment_status") not in
+                             ("enriched_jina", "enriched_jina_step1_only",
+                              "enriched_playwright", "enriched_playwright_step1_only",
+                              "enriched_search", "enriched_search_step1_only",
+                              "no_data", "skipped_resume", ""))
+        cnt_retries    = ss("_jina_retry_count", 0)
 
-        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-        mc1.metric("Enriched (Jina)",   cnt_jina)
-        mc2.metric("Enriched (Google)", cnt_google)
-        mc3.metric("429 Retries",       cnt_retries)
-        mc4.metric("No data",           cnt_nodata)
-        mc5.metric("Errors",            cnt_error)
-        mc6.metric("Est. cost",         f"${total_cost:.4f}")
+        mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
+        mc1.metric("Enriched (Jina)",    cnt_jina)
+        mc2.metric("Enriched (Browser)", cnt_playwright)
+        mc3.metric("Enriched (Google)",  cnt_google)
+        mc4.metric("429 Retries",        cnt_retries)
+        mc5.metric("No data",            cnt_nodata)
+        mc6.metric("Errors",             cnt_error)
+        mc7.metric("Est. cost",          f"${total_cost:.4f}")
 
         _retry_msg = ss("_last_retry_msg", "")
         if _retry_msg:
@@ -1756,7 +1831,10 @@ if ss("processing", False):
                 row_cost = 0.0
             else:
                 status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
-                fields, dbg = enrich_one_row(company_name, raw_url, _api_key, _delay)
+                fields, dbg = enrich_one_row(
+                    company_name, raw_url, _api_key, _delay,
+                    use_playwright=_use_playwright_run,
+                )
                 s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
                 s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
                 row_cost = float(fields.get("total_cost_usd", 0) or 0)
