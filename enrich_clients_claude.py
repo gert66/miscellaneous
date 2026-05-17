@@ -2263,8 +2263,8 @@ if ss("enrichment_done", False):
     if _elm_done:
         summary_cols = orig_cols + [c for c in ELM_ALL_FIELDS if c in df_enriched.columns]
         st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
-        tab1, tab2, tab3 = st.tabs(
-            ["Status & fetch info", "Keyword counts", "Normalized scores"]
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Status & fetch info", "Keyword counts", "Normalized scores", "Metadata & sitemap"]
         )
         with tab1:
             st.dataframe(
@@ -2279,6 +2279,11 @@ if ss("enrichment_done", False):
         with tab3:
             st.dataframe(
                 df_enriched[[c for c in ELM_SCORE_FIELDS if c in df_enriched.columns]],
+                use_container_width=True,
+            )
+        with tab4:
+            st.dataframe(
+                df_enriched[[c for c in ELM_METADATA_FIELDS if c in df_enriched.columns]],
                 use_container_width=True,
             )
     else:
