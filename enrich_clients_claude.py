@@ -976,7 +976,7 @@ def run_step1(
             company_name=company_name or target,
             url=target,
         )
-        raw_text, in_t, out_t, _, _ = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
+        raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
         total_in  += in_t
         total_out += out_t
         raw_fields = _parse_json_response(raw_text)
@@ -1004,47 +1004,16 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
-def _claude_web_search_loop(
-    prompt: str,
-    api_key: str,
-    model_id: str = None,
-    cached_prefix: str = None,
-) -> tuple:
+def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> tuple:
     """
     Run Claude with web_search_20250305 (server-side built-in tool).
     Anthropic executes the search automatically — no tool_result needed.
-
-    When cached_prefix is supplied the message is split into two content blocks:
-    the static prefix (marked ephemeral for prompt caching) and the dynamic prompt.
-
-    Returns (text, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens).
+    Returns (final_text, total_input_tokens, total_output_tokens).
     """
     if model_id is None:
         model_id = MODEL_STEP2
 
     client = anthropic.Anthropic(api_key=api_key)
-
-    if cached_prefix is not None:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": cached_prefix,
-                        "cache_control": {"type": "ephemeral"},
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            }
-        ]
-        extra_kwargs = {"betas": ["prompt-caching-2024-07-31"]}
-    else:
-        messages = [{"role": "user", "content": prompt}]
-        extra_kwargs = {}
 
     for attempt in range(3):
         try:
@@ -1052,17 +1021,14 @@ def _claude_web_search_loop(
                 model=model_id,
                 max_tokens=2048,
                 tools=[WEB_SEARCH_TOOL],
-                messages=messages,
-                **extra_kwargs,
+                messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(
                 getattr(b, "text", "")
                 for b in resp.content
                 if getattr(b, "type", "") == "text"
             ).strip()
-            cache_create = getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
-            cache_read   = getattr(resp.usage, "cache_read_input_tokens",     0) or 0
-            return text, resp.usage.input_tokens, resp.usage.output_tokens, cache_create, cache_read
+            return text, resp.usage.input_tokens, resp.usage.output_tokens
 
         except anthropic.RateLimitError as e:
             wait = 30
@@ -1076,7 +1042,7 @@ def _claude_web_search_loop(
             else:
                 raise
 
-    return "", 0, 0, 0, 0
+    return "", 0, 0
 
 
 def run_step2(url: str, company_name: str, api_key: str, delay: float,
@@ -1103,39 +1069,27 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
     _STRICT_SUFFIX = (
         "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
     )
-    dynamic_prompt = f"Now research this company: {target}"
+    prompt = _STEP2_PROMPT_TMPL.format(url=target)
 
     try:
         time.sleep(delay)
-        raw_text, in_t, out_t, cc_t, cr_t = _claude_web_search_loop(
-            dynamic_prompt, api_key,
-            model_id=model_step2,
-            cached_prefix=STEP2_STATIC_PREFIX,
+        raw_text, in_t, out_t = _claude_web_search_loop(
+            prompt, api_key, model_id=model_step2,
         )
         try:
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
-            # Retry once with a stricter suffix appended to the dynamic part
+            # Retry once with a stricter suffix appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2, cc_t2, cr_t2 = _claude_web_search_loop(
-                dynamic_prompt + _STRICT_SUFFIX, api_key,
-                model_id=model_step2,
-                cached_prefix=STEP2_STATIC_PREFIX,
+            raw_text2, in_t2, out_t2 = _claude_web_search_loop(
+                prompt + _STRICT_SUFFIX, api_key, model_id=model_step2,
             )
             in_t  += in_t2
             out_t += out_t2
-            cc_t  += cc_t2
-            cr_t  += cr_t2
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
-        payload = {
-            "icp_data": icp_raw,
-            "tokens_in": in_t,
-            "tokens_out": out_t,
-            "cache_creation_tokens": cc_t,
-            "cache_read_tokens": cr_t,
-        }
+        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
-        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", cc_t, cr_t)
+        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
     except (json.JSONDecodeError, ValueError) as e:
         return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {e}", 0, 0)
     except anthropic.APIError as e:
