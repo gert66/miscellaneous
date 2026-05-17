@@ -205,12 +205,13 @@ def find_url_via_claude(company_name: str, api_key: str) -> dict:
     }
 
     prompt = (
-        f"What is the official website URL of the company '{company_name}'?\n"
+        f"Search for the official website of the company called '{company_name}'.\n"
         "Return ONLY a raw JSON object with two fields:\n"
-        '- url: the full working URL including https:// (e.g. https://www.example.com)\n'
-        "- notes: one sentence explaining what you found or why no URL exists "
-        "(e.g. 'company dissolved in 2021', 'rebranded to X', 'no website found')\n"
-        "If the company no longer exists or has no website, set url to empty string."
+        '- url: the full working website URL including https:// (e.g. https://www.abnamro.nl)\n'
+        "- notes: one short sentence explaining what you found "
+        "(e.g. 'official Dutch banking website', 'company dissolved in 2021 - no website')\n"
+        "Search by company name, not by URL. "
+        "If the company no longer exists or truly has no website, set url to empty string."
     )
 
     try:
