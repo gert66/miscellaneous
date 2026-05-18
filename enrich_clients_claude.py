@@ -356,10 +356,10 @@ def ensure_debug_log_dir() -> None:
     DEBUG_LOG_DIR.mkdir(exist_ok=True)
 
 
-def write_debug_log(company_name: str, content: str) -> None:
+def write_debug_log(company_name: str, content: str, prefix: str = "step2_prompt") -> None:
     ensure_debug_log_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname = DEBUG_LOG_DIR / f"step2_prompt_{safe_filename(company_name)}_{stamp}.txt"
+    fname = DEBUG_LOG_DIR / f"{prefix}_{safe_filename(company_name)}_{stamp}.txt"
     fname.write_text(content, encoding="utf-8")
 
 
@@ -1121,10 +1121,12 @@ def run_step2_serper(
     delay: float,
     model_step2: str = MODEL_STEP2,
     _debug_callback=None,
+    dry_run: bool = False,
 ) -> tuple:
     """
     Step 2 via Serper Google Search + Claude analysis (no web_search tool).
     Returns the same 8-tuple as run_step2.
+    dry_run=True: generate queries and Claude prompt without calling any API.
     """
     def _dlog(msg: str) -> None:
         if _debug_callback:
@@ -1134,20 +1136,56 @@ def run_step2_serper(
     if not target:
         return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", 0, 0)
 
-    ck = f"step2_serper_{target}"
-    cached = load_cache(ck)
-    if cached is not None:
-        icp = cached.get("icp_data", {})
-        if any(icp.get(f, "") for f in ICP_FIELDS[:3]):
-            in_t  = int(cached.get("tokens_in", 0) or 0)
-            out_t = int(cached.get("tokens_out", 0) or 0)
-            _dlog(f"Using cached Serper Step 2 result for {company_name}")
-            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", 0, 0)
-        _delete_cache(ck)
+    if not dry_run:
+        ck = f"step2_serper_{target}"
+        cached = load_cache(ck)
+        if cached is not None:
+            icp = cached.get("icp_data", {})
+            if any(icp.get(f, "") for f in ICP_FIELDS[:3]):
+                in_t  = int(cached.get("tokens_in", 0) or 0)
+                out_t = int(cached.get("tokens_out", 0) or 0)
+                _dlog(f"Using cached Serper Step 2 result for {company_name}")
+                return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", 0, 0)
+            _delete_cache(ck)
 
     # ── Serper searches ───────────────────────────────────────────────────────
     queries = _build_serper_queries(company_name, target)
     _dlog(f"Generating Serper queries for {company_name}")
+
+    # DRY RUN GUARD: do not call Serper or Anthropic in prompt preview mode
+    if dry_run:
+        _dry_placeholder = "[DRY RUN: Serper results would be inserted here]"
+        _dry_instruction = (
+            f"Now analyze this company based on the web search results provided below.\n\n"
+            f"Company: {target}\n\n"
+            f"Web search results (retrieved via Serper Google Search):\n"
+            f"{_dry_placeholder}\n\n"
+            "Base your analysis ONLY on the search results and company information above. "
+            "Do not claim to have searched the web yourself."
+        )
+        _dry_full_prompt = STEP2_STATIC_PREFIX + f"\n\n{_dry_instruction}"
+        _dlog(f"DRY RUN: Serper queries that would be sent: {queries}")
+        _dlog(f"DRY RUN: skipping Serper + Anthropic calls for {company_name}")
+        if _debug_callback:
+            _debug_callback(
+                "prompt",
+                company=company_name,
+                model=model_step2,
+                provider=STEP2_PROVIDER_SERPER,
+                search_prompt=(
+                    "DRY RUN — Serper queries that would be sent:\n"
+                    + "\n".join(f"  • {q}" for q in queries)
+                ),
+                full_prompt=_dry_full_prompt,
+                notes=[
+                    "DRY RUN ACTIVE: no Anthropic or Serper API calls are being made.",
+                    f"Serper queries that would be sent: {queries}",
+                    f"Selected model: {model_step2}",
+                ],
+                dry_run=True,
+                queries=queries,
+            )
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "dry_run", "DRY RUN: no API call made", 0, 0)
 
     all_hits: list = []
     for q in queries:
@@ -1266,6 +1304,7 @@ def run_step2(
     _debug_callback=None,
     search_provider: str = STEP2_PROVIDER_CLAUDE,
     serper_key: str = "",
+    dry_run: bool = False,
 ) -> tuple:
     """
     Research ICP signals — dispatches to either the Claude web_search route
@@ -1273,11 +1312,14 @@ def run_step2(
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg,
              cache_creation_tokens, cache_read_tokens).
 
+    dry_run=True: generate and log prompts/queries without calling any API.
     _debug_callback: optional callable(event, **kwargs).
-      Events: "status" (msg=str), "prompt" (company, model, provider, search_prompt, full_prompt, notes).
+      Events: "status" (msg=str), "prompt" (company, model, provider, search_prompt,
+              full_prompt, notes, dry_run, queries).
     """
     if search_provider == STEP2_PROVIDER_SERPER:
-        if not serper_key:
+        # In dry run mode the Serper key is not needed — skip the key guard.
+        if not dry_run and not serper_key:
             return (
                 _ICP_EMPTY.copy(), {}, 0, 0, "api_error",
                 "SERPER_API_KEY is missing from .streamlit/secrets.toml", 0, 0,
@@ -1285,6 +1327,7 @@ def run_step2(
         return run_step2_serper(
             url, company_name, api_key, serper_key, delay,
             model_step2=model_step2, _debug_callback=_debug_callback,
+            dry_run=dry_run,
         )
 
     def _dlog(msg: str) -> None:
@@ -1320,12 +1363,22 @@ def run_step2(
             "prompt",
             company=company_name,
             model=model_step2,
-            provider="web_search_20250305",
+            provider=STEP2_PROVIDER_CLAUDE,
             search_prompt=search_prompt,
             full_prompt=full_prompt,
-            notes=[f"Generating Step 2 prompt for {company_name}",
-                   f"Selected model: {model_step2}"],
+            notes=[
+                "DRY RUN ACTIVE: no Anthropic API calls are being made."
+                if dry_run else f"Generating Step 2 prompt for {company_name}",
+                f"Selected model: {model_step2}",
+            ],
+            dry_run=dry_run,
+            queries=[],
         )
+
+    # DRY RUN GUARD: do not call Anthropic in prompt preview mode
+    if dry_run:
+        _dlog(f"DRY RUN: skipping Anthropic call for {company_name}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "dry_run", "DRY RUN: no API call made", 0, 0)
 
     try:
         _dlog(f"Calling Claude web search for {company_name}")
@@ -1426,6 +1479,7 @@ def enrich_one_row(
     _debug_callback=None,
     search_provider: str = STEP2_PROVIDER_CLAUDE,
     serper_key: str = "",
+    dry_run: bool = False,
 ) -> tuple:
     """
     Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
@@ -1456,6 +1510,7 @@ def enrich_one_row(
         url, company_name, api_key, delay, model_step2=model_step2,
         _debug_callback=_debug_callback,
         search_provider=search_provider, serper_key=serper_key,
+        dry_run=dry_run,
     )
     row.update(s2_fields)
     row["step2_status"]   = s2_status
@@ -1732,6 +1787,7 @@ def reset_processing(clear_autosave: bool = False):
         _local_save_enabled=False, _final_auto_saved=False,
         _auto_dl_count=0, _auto_dl_last_msg="",
         _step2_debug_log="", _step2_prompt_records=[],
+        _dry_run_records=[],
     )
 
 
@@ -1858,6 +1914,19 @@ with st.sidebar:
             st.success("✓ Serper API key loaded")
         else:
             st.error("⚠ SERPER_API_KEY is missing from .streamlit/secrets.toml")
+
+    step2_dry_run = st.checkbox(
+        "Step 2 dry run: generate prompts only",
+        value=False,
+        help=(
+            "Generate and display Step 2 prompts/search queries without calling "
+            "Anthropic or Serper. Useful for inspecting what would be sent before "
+            "spending tokens or API credits."
+        ),
+    )
+    st.session_state["_step2_dry_run"] = step2_dry_run
+    if step2_dry_run:
+        st.info("Dry run active — Step 2 will not call any API.")
 
     st.divider()
 
@@ -2129,8 +2198,10 @@ enrichment_done      = ss("enrichment_done", False)
 blocking: list = []
 if _api_key_error and not _elm_mode:
     blocking.append(_api_key_error)
-_active_provider = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
-if _active_provider == STEP2_PROVIDER_SERPER and not serper_key and not _elm_mode:
+_active_provider  = ss("_step2_provider",  STEP2_PROVIDER_CLAUDE)
+_active_dry_run   = ss("_step2_dry_run",   False)
+# Serper key is only required for real (non-dry-run) Serper runs.
+if _active_provider == STEP2_PROVIDER_SERPER and not serper_key and not _elm_mode and not _active_dry_run:
     blocking.append("SERPER_API_KEY is missing from .streamlit/secrets.toml")
 if uploaded is None:
     blocking.append("No file uploaded yet.")
@@ -2186,6 +2257,8 @@ if start_btn and not blocking and not currently_processing:
         _model_step2=ss("_model_step2", MODEL_STEP2),
         _step2_provider=ss("_step2_provider", STEP2_PROVIDER_CLAUDE),
         _serper_key=serper_key,
+        _step2_dry_run=ss("_step2_dry_run", False),
+        _dry_run_records=[],
     )
     st.rerun()
 
@@ -2210,6 +2283,7 @@ if ss("processing", False):
     _model_step2_run     = ss("_model_step2", MODEL_STEP2)
     _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
     _serper_key_run      = ss("_serper_key", "")
+    _dry_run_run         = ss("_step2_dry_run", False)
     total_in          = ss("total_tokens_in", 0)
     total_out         = ss("total_tokens_out", 0)
     total_cost        = ss("total_cost_usd", 0.0)
@@ -2262,6 +2336,12 @@ if ss("processing", False):
         if _retry_msg:
             st.info(_retry_msg)
 
+    if _dry_run_run and not _elm_mode_run:
+        st.warning(
+            "⚠️ **DRY RUN ACTIVE**: no Anthropic or Serper API calls are being made "
+            "for Step 2. Prompts and search queries are generated and displayed only."
+        )
+
     # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
     # Uses HTML anchors so clicking does NOT trigger a Streamlit rerun / freeze.
     if results:
@@ -2273,6 +2353,26 @@ if ss("processing", False):
         ):
             st.caption("These links download via the browser without interrupting processing.")
             _html_dl_buttons(_partial_df, _n_done, _stamp)
+
+    # ── Step 2 dry run preview ────────────────────────────────────────────────
+    if _dry_run_run and not _elm_mode_run:
+        _dry_recs = ss("_dry_run_records", [])
+        with st.expander("Step 2 Dry Run Preview", expanded=True):
+            if not _dry_recs:
+                st.caption("Dry run preview will appear here as companies are processed.")
+            for _dr in _dry_recs:
+                with st.expander(f"Company: {_dr['company']}", expanded=False):
+                    st.markdown(
+                        f"**Provider:** {_dr['provider']}  |  **Model:** `{_dr['model']}`"
+                    )
+                    if _dr.get("queries"):
+                        st.markdown("**Serper queries that would be sent:**")
+                        for _q in _dr["queries"]:
+                            st.code(_q, language=None)
+                    st.markdown("**Generated search instruction / prompt suffix:**")
+                    st.code(_dr.get("search_prompt", ""), language=None)
+                    st.markdown("**Full Step 2 Claude prompt:**")
+                    st.code(_dr.get("full_prompt", ""), language=None)
 
     # ── Step 2 debug log window ───────────────────────────────────────────────
     if ss("_show_step2_debug", False) and not _elm_mode_run:
@@ -2319,39 +2419,53 @@ if ss("processing", False):
         _show_debug_ui = ss("_show_step2_debug", False)
         _save_debug_fs = ss("_save_step2_debug", True)
 
-        def _make_step2_callback(cname: str):
+        def _make_step2_callback(cname: str, dry_run_mode: bool = False):
             def _cb(event: str, **kwargs) -> None:
                 if event == "status":
                     append_debug_log(kwargs.get("msg", ""))
                 elif event == "prompt":
+                    _is_dry   = kwargs.get("dry_run", False)
+                    _file_pfx = "step2_dry_run" if _is_dry else "step2_prompt"
                     if _save_debug_fs:
                         _ts   = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                         _body = format_step2_debug_content(
                             company_name=kwargs.get("company", cname),
                             model=kwargs.get("model", ""),
                             timestamp=_ts,
-                            provider=kwargs.get("provider", "web_search_20250305"),
+                            provider=kwargs.get("provider", STEP2_PROVIDER_CLAUDE),
                             search_prompt=kwargs.get("search_prompt", ""),
                             full_prompt=kwargs.get("full_prompt", ""),
                             notes=kwargs.get("notes", []),
                         )
                         try:
-                            write_debug_log(cname, _body)
+                            write_debug_log(cname, _body, prefix=_file_pfx)
                         except Exception:
                             pass
                     if _show_debug_ui:
                         _recs = st.session_state.get("_step2_prompt_records", [])
                         _recs.append({
-                            "company":      kwargs.get("company", cname),
-                            "prompt":       kwargs.get("full_prompt", ""),
+                            "company":       kwargs.get("company", cname),
+                            "prompt":        kwargs.get("full_prompt", ""),
                             "search_prompt": kwargs.get("search_prompt", ""),
                         })
                         st.session_state["_step2_prompt_records"] = _recs
+                    # Always accumulate dry-run records for the preview section
+                    if dry_run_mode or _is_dry:
+                        _drecs = st.session_state.get("_dry_run_records", [])
+                        _drecs.append({
+                            "company":       kwargs.get("company", cname),
+                            "provider":      kwargs.get("provider", ""),
+                            "model":         kwargs.get("model", ""),
+                            "queries":       kwargs.get("queries", []),
+                            "search_prompt": kwargs.get("search_prompt", ""),
+                            "full_prompt":   kwargs.get("full_prompt", ""),
+                        })
+                        st.session_state["_dry_run_records"] = _drecs
             return _cb
 
         _debug_cb = (
-            _make_step2_callback(company_name)
-            if (_show_debug_ui or _save_debug_fs) and not _elm_mode_run
+            _make_step2_callback(company_name, dry_run_mode=_dry_run_run)
+            if (_show_debug_ui or _save_debug_fs or _dry_run_run) and not _elm_mode_run
             else None
         )
 
@@ -2371,7 +2485,11 @@ if ss("processing", False):
                 row_cost = 0.0
             else:
                 status_box.write(f"🤖 Step 2 model: `{_model_step2_run}`")
-                status_box.write(f"🔍 Step 2 search provider: {_step2_provider_run}")
+                _prov_label = (
+                    f"🔍 Step 2 search provider: {_step2_provider_run}"
+                    + (" **(DRY RUN)**" if _dry_run_run else "")
+                )
+                status_box.write(_prov_label)
                 status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
                 fields, dbg = enrich_one_row(
                     company_name, raw_url, _api_key, _delay,
@@ -2381,6 +2499,7 @@ if ss("processing", False):
                     _debug_callback=_debug_cb,
                     search_provider=_step2_provider_run,
                     serper_key=_serper_key_run,
+                    dry_run=_dry_run_run,
                 )
                 s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
                 s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
@@ -2402,12 +2521,13 @@ if ss("processing", False):
         results.append(fields)
         debug_records.append(dbg)
 
-        # ── Auto-save (crash recovery) ────────────────────────────────────────
-        try:
-            autosave_append(fields, input_row)
-            ss_set(autosave_last_name=company_name or raw_url or f"row {idx + 1}")
-        except Exception:
-            pass  # never let autosave failure abort processing
+        # ── Auto-save (crash recovery) — skipped in dry run ──────────────────
+        if not _dry_run_run:
+            try:
+                autosave_append(fields, input_row)
+                ss_set(autosave_last_name=company_name or raw_url or f"row {idx + 1}")
+            except Exception:
+                pass  # never let autosave failure abort processing
 
         _new_idx = len(results)  # results already includes the row appended above
 
@@ -2471,6 +2591,12 @@ if ss("enrichment_done", False):
         st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
     else:
         st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
+
+    if ss("_step2_dry_run", False) and not _elm_done:
+        st.info(
+            "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
+            "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
+        )
 
     # ── Auto-save final file (runs exactly once per completed run) ────────────
     if not ss("_final_auto_saved", False):
