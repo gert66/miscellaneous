@@ -2927,6 +2927,7 @@ def reset_processing(clear_autosave: bool = False):
         _per_company_autosave_last_saved="",
         _per_company_autosave_last_error="",
         _pca_final_saved=False,
+        _big_final_file_saved=False,
     )
 
 
@@ -3561,6 +3562,7 @@ if start_btn and not blocking and not currently_processing:
         _per_company_autosave_last_saved="",
         _per_company_autosave_last_error="",
         _pca_final_saved=False,
+        _big_final_file_saved=False,
     )
     st.rerun()
 
@@ -4119,6 +4121,21 @@ if ss("enrichment_done", False):
         except Exception as _pca_fin_err:
             ss_set(_pca_final_saved=True)
             st.warning(f"⚠ Per-company autosave final write failed: {_pca_fin_err}")
+
+    # ── Big named final file — written once per completed run ─────────────────
+    if _pca_done_enabled and _pca_done_dir and not ss("_big_final_file_saved", False):
+        try:
+            _big_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            _big_rdir  = Path(_pca_done_dir)
+            _big_xl    = _big_rdir / f"myngle_big_enriched_final_{_big_stamp}.xlsx"
+            _big_csv   = _big_rdir / f"myngle_big_enriched_final_{_big_stamp}.csv"
+            df_to_excel_bytes_write(df_enriched, str(_big_xl))
+            df_enriched.to_csv(_big_csv, index=False, encoding="utf-8-sig")
+            ss_set(_big_final_file_saved=True)
+            st.success(f"Big final enriched file saved to: **{_big_xl}**")
+        except Exception as _big_err:
+            ss_set(_big_final_file_saved=True)
+            st.warning(f"⚠ Big final file save failed: {_big_err}")
 
     # ── Step 2 debug files — download + preview ───────────────────────────────
     if not _elm_done:
