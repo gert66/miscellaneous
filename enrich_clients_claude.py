@@ -245,6 +245,7 @@ LUSHA_API_META_FIELDS = [
     "lusha_api_match_confidence",
     "lusha_api_needs_review",
     "lusha_api_match_notes",
+    "lusha_api_raw_keys",
 ]
 
 ALL_ENRICHMENT_FIELDS = (
@@ -2069,53 +2070,171 @@ _LUSHA_API_BASE = "https://api.lusha.com/company"
 _LUSHA_TIMEOUT  = 15
 
 
+def _lusha_raw_keys_summary(raw: dict) -> str:
+    """
+    Return a compact key-path summary of the top two levels of a dict.
+    Used only for debugging — contains no secret values.
+    Example: "top: data,meta; data: name,domain,industry"
+    """
+    if not isinstance(raw, dict):
+        return f"(not a dict: {type(raw).__name__})"
+    top_keys = list(raw.keys())
+    parts = [f"top: {','.join(str(k) for k in top_keys)}"]
+    for k in top_keys[:5]:
+        v = raw.get(k)
+        if isinstance(v, dict) and v:
+            parts.append(f"{k}: {','.join(str(sk) for sk in list(v.keys())[:15])}")
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            parts.append(f"{k}[0]: {','.join(str(sk) for sk in list(v[0].keys())[:15])}")
+    return "; ".join(parts)
+
+
+def _resolve_lusha_company_node(raw: dict) -> dict:
+    """
+    Try all known Lusha response nesting paths and return the dict that most
+    likely contains the actual company record.
+
+    Lusha API v2 wraps company data under raw["data"]; some versions use
+    raw["company"], raw["data"]["company"], raw["companies"][0], or raw["results"][0].
+    Fall back to raw itself if nothing better is found.
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    # Ordered list of extraction strategies
+    candidates = []
+
+    # raw["data"] — most common v2 envelope
+    d = raw.get("data")
+    if isinstance(d, dict) and d:
+        # raw["data"]["company"] — double-wrapped
+        dd = d.get("company")
+        if isinstance(dd, dict) and dd:
+            candidates.append(dd)
+        else:
+            candidates.append(d)
+
+    # raw["company"]
+    c = raw.get("company")
+    if isinstance(c, dict) and c:
+        candidates.append(c)
+
+    # raw["companies"][0]
+    clist = raw.get("companies")
+    if isinstance(clist, list) and clist and isinstance(clist[0], dict):
+        candidates.append(clist[0])
+
+    # raw["results"][0]
+    rlist = raw.get("results")
+    if isinstance(rlist, list) and rlist and isinstance(rlist[0], dict):
+        candidates.append(rlist[0])
+
+    # raw itself as last resort
+    candidates.append(raw)
+
+    # Score each candidate by how many recognisable company fields it has
+    _score_keys = {
+        "name", "company_name", "industry", "description", "size",
+        "employee_range", "employees", "country", "city", "domain",
+        "linkedin", "founded", "type",
+    }
+    def _score(node):
+        return sum(1 for k in node if k.lower() in _score_keys)
+
+    best = max(candidates, key=_score, default=raw)
+    return best if isinstance(best, dict) else raw
+
+
 def _map_lusha_api_fields(raw: dict, source_url: str) -> dict:
     """
-    Map a raw Lusha API company response dict to LUSHA_API_FIELDS keys.
-    Uses .get() throughout — tolerates missing or differently-shaped responses.
+    Map a raw Lusha API response to LUSHA_API_FIELDS keys.
+    Probes all known nesting structures defensively.
+    lusha_api_raw_keys contains only key names for debugging — no values.
     """
-    def s(key, *fallback_keys):
-        for k in (key, *fallback_keys):
-            v = raw.get(k)
-            if v is not None and str(v).strip() not in ("", "None", "null"):
+    raw_keys_summary = _lusha_raw_keys_summary(raw)
+
+    company = _resolve_lusha_company_node(raw)
+
+    def _sv(node: dict, *keys) -> str:
+        """Extract the first non-empty string value for any of the given keys."""
+        for k in keys:
+            v = node.get(k)
+            if v is not None and str(v).strip() not in ("", "None", "null", "0"):
                 return str(v).strip()
         return ""
 
-    # Lusha nests some data under sub-dicts; handle both flat and nested
-    company = raw if not raw.get("company") else raw.get("company", raw)
+    # Location — Lusha often nests under company["location"]
+    loc = company.get("location") or {}
+    if not isinstance(loc, dict):
+        loc = {}
 
-    domain = clean_domain(s("domain", "website")) or clean_domain(source_url)
+    def _loc(key: str) -> str:
+        v = loc.get(key)
+        if v is not None and str(v).strip() not in ("", "None", "null"):
+            return str(v).strip()
+        return ""
 
-    specialties = company.get("specialties") or company.get("specialties_list") or ""
-    if isinstance(specialties, list):
-        specialties = ", ".join(str(x) for x in specialties if x)
+    country   = _sv(company, "country", "hq_country") or _loc("country") or _loc("countryCode")
+    city      = _sv(company, "city", "hq_city")       or _loc("city")
+    continent = _sv(company, "continent")              or _loc("continent")
 
-    technologies = company.get("technologies") or company.get("technology_stack") or ""
-    if isinstance(technologies, list):
-        technologies = ", ".join(str(x) for x in technologies if x)
+    # Domain
+    domain = (
+        clean_domain(_sv(company, "domain", "website"))
+        or clean_domain(_sv(raw,     "domain"))
+        or clean_domain(source_url)
+    )
+
+    # Lists: specialties and technologies
+    def _join_list(node: dict, *keys) -> str:
+        for k in keys:
+            v = node.get(k)
+            if isinstance(v, list):
+                return ", ".join(str(x) for x in v if x)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    specialties  = _join_list(company, "specialties",  "specialties_list",  "expertises")
+    technologies = _join_list(company, "technologies", "technology_stack",  "tech_stack")
+
+    # Funding — Lusha often nests under company["funding"]
+    funding = company.get("funding") or {}
+    if not isinstance(funding, dict):
+        funding = {}
+
+    def _fund(key: str, *fallback_keys) -> str:
+        v = _sv(funding, key, *fallback_keys)
+        if v:
+            return v
+        return _sv(company, key, *fallback_keys)
 
     return {
-        "lusha_api_company_name":         s("name", "company_name"),
+        "lusha_api_company_name":         _sv(company, "name", "company_name", "companyName"),
         "lusha_api_domain":               domain,
-        "lusha_api_description":          s("description", "about"),
-        "lusha_api_founded_year":         s("founded_year", "founded", "year_founded"),
-        "lusha_api_employee_range":       s("employee_range", "employees", "company_size", "size"),
-        "lusha_api_revenue_range":        s("revenue_range", "revenue", "annual_revenue"),
-        "lusha_api_industry":             s("industry", "main_industry"),
-        "lusha_api_sub_industry":         s("sub_industry", "sub_category"),
-        "lusha_api_company_type":         s("company_type", "type"),
-        "lusha_api_country":              s("country", "hq_country"),
-        "lusha_api_city":                 s("city", "hq_city"),
-        "lusha_api_continent":            s("continent"),
-        "lusha_api_linkedin_url":         s("linkedin_url", "linkedin"),
+        "lusha_api_description":          _sv(company, "description", "about", "summary"),
+        "lusha_api_founded_year":         _sv(company, "founded", "founded_year", "year_founded", "foundedYear"),
+        "lusha_api_employee_range":       _sv(company, "size", "employee_range", "employees", "company_size",
+                                              "employeeRange", "employeeCount", "headcount"),
+        "lusha_api_revenue_range":        _sv(company, "revenue_range", "revenue", "annual_revenue",
+                                              "revenueRange", "annualRevenue"),
+        "lusha_api_industry":             _sv(company, "industry", "main_industry", "primaryIndustry"),
+        "lusha_api_sub_industry":         _sv(company, "sub_industry", "sub_category", "subIndustry"),
+        "lusha_api_company_type":         _sv(company, "type", "company_type", "companyType"),
+        "lusha_api_country":              country,
+        "lusha_api_city":                 city,
+        "lusha_api_continent":            continent,
+        "lusha_api_linkedin_url":         _sv(company, "linkedin", "linkedin_url", "linkedinUrl"),
         "lusha_api_specialties":          specialties,
         "lusha_api_technologies":         technologies,
-        "lusha_api_total_funding_amount": s("total_funding_amount", "total_funding"),
-        "lusha_api_total_funding_rounds": s("total_funding_rounds", "funding_rounds"),
-        "lusha_api_last_round_type":      s("last_round_type", "last_funding_type"),
-        "lusha_api_last_round_amount":    s("last_round_amount", "last_funding_amount"),
-        "lusha_api_last_round_date":      s("last_round_date", "last_funding_date"),
-        "lusha_api_ipo_status":           s("ipo_status", "ipo"),
+        "lusha_api_total_funding_amount": _fund("totalAmount",    "total_funding_amount", "total_funding"),
+        "lusha_api_total_funding_rounds": _fund("totalRounds",    "total_funding_rounds", "funding_rounds"),
+        "lusha_api_last_round_type":      _fund("lastRoundType",  "last_round_type",      "last_funding_type"),
+        "lusha_api_last_round_amount":    _fund("lastRoundAmount","last_round_amount",     "last_funding_amount"),
+        "lusha_api_last_round_date":      _fund("lastRoundDate",  "last_round_date",       "last_funding_date"),
+        "lusha_api_ipo_status":           _sv(company, "ipo", "ipo_status", "ipoStatus"),
+        # Debug-only key summary (key names only, no values)
+        "lusha_api_raw_keys":             raw_keys_summary,
     }
 
 
@@ -2141,9 +2260,7 @@ def flag_lusha_api_review(
     inp_domain = clean_domain(input_url or "")
 
     # ── No useful data returned ───────────────────────────────────────────────
-    useful_fields = [v for k, v in lusha_fields.items()
-                     if k in LUSHA_API_FIELDS and v and v not in ("", "N/A")]
-    if len(useful_fields) < 3:
+    if not _lusha_has_useful_data(lusha_fields):
         reasons.append("No useful Lusha API data returned")
         confidence = "low"
 
@@ -2187,6 +2304,20 @@ def flag_lusha_api_review(
     }
 
 
+# Fields that determine whether a Lusha API response contains useful company data
+_LUSHA_USEFUL_FIELDS = [
+    "lusha_api_company_name",
+    "lusha_api_industry",
+    "lusha_api_employee_range",
+    "lusha_api_country",
+    "lusha_api_description",
+]
+
+
+def _lusha_has_useful_data(fields: dict) -> bool:
+    return any(fields.get(f, "").strip() for f in _LUSHA_USEFUL_FIELDS)
+
+
 def run_lusha_api_enrichment(
     company_name: str,
     raw_url: str,
@@ -2196,11 +2327,20 @@ def run_lusha_api_enrichment(
     Call the real Lusha Company API and return:
     (lusha_fields_dict, raw_json_dict, status, error_message)
 
-    Uses domain when available, falls back to company name.
-    Results are cached under lusha_api_{domain_or_name}.
-    Never raises — all errors are returned as status/error strings.
+    Status values:
+      "ok"             — HTTP 200 AND at least one useful company field was mapped
+      "empty_response" — HTTP 200 but no useful company data found in the response
+      "not_found"      — Lusha returned 404 (no company match)
+      "auth_error"     — 401 invalid key
+      "rate_limit"     — 429 quota exceeded
+      "timeout"        — request timed out
+      "http_{N}"       — other HTTP error
+      "parse_error"    — response body was not valid JSON
+      "no_key"         — API key not provided
+      "no_input"       — neither domain nor company name available
+      "cached"         — result served from local file cache
     """
-    _empty = {f: "" for f in LUSHA_API_FIELDS}
+    _empty = {f: "" for f in LUSHA_API_FIELDS + ["lusha_api_raw_keys"]}
 
     api_key = (api_key or "").strip()
     if not api_key:
@@ -2210,8 +2350,13 @@ def run_lusha_api_enrichment(
     cache_key = f"lusha_api_{domain or safe_filename(company_name or 'unknown')}"
     cached = load_cache(cache_key)
     if cached is not None:
+        cached_status = cached.get("status", "")
+        # Avoid returning "ok" for a previously-cached empty response
+        if cached_status == "not_found":
+            return _empty, cached.get("raw", {}), "not_found", "Lusha API: company not found (cached)"
         fields = _map_lusha_api_fields(cached.get("raw", {}), raw_url)
-        return fields, cached.get("raw", {}), "cached", ""
+        effective_status = "cached" if _lusha_has_useful_data(fields) else "empty_response"
+        return fields, cached.get("raw", {}), effective_status, ""
 
     # ── Build request ─────────────────────────────────────────────────────────
     params: dict = {}
@@ -2232,7 +2377,7 @@ def run_lusha_api_enrichment(
 
         if resp.status_code == 404:
             save_cache(cache_key, {"raw": {}, "status": "not_found"})
-            return _empty, {}, "not_found", f"Lusha API: company not found (404)"
+            return _empty, {}, "not_found", "Lusha API: company not found (404)"
 
         if resp.status_code == 401:
             return _empty, {}, "auth_error", "Lusha API: invalid or missing API key (401)"
@@ -2243,9 +2388,20 @@ def run_lusha_api_enrichment(
         resp.raise_for_status()
 
         raw = resp.json()
-        save_cache(cache_key, {"raw": raw, "status": "ok"})
         fields = _map_lusha_api_fields(raw, raw_url)
-        return fields, raw, "ok", ""
+
+        if _lusha_has_useful_data(fields):
+            status = "ok"
+            error  = ""
+        else:
+            status = "empty_response"
+            error  = (
+                f"Lusha returned HTTP 200 but no useful company fields were mapped. "
+                f"Response keys: {fields.get('lusha_api_raw_keys', '(unknown)')}"
+            )
+
+        save_cache(cache_key, {"raw": raw, "status": status})
+        return fields, raw, status, error
 
     except requests.Timeout:
         return _empty, {}, "timeout", f"Lusha API timed out after {_LUSHA_TIMEOUT}s"
@@ -4052,6 +4208,11 @@ if ss("enrichment_done", False):
         with dbg_dl1:
             debug_enriched = df_enriched.copy()
             if not _elm_done:
+                debug_enriched["lusha_api_raw_json_preview"] = [
+                    json.dumps(d.get("lusha_api_raw_json"), ensure_ascii=False)[:1500]
+                    if d.get("lusha_api_raw_json") else ""
+                    for d in debug_records_done
+                ] + [""] * max(0, len(debug_enriched) - len(debug_records_done))
                 debug_enriched["step1_json_preview"] = [
                     json.dumps(d.get("step1_raw_json"), ensure_ascii=False)[:1500]
                     if d.get("step1_raw_json") else ""
