@@ -2202,6 +2202,7 @@ def run_lusha_api_enrichment(
     """
     _empty = {f: "" for f in LUSHA_API_FIELDS}
 
+    api_key = (api_key or "").strip()
     if not api_key:
         return _empty, {}, "no_key", "Lusha API key not provided"
 
@@ -2704,7 +2705,7 @@ st.caption(
 api_key = ""
 _api_key_error = ""
 try:
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", "") or ""
+    api_key = (st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
 except Exception:
     pass
 
@@ -2719,7 +2720,7 @@ if not api_key:
 # Required entry in .streamlit/secrets.toml: SERPER_API_KEY = "your-key"
 serper_key = ""
 try:
-    serper_key = st.secrets.get("SERPER_API_KEY", "") or ""
+    serper_key = (st.secrets.get("SERPER_API_KEY", "") or "").strip()
 except Exception:
     pass
 
@@ -2727,7 +2728,7 @@ except Exception:
 # Required entry in .streamlit/secrets.toml: LUSHA_API_KEY = "your-key"
 lusha_api_key = ""
 try:
-    lusha_api_key = st.secrets.get("LUSHA_API_KEY", "") or ""
+    lusha_api_key = (st.secrets.get("LUSHA_API_KEY", "") or "").strip()
 except Exception:
     pass
 
