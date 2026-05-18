@@ -2112,13 +2112,24 @@ def _sanitize_provider_list(raw_value: str, allowed: frozenset) -> str:
 
 def _sanitize_icp_provider_fields(fields: dict) -> dict:
     """Deterministic post-processing: enforce category membership rules and
-    remove mYngle from all competitor/provider signal fields."""
-    fields["icp_competitor_signal"] = _sanitize_provider_list(
-        fields.get("icp_competitor_signal", ""), _CAT1_PROVIDERS,
-    )
-    fields["icp_direct_language_competitor_signal"] = _sanitize_provider_list(
-        fields.get("icp_direct_language_competitor_signal", ""), _CAT1_PROVIDERS,
-    )
+    remove mYngle from all competitor/provider signal fields.
+
+    icp_competitor_signal and icp_direct_language_competitor_signal both
+    represent Category 1 providers; after individual sanitization their union
+    is written back to both fields so neither is accidentally left empty when
+    the other has a valid value.
+    """
+    cs = _sanitize_provider_list(fields.get("icp_competitor_signal", ""), _CAT1_PROVIDERS)
+    dl = _sanitize_provider_list(fields.get("icp_direct_language_competitor_signal", ""), _CAT1_PROVIDERS)
+
+    # Build deduplicated union preserving first-seen order
+    seen: dict = {}
+    for name in [n.strip() for n in (cs + ("," if cs and dl else "") + dl).split(",") if n.strip()]:
+        seen.setdefault(name.lower(), name)
+    merged = ", ".join(seen.values())
+
+    fields["icp_competitor_signal"] = merged
+    fields["icp_direct_language_competitor_signal"] = merged
     fields["icp_online_language_learning_signal"] = _sanitize_provider_list(
         fields.get("icp_online_language_learning_signal", ""), _CAT2_PROVIDERS,
     )
