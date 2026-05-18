@@ -2252,7 +2252,39 @@ def ts() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
 
-def save_to_local_folder(df: pd.DataFrame, folder: str) -> tuple[str, str]:
+def get_provider_code(provider_name: str) -> str:
+    """Return a short filename-safe code for the Step 2 search provider."""
+    if provider_name == STEP2_PROVIDER_CLAUDE:
+        return "cws"
+    if provider_name == STEP2_PROVIDER_SERPER:
+        return "sg"
+    return "unk"
+
+
+def get_model_code(model_name: str) -> str:
+    """Return a short filename-safe code for the Step 2 model."""
+    m = (model_name or "").lower()
+    if "haiku" in m:
+        return "hq"
+    if "sonnet" in m:
+        return "sn"
+    if "opus" in m:
+        return "op"
+    return "unk"
+
+
+def build_run_tag() -> str:
+    """
+    Return '{provider_code}_{model_code}' for the current run's Step 2 settings,
+    reading from session state.  Safe to call from both the processing loop and
+    the results section.
+    """
+    prov  = st.session_state.get("_step2_provider", STEP2_PROVIDER_CLAUDE)
+    model = st.session_state.get("_model_step2",    MODEL_STEP2)
+    return f"{get_provider_code(prov)}_{get_model_code(model)}"
+
+
+def save_to_local_folder(df: pd.DataFrame, folder: str, run_tag: str = "") -> tuple[str, str]:
     """
     Write Excel + CSV to *folder* with timestamped filenames.
     Returns (excel_path, csv_path). Raises OSError on permission / path errors.
@@ -2261,8 +2293,9 @@ def save_to_local_folder(df: pd.DataFrame, folder: str) -> tuple[str, str]:
     folder_path = Path(folder.strip())
     folder_path.mkdir(parents=True, exist_ok=True)
     stamp      = ts()
-    excel_path = folder_path / f"enriched_results_{stamp}.xlsx"
-    csv_path   = folder_path / f"enriched_results_{stamp}.csv"
+    tag        = f"_{run_tag}" if run_tag else ""
+    excel_path = folder_path / f"enriched_results{tag}_{stamp}.xlsx"
+    csv_path   = folder_path / f"enriched_results{tag}_{stamp}.csv"
     df_to_excel_bytes_write(df, str(excel_path))
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     return str(excel_path), str(csv_path)
@@ -3269,7 +3302,7 @@ if ss("processing", False):
             _local_path = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
             try:
                 _snap_df = build_partial_df(results, df_work, _active_fields)
-                _xl, _csv = save_to_local_folder(_snap_df, _local_path)
+                _xl, _csv = save_to_local_folder(_snap_df, _local_path, run_tag=build_run_tag())
                 ss_set(_last_local_save=f"{_new_idx} rows → {Path(_xl).name}")
             except Exception as _e:
                 ss_set(_last_local_save=f"⚠ Save failed: {_e}")
@@ -3346,7 +3379,7 @@ if ss("enrichment_done", False):
         _save_dir     = ss("_local_save_path", "") if _save_enabled else _DEFAULT_DOWNLOAD_DIR
         _save_dir     = _save_dir or _DEFAULT_DOWNLOAD_DIR
         try:
-            _final_xl, _ = save_to_local_folder(df_enriched, _save_dir)
+            _final_xl, _ = save_to_local_folder(df_enriched, _save_dir, run_tag=build_run_tag())
             ss_set(_final_auto_saved=True, _final_save_path=_final_xl)
         except Exception as _save_err:
             ss_set(_final_auto_saved=True, _final_save_path="",
@@ -3373,7 +3406,7 @@ if ss("enrichment_done", False):
                     st.download_button(
                         label="⬇ Download all Step 2 debug files as ZIP",
                         data=_zip_bytes,
-                        file_name=f"step2_debug_files_{ts()}.zip",
+                        file_name=f"step2_debug_{build_run_tag()}_{ts()}.zip",
                         mime="application/zip",
                         use_container_width=True,
                         key="dl_all_debug_zip",
@@ -3403,11 +3436,14 @@ if ss("enrichment_done", False):
                         st.divider()
 
     # ── Primary browser download ──────────────────────────────────────────────
-    _fname_prefix_dl = "elm_results" if _elm_done else "claude_enriched"
+    if _elm_done:
+        _fname_dl = f"elm_results_{ts()}.xlsx"
+    else:
+        _fname_dl = f"enriched_results_{build_run_tag()}_{ts()}.xlsx"
     st.download_button(
         label="⬇ Download results to your local Downloads folder",
         data=df_to_excel_bytes(df_enriched),
-        file_name=f"{_fname_prefix_dl}_{ts()}.xlsx",
+        file_name=_fname_dl,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         type="primary",
@@ -3553,8 +3589,13 @@ if ss("enrichment_done", False):
     st.subheader("Download results")
     log_df = make_log_df(debug_records_done, elm_mode=_elm_done)
 
-    _fname_prefix = "elm_results" if _elm_done else "claude_enriched"
-    _log_fname    = "elm_fetch_log.csv" if _elm_done else "claude_processing_log.csv"
+    if _elm_done:
+        _fname_prefix = "elm_results"
+        _log_fname    = "elm_fetch_log.csv"
+    else:
+        _run_tag      = build_run_tag()
+        _fname_prefix = f"enriched_results_{_run_tag}_{ts()}"
+        _log_fname    = f"processing_log_{_run_tag}_{ts()}.csv"
     _xl_help      = (
         "All original columns + keyword counts + normalized scores."
         if _elm_done else
