@@ -54,6 +54,10 @@ AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
+_PER_COMPANY_AUTOSAVE_DEFAULT_DIR = os.path.expanduser(
+    "~/Downloads/company_enrichment_runs"
+)
+_PER_COMPANY_EXCEL_EVERY = 5  # write enriched_partial.xlsx every N rows
 MODEL_STEP1      = "claude-haiku-4-5-20251001"
 MODEL_STEP2      = "claude-haiku-4-5-20251001"
 MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
@@ -2773,6 +2777,105 @@ def autosave_clear() -> None:
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-company run-folder autosave
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_run_folder(base_folder: str, run_tag: str) -> str:
+    """
+    Create and return the path of a new timestamped run folder.
+    Structure:
+      {base_folder}/run_{YYYYMMDD_HHMMSS}_{run_tag}/
+        rows/
+        logs/
+    Raises OSError on permission / path errors (caller must catch).
+    """
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    name  = f"run_{stamp}_{run_tag}" if run_tag else f"run_{stamp}"
+    run_path = Path(base_folder.strip()) / name
+    (run_path / "rows").mkdir(parents=True, exist_ok=True)
+    (run_path / "logs").mkdir(parents=True, exist_ok=True)
+    return str(run_path)
+
+
+def save_company_result_to_run_folder(
+    row_index: int,
+    company_name: str,
+    input_row: pd.Series,
+    enriched_fields: dict,
+    debug_record: dict,
+    run_dir: str,
+) -> tuple:
+    """
+    Write one processed company as JSON to {run_dir}/rows/row_{NNNN}_{name}.json.
+    Returns (success: bool, message: str).
+    Does not include API keys or request headers.
+    """
+    try:
+        safe_name = safe_filename(company_name or f"row_{row_index:04d}")
+        fname = Path(run_dir) / "rows" / f"row_{row_index:04d}_{safe_name}.json"
+
+        # Sanitise the debug record — strip any raw API response objects but keep
+        # scalar metadata; the full raw JSON is already available in the cache files.
+        _safe_debug: dict = {}
+        for k, v in (debug_record or {}).items():
+            if isinstance(v, (str, int, float, bool, type(None))):
+                _safe_debug[k] = v
+            elif isinstance(v, dict):
+                # Truncate large nested dicts (e.g. raw API responses) to key list
+                _safe_debug[k] = (
+                    v if len(json.dumps(v, default=str)) < 4096
+                    else {"_truncated": True, "keys": list(v.keys())}
+                )
+            else:
+                _safe_debug[k] = str(v)[:500]
+
+        record = {
+            "row_index":       row_index,
+            "company_name":    company_name,
+            "saved_at_utc":    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "input_row":       {str(k): str(v) for k, v in input_row.to_dict().items()},
+            "enriched_fields": {k: str(v) for k, v in (enriched_fields or {}).items()},
+            "debug_record":    _safe_debug,
+        }
+        fname.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, str(fname)
+    except Exception as exc:
+        return False, f"Per-company save failed for '{company_name}': {exc}"
+
+
+def save_partial_outputs_to_run_folder(
+    results: list,
+    debug_records: list,
+    df_work: pd.DataFrame,
+    active_fields: list,
+    run_dir: str,
+    elm_mode: bool = False,
+    write_excel: bool = False,
+) -> tuple:
+    """
+    Write cumulative partial files to run_dir:
+      enriched_partial.csv    — always
+      processing_log.csv      — always
+      enriched_partial.xlsx   — only when write_excel=True
+    Returns (success: bool, message: str).
+    """
+    try:
+        rdir = Path(run_dir)
+        partial_df = build_partial_df(results, df_work, active_fields)
+        log_df     = make_log_df(debug_records, elm_mode=elm_mode)
+
+        partial_df.to_csv(rdir / "enriched_partial.csv", index=False, encoding="utf-8-sig")
+        log_df.to_csv(rdir / "processing_log.csv",       index=False, encoding="utf-8-sig")
+
+        if write_excel:
+            df_to_excel_bytes_write(partial_df, str(rdir / "enriched_partial.xlsx"))
+
+        return True, f"{len(results)} rows written to {run_dir}"
+    except Exception as exc:
+        return False, f"Partial output save failed: {exc}"
+
+
 def autosave_already_done(df_saved: pd.DataFrame, name_col: str, domain_col: str | None,
                           company_name: str, raw_url: str) -> bool:
     """Return True if this company already appears in the autosave file."""
@@ -2820,6 +2923,10 @@ def reset_processing(clear_autosave: bool = False):
         _step2_debug_log="", _step2_prompt_records=[],
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _zero_cost_preview=False, _dry_run_preview_count=0,
+        _per_company_autosave_run_dir="",
+        _per_company_autosave_last_saved="",
+        _per_company_autosave_last_error="",
+        _pca_final_saved=False,
     )
 
 
@@ -3127,6 +3234,52 @@ with st.sidebar:
             f"**{_DEFAULT_DOWNLOAD_DIR}** when processing completes."
         )
 
+    # ── Per-company local autosave ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("💾 Per-company local autosave")
+    pca_enabled = st.checkbox(
+        "Enable per-company local autosave",
+        value=ss("_per_company_autosave_enabled", False),
+        key="pca_enabled_checkbox",
+        help=(
+            "Writes one JSON file per company immediately after processing, "
+            "plus cumulative CSV and Excel files. "
+            "Nothing is lost if the app crashes or the browser refreshes."
+        ),
+    )
+    if pca_enabled:
+        _pca_default = ss("_per_company_autosave_base_folder", "") or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+        pca_folder = st.text_input(
+            "Autosave base folder",
+            value=_pca_default,
+            placeholder=_PER_COMPANY_AUTOSAVE_DEFAULT_DIR,
+            key="pca_folder_input",
+        )
+        _pca_folder_eff = (pca_folder or "").strip() or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+        ss_set(
+            _per_company_autosave_enabled=True,
+            _per_company_autosave_base_folder=_pca_folder_eff,
+        )
+        st.caption(
+            "Only works when the app runs locally. "
+            "On Streamlit Cloud this saves to the cloud container, not your PC."
+        )
+        _pca_run_dir = ss("_per_company_autosave_run_dir", "")
+        if _pca_run_dir and ss("processing", False):
+            st.caption(f"📂 Run folder: `{_pca_run_dir}`")
+        _pca_last = ss("_per_company_autosave_last_saved", "")
+        if _pca_last:
+            st.caption(f"✔ Last saved: {_pca_last}")
+        _pca_err = ss("_per_company_autosave_last_error", "")
+        if _pca_err:
+            st.warning(f"⚠ Autosave error: {_pca_err}")
+    else:
+        ss_set(
+            _per_company_autosave_enabled=False,
+            _per_company_autosave_base_folder=ss("_per_company_autosave_base_folder",
+                                                  _PER_COMPANY_AUTOSAVE_DEFAULT_DIR),
+        )
+
     if debug_mode:
         st.divider()
         st.subheader("Debug settings")
@@ -3343,6 +3496,27 @@ if start_btn and not blocking and not currently_processing:
     resume_mode  = ss("_resume_mode", False)
     if not resume_mode:
         autosave_clear()   # wipe any previous autosave on a fresh start
+
+    # ── Create per-company autosave run folder if feature is enabled ──────────
+    _pca_run_dir_new = ""
+    _pca_enabled_now = ss("_per_company_autosave_enabled", False)
+    if _pca_enabled_now:
+        _pca_base = (
+            ss("_per_company_autosave_base_folder", "") or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+        )
+        try:
+            # Build a temporary run tag from current sidebar selections
+            _tmp_prov  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
+            _tmp_model = ss("_model_step2",    MODEL_STEP2)
+            _tmp_lusha = ss("_enable_lusha_api", False)
+            _tmp_tag   = f"{get_provider_code(_tmp_prov)}_{get_model_code(_tmp_model)}"
+            if _tmp_lusha:
+                _tmp_tag = f"{_tmp_tag}_lusha"
+            _pca_run_dir_new = create_run_folder(_pca_base, _tmp_tag)
+        except Exception as _pca_err:
+            st.warning(f"⚠ Could not create autosave run folder: {_pca_err}")
+            _pca_run_dir_new = ""
+
     ss_set(
         processing=True, stop_requested=False,
         process_index=0, results=[], debug_records=[],
@@ -3367,6 +3541,11 @@ if start_btn and not blocking and not currently_processing:
         _lusha_api_key=lusha_api_key,
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
+        # Per-company autosave
+        _per_company_autosave_run_dir=_pca_run_dir_new,
+        _per_company_autosave_last_saved="",
+        _per_company_autosave_last_error="",
+        _pca_final_saved=False,
     )
     st.rerun()
 
@@ -3395,6 +3574,8 @@ if ss("processing", False):
     _zero_cost_run       = ss("_zero_cost_preview", False)
     _enable_lusha_api_run = ss("_enable_lusha_api", False)
     _lusha_api_key_run    = ss("_lusha_api_key", "")
+    _pca_enabled_run  = ss("_per_company_autosave_enabled", False)
+    _pca_run_dir_run  = ss("_per_company_autosave_run_dir", "")
     total_in          = ss("total_tokens_in", 0)
     total_out         = ss("total_tokens_out", 0)
     total_cost        = ss("total_cost_usd", 0.0)
@@ -3775,6 +3956,42 @@ if ss("processing", False):
 
         _new_idx = len(results)  # results already includes the row appended above
 
+        # ── Per-company run-folder autosave ───────────────────────────────────
+        if _pca_enabled_run and _pca_run_dir_run:
+            # 1. Per-company JSON
+            _pca_ok, _pca_msg = save_company_result_to_run_folder(
+                row_index=_new_idx,
+                company_name=company_name,
+                input_row=input_row,
+                enriched_fields=fields,
+                debug_record=dbg,
+                run_dir=_pca_run_dir_run,
+            )
+            if _pca_ok:
+                ss_set(
+                    _per_company_autosave_last_saved=(
+                        f"{company_name or f'row {_new_idx}'} → "
+                        f"row_{_new_idx:04d}_{safe_filename(company_name or 'row')}.json"
+                    ),
+                    _per_company_autosave_last_error="",
+                )
+            else:
+                ss_set(_per_company_autosave_last_error=_pca_msg[:200])
+
+            # 2. Cumulative partial files (CSV always; Excel every N rows)
+            _pca_write_xl = (_new_idx % _PER_COMPANY_EXCEL_EVERY == 0)
+            _pca_ok2, _pca_msg2 = save_partial_outputs_to_run_folder(
+                results=results,
+                debug_records=debug_records,
+                df_work=df_work,
+                active_fields=_active_fields,
+                run_dir=_pca_run_dir_run,
+                elm_mode=_elm_mode_run,
+                write_excel=_pca_write_xl,
+            )
+            if not _pca_ok2:
+                ss_set(_per_company_autosave_last_error=_pca_msg2[:200])
+
         # ── Filesystem snapshot every LOCAL_SAVE_EVERY companies (local runs) ─
         if ss("_local_save_enabled", False) and _new_idx % LOCAL_SAVE_EVERY == 0:
             _local_path = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
@@ -3869,6 +4086,24 @@ if ss("enrichment_done", False):
         st.info(f"📥 Results also saved locally to **{_final_xl_path}**")
     elif _final_xl_error:
         st.warning(f"⚠ Local auto-save failed: {_final_xl_error}")
+
+    # ── Per-company run-folder: write final files once ────────────────────────
+    _pca_done_enabled = ss("_per_company_autosave_enabled", False)
+    _pca_done_dir     = ss("_per_company_autosave_run_dir", "")
+    if _pca_done_enabled and _pca_done_dir and not ss("_pca_final_saved", False):
+        try:
+            _pca_rdir = Path(_pca_done_dir)
+            df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "enriched_final.xlsx"))
+            df_enriched.to_csv(_pca_rdir / "enriched_final.csv", index=False, encoding="utf-8-sig")
+            _pca_log_df = make_log_df(debug_records_done, elm_mode=_elm_done)
+            _pca_log_df.to_csv(_pca_rdir / "processing_log_final.csv", index=False, encoding="utf-8-sig")
+            # Also overwrite enriched_partial.xlsx with the complete dataset
+            df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "enriched_partial.xlsx"))
+            ss_set(_pca_final_saved=True)
+            st.info(f"📂 Per-company autosave — final files written to **{_pca_done_dir}**")
+        except Exception as _pca_fin_err:
+            ss_set(_pca_final_saved=True)
+            st.warning(f"⚠ Per-company autosave final write failed: {_pca_fin_err}")
 
     # ── Step 2 debug files — download + preview ───────────────────────────────
     if not _elm_done:
