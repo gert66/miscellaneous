@@ -118,26 +118,37 @@ production sites, or operations in multiple countries or regions.
 one country but has its headquarters, parent company, group ownership, regional HQ, or \
 reporting lines in another country.
 
-3. Competitor signal — check all three categories below and report findings in the \
-matching output fields:
+3. Competitor signal — check all three categories below and populate the exact matching \
+output field. Each provider belongs to EXACTLY ONE category; do not move it to another.
 
   Category 1 — Direct corporate language training competitors (STRONG signal). \
-If the company is mentioned together with any of the following, this is a very strong \
-buying signal: goFLUENT, Learnlight, Speexx, Voxy, Learnship, Berlitz, \
+These providers must ONLY go into competitor_signal and direct_language_competitor_signal. \
+Do NOT put them into online_language_learning_signal or broader_lnd_platform_signal. \
+Providers: goFLUENT, Learnlight, Speexx, Voxy, Learnship, Berlitz, \
 EF Corporate Solutions, Babbel for Business, Rosetta Stone Enterprise, Preply Business, \
-Talaera, Busuu for Business, Lingoda for Business, Fluentify, Twenix, Cambly. \
-Mentions include: company website, competitor case studies, testimonials, client lists, \
-press releases, supplier pages, training pages, procurement documents, webinars, job ads.
+Talaera, Busuu for Business, Lingoda for Business, Fluentify, Twenix, Cambly.
 
-  Category 2 — Online language learning brands (MEDIUM signal, only in corporate, HR, \
-L&D, employee benefit, or company-wide training context): Duolingo, Babbel, Busuu, \
-Rosetta Stone, Preply, Memrise, Mondly, ELSA Speak, FluentU, italki, Lingoda, \
-Open English, Mango Languages, Pimsleur, Drops, HelloTalk, Tandem.
+  Category 2 — Online language learning brands (MEDIUM signal). \
+These must ONLY go into online_language_learning_signal, and only when found in a \
+corporate, HR, L&D, employee benefit, or company-wide training context. \
+Do NOT put them into competitor_signal, direct_language_competitor_signal, \
+or broader_lnd_platform_signal. \
+Providers: Duolingo, Babbel, Busuu, Rosetta Stone, Preply, Memrise, Mondly, ELSA Speak, \
+FluentU, italki, Lingoda, Open English, Mango Languages, Pimsleur, Drops, HelloTalk, \
+Tandem.
 
-  Category 3 — Broader corporate learning / L&D platforms (L&D maturity signal, not \
-a direct language competitor signal): OpenSesame, Coursera for Business, Udemy Business, \
-LinkedIn Learning, Skillsoft, Docebo, Degreed, Cornerstone, 360Learning, \
-Moodle Workplace, Absorb LMS, TalentLMS, LearnUpon, Pluralsight.
+  Category 3 — Broader corporate learning / L&D platforms (L&D maturity signal). \
+These must ONLY go into broader_lnd_platform_signal. \
+Do NOT put them into competitor_signal, direct_language_competitor_signal, \
+or online_language_learning_signal. \
+Providers: OpenSesame, Coursera for Business, Udemy Business, LinkedIn Learning, \
+Skillsoft, Docebo, Degreed, Cornerstone, 360Learning, Moodle Workplace, Absorb LMS, \
+TalentLMS, LearnUpon, Pluralsight.
+
+  mYngle — mYngle is the company running this analysis and is NOT a competitor. \
+Do NOT place mYngle in any competitor or provider signal field under any circumstances. \
+If mYngle is mentioned in the search results, note it only in the evidence field as a \
+reference or client signal.
 
 4. Merger, acquisition, integration, or new group ownership.
 
@@ -156,9 +167,9 @@ Moodle Workplace, Absorb LMS, TalentLMS, LearnUpon, Pluralsight.
 Return ONLY a raw JSON object with exactly these fields and no others:
 {"lead_score": "High or Medium or Low", \
 "buying_signals": "comma-separated list of signal names actually supported by evidence", \
-"competitor_signal": "Category 1 direct corporate language training competitor name if found, otherwise empty string", \
+"competitor_signal": "comma-separated Category 1 provider names found, otherwise empty string — Category 3 platforms such as LinkedIn Learning or Skillsoft must never appear here", \
 "direct_language_competitor_signal": "comma-separated Category 1 provider names found, otherwise empty string", \
-"online_language_learning_signal": "comma-separated Category 2 provider names found in corporate/HR/L&D context, otherwise empty string", \
+"online_language_learning_signal": "comma-separated Category 2 provider names found in corporate/HR/L&D context only, otherwise empty string — Category 3 platforms must never appear here", \
 "broader_lnd_platform_signal": "comma-separated Category 3 provider names found, otherwise empty string", \
 "evidence": "brief description of what was found and source types", \
 "likely_training_interest": \
@@ -2055,8 +2066,70 @@ def run_step2(
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
 
 
+# ── Provider category membership — used by the post-processing sanitizer ─────
+# Each provider is listed in exactly one set; membership is checked case-insensitively.
+
+_CAT1_PROVIDERS: frozenset = frozenset({
+    "gofluent", "learnlight", "speexx", "voxy", "learnship", "berlitz",
+    "ef corporate solutions", "babbel for business", "rosetta stone enterprise",
+    "preply business", "talaera", "busuu for business", "lingoda for business",
+    "fluentify", "twenix", "cambly",
+})
+
+_CAT2_PROVIDERS: frozenset = frozenset({
+    "duolingo", "babbel", "busuu", "rosetta stone", "preply", "memrise",
+    "mondly", "elsa speak", "fluentu", "italki", "lingoda", "open english",
+    "mango languages", "pimsleur", "drops", "hellotalk", "tandem",
+})
+
+_CAT3_PROVIDERS: frozenset = frozenset({
+    "opensesame", "coursera for business", "udemy business", "linkedin learning",
+    "skillsoft", "docebo", "degreed", "cornerstone", "360learning",
+    "moodle workplace", "absorb lms", "talentlms", "learnupon", "pluralsight",
+})
+
+# mYngle must never appear in any competitor/provider signal field.
+_MYNGLE_VARIANTS: frozenset = frozenset({"myngle", "mYngle"})
+
+
+def _sanitize_provider_list(raw_value: str, allowed: frozenset) -> str:
+    """Return only items from raw_value (comma-separated) whose lowercase name
+    matches a member of allowed, stripping mYngle and cross-category stragglers."""
+    if not raw_value or not raw_value.strip():
+        return ""
+    kept = []
+    for item in raw_value.split(","):
+        name = item.strip()
+        if not name:
+            continue
+        name_lc = name.lower()
+        if name_lc in {v.lower() for v in _MYNGLE_VARIANTS}:
+            continue  # never a competitor/provider
+        if name_lc in allowed:
+            kept.append(name)
+    return ", ".join(kept)
+
+
+def _sanitize_icp_provider_fields(fields: dict) -> dict:
+    """Deterministic post-processing: enforce category membership rules and
+    remove mYngle from all competitor/provider signal fields."""
+    fields["icp_competitor_signal"] = _sanitize_provider_list(
+        fields.get("icp_competitor_signal", ""), _CAT1_PROVIDERS,
+    )
+    fields["icp_direct_language_competitor_signal"] = _sanitize_provider_list(
+        fields.get("icp_direct_language_competitor_signal", ""), _CAT1_PROVIDERS,
+    )
+    fields["icp_online_language_learning_signal"] = _sanitize_provider_list(
+        fields.get("icp_online_language_learning_signal", ""), _CAT2_PROVIDERS,
+    )
+    fields["icp_broader_lnd_platform_signal"] = _sanitize_provider_list(
+        fields.get("icp_broader_lnd_platform_signal", ""), _CAT3_PROVIDERS,
+    )
+    return fields
+
+
 def _extract_icp_fields(raw: dict) -> dict:
-    return {
+    fields = {
         "icp_lead_score":                          str(raw.get("lead_score")                          or "").strip(),
         "icp_buying_signals":                      str(raw.get("buying_signals")                      or "").strip(),
         "icp_competitor_signal":                   str(raw.get("competitor_signal")                   or "").strip(),
@@ -2068,6 +2141,7 @@ def _extract_icp_fields(raw: dict) -> dict:
         "icp_why_relevant":                        str(raw.get("why_relevant")                        or "").strip(),
         "icp_potential_buyer_function":            str(raw.get("potential_buyer_function")            or "").strip(),
     }
+    return _sanitize_icp_provider_fields(fields)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
