@@ -2996,20 +2996,20 @@ except Exception:
     pass
 
 # =============================================================================
-# SIDEBAR  — debug toggle only (no API key input)
+# SIDEBAR
 # =============================================================================
 
 with st.sidebar:
-    # ── Enrichment mode ───────────────────────────────────────────────────────
+    # ── 1. Enrichment mode ────────────────────────────────────────────────────
     enrichment_mode = st.radio(
         "Enrichment mode",
         options=["Full Claude enrichment", "Extreme Light Mode (no API)"],
-        index=1,
+        index=0,                        # default: Full Claude enrichment
         key="enrichment_mode_radio",
         help=(
             "**Full Claude**: Jina AI + Claude API — requires ANTHROPIC_API_KEY.\n\n"
             "**Extreme Light Mode**: fetches company pages with requests/BeautifulSoup, "
-            "extracts keyword signals and normalized scores — no API key, zero tokens."
+            "extracts keyword signals and normalised scores — no API key, zero tokens."
         ),
     )
     _elm_mode = enrichment_mode == "Extreme Light Mode (no API)"
@@ -3017,7 +3017,7 @@ with st.sidebar:
 
     st.header("Settings")
 
-    # ── API key statuses — always shown ──────────────────────────────────────
+    # ── 2. API key statuses ───────────────────────────────────────────────────
     if api_key:
         st.success("✓ Anthropic API key loaded")
     else:
@@ -3025,22 +3025,22 @@ with st.sidebar:
     if serper_key:
         st.success("✓ Serper API key loaded")
     else:
-        st.warning("⚠ Serper API key not set (only needed for Serper provider in real runs)")
+        st.warning("⚠ Serper API key not set (needed for Serper provider)")
     if lusha_api_key:
         st.success("✓ Lusha API key loaded")
     else:
-        st.caption("ⓘ Lusha API key not set (only needed when Lusha API enrichment is enabled)")
+        st.caption("ⓘ Lusha API key not set (needed when Lusha enrichment is enabled)")
 
     st.divider()
 
-    # ── Lusha API enrichment toggle ───────────────────────────────────────────
+    # ── 3. Lusha API enrichment ───────────────────────────────────────────────
     enable_lusha_api = st.checkbox(
         "Enable Lusha API enrichment",
-        value=False,
+        value=True,                     # default: enabled
         key="enable_lusha_api_checkbox",
         help=(
-            "Calls the real Lusha Company API to enrich each row with verified firmographic data. "
-            "Requires LUSHA_API_KEY in .streamlit/secrets.toml.\n\n"
+            "Calls the real Lusha Company API to enrich each row with verified "
+            "firmographic data. Requires LUSHA_API_KEY in .streamlit/secrets.toml.\n\n"
             "Results appear as new columns prefixed lusha_api_. "
             "Existing Step 1 / Step 2 columns are not affected."
         ),
@@ -3053,16 +3053,18 @@ with st.sidebar:
     st.session_state["_enable_lusha_api"] = enable_lusha_api
 
     st.divider()
+
+    # ── 4. Model selection ────────────────────────────────────────────────────
     model_step1_label = st.selectbox(
         "Model — Step 1 (firmographics)",
         options=list(AVAILABLE_MODELS.keys()),
-        index=0,
+        index=0,                        # default: Haiku 4.5
         help="Used for extracting structured company data from scraped pages. Haiku is sufficient here.",
     )
     model_step2_label = st.selectbox(
         "Model — Step 2 (ICP web search)",
         options=list(AVAILABLE_MODELS.keys()),
-        index=0,
+        index=0,                        # default: Haiku 4.5
         help="Used for the agentic web search. Sonnet gives better signal detection but costs ~5x more.",
     )
     selected_model_step1 = AVAILABLE_MODELS[model_step1_label]
@@ -3072,19 +3074,76 @@ with st.sidebar:
 
     st.divider()
 
+    # ── 5. Step 2 web search provider ─────────────────────────────────────────
+    _provider_options = [STEP2_PROVIDER_SERPER, STEP2_PROVIDER_CLAUDE]
     step2_provider = st.selectbox(
         "Step 2 web search provider",
-        options=[STEP2_PROVIDER_CLAUDE, STEP2_PROVIDER_SERPER],
-        index=0,
+        options=_provider_options,
+        index=0,                        # default: Serper Google Search
         help=(
-            f"**{STEP2_PROVIDER_CLAUDE}** (default): uses Anthropic's built-in "
-            "web_search tool — no extra API key needed.\n\n"
-            f"**{STEP2_PROVIDER_SERPER}**: calls the Serper API for Google results, "
-            "then Claude analyzes the snippets. "
-            "Requires `SERPER_API_KEY` in `.streamlit/secrets.toml`."
+            f"**{STEP2_PROVIDER_SERPER}** (default): calls the Serper API for Google "
+            "results, then Claude analyzes the snippets. "
+            "Requires `SERPER_API_KEY` in `.streamlit/secrets.toml`.\n\n"
+            f"**{STEP2_PROVIDER_CLAUDE}**: uses Anthropic's built-in web_search tool — "
+            "no extra API key needed."
         ),
     )
     st.session_state["_step2_provider"] = step2_provider
+
+    st.divider()
+
+    # ── 6. Per-company local autosave ─────────────────────────────────────────
+    st.subheader("💾 Per-company local autosave")
+    pca_enabled = st.checkbox(
+        "Enable per-company local autosave",
+        value=ss("_per_company_autosave_enabled", True),  # default: enabled
+        key="pca_enabled_checkbox",
+        help=(
+            "Writes one JSON file per company immediately after processing, "
+            "plus cumulative CSV and Excel files in a timestamped run folder. "
+            "Nothing is lost if the app crashes or the browser refreshes."
+        ),
+    )
+    if pca_enabled:
+        _pca_default = (
+            ss("_per_company_autosave_base_folder", "") or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+        )
+        pca_folder = st.text_input(
+            "Autosave base folder",
+            value=_pca_default,
+            placeholder=_PER_COMPANY_AUTOSAVE_DEFAULT_DIR,
+            key="pca_folder_input",
+        )
+        _pca_folder_eff = (pca_folder or "").strip() or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+        ss_set(
+            _per_company_autosave_enabled=True,
+            _per_company_autosave_base_folder=_pca_folder_eff,
+        )
+        st.caption(
+            "Only works when the app runs locally. "
+            "On Streamlit Cloud this saves to the cloud container, not your PC."
+        )
+        _pca_run_dir = ss("_per_company_autosave_run_dir", "")
+        if _pca_run_dir and ss("processing", False):
+            st.caption(f"📂 Run folder: `{_pca_run_dir}`")
+        _pca_last = ss("_per_company_autosave_last_saved", "")
+        if _pca_last:
+            st.caption(f"✔ Last saved: {_pca_last}")
+        _pca_err = ss("_per_company_autosave_last_error", "")
+        if _pca_err:
+            st.warning(f"⚠ Autosave error: {_pca_err}")
+    else:
+        ss_set(
+            _per_company_autosave_enabled=False,
+            _per_company_autosave_base_folder=ss(
+                "_per_company_autosave_base_folder", _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
+            ),
+        )
+
+    st.divider()
+
+    # ── 7. Advanced options ───────────────────────────────────────────────────
+    st.markdown("**Advanced options**")
 
     step2_dry_run = st.checkbox(
         "Step 2 dry run: generate prompts only",
@@ -3148,6 +3207,7 @@ with st.sidebar:
         )
 
     st.divider()
+
     if _PLAYWRIGHT_AVAILABLE:
         use_playwright = st.checkbox(
             "Use browser scraping for blocked sites",
@@ -3166,6 +3226,7 @@ with st.sidebar:
     st.session_state["_use_playwright"] = use_playwright
 
     st.divider()
+
     _cache_n = get_cache_count()
     st.caption(f"Enrichment cache: **{_cache_n}** file(s)")
     if st.button("Clear enrichment cache", use_container_width=True, key="clear_cache_always"):
@@ -3174,7 +3235,7 @@ with st.sidebar:
                 f.unlink(missing_ok=True)
         st.rerun()
 
-    # ── Auto-save status ──────────────────────────────────────────────────────
+    # ── Crash-recovery autosave status ────────────────────────────────────────
     _last_name = ss("autosave_last_name", "")
     if ss("processing", False) and _last_name:
         st.divider()
@@ -3199,7 +3260,7 @@ with st.sidebar:
                 ss_set(_resume_mode=False)
                 st.rerun()
 
-    # ── Local auto-save ───────────────────────────────────────────────────────
+    # ── Local auto-save (snapshot every N rows) ───────────────────────────────
     st.divider()
     st.subheader("📁 Local auto-save")
     local_save_enabled = st.checkbox(
@@ -3232,52 +3293,6 @@ with st.sidebar:
         st.caption(
             f"When disabled, the final results file is automatically saved to "
             f"**{_DEFAULT_DOWNLOAD_DIR}** when processing completes."
-        )
-
-    # ── Per-company local autosave ─────────────────────────────────────────────
-    st.divider()
-    st.subheader("💾 Per-company local autosave")
-    pca_enabled = st.checkbox(
-        "Enable per-company local autosave",
-        value=ss("_per_company_autosave_enabled", False),
-        key="pca_enabled_checkbox",
-        help=(
-            "Writes one JSON file per company immediately after processing, "
-            "plus cumulative CSV and Excel files. "
-            "Nothing is lost if the app crashes or the browser refreshes."
-        ),
-    )
-    if pca_enabled:
-        _pca_default = ss("_per_company_autosave_base_folder", "") or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
-        pca_folder = st.text_input(
-            "Autosave base folder",
-            value=_pca_default,
-            placeholder=_PER_COMPANY_AUTOSAVE_DEFAULT_DIR,
-            key="pca_folder_input",
-        )
-        _pca_folder_eff = (pca_folder or "").strip() or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
-        ss_set(
-            _per_company_autosave_enabled=True,
-            _per_company_autosave_base_folder=_pca_folder_eff,
-        )
-        st.caption(
-            "Only works when the app runs locally. "
-            "On Streamlit Cloud this saves to the cloud container, not your PC."
-        )
-        _pca_run_dir = ss("_per_company_autosave_run_dir", "")
-        if _pca_run_dir and ss("processing", False):
-            st.caption(f"📂 Run folder: `{_pca_run_dir}`")
-        _pca_last = ss("_per_company_autosave_last_saved", "")
-        if _pca_last:
-            st.caption(f"✔ Last saved: {_pca_last}")
-        _pca_err = ss("_per_company_autosave_last_error", "")
-        if _pca_err:
-            st.warning(f"⚠ Autosave error: {_pca_err}")
-    else:
-        ss_set(
-            _per_company_autosave_enabled=False,
-            _per_company_autosave_base_folder=ss("_per_company_autosave_base_folder",
-                                                  _PER_COMPANY_AUTOSAVE_DEFAULT_DIR),
         )
 
     if debug_mode:
