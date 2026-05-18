@@ -358,11 +358,12 @@ def ensure_debug_log_dir() -> None:
     DEBUG_LOG_DIR.mkdir(exist_ok=True)
 
 
-def write_debug_log(company_name: str, content: str, prefix: str = "step2_prompt") -> None:
+def write_debug_log(company_name: str, content: str, prefix: str = "step2_prompt") -> Path:
     ensure_debug_log_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname = DEBUG_LOG_DIR / f"{prefix}_{safe_filename(company_name)}_{stamp}.txt"
     fname.write_text(content, encoding="utf-8")
+    return fname
 
 
 def append_debug_log(message: str) -> None:
@@ -439,6 +440,109 @@ def write_search_debug_file(
     )
     fname.write_text(content, encoding="utf-8")
     return fname
+
+
+_SAFE_DEBUG_DIRS = (
+    str(DEBUG_LOG_DIR.resolve()),
+    str(SEARCH_OUTPUT_DIR.resolve()),
+)
+
+
+def _is_safe_debug_path(p: str) -> bool:
+    """Return True only when p resolves inside debug_logs/ or its subdirectories."""
+    try:
+        return str(Path(p).resolve()).startswith(_SAFE_DEBUG_DIRS)
+    except Exception:
+        return False
+
+
+def build_debug_zip(file_records: list) -> bytes:
+    """
+    Build an in-memory ZIP of all debug files in file_records.
+    Only includes files that resolve inside the debug_logs/ tree.
+    Returns raw bytes suitable for st.download_button.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        seen_arcnames: set = set()
+        for rec in file_records:
+            fpath = rec.get("path", "")
+            if not fpath or not _is_safe_debug_path(fpath):
+                continue
+            p = Path(fpath)
+            if not p.exists():
+                continue
+            # Use the path relative to the parent of debug_logs/ as the archive name
+            try:
+                arcname = str(p.relative_to(Path(".")))
+            except ValueError:
+                arcname = p.name
+            # Deduplicate archive names
+            base, suffix = arcname, ""
+            counter = 1
+            while arcname + suffix in seen_arcnames:
+                suffix = f"_{counter}"
+                counter += 1
+            arcname = arcname + suffix
+            seen_arcnames.add(arcname)
+            try:
+                zf.write(p, arcname=arcname)
+            except Exception:
+                pass
+    return buf.getvalue()
+
+
+def _read_debug_file_safe(fpath: str, max_chars: int = 8000) -> tuple[str, bool]:
+    """
+    Read a debug file for preview.  Returns (content, truncated).
+    Only reads files inside the safe debug dirs.
+    """
+    if not fpath or not _is_safe_debug_path(fpath):
+        return "(file not accessible)", False
+    try:
+        text = Path(fpath).read_text(encoding="utf-8", errors="replace")
+        if len(text) > max_chars:
+            return text[:max_chars], True
+        return text, False
+    except Exception as exc:
+        return f"(could not read file: {exc})", False
+
+
+def _debug_file_download_button(rec: dict, key_suffix: str) -> None:
+    """Render a download button for one debug file record."""
+    fpath = rec.get("path", "")
+    if not fpath or not _is_safe_debug_path(fpath):
+        return
+    p = Path(fpath)
+    if not p.exists():
+        st.caption(f"_(file no longer on disk: `{p.name}`)_")
+        return
+    company = rec.get("company", "")
+    label = f"⬇ Download {company} debug file" if company else f"⬇ Download {p.name}"
+    try:
+        data = p.read_bytes()
+        st.download_button(
+            label=label,
+            data=data,
+            file_name=p.name,
+            mime="text/plain",
+            key=f"dl_dbg_{key_suffix}",
+        )
+    except Exception:
+        st.caption(f"_(download unavailable for `{p.name}`)_")
+
+
+def _debug_file_preview_expander(rec: dict, key_suffix: str) -> None:
+    """Render a collapsed preview expander for one debug file record."""
+    fpath = rec.get("path", "")
+    if not fpath:
+        return
+    p = Path(fpath)
+    with st.expander(f"Preview: {p.name}", expanded=False):
+        text, truncated = _read_debug_file_safe(fpath)
+        st.code(text, language=None)
+        if truncated:
+            st.caption("_(preview truncated to 8 000 chars — download the full file above)_")
 
 
 def _format_serper_query_debug(
@@ -2179,7 +2283,7 @@ def reset_processing(clear_autosave: bool = False):
         _local_save_enabled=False, _final_auto_saved=False,
         _auto_dl_count=0, _auto_dl_last_msg="",
         _step2_debug_log="", _step2_prompt_records=[],
-        _dry_run_records=[], _search_output_records=[],
+        _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _zero_cost_preview=False, _dry_run_preview_count=0,
     )
 
@@ -2688,7 +2792,7 @@ if start_btn and not blocking and not currently_processing:
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
         _zero_cost_preview=ss("_zero_cost_preview", False),
-        _dry_run_records=[], _search_output_records=[],
+        _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
     )
     st.rerun()
@@ -2822,19 +2926,24 @@ if ss("processing", False):
     if ss("_show_step2_debug", False) and not _elm_mode_run:
         _srecs = ss("_search_output_records", [])
         if _srecs:
-            with st.expander("Search outputs (all companies so far)", expanded=False):
+            with st.expander(
+                f"Search outputs ({len(_srecs)} action(s) so far)", expanded=False
+            ):
                 st.caption(
                     f"Detailed files saved in `{SEARCH_OUTPUT_DIR}/`. "
-                    f"{len(_srecs)} search action(s) recorded."
+                    "Use the download buttons below to access them from the browser."
                 )
-            for _sr in _srecs:
+            for _sri, _sr in enumerate(_srecs):
                 _sr_label = (
                     f"Search output: {_sr['company']} "
                     f"({'DRY RUN' if _sr.get('dry_run') else _sr.get('provider', '')})"
                 )
                 with st.expander(_sr_label, expanded=False):
-                    st.markdown(f"**Provider:** {_sr.get('provider', '')}  |  **Dry run:** {_sr.get('dry_run', False)}")
-                    st.markdown(f"**Query / search instruction:**")
+                    st.markdown(
+                        f"**Provider:** {_sr.get('provider', '')}  |  "
+                        f"**Dry run:** {_sr.get('dry_run', False)}"
+                    )
+                    st.markdown("**Query / search instruction:**")
                     st.code(_sr.get("query", ""), language=None)
                     _rc = _sr.get("result_count", 0)
                     st.markdown(f"**Results returned:** {_rc}")
@@ -2848,7 +2957,14 @@ if ss("processing", False):
                             )
                     _df = _sr.get("debug_file", "")
                     if _df:
-                        st.caption(f"Full debug file saved: `{_df}`")
+                        st.caption(f"`{_df}`")
+                        _rec_wrap = {
+                            "path":    _df,
+                            "company": _sr.get("company", ""),
+                            "dry_run": _sr.get("dry_run", False),
+                        }
+                        _debug_file_download_button(_rec_wrap, f"run_{idx}_{_sri}")
+                        _debug_file_preview_expander(_rec_wrap, f"prev_{idx}_{_sri}")
 
     # ── Step 2 debug log window ───────────────────────────────────────────────
     if ss("_show_step2_debug", False) and not _elm_mode_run:
@@ -2900,18 +3016,35 @@ if ss("processing", False):
                 if event == "status":
                     append_debug_log(kwargs.get("msg", ""))
                 elif event == "search_output":
+                    _so_rec = {
+                        "company":      kwargs.get("company", cname),
+                        "provider":     kwargs.get("provider", ""),
+                        "query":        kwargs.get("query", ""),
+                        "result_count": kwargs.get("result_count", 0),
+                        "top_results":  kwargs.get("top_results", []),
+                        "debug_file":   kwargs.get("debug_file", ""),
+                        "dry_run":      kwargs.get("dry_run", False),
+                    }
                     if _show_debug_ui:
                         _srecs = st.session_state.get("_search_output_records", [])
-                        _srecs.append({
-                            "company":      kwargs.get("company", cname),
-                            "provider":     kwargs.get("provider", ""),
-                            "query":        kwargs.get("query", ""),
-                            "result_count": kwargs.get("result_count", 0),
-                            "top_results":  kwargs.get("top_results", []),
-                            "debug_file":   kwargs.get("debug_file", ""),
-                            "dry_run":      kwargs.get("dry_run", False),
-                        })
+                        _srecs.append(_so_rec)
                         st.session_state["_search_output_records"] = _srecs
+                    # Always track search output files for download (when saving is on)
+                    _so_path = kwargs.get("debug_file", "")
+                    if _so_path and _save_debug_fs:
+                        try:
+                            _all_files = st.session_state.get("_step2_debug_files", [])
+                            _all_files.append({
+                                "path":     _so_path,
+                                "filename": Path(_so_path).name,
+                                "company":  kwargs.get("company", cname),
+                                "provider": kwargs.get("provider", ""),
+                                "kind":     "search",
+                                "dry_run":  kwargs.get("dry_run", False),
+                            })
+                            st.session_state["_step2_debug_files"] = _all_files
+                        except Exception:
+                            pass
                 elif event == "prompt":
                     _is_dry   = kwargs.get("dry_run", False)
                     _file_pfx = "step2_dry_run" if _is_dry else "step2_prompt"
@@ -2927,7 +3060,17 @@ if ss("processing", False):
                             notes=kwargs.get("notes", []),
                         )
                         try:
-                            write_debug_log(cname, _body, prefix=_file_pfx)
+                            _prompt_path = write_debug_log(cname, _body, prefix=_file_pfx)
+                            _all_files = st.session_state.get("_step2_debug_files", [])
+                            _all_files.append({
+                                "path":     str(_prompt_path),
+                                "filename": _prompt_path.name,
+                                "company":  kwargs.get("company", cname),
+                                "provider": kwargs.get("provider", STEP2_PROVIDER_CLAUDE),
+                                "kind":     "prompt_dry_run" if _is_dry else "prompt",
+                                "dry_run":  _is_dry,
+                            })
+                            st.session_state["_step2_debug_files"] = _all_files
                         except Exception:
                             pass
                     if _show_debug_ui:
@@ -3150,21 +3293,48 @@ if ss("enrichment_done", False):
     elif _final_xl_error:
         st.warning(f"⚠ Local auto-save failed: {_final_xl_error}")
 
-    # ── Search debug files summary ────────────────────────────────────────────
-    if not _elm_done and ss("_save_step2_debug", True):
-        _srecs_done = ss("_search_output_records", [])
-        if _srecs_done:
+    # ── Step 2 debug files — download + preview ───────────────────────────────
+    if not _elm_done:
+        _all_dbg_files = ss("_step2_debug_files", [])
+        if _all_dbg_files:
             with st.expander(
-                f"🔍 Step 2 search debug files ({len(_srecs_done)} file(s) saved)",
-                expanded=False,
+                f"🔍 Step 2 debug files ({len(_all_dbg_files)} file(s))",
+                expanded=True,
             ):
-                st.caption(f"All files saved in `{SEARCH_OUTPUT_DIR}/`")
-                for _sr in _srecs_done:
-                    _df_path = _sr.get("debug_file", "")
-                    if _df_path:
-                        _tag = " [DRY RUN]" if _sr.get("dry_run") else ""
-                        st.text(f"{_sr.get('company','')} — {_sr.get('provider','')}{_tag}")
-                        st.caption(f"  `{_df_path}`")
+                # ── ZIP download (all files in one click) ─────────────────────
+                try:
+                    _zip_bytes = build_debug_zip(_all_dbg_files)
+                    st.download_button(
+                        label="⬇ Download all Step 2 debug files as ZIP",
+                        data=_zip_bytes,
+                        file_name=f"step2_debug_files_{ts()}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="dl_all_debug_zip",
+                    )
+                except Exception as _ze:
+                    st.warning(f"Could not build ZIP: {_ze}")
+
+                st.divider()
+
+                # ── Per-file: download button + preview ───────────────────────
+                for _fi, _frec in enumerate(_all_dbg_files):
+                    _tag  = " [DRY RUN]" if _frec.get("dry_run") else ""
+                    _kind = _frec.get("kind", "")
+                    _kind_label = {
+                        "prompt":          "Prompt file",
+                        "prompt_dry_run":  "Prompt file (dry run)",
+                        "search":          "Search I/O file",
+                    }.get(_kind, "Debug file")
+                    st.markdown(
+                        f"**{_kind_label}{_tag}** — {_frec.get('company', '')} "
+                        f"· {_frec.get('provider', '')}"
+                    )
+                    st.caption(f"`{_frec.get('filename','')}`")
+                    _debug_file_download_button(_frec, f"done_{_fi}")
+                    _debug_file_preview_expander(_frec, f"done_{_fi}")
+                    if _fi < len(_all_dbg_files) - 1:
+                        st.divider()
 
     # ── Primary browser download ──────────────────────────────────────────────
     _fname_prefix_dl = "elm_results" if _elm_done else "claude_enriched"
