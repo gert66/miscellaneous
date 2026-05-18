@@ -729,9 +729,12 @@ def reset_processing():
 def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame) -> None:
     """Assemble the enriched DataFrame from per-row results and mark done."""
     df_out      = df_work.copy().reset_index(drop=True)
-    enriched_df = pd.DataFrame(results)
+    # results may be shorter than df_out (early stop, errors).
+    # Reindex to the full row range so column assignment lengths always match;
+    # unprocessed rows get NaN which fillna converts to "".
+    enriched_df = pd.DataFrame(results).reindex(df_out.index)
     for col in LUSHA_FIELDS:
-        df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
+        df_out[col] = enriched_df[col].fillna("").values if col in enriched_df.columns else ""
     ss_set(
         processing=False, stop_requested=False,
         enrichment_done=True, df_enriched=df_out,
