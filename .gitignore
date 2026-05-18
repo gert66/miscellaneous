@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.streamlit/secrets.toml
+claude_json_cache/
+debug_logs/
+/tmp/
+*.xlsx
+*.csv
