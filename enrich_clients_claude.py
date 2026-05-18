@@ -358,6 +358,14 @@ def ensure_debug_log_dir() -> None:
     DEBUG_LOG_DIR.mkdir(exist_ok=True)
 
 
+def append_to_debug_file(path: Path, content: str) -> None:
+    """Append content to an existing debug file (creates it if missing)."""
+    if not path or not _is_safe_debug_path(str(path)):
+        return
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(content)
+
+
 def write_debug_log(company_name: str, content: str, prefix: str = "step2_prompt") -> Path:
     ensure_debug_log_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -646,13 +654,28 @@ def _format_claude_post_debug(
     resp,
     raw_text: str,
     error_str: str = "",
+    parsed_json=None,
+    dry_run_skip: bool = False,
 ) -> str:
     sep  = "=" * 60
     thin = "-" * 40
 
+    if dry_run_skip:
+        return (
+            f"\n\n{sep}\n"
+            f"STEP 2 CLAUDE WEB SEARCH — POST-CALL DEBUG (NOT EXECUTED)\n"
+            f"{sep}\n"
+            f"COMPANY:   {company_name}\n"
+            f"MODEL:     {model}\n"
+            f"TIMESTAMP: {timestamp} UTC\n"
+            f"\nPOST-CALL DEBUG: skipped because dry run / zero-cost preview was active.\n"
+            f"No Anthropic API call was made.\n"
+            f"{sep}\n"
+        )
+
     if error_str:
         return (
-            f"{sep}\n"
+            f"\n\n{sep}\n"
             f"STEP 2 CLAUDE WEB SEARCH — POST-CALL DEBUG\n"
             f"{sep}\n"
             f"COMPANY:   {company_name}\n"
@@ -710,8 +733,17 @@ def _format_claude_post_debug(
 
     raw_resp_dump = safe_json_dump(resp) if resp else "(not available)"
 
+    parsed_section = ""
+    if parsed_json is not None:
+        parsed_section = (
+            f"\nPARSED JSON OUTPUT\n{thin}\n"
+            + safe_json_dump(parsed_json) + "\n"
+        )
+    else:
+        parsed_section = f"\nPARSED JSON OUTPUT\n{thin}\n(not available or parse failed)\n"
+
     return (
-        f"{sep}\n"
+        f"\n\n{sep}\n"
         f"STEP 2 CLAUDE WEB SEARCH — POST-CALL DEBUG\n"
         f"{sep}\n"
         f"COMPANY:              {company_name}\n"
@@ -725,6 +757,7 @@ def _format_claude_post_debug(
         + _blk_section("TOOL RESULT BLOCKS", tool_result_blocks)
         + _blk_section("WEB SEARCH / SOURCE BLOCKS", web_search_blocks)
         + citation_section
+        + parsed_section
         + f"\nRAW RESPONSE OBJECT\n{thin}\n{raw_resp_dump}\n"
         + f"{sep}\n"
     )
@@ -1683,23 +1716,11 @@ def run_step2_serper(
         out_t = resp.usage.output_tokens
         _dlog(f"Received Claude response for {company_name}")
 
-        # Write Claude analysis post-call debug file (Serper route — Claude has no web search tool here)
-        if _debug_callback:
-            _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                _post_content = _format_claude_post_debug(
-                    company_name, model_step2, _ts, resp, raw_text,
-                )
-                write_search_debug_file(
-                    company_name, "serper_google_search_claude_response",
-                    _post_content, index=len(queries) + 1,
-                )
-            except Exception:
-                pass
-
+        # Parse (with one retry on failure)
+        _icp_raw = None
         try:
             _dlog(f"Parsing Step 2 Serper response for {company_name}")
-            icp_raw = _parse_json_response(raw_text)
+            _icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             _dlog(f"Parse failed — retrying with strict suffix for {company_name}")
             time.sleep(delay)
@@ -1715,12 +1736,37 @@ def run_step2_serper(
             in_t  += resp2.usage.input_tokens
             out_t += resp2.usage.output_tokens
             _dlog(f"Parsing Step 2 Serper retry response for {company_name}")
-            icp_raw = _parse_json_response(raw_text2)
+            _icp_raw = _parse_json_response(raw_text2)
 
-        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        # Write Claude analysis post-call debug file (after parsing so it includes parsed JSON)
+        if _debug_callback:
+            _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _post_content = _format_claude_post_debug(
+                    company_name, model_step2, _ts, resp, raw_text,
+                    parsed_json=_icp_raw,
+                )
+                _serper_resp_path = write_search_debug_file(
+                    company_name, "serper_google_search_claude_response",
+                    _post_content, index=len(queries) + 1,
+                )
+                _debug_callback(
+                    "search_output",
+                    company=company_name,
+                    provider=STEP2_PROVIDER_SERPER,
+                    query="[Claude analysis of Serper results]",
+                    result_count=0,
+                    top_results=[],
+                    debug_file=str(_serper_resp_path),
+                    dry_run=False,
+                )
+            except Exception:
+                pass
+
+        payload = {"icp_data": _icp_raw, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
         _dlog(f"Finished Step 2 (Serper) for {company_name}")
-        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
+        return (_extract_icp_fields(_icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
 
     except (json.JSONDecodeError, ValueError) as e:
         _dlog(f"Step 2 Serper parse error for {company_name}: {e}")
@@ -1796,7 +1842,8 @@ def run_step2(
     _dlog(f"Generating Step 2 prompt for {company_name}")
     _dlog(f"Selected model: {model_step2}")
 
-    _ts_pre = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    _ts_pre    = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    _pre_fpath = None   # path of the pre-call file; post-call section is appended here
 
     if _debug_callback:
         _debug_callback(
@@ -1837,6 +1884,18 @@ def run_step2(
     # DRY RUN GUARD: do not call Anthropic in prompt preview mode
     if dry_run:
         _dlog(f"DRY RUN: skipping Anthropic call for {company_name}")
+        if _pre_fpath:
+            try:
+                append_to_debug_file(
+                    _pre_fpath,
+                    _format_claude_post_debug(
+                        company_name, model_step2,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        None, "", dry_run_skip=True,
+                    ),
+                )
+            except Exception:
+                pass
         return (_ICP_EMPTY.copy(), {}, 0, 0, "dry_run", "DRY RUN: no API call made", 0, 0)
 
     try:
@@ -1847,66 +1906,73 @@ def run_step2(
         )
         _dlog(f"Received Claude response for {company_name}")
 
-        # Write post-call debug file
-        if _debug_callback:
-            _ts_post = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                _post_content = _format_claude_post_debug(
-                    company_name, model_step2, _ts_post, _resp, raw_text,
-                )
-                write_search_debug_file(
-                    company_name, "claude_web_search", _post_content, index=2,
-                )
-            except Exception:
-                pass
-
+        # Parse (with one retry on failure)
+        _icp_raw = None
         try:
             _dlog(f"Parsing Step 2 response for {company_name}")
-            icp_raw = _parse_json_response(raw_text)
+            _icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             _dlog(f"Parse failed — retrying with strict suffix for {company_name}")
             time.sleep(delay)
-            raw_text2, in_t2, out_t2, _resp2 = _claude_web_search_full(
+            raw_text2, in_t2, out_t2, _ = _claude_web_search_full(
                 full_prompt + _STRICT_SUFFIX, api_key, model_id=model_step2,
             )
             in_t  += in_t2
             out_t += out_t2
             _dlog(f"Parsing Step 2 retry response for {company_name}")
-            icp_raw = _parse_json_response(raw_text2)   # raises if still bad
-        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+            _icp_raw = _parse_json_response(raw_text2)  # raises if still bad
+
+        # Append post-call section (with parsed JSON) to the pre-call file
+        if _pre_fpath:
+            try:
+                append_to_debug_file(
+                    _pre_fpath,
+                    _format_claude_post_debug(
+                        company_name, model_step2,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        _resp, raw_text, parsed_json=_icp_raw,
+                    ),
+                )
+            except Exception:
+                pass
+
+        payload = {"icp_data": _icp_raw, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
         _dlog(f"Finished Step 2 for {company_name}")
-        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
+        return (_extract_icp_fields(_icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
+
     except (json.JSONDecodeError, ValueError) as e:
         _dlog(f"Step 2 parse error for {company_name}: {e}")
-        if _debug_callback:
+        if _pre_fpath:
             try:
-                _ts_err = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                _err_content = _format_claude_post_debug(
-                    company_name, model_step2, _ts_err, None, "",
-                    error_str=f"Parse error: {type(e).__name__}: {e}",
-                )
-                write_search_debug_file(
-                    company_name, "claude_web_search", _err_content, index=2,
+                append_to_debug_file(
+                    _pre_fpath,
+                    _format_claude_post_debug(
+                        company_name, model_step2,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        None, "", error_str=f"Parse error: {type(e).__name__}: {e}",
+                    ),
                 )
             except Exception:
                 pass
         return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {type(e).__name__}: {e}", 0, 0)
+
     except anthropic.APIError as e:
         _dlog(f"Step 2 API error for {company_name}: {e}")
-        if _debug_callback:
+        if _pre_fpath:
             try:
-                _ts_err = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                _err_content = _format_claude_post_debug(
-                    company_name, model_step2, _ts_err, None, "",
-                    error_str=f"Claude API {type(e).__name__}: {e}",
-                )
-                write_search_debug_file(
-                    company_name, "claude_web_search", _err_content, index=2,
+                append_to_debug_file(
+                    _pre_fpath,
+                    _format_claude_post_debug(
+                        company_name, model_step2,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        None, "", error_str=f"Claude API {type(e).__name__}: {e}",
+                    ),
                 )
             except Exception:
                 pass
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
+
     except Exception as e:
         _dlog(f"Step 2 error for {company_name}: {e}")
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
