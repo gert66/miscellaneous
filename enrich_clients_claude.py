@@ -214,7 +214,42 @@ META_FIELDS = [
     "total_cost_usd",
 ]
 
-ALL_ENRICHMENT_FIELDS = STEP1_FIELDS + ICP_FIELDS + META_FIELDS
+# Real Lusha API enrichment fields (prefix "lusha_api_")
+LUSHA_API_FIELDS = [
+    "lusha_api_company_name",
+    "lusha_api_domain",
+    "lusha_api_description",
+    "lusha_api_founded_year",
+    "lusha_api_employee_range",
+    "lusha_api_revenue_range",
+    "lusha_api_industry",
+    "lusha_api_sub_industry",
+    "lusha_api_company_type",
+    "lusha_api_country",
+    "lusha_api_city",
+    "lusha_api_continent",
+    "lusha_api_linkedin_url",
+    "lusha_api_specialties",
+    "lusha_api_technologies",
+    "lusha_api_total_funding_amount",
+    "lusha_api_total_funding_rounds",
+    "lusha_api_last_round_type",
+    "lusha_api_last_round_amount",
+    "lusha_api_last_round_date",
+    "lusha_api_ipo_status",
+]
+
+LUSHA_API_META_FIELDS = [
+    "lusha_api_status",
+    "lusha_api_error",
+    "lusha_api_match_confidence",
+    "lusha_api_needs_review",
+    "lusha_api_match_notes",
+]
+
+ALL_ENRICHMENT_FIELDS = (
+    LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS + META_FIELDS
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Extreme Light Mode (ELM) — zero-token, no API key, keyword-only extraction
@@ -2027,6 +2062,202 @@ def flag_review(row: dict, input_company_name: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Real Lusha API enrichment (optional additional layer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LUSHA_API_BASE = "https://api.lusha.com/company"
+_LUSHA_TIMEOUT  = 15
+
+
+def _map_lusha_api_fields(raw: dict, source_url: str) -> dict:
+    """
+    Map a raw Lusha API company response dict to LUSHA_API_FIELDS keys.
+    Uses .get() throughout — tolerates missing or differently-shaped responses.
+    """
+    def s(key, *fallback_keys):
+        for k in (key, *fallback_keys):
+            v = raw.get(k)
+            if v is not None and str(v).strip() not in ("", "None", "null"):
+                return str(v).strip()
+        return ""
+
+    # Lusha nests some data under sub-dicts; handle both flat and nested
+    company = raw if not raw.get("company") else raw.get("company", raw)
+
+    domain = clean_domain(s("domain", "website")) or clean_domain(source_url)
+
+    specialties = company.get("specialties") or company.get("specialties_list") or ""
+    if isinstance(specialties, list):
+        specialties = ", ".join(str(x) for x in specialties if x)
+
+    technologies = company.get("technologies") or company.get("technology_stack") or ""
+    if isinstance(technologies, list):
+        technologies = ", ".join(str(x) for x in technologies if x)
+
+    return {
+        "lusha_api_company_name":         s("name", "company_name"),
+        "lusha_api_domain":               domain,
+        "lusha_api_description":          s("description", "about"),
+        "lusha_api_founded_year":         s("founded_year", "founded", "year_founded"),
+        "lusha_api_employee_range":       s("employee_range", "employees", "company_size", "size"),
+        "lusha_api_revenue_range":        s("revenue_range", "revenue", "annual_revenue"),
+        "lusha_api_industry":             s("industry", "main_industry"),
+        "lusha_api_sub_industry":         s("sub_industry", "sub_category"),
+        "lusha_api_company_type":         s("company_type", "type"),
+        "lusha_api_country":              s("country", "hq_country"),
+        "lusha_api_city":                 s("city", "hq_city"),
+        "lusha_api_continent":            s("continent"),
+        "lusha_api_linkedin_url":         s("linkedin_url", "linkedin"),
+        "lusha_api_specialties":          specialties,
+        "lusha_api_technologies":         technologies,
+        "lusha_api_total_funding_amount": s("total_funding_amount", "total_funding"),
+        "lusha_api_total_funding_rounds": s("total_funding_rounds", "funding_rounds"),
+        "lusha_api_last_round_type":      s("last_round_type", "last_funding_type"),
+        "lusha_api_last_round_amount":    s("last_round_amount", "last_funding_amount"),
+        "lusha_api_last_round_date":      s("last_round_date", "last_funding_date"),
+        "lusha_api_ipo_status":           s("ipo_status", "ipo"),
+    }
+
+
+def flag_lusha_api_review(
+    lusha_fields: dict,
+    input_company_name: str,
+    input_url: str,
+) -> dict:
+    """
+    Evaluate match quality for a real Lusha API result.
+    Returns dict with keys: lusha_api_match_confidence, lusha_api_needs_review,
+    lusha_api_match_notes.
+    Kept separate from flag_review() which evaluates Step 1 fields.
+    """
+    reasons: list = []
+    confidence = "high"
+
+    api_name   = lusha_fields.get("lusha_api_company_name", "")
+    api_domain = lusha_fields.get("lusha_api_domain",       "")
+    api_status = lusha_fields.get("lusha_api_status",       "")
+
+    inp_name   = (input_company_name or "").strip()
+    inp_domain = clean_domain(input_url or "")
+
+    # ── No useful data returned ───────────────────────────────────────────────
+    useful_fields = [v for k, v in lusha_fields.items()
+                     if k in LUSHA_API_FIELDS and v and v not in ("", "N/A")]
+    if len(useful_fields) < 3:
+        reasons.append("No useful Lusha API data returned")
+        confidence = "low"
+
+    # ── Company name similarity ───────────────────────────────────────────────
+    if inp_name and api_name:
+        inp_core = _strip_legal(inp_name).strip() or inp_name
+        api_core = _strip_legal(api_name).strip()  or api_name
+        sim = str_similarity(inp_core, api_core)
+        if sim < 0.60:
+            reasons.append(
+                f"Name mismatch: input '{inp_name}' vs Lusha API '{api_name}' ({sim:.0%})"
+            )
+            confidence = "low"
+        elif sim < 0.80:
+            reasons.append(
+                f"Possible name mismatch: '{inp_name}' vs '{api_name}' ({sim:.0%})"
+            )
+            if confidence == "high":
+                confidence = "medium"
+
+    # ── Domain comparison ─────────────────────────────────────────────────────
+    if inp_domain and api_domain:
+        if inp_domain != api_domain:
+            reasons.append(
+                f"Domain conflict: input '{inp_domain}' vs Lusha API '{api_domain}'"
+            )
+            if confidence != "low":
+                confidence = "medium"
+
+    # ── API-level error ───────────────────────────────────────────────────────
+    if api_status and api_status not in ("ok", "cached"):
+        reasons.append(f"Lusha API status: {api_status}")
+        if confidence == "high":
+            confidence = "medium"
+
+    needs_review = "TRUE" if (confidence == "low" or reasons) else "FALSE"
+    return {
+        "lusha_api_match_confidence": confidence,
+        "lusha_api_needs_review":     needs_review,
+        "lusha_api_match_notes":      "; ".join(reasons) if reasons else "",
+    }
+
+
+def run_lusha_api_enrichment(
+    company_name: str,
+    raw_url: str,
+    api_key: str,
+) -> tuple:
+    """
+    Call the real Lusha Company API and return:
+    (lusha_fields_dict, raw_json_dict, status, error_message)
+
+    Uses domain when available, falls back to company name.
+    Results are cached under lusha_api_{domain_or_name}.
+    Never raises — all errors are returned as status/error strings.
+    """
+    _empty = {f: "" for f in LUSHA_API_FIELDS}
+
+    if not api_key:
+        return _empty, {}, "no_key", "Lusha API key not provided"
+
+    domain = clean_domain(raw_url)
+    cache_key = f"lusha_api_{domain or safe_filename(company_name or 'unknown')}"
+    cached = load_cache(cache_key)
+    if cached is not None:
+        fields = _map_lusha_api_fields(cached.get("raw", {}), raw_url)
+        return fields, cached.get("raw", {}), "cached", ""
+
+    # ── Build request ─────────────────────────────────────────────────────────
+    params: dict = {}
+    if domain:
+        params["domain"] = domain
+    elif company_name:
+        params["name"] = company_name
+    else:
+        return _empty, {}, "no_input", "No domain or company name available"
+
+    try:
+        resp = requests.get(
+            _LUSHA_API_BASE,
+            headers={"api_key": api_key, "Accept": "application/json"},
+            params=params,
+            timeout=_LUSHA_TIMEOUT,
+        )
+
+        if resp.status_code == 404:
+            save_cache(cache_key, {"raw": {}, "status": "not_found"})
+            return _empty, {}, "not_found", f"Lusha API: company not found (404)"
+
+        if resp.status_code == 401:
+            return _empty, {}, "auth_error", "Lusha API: invalid or missing API key (401)"
+
+        if resp.status_code == 429:
+            return _empty, {}, "rate_limit", "Lusha API: rate limit exceeded (429)"
+
+        resp.raise_for_status()
+
+        raw = resp.json()
+        save_cache(cache_key, {"raw": raw, "status": "ok"})
+        fields = _map_lusha_api_fields(raw, raw_url)
+        return fields, raw, "ok", ""
+
+    except requests.Timeout:
+        return _empty, {}, "timeout", f"Lusha API timed out after {_LUSHA_TIMEOUT}s"
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        return _empty, {}, f"http_{code}", f"Lusha API HTTP {code}: {str(e)[:120]}"
+    except (json.JSONDecodeError, ValueError) as e:
+        return _empty, {}, "parse_error", f"Lusha API invalid JSON: {str(e)[:120]}"
+    except Exception as e:
+        return _empty, {}, "error", f"Lusha API error: {type(e).__name__}: {str(e)[:120]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-row enrichment  ← orchestrates both steps
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2042,9 +2273,12 @@ def enrich_one_row(
     search_provider: str = STEP2_PROVIDER_CLAUDE,
     serper_key: str = "",
     dry_run: bool = False,
+    enable_lusha_api: bool = False,
+    lusha_api_key: str = "",
 ) -> tuple:
     """
-    Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
+    Run optional Lusha API enrichment, then Step 1 (Jina + Claude extraction),
+    then Step 2 (Claude web_search ICP).
     Returns (combined_fields_dict, debug_record_dict).
     """
     url          = raw_url.strip() if raw_url else ""
@@ -2054,6 +2288,21 @@ def enrich_one_row(
 
     # 8-second pause between companies to stay under the token/min rate limit
     time.sleep(8)
+
+    # ── Optional: Lusha API enrichment ────────────────────────────────────────
+    _lusha_raw_json = {}
+    if enable_lusha_api and lusha_api_key:
+        la_fields, _lusha_raw_json, la_status, la_err = run_lusha_api_enrichment(
+            company_name, url, lusha_api_key,
+        )
+        row.update(la_fields)
+        row["lusha_api_status"] = la_status
+        row["lusha_api_error"]  = la_err
+        review_meta = flag_lusha_api_review(la_fields, company_name, url)
+        row.update(review_meta)
+    elif enable_lusha_api and not lusha_api_key:
+        row["lusha_api_status"] = "no_key"
+        row["lusha_api_error"]  = "Lusha API key not provided"
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
     s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
@@ -2106,6 +2355,8 @@ def enrich_one_row(
         "input_company_name":       company_name,
         "input_url":                raw_url,
         "normalized_url":           normalize_url(url),
+        "lusha_api_status":         row.get("lusha_api_status", ""),
+        "lusha_api_raw_json":       _lusha_raw_json,
         "step1_status":             s1_status,
         "step1_raw_json":           s1_raw,
         "step1_tokens_in":          s1_in,
@@ -2125,6 +2376,29 @@ def enrich_one_row(
         "match_notes":              row["match_notes"],
     }
     return row, dbg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature engineering placeholder (not implemented yet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_model_features(df_enriched: pd.DataFrame) -> pd.DataFrame:
+    """
+    TODO:
+    Convert raw enrichment data into model-ready scalar/discrete features.
+    This should later create fields such as:
+    - multi_country_presence: 0/1
+    - foreign_hq_signal: 0/1
+    - competitor_signal: 0/1
+    - employee_size_score: 1-5
+    - international_presence_score: 1-5
+    - language_need_score: 1-5
+    - industry_fit_score: 1-5
+    - data_quality_score: 1-5
+
+    This should stay separate from raw enrichment.
+    """
+    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2213,6 +2487,7 @@ def make_log_df(debug_records: list, elm_mode: bool = False) -> pd.DataFrame:
             rows.append({
                 "input_company_name":  d.get("input_company_name", ""),
                 "input_url":           d.get("input_url", ""),
+                "lusha_api_status":    d.get("lusha_api_status", ""),
                 "step1_status":        d.get("step1_status", ""),
                 "step2_status":        d.get("step2_status", ""),
                 "enrichment_status":   d.get("enrichment_status", ""),
@@ -2275,13 +2550,17 @@ def get_model_code(model_name: str) -> str:
 
 def build_run_tag() -> str:
     """
-    Return '{provider_code}_{model_code}' for the current run's Step 2 settings,
-    reading from session state.  Safe to call from both the processing loop and
-    the results section.
+    Return a filename-safe tag for the current run, including provider code,
+    model code, and 'lusha' suffix when Lusha API enrichment is enabled.
+    Safe to call from both the processing loop and the results section.
     """
-    prov  = st.session_state.get("_step2_provider", STEP2_PROVIDER_CLAUDE)
-    model = st.session_state.get("_model_step2",    MODEL_STEP2)
-    return f"{get_provider_code(prov)}_{get_model_code(model)}"
+    prov  = st.session_state.get("_step2_provider",   STEP2_PROVIDER_CLAUDE)
+    model = st.session_state.get("_model_step2",       MODEL_STEP2)
+    lusha = st.session_state.get("_enable_lusha_api",  False)
+    tag   = f"{get_provider_code(prov)}_{get_model_code(model)}"
+    if lusha:
+        tag = f"{tag}_lusha"
+    return tag
 
 
 def save_to_local_folder(df: pd.DataFrame, folder: str, run_tag: str = "") -> tuple[str, str]:
@@ -2444,6 +2723,14 @@ try:
 except Exception:
     pass
 
+# Lusha API key — optional, only needed when Lusha API enrichment is enabled.
+# Required entry in .streamlit/secrets.toml: LUSHA_API_KEY = "your-key"
+lusha_api_key = ""
+try:
+    lusha_api_key = st.secrets.get("LUSHA_API_KEY", "") or ""
+except Exception:
+    pass
+
 # =============================================================================
 # SIDEBAR  — debug toggle only (no API key input)
 # =============================================================================
@@ -2475,6 +2762,31 @@ with st.sidebar:
         st.success("✓ Serper API key loaded")
     else:
         st.warning("⚠ Serper API key not set (only needed for Serper provider in real runs)")
+    if lusha_api_key:
+        st.success("✓ Lusha API key loaded")
+    else:
+        st.caption("ⓘ Lusha API key not set (only needed when Lusha API enrichment is enabled)")
+
+    st.divider()
+
+    # ── Lusha API enrichment toggle ───────────────────────────────────────────
+    enable_lusha_api = st.checkbox(
+        "Enable Lusha API enrichment",
+        value=False,
+        key="enable_lusha_api_checkbox",
+        help=(
+            "Calls the real Lusha Company API to enrich each row with verified firmographic data. "
+            "Requires LUSHA_API_KEY in .streamlit/secrets.toml.\n\n"
+            "Results appear as new columns prefixed lusha_api_. "
+            "Existing Step 1 / Step 2 columns are not affected."
+        ),
+    )
+    if enable_lusha_api and not lusha_api_key:
+        st.warning(
+            "⚠️ LUSHA_API_KEY is missing from .streamlit/secrets.toml. "
+            "Add it or disable Lusha API enrichment."
+        )
+    st.session_state["_enable_lusha_api"] = enable_lusha_api
 
     st.divider()
     model_step1_label = st.selectbox(
@@ -2829,6 +3141,9 @@ if (
     and not _is_preview_mode
 ):
     blocking.append("SERPER_API_KEY is missing from .streamlit/secrets.toml")
+_active_lusha_api = ss("_enable_lusha_api", False)
+if _active_lusha_api and not lusha_api_key:
+    blocking.append("LUSHA_API_KEY is missing from .streamlit/secrets.toml")
 if uploaded is None:
     blocking.append("No file uploaded yet.")
 if file_error:
@@ -2891,6 +3206,8 @@ if start_btn and not blocking and not currently_processing:
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
         _zero_cost_preview=ss("_zero_cost_preview", False),
+        _enable_lusha_api=ss("_enable_lusha_api", False),
+        _lusha_api_key=lusha_api_key,
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
     )
@@ -2919,6 +3236,8 @@ if ss("processing", False):
     _serper_key_run      = ss("_serper_key", "")
     _dry_run_run         = ss("_step2_dry_run", False)
     _zero_cost_run       = ss("_zero_cost_preview", False)
+    _enable_lusha_api_run = ss("_enable_lusha_api", False)
+    _lusha_api_key_run    = ss("_lusha_api_key", "")
     total_in          = ss("total_tokens_in", 0)
     total_out         = ss("total_tokens_out", 0)
     total_cost        = ss("total_cost_usd", 0.0)
@@ -3265,6 +3584,8 @@ if ss("processing", False):
                         search_provider=_step2_provider_run,
                         serper_key=_serper_key_run,
                         dry_run=_dry_run_run,
+                        enable_lusha_api=_enable_lusha_api_run,
+                        lusha_api_key=_lusha_api_key_run,
                     )
                 if not (_zero_cost_run and _dry_run_run):
                     s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
@@ -3552,11 +3873,16 @@ if ss("enrichment_done", False):
                 use_container_width=True,
             )
     else:
+        _lusha_done = ss("_enable_lusha_api", False)
         summary_cols = orig_cols + [
             c for c in [
                 # Metadata
                 "enrichment_status", "step1_status", "step2_status",
                 "needs_manual_review", "match_notes",
+                # Lusha API (real) — key fields only in summary
+                "lusha_api_status", "lusha_api_match_confidence", "lusha_api_needs_review",
+                "lusha_api_company_name", "lusha_api_domain", "lusha_api_industry",
+                "lusha_api_employee_range", "lusha_api_country",
                 # Step 1 — firmographics
                 "lusha_company_name", "lusha_domain", "lusha_industry", "lusha_sub_industry",
                 "lusha_company_type", "lusha_employee_range", "lusha_revenue",
@@ -3577,13 +3903,23 @@ if ss("enrichment_done", False):
             if c in df_enriched.columns
         ]
         st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
-        tab1, tab2 = st.tabs(["Step 1 — All firmographic columns", "Step 2 — All ICP columns"])
-        with tab1:
+        _tabs = ["Step 1 — All firmographic columns", "Step 2 — All ICP columns"]
+        if _lusha_done:
+            _tabs.append("Lusha API fields")
+        _tab_objs = st.tabs(_tabs)
+        with _tab_objs[0]:
             st.dataframe(df_enriched[[c for c in STEP1_FIELDS if c in df_enriched.columns]],
                          use_container_width=True)
-        with tab2:
+        with _tab_objs[1]:
             st.dataframe(df_enriched[[c for c in ICP_FIELDS if c in df_enriched.columns]],
                          use_container_width=True)
+        if _lusha_done and len(_tab_objs) > 2:
+            with _tab_objs[2]:
+                _lusha_display_cols = [
+                    c for c in LUSHA_API_FIELDS + LUSHA_API_META_FIELDS
+                    if c in df_enriched.columns
+                ]
+                st.dataframe(df_enriched[_lusha_display_cols], use_container_width=True)
 
     # ── Downloads ─────────────────────────────────────────────────────────────
     st.subheader("Download results")
@@ -3660,6 +3996,7 @@ if ss("enrichment_done", False):
                     "row":               i + 1,
                     "company":           d.get("input_company_name", ""),
                     "url":               d.get("input_url", ""),
+                    "lusha_api_status":  d.get("lusha_api_status", ""),
                     "step1_status":      d.get("step1_status", ""),
                     "step2_status":      d.get("step2_status", ""),
                     "enrichment_status": d.get("enrichment_status", ""),
@@ -3688,7 +4025,14 @@ if ss("enrichment_done", False):
             )
             if sel_idx is not None:
                 d = debug_records_done[sel_idx]
-                col_a, col_b = st.columns(2)
+                col_lusha, col_a, col_b = st.columns(3)
+                with col_lusha:
+                    st.markdown("**Lusha API — real company data**")
+                    st.caption(f"Status: `{d.get('lusha_api_status', '(not run)')}`")
+                    if d.get("lusha_api_raw_json"):
+                        st.json(d["lusha_api_raw_json"])
+                    else:
+                        st.info("No Lusha API response (disabled or no data).")
                 with col_a:
                     st.markdown("**Step 1 — Jina + Claude extraction**")
                     if d.get("step1_raw_json"):
