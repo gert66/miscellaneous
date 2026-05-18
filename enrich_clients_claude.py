@@ -315,6 +315,7 @@ _STATUS_LABELS = {
     "skipped_resume":                "Skipped (resumed)",
     "enriched_playwright":           "Enriched via browser scrape",
     "playwright_blocked":            "Browser blocked (bot detection)",
+    "zero_cost_preview":             "Zero-cost preview",
 }
 
 
@@ -1788,6 +1789,7 @@ def reset_processing(clear_autosave: bool = False):
         _auto_dl_count=0, _auto_dl_last_msg="",
         _step2_debug_log="", _step2_prompt_records=[],
         _dry_run_records=[],
+        _zero_cost_preview=False, _dry_run_preview_count=0,
     )
 
 
@@ -1870,10 +1872,15 @@ with st.sidebar:
 
     st.header("Settings")
 
+    # ── API key statuses — always shown ──────────────────────────────────────
     if api_key:
         st.success("✓ Anthropic API key loaded")
     else:
-        st.error("⚠ API key missing")
+        st.error("⚠ Anthropic API key missing")
+    if serper_key:
+        st.success("✓ Serper API key loaded")
+    else:
+        st.warning("⚠ Serper API key not set (only needed for Serper provider in real runs)")
 
     st.divider()
     model_step1_label = st.selectbox(
@@ -1909,12 +1916,6 @@ with st.sidebar:
     )
     st.session_state["_step2_provider"] = step2_provider
 
-    if step2_provider == STEP2_PROVIDER_SERPER:
-        if serper_key:
-            st.success("✓ Serper API key loaded")
-        else:
-            st.error("⚠ SERPER_API_KEY is missing from .streamlit/secrets.toml")
-
     step2_dry_run = st.checkbox(
         "Step 2 dry run: generate prompts only",
         value=False,
@@ -1927,6 +1928,21 @@ with st.sidebar:
     st.session_state["_step2_dry_run"] = step2_dry_run
     if step2_dry_run:
         st.info("Dry run active — Step 2 will not call any API.")
+
+    _zero_cost_default = step2_dry_run
+    zero_cost_preview = st.checkbox(
+        "Zero-cost preview: skip Step 1 API calls",
+        value=_zero_cost_default,
+        help=(
+            "When enabled alongside dry run, skips ALL external API calls — "
+            "Jina, Anthropic, Serper, and browser scraping. "
+            "Uses only uploaded row data and existing cache to build Step 2 prompt previews. "
+            "Cost stays $0.00."
+        ),
+    )
+    st.session_state["_zero_cost_preview"] = zero_cost_preview
+    if zero_cost_preview and step2_dry_run:
+        st.info("Zero-cost preview active — no Step 1 or Step 2 API calls will be made.")
 
     st.divider()
 
@@ -2196,12 +2212,23 @@ currently_processing = ss("processing", False)
 enrichment_done      = ss("enrichment_done", False)
 
 blocking: list = []
-if _api_key_error and not _elm_mode:
+_active_provider     = ss("_step2_provider",    STEP2_PROVIDER_CLAUDE)
+_active_dry_run      = ss("_step2_dry_run",     False)
+_active_zero_cost    = ss("_zero_cost_preview", False)
+_is_preview_mode     = _active_dry_run or _active_zero_cost
+
+# (1) Claude real run → Anthropic key required
+# (2) Serper real run → both Anthropic + Serper keys required
+# (3) Dry run only   → no API keys required
+# (4) Zero-cost      → no API keys required
+if _api_key_error and not _elm_mode and not _is_preview_mode:
     blocking.append(_api_key_error)
-_active_provider  = ss("_step2_provider",  STEP2_PROVIDER_CLAUDE)
-_active_dry_run   = ss("_step2_dry_run",   False)
-# Serper key is only required for real (non-dry-run) Serper runs.
-if _active_provider == STEP2_PROVIDER_SERPER and not serper_key and not _elm_mode and not _active_dry_run:
+if (
+    _active_provider == STEP2_PROVIDER_SERPER
+    and not serper_key
+    and not _elm_mode
+    and not _is_preview_mode
+):
     blocking.append("SERPER_API_KEY is missing from .streamlit/secrets.toml")
 if uploaded is None:
     blocking.append("No file uploaded yet.")
@@ -2218,13 +2245,19 @@ if blocking and not currently_processing:
 elif not blocking and not currently_processing and not enrichment_done:
     _s1 = ss("_model_step1", MODEL_STEP1)
     _s2 = ss("_model_step2", MODEL_STEP2)
-    _cost_per_row = _COST_EST.get((_s1, _s2), 0.05)
-    est = n_to_process * _cost_per_row
-    st.info(
-        f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
-        f"Rough estimated cost: ~${est:.2f} "
-        f"(~${_cost_per_row:.2f}/company with current model selection)."
-    )
+    if _is_preview_mode or _elm_mode:
+        st.info(
+            f"Ready to preview **{n_to_process:,}** rows. "
+            "Estimated cost: **$0.00** — no API calls will be made."
+        )
+    else:
+        _cost_per_row = _COST_EST.get((_s1, _s2), 0.05)
+        est = n_to_process * _cost_per_row
+        st.info(
+            f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
+            f"Rough estimated cost: ~${est:.2f} "
+            f"(~${_cost_per_row:.2f}/company with current model selection)."
+        )
 
 start_btn = st.button(
     "▶ Start enrichment",
@@ -2258,7 +2291,9 @@ if start_btn and not blocking and not currently_processing:
         _step2_provider=ss("_step2_provider", STEP2_PROVIDER_CLAUDE),
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
+        _zero_cost_preview=ss("_zero_cost_preview", False),
         _dry_run_records=[],
+        _dry_run_preview_count=0,
     )
     st.rerun()
 
@@ -2284,6 +2319,7 @@ if ss("processing", False):
     _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
     _serper_key_run      = ss("_serper_key", "")
     _dry_run_run         = ss("_step2_dry_run", False)
+    _zero_cost_run       = ss("_zero_cost_preview", False)
     total_in          = ss("total_tokens_in", 0)
     total_out         = ss("total_tokens_out", 0)
     total_cost        = ss("total_cost_usd", 0.0)
@@ -2320,23 +2356,35 @@ if ss("processing", False):
                              ("enriched_jina", "enriched_jina_step1_only",
                               "enriched_playwright", "enriched_playwright_step1_only",
                               "enriched_search", "enriched_search_step1_only",
-                              "no_data", "skipped_resume", ""))
+                              "no_data", "skipped_resume", "zero_cost_preview", ""))
         cnt_retries    = ss("_jina_retry_count", 0)
+        cnt_previews   = ss("_dry_run_preview_count", 0)
 
-        mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
-        mc1.metric("Enriched (Jina)",    cnt_jina)
-        mc2.metric("Enriched (Browser)", cnt_playwright)
-        mc3.metric("Enriched (Google)",  cnt_google)
-        mc4.metric("429 Retries",        cnt_retries)
-        mc5.metric("No data",            cnt_nodata)
-        mc6.metric("Errors",             cnt_error)
-        mc7.metric("Est. cost",          f"${total_cost:.4f}")
+        if _zero_cost_run and _dry_run_run:
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Dry-run previews generated", cnt_previews)
+            mc2.metric("Errors",                     cnt_error)
+            mc3.metric("Est. cost",                  "$0.00")
+        else:
+            mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
+            mc1.metric("Enriched (Jina)",    cnt_jina)
+            mc2.metric("Enriched (Browser)", cnt_playwright)
+            mc3.metric("Enriched (Google)",  cnt_google)
+            mc4.metric("429 Retries",        cnt_retries)
+            mc5.metric("No data",            cnt_nodata)
+            mc6.metric("Errors",             cnt_error)
+            mc7.metric("Est. cost",          f"${total_cost:.4f}")
 
         _retry_msg = ss("_last_retry_msg", "")
         if _retry_msg:
             st.info(_retry_msg)
 
-    if _dry_run_run and not _elm_mode_run:
+    if _zero_cost_run and _dry_run_run and not _elm_mode_run:
+        st.warning(
+            "⚠️ **ZERO-COST PREVIEW ACTIVE**: no Step 1 or Step 2 API calls are being made. "
+            "Using only uploaded row data and existing cache to generate Step 2 prompt previews."
+        )
+    elif _dry_run_run and not _elm_mode_run:
         st.warning(
             "⚠️ **DRY RUN ACTIVE**: no Anthropic or Serper API calls are being made "
             "for Step 2. Prompts and search queries are generated and displayed only."
@@ -2487,41 +2535,76 @@ if ss("processing", False):
                 status_box.write(f"🤖 Step 2 model: `{_model_step2_run}`")
                 _prov_label = (
                     f"🔍 Step 2 search provider: {_step2_provider_run}"
-                    + (" **(DRY RUN)**" if _dry_run_run else "")
+                    + (" **(ZERO-COST PREVIEW)**" if (_zero_cost_run and _dry_run_run) else
+                       " **(DRY RUN)**" if _dry_run_run else "")
                 )
                 status_box.write(_prov_label)
-                status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
-                fields, dbg = enrich_one_row(
-                    company_name, raw_url, _api_key, _delay,
-                    use_playwright=_use_playwright_run,
-                    model_step1=_model_step1_run,
-                    model_step2=_model_step2_run,
-                    _debug_callback=_debug_cb,
-                    search_provider=_step2_provider_run,
-                    serper_key=_serper_key_run,
-                    dry_run=_dry_run_run,
-                )
-                s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
-                s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
-                row_cost = float(fields.get("total_cost_usd", 0) or 0)
-                _retry_note = ""
-                if "enriched_search" in fields.get("enrichment_status", ""):
-                    _retry_note = " | ⚡ Google fallback used"
-                elif ss("_last_retry_msg", ""):
-                    _retry_note = " | ⏳ Had Jina 429 retry"
-                if fields.get("step2_status") == "api_error":
+
+                # ── ZERO-COST PREVIEW GUARD ───────────────────────────────────
+                # Do NOT call Jina, Claude, Serper, browser scraping, or any
+                # external API. Use only uploaded row data and existing cache.
+                if _zero_cost_run and _dry_run_run:
                     status_box.write(
-                        f"⚠️ Step 2 API error: {fields.get('error_message', '(no detail)')}"
+                        "⚡ Zero-cost preview — skipping all Step 1 API calls, "
+                        "running Step 2 dry run from row data only…"
                     )
-                status_box.write(
-                    f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
-                    f"Row cost: ${row_cost:.5f}{_retry_note}"
-                )
+                    # Build a minimal debug record (no real API calls)
+                    dbg = {"input_company_name": company_name, "zero_cost_preview": True}
+                    # Call run_step2 with dry_run=True; no Jina/browser scraping
+                    icp_fields, _step2_cache, _s2_ti, _s2_to, _s2_status, _s2_msg, _s2_cr, _s2_cc = run_step2(
+                        url=raw_url,
+                        company_name=company_name,
+                        api_key="",
+                        delay=_delay,
+                        model_step2=_model_step2_run,
+                        _debug_callback=_debug_cb,
+                        search_provider=_step2_provider_run,
+                        serper_key="",
+                        dry_run=True,
+                    )
+                    fields = {f: "" for f in ALL_ENRICHMENT_FIELDS}
+                    fields["enrichment_status"] = "zero_cost_preview"
+                    fields["step2_status"]      = _s2_status
+                    fields.update(icp_fields)
+                    # Increment the preview counter
+                    ss_set(_dry_run_preview_count=ss("_dry_run_preview_count", 0) + 1)
+                    row_cost = 0.0
+                    status_box.write("✅ Zero-cost preview done — no tokens used.")
+                # ── END ZERO-COST PREVIEW GUARD ──────────────────────────────
+                else:
+                    status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
+                    fields, dbg = enrich_one_row(
+                        company_name, raw_url, _api_key, _delay,
+                        use_playwright=_use_playwright_run,
+                        model_step1=_model_step1_run,
+                        model_step2=_model_step2_run,
+                        _debug_callback=_debug_cb,
+                        search_provider=_step2_provider_run,
+                        serper_key=_serper_key_run,
+                        dry_run=_dry_run_run,
+                    )
+                if not (_zero_cost_run and _dry_run_run):
+                    s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
+                    s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
+                    row_cost = float(fields.get("total_cost_usd", 0) or 0)
+                    _retry_note = ""
+                    if "enriched_search" in fields.get("enrichment_status", ""):
+                        _retry_note = " | ⚡ Google fallback used"
+                    elif ss("_last_retry_msg", ""):
+                        _retry_note = " | ⏳ Had Jina 429 retry"
+                    if fields.get("step2_status") == "api_error":
+                        status_box.write(
+                            f"⚠️ Step 2 API error: {fields.get('error_message', '(no detail)')}"
+                        )
+                    status_box.write(
+                        f"✅ Done — Step 1: {s1_tok} tokens | Step 2: {s2_tok} tokens | "
+                        f"Row cost: ${row_cost:.5f}{_retry_note}"
+                    )
 
         results.append(fields)
         debug_records.append(dbg)
 
-        # ── Auto-save (crash recovery) — skipped in dry run ──────────────────
+        # ── Auto-save (crash recovery) — skipped in dry run / zero-cost preview ──
         if not _dry_run_run:
             try:
                 autosave_append(fields, input_row)
@@ -2592,7 +2675,16 @@ if ss("enrichment_done", False):
     else:
         st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
 
-    if ss("_step2_dry_run", False) and not _elm_done:
+    _done_dry_run   = ss("_step2_dry_run",     False)
+    _done_zero_cost = ss("_zero_cost_preview", False)
+    if _done_zero_cost and _done_dry_run and not _elm_done:
+        _preview_count = ss("_dry_run_preview_count", 0)
+        st.info(
+            f"ℹ️ **Zero-cost preview completed.** No Step 1 or Step 2 API calls were made — "
+            f"**{_preview_count}** dry-run previews generated. "
+            "Disable zero-cost preview and dry run, then re-run to perform real enrichment."
+        )
+    elif _done_dry_run and not _elm_done:
         st.info(
             "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
             "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
