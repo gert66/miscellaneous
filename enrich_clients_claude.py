@@ -118,13 +118,26 @@ production sites, or operations in multiple countries or regions.
 one country but has its headquarters, parent company, group ownership, regional HQ, or \
 reporting lines in another country.
 
-3. Competitor signal - Check whether the company is mentioned together with any of the \
-following competitors: GoFluent, Learnlight, Learnship, Voxy, Speexx, Preply, \
-Fluentify, Twenix, Cambly, Berlitz, EF. This includes mentions on the company website, \
-competitor case studies, testimonials, client lists, press releases, supplier pages, \
-training pages, procurement documents, webinars, articles, events, job ads, or any page \
-where the company name and competitor name appear together. If the company is mentioned \
-together with one of these competitors, this is a very strong signal.
+3. Competitor signal — check all three categories below and report findings in the \
+matching output fields:
+
+  Category 1 — Direct corporate language training competitors (STRONG signal). \
+If the company is mentioned together with any of the following, this is a very strong \
+buying signal: goFLUENT, Learnlight, Speexx, Voxy, Learnship, Berlitz, \
+EF Corporate Solutions, Babbel for Business, Rosetta Stone Enterprise, Preply Business, \
+Talaera, Busuu for Business, Lingoda for Business, Fluentify, Twenix, Cambly. \
+Mentions include: company website, competitor case studies, testimonials, client lists, \
+press releases, supplier pages, training pages, procurement documents, webinars, job ads.
+
+  Category 2 — Online language learning brands (MEDIUM signal, only in corporate, HR, \
+L&D, employee benefit, or company-wide training context): Duolingo, Babbel, Busuu, \
+Rosetta Stone, Preply, Memrise, Mondly, ELSA Speak, FluentU, italki, Lingoda, \
+Open English, Mango Languages, Pimsleur, Drops, HelloTalk, Tandem.
+
+  Category 3 — Broader corporate learning / L&D platforms (L&D maturity signal, not \
+a direct language competitor signal): OpenSesame, Coursera for Business, Udemy Business, \
+LinkedIn Learning, Skillsoft, Docebo, Degreed, Cornerstone, 360Learning, \
+Moodle Workplace, Absorb LMS, TalentLMS, LearnUpon, Pluralsight.
 
 4. Merger, acquisition, integration, or new group ownership.
 
@@ -143,7 +156,10 @@ together with one of these competitors, this is a very strong signal.
 Return ONLY a raw JSON object with exactly these fields and no others:
 {"lead_score": "High or Medium or Low", \
 "buying_signals": "comma-separated list of signal names actually supported by evidence", \
-"competitor_signal": "name of competitor if found, otherwise empty string", \
+"competitor_signal": "Category 1 direct corporate language training competitor name if found, otherwise empty string", \
+"direct_language_competitor_signal": "comma-separated Category 1 provider names found, otherwise empty string", \
+"online_language_learning_signal": "comma-separated Category 2 provider names found in corporate/HR/L&D context, otherwise empty string", \
+"broader_lnd_platform_signal": "comma-separated Category 3 provider names found, otherwise empty string", \
 "evidence": "brief description of what was found and source types", \
 "likely_training_interest": \
 "comma-separated list from: Language training / Business English, \
@@ -193,6 +209,9 @@ ICP_FIELDS = [
     "icp_lead_score",
     "icp_buying_signals",
     "icp_competitor_signal",
+    "icp_direct_language_competitor_signal",
+    "icp_online_language_learning_signal",
+    "icp_broader_lnd_platform_signal",
     "icp_evidence",
     "icp_likely_training_interest",
     "icp_why_relevant",
@@ -1491,11 +1510,29 @@ def _claude_web_search_full(prompt: str, api_key: str, model_id: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_serper_queries(company_name: str, target: str) -> list:
-    """Return 2 focused Google-style queries covering the main Step 2 ICP signals."""
+    """Return 5 targeted Google-style queries for Serper Standard Plus.
+
+    Covers language-training intent, L&D signals, and three tiers of provider
+    co-mention (direct corporate language competitors, online language brands,
+    broader L&D platforms).  A future optional Deep Search with Jina full-page
+    fetching can be layered on top of these results later.
+    """
     name = company_name or target
     return [
-        f'"{name}" international offices global headquarters language training',
-        f'"{name}" learning development corporate training language employees hiring',
+        f'"{name}" language training OR "business English" OR "communication training"',
+        f'"{name}" "learning and development" OR L&D OR academy OR onboarding',
+        (
+            f'"{name}" goFLUENT OR Learnlight OR Speexx OR Voxy OR Learnship'
+            f' OR Berlitz OR "EF Corporate Solutions"'
+        ),
+        (
+            f'"{name}" "Preply Business" OR "Babbel for Business"'
+            f' OR "Busuu for Business" OR "Rosetta Stone Enterprise" OR Talaera'
+        ),
+        (
+            f'"{name}" "LinkedIn Learning" OR "Udemy Business"'
+            f' OR "Coursera for Business" OR OpenSesame OR Skillsoft'
+        ),
     ]
 
 
@@ -2020,13 +2057,16 @@ def run_step2(
 
 def _extract_icp_fields(raw: dict) -> dict:
     return {
-        "icp_lead_score":                str(raw.get("lead_score")                or "").strip(),
-        "icp_buying_signals":            str(raw.get("buying_signals")            or "").strip(),
-        "icp_competitor_signal":         str(raw.get("competitor_signal")         or "").strip(),
-        "icp_evidence":                  str(raw.get("evidence")                  or "").strip(),
-        "icp_likely_training_interest":  str(raw.get("likely_training_interest")  or "").strip(),
-        "icp_why_relevant":              str(raw.get("why_relevant")              or "").strip(),
-        "icp_potential_buyer_function":  str(raw.get("potential_buyer_function")  or "").strip(),
+        "icp_lead_score":                          str(raw.get("lead_score")                          or "").strip(),
+        "icp_buying_signals":                      str(raw.get("buying_signals")                      or "").strip(),
+        "icp_competitor_signal":                   str(raw.get("competitor_signal")                   or "").strip(),
+        "icp_direct_language_competitor_signal":   str(raw.get("direct_language_competitor_signal")   or "").strip(),
+        "icp_online_language_learning_signal":     str(raw.get("online_language_learning_signal")     or "").strip(),
+        "icp_broader_lnd_platform_signal":         str(raw.get("broader_lnd_platform_signal")         or "").strip(),
+        "icp_evidence":                            str(raw.get("evidence")                            or "").strip(),
+        "icp_likely_training_interest":            str(raw.get("likely_training_interest")            or "").strip(),
+        "icp_why_relevant":                        str(raw.get("why_relevant")                        or "").strip(),
+        "icp_potential_buyer_function":            str(raw.get("potential_buyer_function")            or "").strip(),
     }
 
 
@@ -4318,6 +4358,9 @@ if ss("enrichment_done", False):
                 "lusha_ipo_status",
                 # Step 2 — ICP buying signals
                 "icp_lead_score", "icp_buying_signals", "icp_competitor_signal",
+                "icp_direct_language_competitor_signal",
+                "icp_online_language_learning_signal",
+                "icp_broader_lnd_platform_signal",
                 "icp_evidence", "icp_likely_training_interest",
                 "icp_why_relevant", "icp_potential_buyer_function",
                 # Cost
