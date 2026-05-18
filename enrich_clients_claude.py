@@ -49,6 +49,7 @@ JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
 DEBUG_LOG_DIR    = Path("debug_logs")
+SEARCH_OUTPUT_DIR = DEBUG_LOG_DIR / "search_outputs"
 AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
@@ -394,6 +395,234 @@ def format_step2_debug_content(
         f"\nFULL CLAUDE PROMPT\n{thin}\n{full_prompt}\n"
         f"\nSTATUS / NOTES\n{thin}\n{note_block}\n"
         f"{sep}\n"
+    )
+
+
+def safe_json_dump(obj) -> str:
+    """Serialize API response objects to indented JSON without exposing secrets."""
+    if obj is None:
+        return "null"
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        pass
+    if hasattr(obj, "model_dump"):
+        try:
+            return json.dumps(obj.model_dump(), ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            pass
+    if hasattr(obj, "dict"):
+        try:
+            return json.dumps(obj.dict(), ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            pass
+    return str(obj)
+
+
+def ensure_search_output_dir() -> None:
+    SEARCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def write_search_debug_file(
+    company_name: str,
+    provider_label: str,
+    content: str,
+    ext: str = "txt",
+    index: int = 1,
+) -> Path:
+    """Write one search debug file; return the path."""
+    ensure_search_output_dir()
+    stamp    = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_co  = safe_filename(company_name)
+    fname    = SEARCH_OUTPUT_DIR / (
+        f"step2_search_{safe_co}_{provider_label}_{stamp}_search{index:02d}.{ext}"
+    )
+    fname.write_text(content, encoding="utf-8")
+    return fname
+
+
+def _format_serper_query_debug(
+    company_name: str,
+    model: str,
+    timestamp: str,
+    query: str,
+    index: int,
+    total_queries: int,
+    results: list,
+    http_status: int,
+    raw_json,
+    error_str,
+    dry_run: bool = False,
+) -> str:
+    sep  = "=" * 60
+    thin = "-" * 40
+    payload_safe = safe_json_dump({
+        "q": query, "gl": "us", "hl": "en", "num": 10,
+        # API key is intentionally excluded
+    })
+    if dry_run:
+        result_block = "[DRY RUN: no web search output because no API call was made]"
+        http_block   = "N/A (dry run)"
+        raw_block    = "[DRY RUN: no raw response]"
+    else:
+        http_block = str(http_status) if http_status else "0 (network error)"
+        if error_str:
+            result_block = f"ERROR: {error_str}"
+            raw_block    = safe_json_dump(raw_json) if raw_json else "(no response body)"
+        else:
+            raw_block = safe_json_dump(raw_json) if raw_json else "(not captured)"
+            lines = []
+            for r in results:
+                lines.append(f"[{r.get('position', '?')}] {r.get('title', '(no title)')}")
+                if r.get("date"):
+                    lines.append(f"    Date: {r['date']}")
+                lines.append(f"    URL:  {r.get('link', '')}")
+                lines.append(f"    {r.get('snippet', '')}")
+                sl = r.get("sitelinks", [])
+                if sl:
+                    lines.append(f"    Sitelinks: {sl}")
+                lines.append("")
+            result_block = "\n".join(lines).strip() or "(no results)"
+
+    mode_note = "DRY RUN — no API call was made." if dry_run else ""
+    return (
+        f"{sep}\n"
+        f"STEP 2 SERPER SEARCH DEBUG{' — DRY RUN' if dry_run else ''}\n"
+        f"{sep}\n"
+        f"COMPANY:              {company_name}\n"
+        f"MODEL:                {model}\n"
+        f"PROVIDER:             Serper Google Search\n"
+        f"TIMESTAMP:            {timestamp} UTC\n"
+        f"QUERY INDEX:          {index} of {total_queries}\n"
+        f"\nSERPER QUERY\n{thin}\n{query}\n"
+        f"\nSERPER REQUEST PAYLOAD (API key excluded)\n{thin}\n{payload_safe}\n"
+        f"\nHTTP STATUS CODE\n{thin}\n{http_block}\n"
+        f"\nRAW SERPER RESPONSE\n{thin}\n{raw_block}\n"
+        f"\nEXTRACTED ORGANIC RESULTS ({len(results)} result(s))\n{thin}\n{result_block}\n"
+        + (f"\nSTATUS / NOTES\n{thin}\n{mode_note or '(none)'}\n" if mode_note or error_str else "")
+        + f"{sep}\n"
+    )
+
+
+def _format_claude_pre_debug(
+    company_name: str,
+    model: str,
+    timestamp: str,
+    prompt: str,
+    dry_run: bool = False,
+) -> str:
+    sep  = "=" * 60
+    thin = "-" * 40
+    tools_safe = safe_json_dump([WEB_SEARCH_TOOL])
+    mode = "DRY RUN — no API call will be made." if dry_run else ""
+    return (
+        f"{sep}\n"
+        f"STEP 2 CLAUDE WEB SEARCH — PRE-CALL DEBUG{' (DRY RUN)' if dry_run else ''}\n"
+        f"{sep}\n"
+        f"COMPANY:              {company_name}\n"
+        f"MODEL:                {model}\n"
+        f"PROVIDER:             Claude Web Search\n"
+        f"TIMESTAMP:            {timestamp} UTC\n"
+        f"\nNOTE ON INTERNAL SEARCH QUERY\n{thin}\n"
+        "The web_search_20250305 tool is a server-side built-in Anthropic tool.\n"
+        "Claude generates the actual search query internally; it is NOT exposed\n"
+        "by the API response.\n"
+        "\n\"Exact internal Claude Web Search query was not exposed by the API response.\"\n"
+        f"\nFULL STEP 2 PROMPT SENT TO CLAUDE\n{thin}\n{prompt}\n"
+        f"\nTOOLS CONFIGURATION (secrets excluded)\n{thin}\n{tools_safe}\n"
+        + (f"\nSTATUS / NOTES\n{thin}\n{mode}\n" if mode else "")
+        + f"{sep}\n"
+    )
+
+
+def _format_claude_post_debug(
+    company_name: str,
+    model: str,
+    timestamp: str,
+    resp,
+    raw_text: str,
+    error_str: str = "",
+) -> str:
+    sep  = "=" * 60
+    thin = "-" * 40
+
+    if error_str:
+        return (
+            f"{sep}\n"
+            f"STEP 2 CLAUDE WEB SEARCH — POST-CALL DEBUG\n"
+            f"{sep}\n"
+            f"COMPANY:   {company_name}\n"
+            f"MODEL:     {model}\n"
+            f"TIMESTAMP: {timestamp} UTC\n"
+            f"\nERROR\n{thin}\n{error_str}\n"
+            f"{sep}\n"
+        )
+
+    stop_reason = getattr(resp, "stop_reason", "unknown") if resp else "unknown"
+    usage       = getattr(resp, "usage", None)
+    in_tok      = getattr(usage, "input_tokens",  "?") if usage else "?"
+    out_tok     = getattr(usage, "output_tokens", "?") if usage else "?"
+
+    tool_use_blocks    = []
+    tool_result_blocks = []
+    web_search_blocks  = []
+    citation_blocks    = []
+    other_blocks       = []
+
+    if resp and hasattr(resp, "content"):
+        for blk in resp.content:
+            btype = getattr(blk, "type", "")
+            if btype == "tool_use":
+                tool_use_blocks.append(blk)
+            elif btype == "tool_result":
+                tool_result_blocks.append(blk)
+            elif btype in ("web_search_result", "server_tool_use"):
+                web_search_blocks.append(blk)
+            elif btype == "text":
+                pass  # already in raw_text
+            else:
+                other_blocks.append(blk)
+        # Collect citations if present on text blocks
+        for blk in resp.content:
+            if getattr(blk, "type", "") == "text":
+                cits = getattr(blk, "citations", []) or []
+                citation_blocks.extend(cits)
+
+    def _blk_section(label, blocks):
+        if not blocks:
+            return f"\n{label}\n{thin}\n(none)\n"
+        lines = [f"\n{label}\n{thin}"]
+        for b in blocks:
+            lines.append(safe_json_dump(b))
+        return "\n".join(lines) + "\n"
+
+    citation_section = ""
+    if citation_blocks:
+        citation_section = f"\nCITATIONS / SOURCE REFERENCES\n{thin}\n"
+        for c in citation_blocks:
+            citation_section += safe_json_dump(c) + "\n"
+    else:
+        citation_section = f"\nCITATIONS / SOURCE REFERENCES\n{thin}\n(none)\n"
+
+    raw_resp_dump = safe_json_dump(resp) if resp else "(not available)"
+
+    return (
+        f"{sep}\n"
+        f"STEP 2 CLAUDE WEB SEARCH — POST-CALL DEBUG\n"
+        f"{sep}\n"
+        f"COMPANY:              {company_name}\n"
+        f"MODEL:                {model}\n"
+        f"PROVIDER:             Claude Web Search\n"
+        f"TIMESTAMP:            {timestamp} UTC\n"
+        f"STOP REASON:          {stop_reason}\n"
+        f"USAGE:                input_tokens={in_tok}, output_tokens={out_tok}\n"
+        f"\nRESPONSE TEXT\n{thin}\n{raw_text or '(empty)'}\n"
+        + _blk_section("TOOL USE BLOCKS", tool_use_blocks)
+        + _blk_section("TOOL RESULT BLOCKS", tool_result_blocks)
+        + _blk_section("WEB SEARCH / SOURCE BLOCKS", web_search_blocks)
+        + citation_section
+        + f"\nRAW RESPONSE OBJECT\n{thin}\n{raw_resp_dump}\n"
+        + f"{sep}\n"
     )
 
 
@@ -1047,6 +1276,39 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
     return "", 0, 0
 
 
+def _claude_web_search_full(prompt: str, api_key: str, model_id: str) -> tuple:
+    """
+    Like _claude_web_search_loop but also returns the raw response object.
+    Returns (text, in_t, out_t, resp_or_None).
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+    for _ in range(3):
+        try:
+            resp = client.messages.create(
+                model=model_id,
+                max_tokens=2048,
+                tools=[WEB_SEARCH_TOOL],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(
+                getattr(b, "text", "")
+                for b in resp.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            return text, resp.usage.input_tokens, resp.usage.output_tokens, resp
+        except anthropic.RateLimitError as e:
+            wait = 30
+            if hasattr(e, "response") and e.response is not None:
+                wait = int(e.response.headers.get("retry-after", 30))
+            time.sleep(wait)
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529:
+                time.sleep(60)
+            else:
+                raise
+    return "", 0, 0, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Serper Google Search helpers (Step 2 alternative provider)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1060,12 +1322,15 @@ def _build_serper_queries(company_name: str, target: str) -> list:
     ]
 
 
-def _call_serper(query: str, serper_key: str, timeout: int = 15) -> list:
+def _call_serper(query: str, serper_key: str, timeout: int = 15):
     """
-    POST one query to the Serper API and return organic results as a list of dicts.
-    Each dict contains: title, link, snippet, position, date.
-    Raises RuntimeError on any failure so the caller can handle gracefully.
+    POST one query to the Serper API.
+    Returns (organic_results, http_status, raw_json_or_None, error_str_or_None).
+    organic_results is a list of dicts; empty on error.
+    Never logs or returns the serper_key.
     """
+    raw_json    = None
+    http_status = 0
     try:
         resp = requests.post(
             SERPER_SEARCH_URL,
@@ -1073,30 +1338,40 @@ def _call_serper(query: str, serper_key: str, timeout: int = 15) -> list:
             json={"q": query, "gl": "us", "hl": "en", "num": 10},
             timeout=timeout,
         )
+        http_status = resp.status_code
         resp.raise_for_status()
-        data = resp.json()
+        raw_json = resp.json()
     except requests.Timeout:
-        raise RuntimeError("Serper API timed out")
+        return [], 0, None, "Serper API timed out"
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 0
+        http_status = code
+        try:
+            raw_json = e.response.json() if e.response is not None else None
+        except Exception:
+            pass
         if code == 403:
-            raise RuntimeError("Serper API key rejected (403)")
+            return [], code, raw_json, "Serper API key rejected (403)"
         if code == 429:
-            raise RuntimeError("Serper quota exceeded (429)")
-        raise RuntimeError(f"Serper HTTP {code}: {e}")
+            return [], code, raw_json, "Serper quota exceeded (429)"
+        return [], code, raw_json, f"Serper HTTP {code}: {e}"
     except (json.JSONDecodeError, ValueError) as e:
-        raise RuntimeError(f"Serper returned invalid JSON: {e}")
+        return [], http_status, None, f"Serper returned invalid JSON: {e}"
+    except Exception as e:
+        return [], 0, None, f"Serper error: {e}"
 
-    return [
+    results = [
         {
-            "title":    item.get("title", ""),
-            "link":     item.get("link", ""),
-            "snippet":  item.get("snippet", ""),
-            "position": item.get("position", ""),
-            "date":     item.get("date", ""),
+            "title":     item.get("title", ""),
+            "link":      item.get("link", ""),
+            "snippet":   item.get("snippet", ""),
+            "position":  item.get("position", ""),
+            "date":      item.get("date", ""),
+            "sitelinks": item.get("sitelinks", []),
         }
-        for item in data.get("organic", [])
+        for item in (raw_json or {}).get("organic", [])
     ]
+    return results, http_status, raw_json, None
 
 
 def _format_serper_results(results: list) -> str:
@@ -1168,6 +1443,28 @@ def run_step2_serper(
         _dlog(f"DRY RUN: Serper queries that would be sent: {queries}")
         _dlog(f"DRY RUN: skipping Serper + Anthropic calls for {company_name}")
         if _debug_callback:
+            _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            for _qi, _q in enumerate(queries, 1):
+                try:
+                    _dry_content = _format_serper_query_debug(
+                        company_name, model_step2, _ts, _q, _qi, len(queries),
+                        [], 0, None, None, dry_run=True,
+                    )
+                    _fpath = write_search_debug_file(
+                        company_name, "serper_google_search", _dry_content, index=_qi,
+                    )
+                    _debug_callback(
+                        "search_output",
+                        company=company_name,
+                        provider=STEP2_PROVIDER_SERPER,
+                        query=_q,
+                        result_count=0,
+                        top_results=[],
+                        debug_file=str(_fpath),
+                        dry_run=True,
+                    )
+                except Exception:
+                    pass
             _debug_callback(
                 "prompt",
                 company=company_name,
@@ -1189,14 +1486,36 @@ def run_step2_serper(
         return (_ICP_EMPTY.copy(), {}, 0, 0, "dry_run", "DRY RUN: no API call made", 0, 0)
 
     all_hits: list = []
-    for q in queries:
+    for qi, q in enumerate(queries, 1):
         _dlog(f"Serper query: {q}")
-        try:
-            hits = _call_serper(q, serper_key)
+        hits, http_status, raw_json, err_str = _call_serper(q, serper_key)
+        if err_str:
+            _dlog(f"Serper warning — {err_str}")
+        else:
             all_hits.extend(hits)
             _dlog(f"Serper returned {len(hits)} results")
-        except RuntimeError as exc:
-            _dlog(f"Serper warning — {exc}")
+        if _debug_callback:
+            _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _content = _format_serper_query_debug(
+                    company_name, model_step2, _ts, q, qi, len(queries),
+                    hits, http_status, raw_json, err_str,
+                )
+                _fpath = write_search_debug_file(
+                    company_name, "serper_google_search", _content, index=qi,
+                )
+                _debug_callback(
+                    "search_output",
+                    company=company_name,
+                    provider=STEP2_PROVIDER_SERPER,
+                    query=q,
+                    result_count=len(hits),
+                    top_results=hits[:3],
+                    debug_file=str(_fpath),
+                    dry_run=False,
+                )
+            except Exception:
+                pass
 
     # Deduplicate by URL
     seen: set = set()
@@ -1259,6 +1578,20 @@ def run_step2_serper(
         in_t  = resp.usage.input_tokens
         out_t = resp.usage.output_tokens
         _dlog(f"Received Claude response for {company_name}")
+
+        # Write Claude analysis post-call debug file (Serper route — Claude has no web search tool here)
+        if _debug_callback:
+            _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _post_content = _format_claude_post_debug(
+                    company_name, model_step2, _ts, resp, raw_text,
+                )
+                write_search_debug_file(
+                    company_name, "serper_google_search_claude_response",
+                    _post_content, index=len(queries) + 1,
+                )
+            except Exception:
+                pass
 
         try:
             _dlog(f"Parsing Step 2 Serper response for {company_name}")
@@ -1359,6 +1692,8 @@ def run_step2(
     _dlog(f"Generating Step 2 prompt for {company_name}")
     _dlog(f"Selected model: {model_step2}")
 
+    _ts_pre = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
     if _debug_callback:
         _debug_callback(
             "prompt",
@@ -1375,6 +1710,25 @@ def run_step2(
             dry_run=dry_run,
             queries=[],
         )
+        try:
+            _pre_content = _format_claude_pre_debug(
+                company_name, model_step2, _ts_pre, full_prompt, dry_run=dry_run,
+            )
+            _pre_fpath = write_search_debug_file(
+                company_name, "claude_web_search", _pre_content, index=1,
+            )
+            _debug_callback(
+                "search_output",
+                company=company_name,
+                provider=STEP2_PROVIDER_CLAUDE,
+                query=search_prompt,
+                result_count=0,
+                top_results=[],
+                debug_file=str(_pre_fpath),
+                dry_run=dry_run,
+            )
+        except Exception:
+            pass
 
     # DRY RUN GUARD: do not call Anthropic in prompt preview mode
     if dry_run:
@@ -1384,18 +1738,31 @@ def run_step2(
     try:
         _dlog(f"Calling Claude web search for {company_name}")
         time.sleep(delay)
-        raw_text, in_t, out_t = _claude_web_search_loop(
+        raw_text, in_t, out_t, _resp = _claude_web_search_full(
             full_prompt, api_key, model_id=model_step2,
         )
         _dlog(f"Received Claude response for {company_name}")
+
+        # Write post-call debug file
+        if _debug_callback:
+            _ts_post = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _post_content = _format_claude_post_debug(
+                    company_name, model_step2, _ts_post, _resp, raw_text,
+                )
+                write_search_debug_file(
+                    company_name, "claude_web_search", _post_content, index=2,
+                )
+            except Exception:
+                pass
+
         try:
             _dlog(f"Parsing Step 2 response for {company_name}")
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
             _dlog(f"Parse failed — retrying with strict suffix for {company_name}")
-            # Retry once with a stricter suffix appended
             time.sleep(delay)
-            raw_text2, in_t2, out_t2 = _claude_web_search_loop(
+            raw_text2, in_t2, out_t2, _resp2 = _claude_web_search_full(
                 full_prompt + _STRICT_SUFFIX, api_key, model_id=model_step2,
             )
             in_t  += in_t2
@@ -1408,9 +1775,33 @@ def run_step2(
         return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
     except (json.JSONDecodeError, ValueError) as e:
         _dlog(f"Step 2 parse error for {company_name}: {e}")
+        if _debug_callback:
+            try:
+                _ts_err = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                _err_content = _format_claude_post_debug(
+                    company_name, model_step2, _ts_err, None, "",
+                    error_str=f"Parse error: {type(e).__name__}: {e}",
+                )
+                write_search_debug_file(
+                    company_name, "claude_web_search", _err_content, index=2,
+                )
+            except Exception:
+                pass
         return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {type(e).__name__}: {e}", 0, 0)
     except anthropic.APIError as e:
         _dlog(f"Step 2 API error for {company_name}: {e}")
+        if _debug_callback:
+            try:
+                _ts_err = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                _err_content = _format_claude_post_debug(
+                    company_name, model_step2, _ts_err, None, "",
+                    error_str=f"Claude API {type(e).__name__}: {e}",
+                )
+                write_search_debug_file(
+                    company_name, "claude_web_search", _err_content, index=2,
+                )
+            except Exception:
+                pass
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
     except Exception as e:
         _dlog(f"Step 2 error for {company_name}: {e}")
@@ -1788,7 +2179,7 @@ def reset_processing(clear_autosave: bool = False):
         _local_save_enabled=False, _final_auto_saved=False,
         _auto_dl_count=0, _auto_dl_last_msg="",
         _step2_debug_log="", _step2_prompt_records=[],
-        _dry_run_records=[],
+        _dry_run_records=[], _search_output_records=[],
         _zero_cost_preview=False, _dry_run_preview_count=0,
     )
 
@@ -1971,6 +2362,11 @@ with st.sidebar:
     )
     st.session_state["_show_step2_debug"] = show_step2_debug
     st.session_state["_save_step2_debug"] = save_step2_debug
+    if save_step2_debug:
+        st.caption(
+            f"Prompt files → `{DEBUG_LOG_DIR}/`  \n"
+            f"Search I/O files → `{SEARCH_OUTPUT_DIR}/`"
+        )
 
     st.divider()
     if _PLAYWRIGHT_AVAILABLE:
@@ -2292,7 +2688,7 @@ if start_btn and not blocking and not currently_processing:
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
         _zero_cost_preview=ss("_zero_cost_preview", False),
-        _dry_run_records=[],
+        _dry_run_records=[], _search_output_records=[],
         _dry_run_preview_count=0,
     )
     st.rerun()
@@ -2422,6 +2818,38 @@ if ss("processing", False):
                     st.markdown("**Full Step 2 Claude prompt:**")
                     st.code(_dr.get("full_prompt", ""), language=None)
 
+    # ── Step 2 search output records (UI) ────────────────────────────────────
+    if ss("_show_step2_debug", False) and not _elm_mode_run:
+        _srecs = ss("_search_output_records", [])
+        if _srecs:
+            with st.expander("Search outputs (all companies so far)", expanded=False):
+                st.caption(
+                    f"Detailed files saved in `{SEARCH_OUTPUT_DIR}/`. "
+                    f"{len(_srecs)} search action(s) recorded."
+                )
+            for _sr in _srecs:
+                _sr_label = (
+                    f"Search output: {_sr['company']} "
+                    f"({'DRY RUN' if _sr.get('dry_run') else _sr.get('provider', '')})"
+                )
+                with st.expander(_sr_label, expanded=False):
+                    st.markdown(f"**Provider:** {_sr.get('provider', '')}  |  **Dry run:** {_sr.get('dry_run', False)}")
+                    st.markdown(f"**Query / search instruction:**")
+                    st.code(_sr.get("query", ""), language=None)
+                    _rc = _sr.get("result_count", 0)
+                    st.markdown(f"**Results returned:** {_rc}")
+                    _tops = _sr.get("top_results", [])
+                    if _tops:
+                        st.markdown("**Top results:**")
+                        for _t in _tops:
+                            st.markdown(
+                                f"- [{_t.get('title','(no title)')}]({_t.get('link','')})"
+                                + (f"  — {_t.get('snippet','')[:120]}" if _t.get('snippet') else "")
+                            )
+                    _df = _sr.get("debug_file", "")
+                    if _df:
+                        st.caption(f"Full debug file saved: `{_df}`")
+
     # ── Step 2 debug log window ───────────────────────────────────────────────
     if ss("_show_step2_debug", False) and not _elm_mode_run:
         _log_text     = ss("_step2_debug_log", "")
@@ -2471,6 +2899,19 @@ if ss("processing", False):
             def _cb(event: str, **kwargs) -> None:
                 if event == "status":
                     append_debug_log(kwargs.get("msg", ""))
+                elif event == "search_output":
+                    if _show_debug_ui:
+                        _srecs = st.session_state.get("_search_output_records", [])
+                        _srecs.append({
+                            "company":      kwargs.get("company", cname),
+                            "provider":     kwargs.get("provider", ""),
+                            "query":        kwargs.get("query", ""),
+                            "result_count": kwargs.get("result_count", 0),
+                            "top_results":  kwargs.get("top_results", []),
+                            "debug_file":   kwargs.get("debug_file", ""),
+                            "dry_run":      kwargs.get("dry_run", False),
+                        })
+                        st.session_state["_search_output_records"] = _srecs
                 elif event == "prompt":
                     _is_dry   = kwargs.get("dry_run", False)
                     _file_pfx = "step2_dry_run" if _is_dry else "step2_prompt"
@@ -2708,6 +3149,22 @@ if ss("enrichment_done", False):
         st.info(f"📥 Results also saved locally to **{_final_xl_path}**")
     elif _final_xl_error:
         st.warning(f"⚠ Local auto-save failed: {_final_xl_error}")
+
+    # ── Search debug files summary ────────────────────────────────────────────
+    if not _elm_done and ss("_save_step2_debug", True):
+        _srecs_done = ss("_search_output_records", [])
+        if _srecs_done:
+            with st.expander(
+                f"🔍 Step 2 search debug files ({len(_srecs_done)} file(s) saved)",
+                expanded=False,
+            ):
+                st.caption(f"All files saved in `{SEARCH_OUTPUT_DIR}/`")
+                for _sr in _srecs_done:
+                    _df_path = _sr.get("debug_file", "")
+                    if _df_path:
+                        _tag = " [DRY RUN]" if _sr.get("dry_run") else ""
+                        st.text(f"{_sr.get('company','')} — {_sr.get('provider','')}{_tag}")
+                        st.caption(f"  `{_df_path}`")
 
     # ── Primary browser download ──────────────────────────────────────────────
     _fname_prefix_dl = "elm_results" if _elm_done else "claude_enriched"
