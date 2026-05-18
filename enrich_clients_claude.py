@@ -48,6 +48,7 @@ except ImportError:
 JINA_READER_URL  = "https://r.jina.ai/"
 JINA_SEARCH_URL  = "https://s.jina.ai/"
 CACHE_DIR        = Path("claude_json_cache")
+DEBUG_LOG_DIR    = Path("debug_logs")
 AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
@@ -341,6 +342,54 @@ def safe_filename(text: str) -> str:
     text = re.sub(r"[^\w\s\-.]", "", text)
     text = re.sub(r"\s+", "_", text).strip("_")
     return text[:120] or "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 debug logging helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_debug_log_dir() -> None:
+    DEBUG_LOG_DIR.mkdir(exist_ok=True)
+
+
+def write_debug_log(company_name: str, content: str) -> None:
+    ensure_debug_log_dir()
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname = DEBUG_LOG_DIR / f"step2_prompt_{safe_filename(company_name)}_{stamp}.txt"
+    fname.write_text(content, encoding="utf-8")
+
+
+def append_debug_log(message: str) -> None:
+    """Append a timestamped message to the in-session debug log."""
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{stamp}] {message}\n"
+    current = st.session_state.get("_step2_debug_log", "")
+    st.session_state["_step2_debug_log"] = current + entry
+
+
+def format_step2_debug_content(
+    company_name: str,
+    model: str,
+    timestamp: str,
+    provider: str,
+    search_prompt: str,
+    full_prompt: str,
+    notes: list,
+) -> str:
+    sep  = "=" * 60
+    thin = "-" * 40
+    note_block = "\n".join(notes) if notes else "(none)"
+    return (
+        f"{sep}\n"
+        f"COMPANY:             {company_name}\n"
+        f"MODEL:               {model}\n"
+        f"TIMESTAMP:           {timestamp}\n"
+        f"WEB SEARCH PROVIDER: {provider}\n"
+        f"\nGENERATED SEARCH PROMPT\n{thin}\n{search_prompt}\n"
+        f"\nFULL CLAUDE PROMPT\n{thin}\n{full_prompt}\n"
+        f"\nSTATUS / NOTES\n{thin}\n{note_block}\n"
+        f"{sep}\n"
+    )
 
 
 def str_similarity(a: str, b: str) -> float:
@@ -994,12 +1043,19 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
 
 
 def run_step2(url: str, company_name: str, api_key: str, delay: float,
-              model_step2: str = MODEL_STEP2) -> tuple:
+              model_step2: str = MODEL_STEP2, _debug_callback=None) -> tuple:
     """
     Research ICP signals using Claude with web_search.
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg,
              cache_creation_tokens, cache_read_tokens).
+
+    _debug_callback: optional callable(event, **kwargs).
+      Events: "status" (msg=str), "prompt" (company, model, provider, search_prompt, full_prompt, notes).
     """
+    def _dlog(msg: str) -> None:
+        if _debug_callback:
+            _debug_callback("status", msg=msg)
+
     target = normalize_url(url) if url else company_name
     if not target:
         return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", 0, 0)
@@ -1011,38 +1067,64 @@ def run_step2(url: str, company_name: str, api_key: str, delay: float,
         if any(icp.get(f, "") for f in ICP_FIELDS[:3]):  # basic sanity check
             in_t  = int(cached.get("tokens_in", 0) or 0)
             out_t = int(cached.get("tokens_out", 0) or 0)
+            _dlog(f"Using cached Step 2 result for {company_name}")
             return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", 0, 0)
         _delete_cache(ck)
 
     _STRICT_SUFFIX = (
         "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
     )
-    prompt = STEP2_STATIC_PREFIX + f"\n\nNow research this company: {target}"
+    search_prompt = f"Now research this company: {target}"
+    full_prompt   = STEP2_STATIC_PREFIX + f"\n\n{search_prompt}"
+
+    _dlog(f"Generating Step 2 prompt for {company_name}")
+    _dlog(f"Selected model: {model_step2}")
+
+    if _debug_callback:
+        _debug_callback(
+            "prompt",
+            company=company_name,
+            model=model_step2,
+            provider="web_search_20250305",
+            search_prompt=search_prompt,
+            full_prompt=full_prompt,
+            notes=[f"Generating Step 2 prompt for {company_name}",
+                   f"Selected model: {model_step2}"],
+        )
 
     try:
+        _dlog(f"Calling Claude web search for {company_name}")
         time.sleep(delay)
         raw_text, in_t, out_t = _claude_web_search_loop(
-            prompt, api_key, model_id=model_step2,
+            full_prompt, api_key, model_id=model_step2,
         )
+        _dlog(f"Received Claude response for {company_name}")
         try:
+            _dlog(f"Parsing Step 2 response for {company_name}")
             icp_raw = _parse_json_response(raw_text)
         except (json.JSONDecodeError, ValueError):
+            _dlog(f"Parse failed — retrying with strict suffix for {company_name}")
             # Retry once with a stricter suffix appended
             time.sleep(delay)
             raw_text2, in_t2, out_t2 = _claude_web_search_loop(
-                prompt + _STRICT_SUFFIX, api_key, model_id=model_step2,
+                full_prompt + _STRICT_SUFFIX, api_key, model_id=model_step2,
             )
             in_t  += in_t2
             out_t += out_t2
+            _dlog(f"Parsing Step 2 retry response for {company_name}")
             icp_raw = _parse_json_response(raw_text2)   # raises if still bad
         payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
         save_cache(ck, payload)
+        _dlog(f"Finished Step 2 for {company_name}")
         return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
     except (json.JSONDecodeError, ValueError) as e:
+        _dlog(f"Step 2 parse error for {company_name}: {e}")
         return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Claude parse error: {type(e).__name__}: {e}", 0, 0)
     except anthropic.APIError as e:
+        _dlog(f"Step 2 API error for {company_name}: {e}")
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
     except Exception as e:
+        _dlog(f"Step 2 error for {company_name}: {e}")
         return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
 
 
@@ -1106,6 +1188,7 @@ def enrich_one_row(
     use_playwright: bool = True,
     model_step1: str = MODEL_STEP1,
     model_step2: str = MODEL_STEP2,
+    _debug_callback=None,
 ) -> tuple:
     """
     Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
@@ -1134,6 +1217,7 @@ def enrich_one_row(
     # ── Step 2 ────────────────────────────────────────────────────────────────
     s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
         url, company_name, api_key, delay, model_step2=model_step2,
+        _debug_callback=_debug_callback,
     )
     row.update(s2_fields)
     row["step2_status"]   = s2_status
@@ -1409,6 +1493,7 @@ def reset_processing(clear_autosave: bool = False):
         _jina_retry_count=0, _last_retry_msg="",
         _local_save_enabled=False, _final_auto_saved=False,
         _auto_dl_count=0, _auto_dl_last_msg="",
+        _step2_debug_log="", _step2_prompt_records=[],
     )
 
 
@@ -1513,6 +1598,26 @@ with st.sidebar:
         value=False,
         help="Shows per-row JSON responses, cache tools, and additional downloads.",
     )
+
+    st.markdown("**Step 2 debug logging**")
+    show_step2_debug = st.checkbox(
+        "Show Step 2 debug logs",
+        value=False,
+        help=(
+            "Shows a live debug/log window in the app during Step 2 processing. "
+            "Reveals the exact prompt sent to Claude and status messages per company."
+        ),
+    )
+    save_step2_debug = st.checkbox(
+        "Save Step 2 debug logs to files",
+        value=True,
+        help=(
+            f"Saves one .txt file per company to the `{DEBUG_LOG_DIR}/` folder. "
+            "Includes model, prompt, provider, and status notes."
+        ),
+    )
+    st.session_state["_show_step2_debug"] = show_step2_debug
+    st.session_state["_save_step2_debug"] = save_step2_debug
 
     st.divider()
     if _PLAYWRIGHT_AVAILABLE:
@@ -1894,6 +1999,19 @@ if ss("processing", False):
             st.caption("These links download via the browser without interrupting processing.")
             _html_dl_buttons(_partial_df, _n_done, _stamp)
 
+    # ── Step 2 debug log window ───────────────────────────────────────────────
+    if ss("_show_step2_debug", False) and not _elm_mode_run:
+        _log_text     = ss("_step2_debug_log", "")
+        _prompt_recs  = ss("_step2_prompt_records", [])
+        with st.expander("Step 2 Debug Log", expanded=True):
+            if _log_text:
+                st.code(_log_text, language=None)
+            else:
+                st.caption("No log entries yet — will appear as companies are processed.")
+        for _pr in _prompt_recs:
+            with st.expander(f"Prompt sent for {_pr['company']}", expanded=False):
+                st.code(_pr.get("prompt", ""), language=None)
+
     _resume_mode = ss("_resume_mode", False)
     _saved_df    = autosave_load() if _resume_mode else None
 
@@ -1922,6 +2040,46 @@ if ss("processing", False):
             ss_set(results=results, debug_records=debug_records, process_index=idx + 1)
             st.rerun()
 
+        # ── Build Step 2 debug callback if either debug option is enabled ────────
+        _show_debug_ui = ss("_show_step2_debug", False)
+        _save_debug_fs = ss("_save_step2_debug", True)
+
+        def _make_step2_callback(cname: str):
+            def _cb(event: str, **kwargs) -> None:
+                if event == "status":
+                    append_debug_log(kwargs.get("msg", ""))
+                elif event == "prompt":
+                    if _save_debug_fs:
+                        _ts   = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                        _body = format_step2_debug_content(
+                            company_name=kwargs.get("company", cname),
+                            model=kwargs.get("model", ""),
+                            timestamp=_ts,
+                            provider=kwargs.get("provider", "web_search_20250305"),
+                            search_prompt=kwargs.get("search_prompt", ""),
+                            full_prompt=kwargs.get("full_prompt", ""),
+                            notes=kwargs.get("notes", []),
+                        )
+                        try:
+                            write_debug_log(cname, _body)
+                        except Exception:
+                            pass
+                    if _show_debug_ui:
+                        _recs = st.session_state.get("_step2_prompt_records", [])
+                        _recs.append({
+                            "company":      kwargs.get("company", cname),
+                            "prompt":       kwargs.get("full_prompt", ""),
+                            "search_prompt": kwargs.get("search_prompt", ""),
+                        })
+                        st.session_state["_step2_prompt_records"] = _recs
+            return _cb
+
+        _debug_cb = (
+            _make_step2_callback(company_name)
+            if (_show_debug_ui or _save_debug_fs) and not _elm_mode_run
+            else None
+        )
+
         with st.status(
             f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}**",
             expanded=False,
@@ -1944,6 +2102,7 @@ if ss("processing", False):
                     use_playwright=_use_playwright_run,
                     model_step1=_model_step1_run,
                     model_step2=_model_step2_run,
+                    _debug_callback=_debug_cb,
                 )
                 s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
                 s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
