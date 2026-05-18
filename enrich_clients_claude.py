@@ -58,6 +58,10 @@ MODEL_STEP2      = "claude-haiku-4-5-20251001"
 MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
+SERPER_SEARCH_URL    = "https://google.serper.dev/search"
+STEP2_PROVIDER_CLAUDE = "Claude Web Search"
+STEP2_PROVIDER_SERPER = "Serper Google Search"
+
 AVAILABLE_MODELS = {
     "Haiku 4.5 (fast, cheap)":                   "claude-haiku-4-5-20251001",
     "Sonnet 4.5 (better reasoning, higher cost)": "claude-sonnet-4-5-20250929",
@@ -1042,16 +1046,247 @@ def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> 
     return "", 0, 0
 
 
-def run_step2(url: str, company_name: str, api_key: str, delay: float,
-              model_step2: str = MODEL_STEP2, _debug_callback=None) -> tuple:
+# ─────────────────────────────────────────────────────────────────────────────
+# Serper Google Search helpers (Step 2 alternative provider)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_serper_queries(company_name: str, target: str) -> list:
+    """Return 2 focused Google-style queries covering the main Step 2 ICP signals."""
+    name = company_name or target
+    return [
+        f'"{name}" international offices global headquarters language training',
+        f'"{name}" learning development corporate training language employees hiring',
+    ]
+
+
+def _call_serper(query: str, serper_key: str, timeout: int = 15) -> list:
     """
-    Research ICP signals using Claude with web_search.
+    POST one query to the Serper API and return organic results as a list of dicts.
+    Each dict contains: title, link, snippet, position, date.
+    Raises RuntimeError on any failure so the caller can handle gracefully.
+    """
+    try:
+        resp = requests.post(
+            SERPER_SEARCH_URL,
+            headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+            json={"q": query, "gl": "us", "hl": "en", "num": 10},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.Timeout:
+        raise RuntimeError("Serper API timed out")
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        if code == 403:
+            raise RuntimeError("Serper API key rejected (403)")
+        if code == 429:
+            raise RuntimeError("Serper quota exceeded (429)")
+        raise RuntimeError(f"Serper HTTP {code}: {e}")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f"Serper returned invalid JSON: {e}")
+
+    return [
+        {
+            "title":    item.get("title", ""),
+            "link":     item.get("link", ""),
+            "snippet":  item.get("snippet", ""),
+            "position": item.get("position", ""),
+            "date":     item.get("date", ""),
+        }
+        for item in data.get("organic", [])
+    ]
+
+
+def _format_serper_results(results: list) -> str:
+    """Format Serper organic results into a readable text block for Claude."""
+    if not results:
+        return "(No web search results were found.)"
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.get('title', '(no title)')}")
+        if r.get("date"):
+            lines.append(f"    Date: {r['date']}")
+        lines.append(f"    URL: {r.get('link', '')}")
+        lines.append(f"    {r.get('snippet', '')}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def run_step2_serper(
+    url: str,
+    company_name: str,
+    api_key: str,
+    serper_key: str,
+    delay: float,
+    model_step2: str = MODEL_STEP2,
+    _debug_callback=None,
+) -> tuple:
+    """
+    Step 2 via Serper Google Search + Claude analysis (no web_search tool).
+    Returns the same 8-tuple as run_step2.
+    """
+    def _dlog(msg: str) -> None:
+        if _debug_callback:
+            _debug_callback("status", msg=msg)
+
+    target = normalize_url(url) if url else company_name
+    if not target:
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", 0, 0)
+
+    ck = f"step2_serper_{target}"
+    cached = load_cache(ck)
+    if cached is not None:
+        icp = cached.get("icp_data", {})
+        if any(icp.get(f, "") for f in ICP_FIELDS[:3]):
+            in_t  = int(cached.get("tokens_in", 0) or 0)
+            out_t = int(cached.get("tokens_out", 0) or 0)
+            _dlog(f"Using cached Serper Step 2 result for {company_name}")
+            return (_extract_icp_fields(icp), cached, in_t, out_t, "cached", "", 0, 0)
+        _delete_cache(ck)
+
+    # ── Serper searches ───────────────────────────────────────────────────────
+    queries = _build_serper_queries(company_name, target)
+    _dlog(f"Generating Serper queries for {company_name}")
+
+    all_hits: list = []
+    for q in queries:
+        _dlog(f"Serper query: {q}")
+        try:
+            hits = _call_serper(q, serper_key)
+            all_hits.extend(hits)
+            _dlog(f"Serper returned {len(hits)} results")
+        except RuntimeError as exc:
+            _dlog(f"Serper warning — {exc}")
+
+    # Deduplicate by URL
+    seen: set = set()
+    deduped: list = []
+    for r in all_hits:
+        lnk = r.get("link", "")
+        if lnk and lnk not in seen:
+            seen.add(lnk)
+            deduped.append(r)
+
+    _dlog(f"Total unique Serper results for {company_name}: {len(deduped)}")
+
+    # ── Build Claude prompt ────────────────────────────────────────────────────
+    results_text = _format_serper_results(deduped)
+    search_instruction = (
+        f"Now analyze this company based on the web search results provided below.\n\n"
+        f"Company: {target}\n\n"
+        f"Web search results (retrieved via Serper Google Search):\n"
+        f"{results_text}\n\n"
+        "Base your analysis ONLY on the search results and company information above. "
+        "Do not claim to have searched the web yourself."
+    )
+    full_prompt = STEP2_STATIC_PREFIX + f"\n\n{search_instruction}"
+
+    _dlog(f"Selected model: {model_step2}")
+
+    if _debug_callback:
+        _debug_callback(
+            "prompt",
+            company=company_name,
+            model=model_step2,
+            provider=STEP2_PROVIDER_SERPER,
+            search_prompt=f"Queries: {queries}\n\nResults count: {len(deduped)}",
+            full_prompt=full_prompt,
+            notes=[
+                f"Serper queries used: {queries}",
+                f"Unique results retrieved: {len(deduped)}",
+                f"Selected model: {model_step2}",
+            ],
+        )
+
+    # ── Claude analysis (no web_search tool — we supply the context) ──────────
+    _STRICT_SUFFIX = (
+        "\n\nReply with ONLY a JSON object, no explanation, no markdown, no backticks."
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+
+    _dlog(f"Calling Claude for Serper analysis of {company_name}")
+    try:
+        time.sleep(delay)
+        resp = client.messages.create(
+            model=model_step2,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": full_prompt}],
+        )
+        raw_text = "".join(
+            getattr(b, "text", "") for b in resp.content
+            if getattr(b, "type", "") == "text"
+        ).strip()
+        in_t  = resp.usage.input_tokens
+        out_t = resp.usage.output_tokens
+        _dlog(f"Received Claude response for {company_name}")
+
+        try:
+            _dlog(f"Parsing Step 2 Serper response for {company_name}")
+            icp_raw = _parse_json_response(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            _dlog(f"Parse failed — retrying with strict suffix for {company_name}")
+            time.sleep(delay)
+            resp2 = client.messages.create(
+                model=model_step2,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": full_prompt + _STRICT_SUFFIX}],
+            )
+            raw_text2 = "".join(
+                getattr(b, "text", "") for b in resp2.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            in_t  += resp2.usage.input_tokens
+            out_t += resp2.usage.output_tokens
+            _dlog(f"Parsing Step 2 Serper retry response for {company_name}")
+            icp_raw = _parse_json_response(raw_text2)
+
+        payload = {"icp_data": icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        save_cache(ck, payload)
+        _dlog(f"Finished Step 2 (Serper) for {company_name}")
+        return (_extract_icp_fields(icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
+
+    except (json.JSONDecodeError, ValueError) as e:
+        _dlog(f"Step 2 Serper parse error for {company_name}: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "parse_error", f"Serper parse error: {type(e).__name__}: {e}", 0, 0)
+    except anthropic.APIError as e:
+        _dlog(f"Step 2 Serper API error for {company_name}: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"Claude API {type(e).__name__}: {e}", 0, 0)
+    except Exception as e:
+        _dlog(f"Step 2 Serper error for {company_name}: {e}")
+        return (_ICP_EMPTY.copy(), {}, 0, 0, "api_error", f"{type(e).__name__}: {e}", 0, 0)
+
+
+def run_step2(
+    url: str,
+    company_name: str,
+    api_key: str,
+    delay: float,
+    model_step2: str = MODEL_STEP2,
+    _debug_callback=None,
+    search_provider: str = STEP2_PROVIDER_CLAUDE,
+    serper_key: str = "",
+) -> tuple:
+    """
+    Research ICP signals — dispatches to either the Claude web_search route
+    or the Serper Google Search route depending on search_provider.
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg,
              cache_creation_tokens, cache_read_tokens).
 
     _debug_callback: optional callable(event, **kwargs).
       Events: "status" (msg=str), "prompt" (company, model, provider, search_prompt, full_prompt, notes).
     """
+    if search_provider == STEP2_PROVIDER_SERPER:
+        if not serper_key:
+            return (
+                _ICP_EMPTY.copy(), {}, 0, 0, "api_error",
+                "SERPER_API_KEY is missing from .streamlit/secrets.toml", 0, 0,
+            )
+        return run_step2_serper(
+            url, company_name, api_key, serper_key, delay,
+            model_step2=model_step2, _debug_callback=_debug_callback,
+        )
+
     def _dlog(msg: str) -> None:
         if _debug_callback:
             _debug_callback("status", msg=msg)
@@ -1189,6 +1424,8 @@ def enrich_one_row(
     model_step1: str = MODEL_STEP1,
     model_step2: str = MODEL_STEP2,
     _debug_callback=None,
+    search_provider: str = STEP2_PROVIDER_CLAUDE,
+    serper_key: str = "",
 ) -> tuple:
     """
     Run Step 1 (Jina + Claude extraction) then Step 2 (Claude web_search ICP).
@@ -1218,6 +1455,7 @@ def enrich_one_row(
     s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
         url, company_name, api_key, delay, model_step2=model_step2,
         _debug_callback=_debug_callback,
+        search_provider=search_provider, serper_key=serper_key,
     )
     row.update(s2_fields)
     row["step2_status"]   = s2_status
@@ -1546,6 +1784,14 @@ if not api_key:
         "`ANTHROPIC_API_KEY = \"sk-ant-...\"`"
     )
 
+# Serper key — optional, only needed when Step 2 provider is Serper Google Search.
+# Required entry in .streamlit/secrets.toml: SERPER_API_KEY = "your-key"
+serper_key = ""
+try:
+    serper_key = st.secrets.get("SERPER_API_KEY", "") or ""
+except Exception:
+    pass
+
 # =============================================================================
 # SIDEBAR  — debug toggle only (no API key input)
 # =============================================================================
@@ -1590,6 +1836,28 @@ with st.sidebar:
     selected_model_step2 = AVAILABLE_MODELS[model_step2_label]
     st.session_state["_model_step1"] = selected_model_step1
     st.session_state["_model_step2"] = selected_model_step2
+
+    st.divider()
+
+    step2_provider = st.selectbox(
+        "Step 2 web search provider",
+        options=[STEP2_PROVIDER_CLAUDE, STEP2_PROVIDER_SERPER],
+        index=0,
+        help=(
+            f"**{STEP2_PROVIDER_CLAUDE}** (default): uses Anthropic's built-in "
+            "web_search tool — no extra API key needed.\n\n"
+            f"**{STEP2_PROVIDER_SERPER}**: calls the Serper API for Google results, "
+            "then Claude analyzes the snippets. "
+            "Requires `SERPER_API_KEY` in `.streamlit/secrets.toml`."
+        ),
+    )
+    st.session_state["_step2_provider"] = step2_provider
+
+    if step2_provider == STEP2_PROVIDER_SERPER:
+        if serper_key:
+            st.success("✓ Serper API key loaded")
+        else:
+            st.error("⚠ SERPER_API_KEY is missing from .streamlit/secrets.toml")
 
     st.divider()
 
@@ -1861,6 +2129,9 @@ enrichment_done      = ss("enrichment_done", False)
 blocking: list = []
 if _api_key_error and not _elm_mode:
     blocking.append(_api_key_error)
+_active_provider = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
+if _active_provider == STEP2_PROVIDER_SERPER and not serper_key and not _elm_mode:
+    blocking.append("SERPER_API_KEY is missing from .streamlit/secrets.toml")
 if uploaded is None:
     blocking.append("No file uploaded yet.")
 if file_error:
@@ -1913,6 +2184,8 @@ if start_btn and not blocking and not currently_processing:
         _use_playwright=ss("_use_playwright", True),
         _model_step1=ss("_model_step1", MODEL_STEP1),
         _model_step2=ss("_model_step2", MODEL_STEP2),
+        _step2_provider=ss("_step2_provider", STEP2_PROVIDER_CLAUDE),
+        _serper_key=serper_key,
     )
     st.rerun()
 
@@ -1932,9 +2205,11 @@ if ss("processing", False):
     _delay        = ss("_delay", 1.0)
     _elm_mode_run  = ss("_elm_mode", False)
     _active_fields = ss("_active_fields", ALL_ENRICHMENT_FIELDS)
-    _use_playwright_run = ss("_use_playwright", True)
-    _model_step1_run    = ss("_model_step1", MODEL_STEP1)
-    _model_step2_run    = ss("_model_step2", MODEL_STEP2)
+    _use_playwright_run  = ss("_use_playwright", True)
+    _model_step1_run     = ss("_model_step1", MODEL_STEP1)
+    _model_step2_run     = ss("_model_step2", MODEL_STEP2)
+    _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
+    _serper_key_run      = ss("_serper_key", "")
     total_in          = ss("total_tokens_in", 0)
     total_out         = ss("total_tokens_out", 0)
     total_cost        = ss("total_cost_usd", 0.0)
@@ -2096,6 +2371,7 @@ if ss("processing", False):
                 row_cost = 0.0
             else:
                 status_box.write(f"🤖 Step 2 model: `{_model_step2_run}`")
+                status_box.write(f"🔍 Step 2 search provider: {_step2_provider_run}")
                 status_box.write("⏳ Step 1 — Fetching page + extracting firmographics…")
                 fields, dbg = enrich_one_row(
                     company_name, raw_url, _api_key, _delay,
@@ -2103,6 +2379,8 @@ if ss("processing", False):
                     model_step1=_model_step1_run,
                     model_step2=_model_step2_run,
                     _debug_callback=_debug_cb,
+                    search_provider=_step2_provider_run,
+                    serper_key=_serper_key_run,
                 )
                 s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
                 s2_tok   = int(fields.get("step2_tokens_in",  0) or 0) + int(fields.get("step2_tokens_out", 0) or 0)
