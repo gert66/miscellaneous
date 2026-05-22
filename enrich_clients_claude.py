@@ -51,13 +51,12 @@ CACHE_DIR        = Path("claude_json_cache")
 DEBUG_LOG_DIR    = Path("debug_logs")
 SEARCH_OUTPUT_DIR = DEBUG_LOG_DIR / "search_outputs"
 AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
-LOCAL_SAVE_EVERY      = 5    # filesystem snapshot every N companies (local runs)
+CHECKPOINT_EVERY      = 50   # write checkpoint_NNN.xlsx every N companies
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
 _PER_COMPANY_AUTOSAVE_DEFAULT_DIR = os.path.expanduser(
     "~/Downloads/company_enrichment_runs"
 )
-_PER_COMPANY_EXCEL_EVERY = 5  # write enriched_partial.xlsx every N rows
 MODEL_STEP1      = "claude-haiku-4-5-20251001"
 MODEL_STEP2      = "claude-haiku-4-5-20251001"
 MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
@@ -3539,6 +3538,7 @@ def create_run_folder(base_folder: str, run_tag: str) -> str:
     run_path = Path(base_folder.strip()) / name
     (run_path / "rows").mkdir(parents=True, exist_ok=True)
     (run_path / "logs").mkdir(parents=True, exist_ok=True)
+    (run_path / "cache").mkdir(parents=True, exist_ok=True)
     return str(run_path)
 
 
@@ -3595,13 +3595,14 @@ def save_partial_outputs_to_run_folder(
     active_fields: list,
     run_dir: str,
     elm_mode: bool = False,
-    write_excel: bool = False,
+    row_count: int = 0,
 ) -> tuple:
     """
-    Write cumulative partial files to run_dir:
-      enriched_partial.csv    — always
-      processing_log.csv      — always
-      enriched_partial.xlsx   — only when write_excel=True
+    Write cumulative files to run_dir:
+      latest_results.csv    — always overwritten
+      latest_results.xlsx   — always overwritten
+      processing_log.csv    — always overwritten
+      checkpoint_NNN.xlsx   — when row_count is a multiple of CHECKPOINT_EVERY
     Returns (success: bool, message: str).
     """
     try:
@@ -3609,11 +3610,12 @@ def save_partial_outputs_to_run_folder(
         partial_df = build_partial_df(results, df_work, active_fields)
         log_df     = make_log_df(debug_records, elm_mode=elm_mode)
 
-        partial_df.to_csv(rdir / "enriched_partial.csv", index=False, encoding="utf-8-sig")
-        log_df.to_csv(rdir / "processing_log.csv",       index=False, encoding="utf-8-sig")
+        partial_df.to_csv(rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
+        log_df.to_csv(rdir / "processing_log.csv",     index=False, encoding="utf-8-sig")
+        df_to_excel_bytes_write(partial_df, str(rdir / "latest_results.xlsx"))
 
-        if write_excel:
-            df_to_excel_bytes_write(partial_df, str(rdir / "enriched_partial.xlsx"))
+        if row_count > 0 and row_count % CHECKPOINT_EVERY == 0:
+            df_to_excel_bytes_write(partial_df, str(rdir / f"checkpoint_{row_count:04d}.xlsx"))
 
         return True, f"{len(results)} rows written to {run_dir}"
     except Exception as exc:
@@ -3670,8 +3672,7 @@ def reset_processing(clear_autosave: bool = False):
         _per_company_autosave_run_dir="",
         _per_company_autosave_last_saved="",
         _per_company_autosave_last_error="",
-        _pca_final_saved=False,
-        _big_final_file_saved=False,
+        _final_save_path="", _final_save_error="",
     )
 
 
@@ -4088,8 +4089,9 @@ with st.sidebar:
         value=ss("local_save_enabled", True),   # default: enabled
         key="local_save_enabled",
         help=(
-            f"Saves an Excel + CSV snapshot every {LOCAL_SAVE_EVERY} companies and once more "
-            "on completion. Only works when the app runs locally."
+            "Overwrites latest_results.xlsx/csv after every company. "
+            f"Writes checkpoint_NNN.xlsx every {CHECKPOINT_EVERY} companies. "
+            "Only works when the app runs locally."
         ),
     )
     if local_save_enabled:
@@ -4105,15 +4107,15 @@ with st.sidebar:
         st.caption(f"📁 Saving to: **{_eff_path}**")
         _last_local = ss("_last_local_save", "")
         if _last_local:
-            st.caption(f"Last snapshot: {_last_local}")
+            st.caption(f"Last save: {_last_local}")
         else:
-            st.caption(f"Snapshot every **{LOCAL_SAVE_EVERY}** rows + on completion.")
+            st.caption(
+                f"Saves **latest_results.xlsx** after every company + "
+                f"**checkpoint_NNN.xlsx** every {CHECKPOINT_EVERY} rows."
+            )
     else:
         ss_set(_local_save_path="", _local_save_enabled=False)
-        st.caption(
-            f"When disabled, only the final results file is saved to "
-            f"**{_DEFAULT_DOWNLOAD_DIR}** on completion."
-        )
+        st.caption("When disabled, only the in-browser download button is available.")
 
     if debug_mode:
         st.divider()
@@ -4390,8 +4392,7 @@ if start_btn and not blocking and not currently_processing:
         _per_company_autosave_run_dir=_pca_run_dir_new,
         _per_company_autosave_last_saved="",
         _per_company_autosave_last_error="",
-        _pca_final_saved=False,
-        _big_final_file_saved=False,
+        _final_save_path="", _final_save_error="",
     )
     st.rerun()
 
@@ -4848,8 +4849,7 @@ if ss("processing", False):
             else:
                 ss_set(_per_company_autosave_last_error=_pca_msg[:200])
 
-            # 2. Cumulative partial files (CSV always; Excel every N rows)
-            _pca_write_xl = (_new_idx % _PER_COMPANY_EXCEL_EVERY == 0)
+            # 2. Cumulative partial files (latest_results.* + checkpoint on multiples)
             _pca_ok2, _pca_msg2 = save_partial_outputs_to_run_folder(
                 results=results,
                 debug_records=debug_records,
@@ -4857,20 +4857,18 @@ if ss("processing", False):
                 active_fields=_active_fields,
                 run_dir=_pca_run_dir_run,
                 elm_mode=_elm_mode_run,
-                write_excel=_pca_write_xl,
+                row_count=_new_idx,
             )
-            if not _pca_ok2:
-                ss_set(_per_company_autosave_last_error=_pca_msg2[:200])
-
-        # ── Filesystem snapshot every LOCAL_SAVE_EVERY companies (local runs) ─
-        if ss("_local_save_enabled", False) and _new_idx % LOCAL_SAVE_EVERY == 0:
-            _local_path = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
-            try:
-                _snap_df = build_partial_df(results, df_work, _active_fields)
-                _xl, _csv = save_to_local_folder(_snap_df, _local_path, run_tag=build_run_tag())
-                ss_set(_last_local_save=f"{_new_idx} rows → {Path(_xl).name}")
-            except Exception as _e:
-                ss_set(_last_local_save=f"⚠ Save failed: {_e}")
+            if _pca_ok2:
+                _save_label = f"{_new_idx} rows → latest_results.xlsx"
+                if _new_idx > 0 and _new_idx % CHECKPOINT_EVERY == 0:
+                    _save_label += f" + checkpoint_{_new_idx:04d}.xlsx"
+                ss_set(_last_local_save=_save_label)
+            else:
+                ss_set(
+                    _per_company_autosave_last_error=_pca_msg2[:200],
+                    _last_local_save=f"⚠ Save failed: {_pca_msg2[:120]}",
+                )
 
         # ── Auto browser-download every _AUTO_DL_EVERY companies ─────────────
         _auto_dl_done = ss("_auto_dl_count", 0)
@@ -4938,57 +4936,29 @@ if ss("enrichment_done", False):
             "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
         )
 
-    # ── Auto-save final file (runs exactly once per completed run) ────────────
-    if not ss("_final_auto_saved", False):
-        _save_enabled = ss("_local_save_enabled", False)
-        _save_dir     = ss("_local_save_path", "") if _save_enabled else _DEFAULT_DOWNLOAD_DIR
-        _save_dir     = _save_dir or _DEFAULT_DOWNLOAD_DIR
-        try:
-            _final_xl, _ = save_to_local_folder(df_enriched, _save_dir, run_tag=build_run_tag())
-            ss_set(_final_auto_saved=True, _final_save_path=_final_xl)
-        except Exception as _save_err:
-            ss_set(_final_auto_saved=True, _final_save_path="",
-                   _final_save_error=str(_save_err))
-
-    _final_xl_path  = ss("_final_save_path", "")
-    _final_xl_error = ss("_final_save_error", "")
-    if _final_xl_path:
-        st.info(f"📥 Results also saved locally to **{_final_xl_path}**")
-    elif _final_xl_error:
-        st.warning(f"⚠ Local auto-save failed: {_final_xl_error}")
-
-    # ── Per-company run-folder: write final files once ────────────────────────
+    # ── Auto-save final file into run folder (runs exactly once per completed run) ─
     _pca_done_enabled = ss("_per_company_autosave_enabled", False)
     _pca_done_dir     = ss("_per_company_autosave_run_dir", "")
-    if _pca_done_enabled and _pca_done_dir and not ss("_pca_final_saved", False):
-        try:
-            _pca_rdir = Path(_pca_done_dir)
-            df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "enriched_final.xlsx"))
-            df_enriched.to_csv(_pca_rdir / "enriched_final.csv", index=False, encoding="utf-8-sig")
-            _pca_log_df = make_log_df(debug_records_done, elm_mode=_elm_done)
-            _pca_log_df.to_csv(_pca_rdir / "processing_log_final.csv", index=False, encoding="utf-8-sig")
-            # Also overwrite enriched_partial.xlsx with the complete dataset
-            df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "enriched_partial.xlsx"))
-            ss_set(_pca_final_saved=True)
-            st.info(f"📂 Per-company autosave — final files written to **{_pca_done_dir}**")
-        except Exception as _pca_fin_err:
-            ss_set(_pca_final_saved=True)
-            st.warning(f"⚠ Per-company autosave final write failed: {_pca_fin_err}")
+    if not ss("_final_auto_saved", False):
+        if _pca_done_enabled and _pca_done_dir:
+            try:
+                _pca_rdir = Path(_pca_done_dir)
+                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "final_results.xlsx"))
+                df_enriched.to_csv(_pca_rdir / "final_results.csv", index=False, encoding="utf-8-sig")
+                # overwrite latest_results.* with the complete dataset too
+                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "latest_results.xlsx"))
+                df_enriched.to_csv(_pca_rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
+                ss_set(_final_auto_saved=True, _final_save_path=str(_pca_rdir / "final_results.xlsx"))
+                st.info(f"📂 Final results saved to **{_pca_done_dir}**")
+            except Exception as _fin_err:
+                ss_set(_final_auto_saved=True, _final_save_path="",
+                       _final_save_error=str(_fin_err))
+        else:
+            ss_set(_final_auto_saved=True)
 
-    # ── Big named final file — written once per completed run ─────────────────
-    if _pca_done_enabled and _pca_done_dir and not ss("_big_final_file_saved", False):
-        try:
-            _big_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            _big_rdir  = Path(_pca_done_dir)
-            _big_xl    = _big_rdir / f"myngle_big_enriched_final_{_big_stamp}.xlsx"
-            _big_csv   = _big_rdir / f"myngle_big_enriched_final_{_big_stamp}.csv"
-            df_to_excel_bytes_write(df_enriched, str(_big_xl))
-            df_enriched.to_csv(_big_csv, index=False, encoding="utf-8-sig")
-            ss_set(_big_final_file_saved=True)
-            st.success(f"Big final enriched file saved to: **{_big_xl}**")
-        except Exception as _big_err:
-            ss_set(_big_final_file_saved=True)
-            st.warning(f"⚠ Big final file save failed: {_big_err}")
+    _final_xl_error = ss("_final_save_error", "")
+    if _final_xl_error:
+        st.warning(f"⚠ Final auto-save failed: {_final_xl_error}")
 
     # ── Step 2 debug files — download + preview ───────────────────────────────
     if not _elm_done:
