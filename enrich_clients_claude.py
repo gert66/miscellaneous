@@ -3094,11 +3094,12 @@ def enrich_one_row(
     row["total_tokens_out"] = str(total_out)
     row["total_cost_usd"]   = f"{calc_cost(total_in, total_out):.6f}"
 
-    has_s1 = _step1_has_data(s1_fields)
+    has_s1 = _step1_has_data(s1_fields) if run_step1_enrichment else bool(existing_lusha_data)
     has_s2 = any(s2_fields.get(f, "") for f in ICP_FIELDS[:3])
 
-    if has_s1:
-        # Preserve tier status (enriched_jina / enriched_search); append _step1_only if no ICP
+    if not run_step1_enrichment and existing_lusha_data:
+        row["enrichment_status"] = "existing_lusha_preserved" if has_s2 else "existing_lusha_only"
+    elif has_s1:
         row["enrichment_status"] = s1_status if has_s2 else f"{s1_status}_step1_only"
     else:
         row["enrichment_status"] = "no_data"
@@ -3223,11 +3224,20 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Enriched")
-        # Second sheet: model-ready features (scores + binaries only)
         try:
             mf_df = _build_model_features_df(df)
             if not mf_df.empty:
                 mf_df.to_excel(writer, index=False, sheet_name="model_features")
+        except Exception:
+            pass
+        try:
+            ev_cols = [c for c in df.columns if c.endswith("_evidence")]
+            if ev_cols:
+                # Include company name/domain columns plus all evidence columns
+                id_cols = [c for c in df.columns if c not in set(ALL_ENRICHMENT_FIELDS)][:3]
+                qa_cols = list(dict.fromkeys(id_cols + ev_cols))
+                qa_df = df[[c for c in qa_cols if c in df.columns]]
+                qa_df.to_excel(writer, index=False, sheet_name="qa_evidence")
         except Exception:
             pass
     return buf.getvalue()
@@ -3409,6 +3419,16 @@ def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
             mf_df = _build_model_features_df(df)
             if not mf_df.empty:
                 mf_df.to_excel(writer, index=False, sheet_name="model_features")
+        except Exception:
+            pass
+        try:
+            ev_cols = [c for c in df.columns if c.endswith("_evidence")]
+            if ev_cols:
+                # Include company name/domain columns plus all evidence columns
+                id_cols = [c for c in df.columns if c not in set(ALL_ENRICHMENT_FIELDS)][:3]
+                qa_cols = list(dict.fromkeys(id_cols + ev_cols))
+                qa_df = df[[c for c in qa_cols if c in df.columns]]
+                qa_df.to_excel(writer, index=False, sheet_name="qa_evidence")
         except Exception:
             pass
 
@@ -3721,6 +3741,42 @@ with st.sidebar:
             "Add it or disable Lusha API enrichment."
         )
     st.session_state["_enable_lusha_api"] = enable_lusha_api
+
+    st.divider()
+
+    # ── 3b. Step selection ────────────────────────────────────────────────────
+    _has_lusha_input = ss("_has_lusha_input", False)
+    if _has_lusha_input:
+        st.info(
+            "ℹ️ Existing Lucia/Lusha fields detected in the uploaded file. "
+            "Step 1 firmographic enrichment is disabled by default — "
+            "existing values will be preserved."
+        )
+
+    run_step1_enrichment = st.checkbox(
+        "Run Step 1 firmographic enrichment",
+        value=not _has_lusha_input,
+        key="run_step1_enrichment_checkbox",
+        help=(
+            "Runs Jina AI + Claude extraction to fill firmographic fields. "
+            "Disable when the uploaded file already contains Lusha/Lucia enrichment. "
+            "When disabled, existing Lusha/Lucia values are preserved unchanged."
+        ),
+    )
+    if run_step1_enrichment and _has_lusha_input:
+        st.warning(
+            "⚠️ Step 1 is enabled but Lusha/Lucia fields already exist in the file. "
+            "Existing non-empty values will be preserved."
+        )
+    st.session_state["_run_step1_enrichment"] = run_step1_enrichment
+
+    run_step2_enrichment = st.checkbox(
+        "Run Step 2 ICP/web enrichment",
+        value=True,
+        key="run_step2_enrichment_checkbox",
+        help="Runs web search + Claude analysis to fill ICP buying signal fields.",
+    )
+    st.session_state["_run_step2_enrichment"] = run_step2_enrichment
 
     st.divider()
 
@@ -4043,8 +4099,14 @@ if new_file_key != ss("_file_key"):
                 else pd.read_excel(uploaded)
             )
             ss_set(df_raw=df_loaded, file_name=fname)
+            # Detect existing Lusha/Lucia enrichment columns
+            _detected_lusha = detect_lusha_columns(df_loaded)
+            ss_set(
+                _lusha_cols_in_input=_detected_lusha,
+                _has_lusha_input=bool(_detected_lusha),
+            )
         except Exception as exc:
-            ss_set(file_error=str(exc))
+            ss_set(file_error=str(exc), _lusha_cols_in_input=[], _has_lusha_input=False)
 
 df_raw: pd.DataFrame | None = ss("df_raw")
 file_error: str | None      = ss("file_error")
@@ -4262,6 +4324,8 @@ if start_btn and not blocking and not currently_processing:
         _lusha_api_key=lusha_api_key,
         _extract_model_signals=ss("_extract_model_signals", True),
         _include_signal_evidence=ss("_include_signal_evidence", True),
+        _run_step1_enrichment=ss("_run_step1_enrichment", True),
+        _run_step2_enrichment=ss("_run_step2_enrichment", True),
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
         # Per-company autosave
@@ -4300,6 +4364,8 @@ if ss("processing", False):
     _lusha_api_key_run         = ss("_lusha_api_key", "")
     _extract_model_signals_run = ss("_extract_model_signals", True)
     _include_signal_evidence_run = ss("_include_signal_evidence", True)
+    _run_step1_enrichment_run  = ss("_run_step1_enrichment", True)
+    _run_step2_enrichment_run  = ss("_run_step2_enrichment", True)
     _pca_enabled_run  = ss("_per_company_autosave_enabled", False)
     _pca_run_dir_run  = ss("_per_company_autosave_run_dir", "")
     total_in          = ss("total_tokens_in", 0)
@@ -4470,6 +4536,18 @@ if ss("processing", False):
         input_row    = df_work.iloc[idx]
         company_name = str(input_row.get(_name_col, "")).strip()
         raw_url      = str(input_row.get(_domain_col, "")).strip() if _domain_col else ""
+
+        # Normalize domain-only values to a URL (prepend https:// if needed)
+        if raw_url and not raw_url.startswith(("http://", "https://")):
+            raw_url = normalize_url(raw_url)
+
+        # Extract existing Lusha/Lucia field values from the input row
+        _lusha_field_set = set(LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS)
+        _existing_lusha = {
+            k: (str(v) if not isinstance(v, str) else v)
+            for k, v in input_row.items()
+            if k in _lusha_field_set and v is not None and str(v).strip() not in ("", "nan", "NaN", "None")
+        }
 
         # ── Resume: skip rows already in autosave ─────────────────────────────
         if _resume_mode and autosave_already_done(
@@ -4655,6 +4733,9 @@ if ss("processing", False):
                         lusha_api_key=_lusha_api_key_run,
                         extract_model_signals=_extract_model_signals_run,
                         include_signal_evidence=_include_signal_evidence_run,
+                        run_step1_enrichment=_run_step1_enrichment_run,
+                        run_step2_enrichment=_run_step2_enrichment_run,
+                        existing_lusha_data=_existing_lusha or None,
                     )
                 if not (_zero_cost_run and _dry_run_run):
                     s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
