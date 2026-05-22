@@ -348,6 +348,7 @@ META_FIELDS = [
     "enrichment_status",
     "step1_status",
     "step2_status",
+    "step2_provider_used",
     "needs_manual_review",
     "match_notes",
     "error_message",
@@ -2105,7 +2106,7 @@ def run_step2(
     if not target:
         return (_ICP_EMPTY.copy(), {}, 0, 0, "no_input", "No URL or company name", 0, 0)
 
-    ck = f"step2_{target}"
+    ck = f"step2_claude_{target}"
     cached = load_cache(ck)
     if cached is not None:
         icp = cached.get("icp_data", {})
@@ -2466,16 +2467,19 @@ def run_model_signal_extraction(
     api_key: str,
     model_id: str = MODEL_STEP2,
     include_evidence: bool = True,
+    search_provider: str = STEP2_PROVIDER_SERPER,
 ) -> dict:
     """
     Extract structured model signals from already-fetched enrichment context.
     Returns a dict with all MODEL_SIGNAL_FIELDS populated.
     Never calls Jina, Serper, or the web_search tool — uses only provided context.
+    Cache key is provider-specific so Serper and Claude results don't overwrite each other.
     """
     empty = _build_model_signal_empty()
 
     domain = clean_domain(raw_url) or company_name
-    cache_key = f"model_signals_{domain or safe_filename(company_name or 'unknown')}"
+    _prov_code = "sg" if search_provider == STEP2_PROVIDER_SERPER else "cws"
+    cache_key = f"model_signals_{_prov_code}_{domain or safe_filename(company_name or 'unknown')}"
 
     cached = load_cache(cache_key)
     if cached is not None and cached.get("version") == 1:
@@ -3006,10 +3010,11 @@ def enrich_one_row(
         dry_run=dry_run,
     )
     row.update(s2_fields)
-    row["step2_status"]   = s2_status
-    row["step2_tokens_in"]  = str(s2_in)
-    row["step2_tokens_out"] = str(s2_out)
-    row["step2_cost_usd"]   = f"{calc_cost(s2_in, s2_out):.6f}"
+    row["step2_status"]        = s2_status
+    row["step2_provider_used"] = search_provider
+    row["step2_tokens_in"]     = str(s2_in)
+    row["step2_tokens_out"]    = str(s2_out)
+    row["step2_cost_usd"]      = f"{calc_cost(s2_in, s2_out):.6f}"
 
     # ── Combined metadata ─────────────────────────────────────────────────────
     total_in  = s1_in  + s2_in
@@ -3042,6 +3047,7 @@ def enrich_one_row(
                 api_key=api_key,
                 model_id=model_step2,
                 include_evidence=include_signal_evidence,
+                search_provider=search_provider,
             )
             row.update(ms_fields)
         except Exception as _ms_exc:
@@ -3298,7 +3304,7 @@ def build_run_tag() -> str:
     model code, and 'lusha' suffix when Lusha API enrichment is enabled.
     Safe to call from both the processing loop and the results section.
     """
-    prov  = st.session_state.get("_step2_provider",   STEP2_PROVIDER_CLAUDE)
+    prov  = st.session_state.get("_step2_provider",   STEP2_PROVIDER_SERPER)
     model = st.session_state.get("_model_step2",       MODEL_STEP2)
     lusha = st.session_state.get("_enable_lusha_api",  False)
     tag   = f"{get_provider_code(prov)}_{get_model_code(model)}"
@@ -3612,10 +3618,13 @@ with st.sidebar:
         st.success("✓ Anthropic API key loaded")
     else:
         st.error("⚠ Anthropic API key missing")
+    _current_provider = st.session_state.get("_step2_provider", STEP2_PROVIDER_SERPER)
     if serper_key:
         st.success("✓ Serper API key loaded")
+    elif _current_provider == STEP2_PROVIDER_SERPER:
+        st.error("⚠ Serper API key missing — required for Serper Google Search")
     else:
-        st.warning("⚠ Serper API key not set (needed for Serper provider)")
+        st.caption("ⓘ Serper API key not set (only needed for Serper Google Search)")
     if lusha_api_key:
         st.success("✓ Lusha API key loaded")
     else:
@@ -3670,15 +3679,23 @@ with st.sidebar:
         "Step 2 web search provider",
         options=_provider_options,
         index=0,                        # default: Serper Google Search
+        key="step2_provider_selectbox",
         help=(
             f"**{STEP2_PROVIDER_SERPER}** (default): calls the Serper API for Google "
             "results, then Claude analyzes the snippets. "
             "Requires `SERPER_API_KEY` in `.streamlit/secrets.toml`.\n\n"
             f"**{STEP2_PROVIDER_CLAUDE}**: uses Anthropic's built-in web_search tool — "
-            "no extra API key needed."
+            "no extra API key needed, but costs more tokens per company."
         ),
     )
     st.session_state["_step2_provider"] = step2_provider
+    if step2_provider == STEP2_PROVIDER_SERPER and not serper_key:
+        st.error(
+            "⚠️ SERPER_API_KEY missing — add it to `.streamlit/secrets.toml` "
+            "or switch to Claude Web Search."
+        )
+    elif step2_provider == STEP2_PROVIDER_CLAUDE:
+        st.info("ℹ️ Claude Web Search: uses Anthropic web_search tool, no Serper key needed.")
 
     st.divider()
 
@@ -4066,7 +4083,7 @@ currently_processing = ss("processing", False)
 enrichment_done      = ss("enrichment_done", False)
 
 blocking: list = []
-_active_provider     = ss("_step2_provider",    STEP2_PROVIDER_CLAUDE)
+_active_provider     = ss("_step2_provider",    STEP2_PROVIDER_SERPER)
 _active_dry_run      = ss("_step2_dry_run",     False)
 _active_zero_cost    = ss("_zero_cost_preview", False)
 _is_preview_mode     = _active_dry_run or _active_zero_cost
@@ -4139,7 +4156,7 @@ if start_btn and not blocking and not currently_processing:
         )
         try:
             # Build a temporary run tag from current sidebar selections
-            _tmp_prov  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
+            _tmp_prov  = ss("_step2_provider", STEP2_PROVIDER_SERPER)
             _tmp_model = ss("_model_step2",    MODEL_STEP2)
             _tmp_lusha = ss("_enable_lusha_api", False)
             _tmp_tag   = f"{get_provider_code(_tmp_prov)}_{get_model_code(_tmp_model)}"
@@ -4166,7 +4183,7 @@ if start_btn and not blocking and not currently_processing:
         _use_playwright=ss("_use_playwright", True),
         _model_step1=ss("_model_step1", MODEL_STEP1),
         _model_step2=ss("_model_step2", MODEL_STEP2),
-        _step2_provider=ss("_step2_provider", STEP2_PROVIDER_CLAUDE),
+        _step2_provider=ss("_step2_provider", STEP2_PROVIDER_SERPER),
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
         _zero_cost_preview=ss("_zero_cost_preview", False),
@@ -4204,7 +4221,7 @@ if ss("processing", False):
     _use_playwright_run  = ss("_use_playwright", True)
     _model_step1_run     = ss("_model_step1", MODEL_STEP1)
     _model_step2_run     = ss("_model_step2", MODEL_STEP2)
-    _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_CLAUDE)
+    _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_SERPER)
     _serper_key_run      = ss("_serper_key", "")
     _dry_run_run         = ss("_step2_dry_run", False)
     _zero_cost_run       = ss("_zero_cost_preview", False)
@@ -4541,8 +4558,9 @@ if ss("processing", False):
                         dry_run=True,
                     )
                     fields = {f: "" for f in ALL_ENRICHMENT_FIELDS}
-                    fields["enrichment_status"] = "zero_cost_preview"
-                    fields["step2_status"]      = _s2_status
+                    fields["enrichment_status"]   = "zero_cost_preview"
+                    fields["step2_status"]        = _s2_status
+                    fields["step2_provider_used"] = _step2_provider_run
                     fields.update(icp_fields)
                     # Fill model-signal defaults (no API call in zero-cost mode)
                     fields.update(_build_model_signal_empty())
