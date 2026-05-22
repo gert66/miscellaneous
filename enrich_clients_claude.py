@@ -349,6 +349,9 @@ META_FIELDS = [
     "step1_status",
     "step2_status",
     "step2_provider_used",
+    "lucia_data_status",
+    "lucia_api_called",
+    "step1_run_status",
     "needs_manual_review",
     "match_notes",
     "error_message",
@@ -565,7 +568,16 @@ _STEP1_DATA_FIELDS = [
 ]
 
 _COMPANY_HINTS = ["company", "account", "organisation", "organization", "name", "naam", "bedrijf"]
-_DOMAIN_HINTS  = ["domain", "website", "url", "web", "site", "domein"]
+_DOMAIN_HINTS  = ["domain", "website", "url", "web", "site", "domein",
+                   "lusha_domain", "company_domain", "company_url"]
+
+# Prefixes and field names used to detect existing Lusha/Lucia enrichment columns
+_LUSHA_COL_PREFIXES = ("lusha_", "lusha_api_", "lucia_")
+_LUSHA_COL_NAMES_EXACT = frozenset([
+    "company_size", "employee_range", "employee_size_score",
+    "revenue", "revenue_range", "industry", "sub_industry",
+    "founded_year", "country", "city", "linkedin_url",
+])
 
 _STATUS_LABELS = {
     "enriched_jina":                 "Enriched via Jina",
@@ -1069,6 +1081,18 @@ def detect_columns(df: pd.DataFrame) -> tuple:
         name_col   if ns >= 0.45 else None,
         domain_col if ds >= 0.55 and domain_col != name_col else None,
     )
+
+
+def detect_lusha_columns(df: pd.DataFrame) -> list:
+    """Return list of column names in df that look like existing Lusha/Lucia enrichment fields."""
+    found = []
+    for col in df.columns:
+        col_l = col.lower().strip()
+        if any(col_l.startswith(p) for p in _LUSHA_COL_PREFIXES):
+            found.append(col)
+        elif col_l in _LUSHA_COL_NAMES_EXACT:
+            found.append(col)
+    return found
 
 
 def calc_cost(in_tok: int, out_tok: int) -> float:
@@ -2963,6 +2987,9 @@ def enrich_one_row(
     lusha_api_key: str = "",
     extract_model_signals: bool = True,
     include_signal_evidence: bool = True,
+    run_step1_enrichment: bool = True,
+    run_step2_enrichment: bool = True,
+    existing_lusha_data: dict | None = None,
 ) -> tuple:
     """
     Run optional Lusha API enrichment, then Step 1 (Jina + Claude extraction),
@@ -2973,6 +3000,14 @@ def enrich_one_row(
     company_name = company_name.strip() if company_name else ""
 
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
+
+    # Populate row with any pre-existing Lusha/Lucia data from the input file
+    # so downstream steps (Step 2, Step 3) can use it as context.
+    _lusha_fields_set = set(LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS)
+    if existing_lusha_data:
+        for _k, _v in existing_lusha_data.items():
+            if _k in _lusha_fields_set:
+                row[_k] = _v
 
     # 8-second pause between companies to stay under the token/min rate limit
     time.sleep(8)
@@ -2993,30 +3028,64 @@ def enrich_one_row(
         row["lusha_api_error"]  = "Lusha API key not provided"
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
-    s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
-        url, company_name, api_key, delay,
-        use_playwright=use_playwright, model_step1=model_step1,
-    )
-
-    row.update(s1_fields)
-    row["step1_status"]     = s1_status
-    row["step1_tokens_in"]  = str(s1_in)
-    row["step1_tokens_out"] = str(s1_out)
-    row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
+    if run_step1_enrichment:
+        s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
+            url, company_name, api_key, delay,
+            use_playwright=use_playwright, model_step1=model_step1,
+        )
+        # Only overwrite existing non-empty Lusha fields if the new value is non-empty
+        if existing_lusha_data:
+            for _sf, _sv in s1_fields.items():
+                if _sv or not row.get(_sf):
+                    row[_sf] = _sv
+        else:
+            row.update(s1_fields)
+        row["step1_status"]     = s1_status
+        row["step1_run_status"] = s1_status
+        row["step1_tokens_in"]  = str(s1_in)
+        row["step1_tokens_out"] = str(s1_out)
+        row["step1_cost_usd"]   = f"{calc_cost(s1_in, s1_out):.6f}"
+    else:
+        # Step 1 skipped — use existing data already loaded into row above
+        s1_fields = {}
+        s1_raw    = {}
+        s1_in = s1_out = 0
+        s1_status = "skipped_existing_data"
+        s1_err    = ""
+        s1_pw_dbg = {"playwright_attempted": False, "playwright_result": "skipped"}
+        row["step1_status"]     = "skipped_existing_data"
+        row["step1_run_status"] = "skipped_existing_data"
+        row["step1_cost_usd"]   = "0.000000"
+        row["lucia_api_called"] = 0
+        if existing_lusha_data:
+            row["lucia_data_status"] = "existing_preserved"
+        else:
+            row["lucia_data_status"] = "missing_not_requested"
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
-    s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
-        url, company_name, api_key, delay, model_step2=model_step2,
-        _debug_callback=_debug_callback,
-        search_provider=search_provider, serper_key=serper_key,
-        dry_run=dry_run,
-    )
-    row.update(s2_fields)
-    row["step2_status"]        = s2_status
-    row["step2_provider_used"] = search_provider
-    row["step2_tokens_in"]     = str(s2_in)
-    row["step2_tokens_out"]    = str(s2_out)
-    row["step2_cost_usd"]      = f"{calc_cost(s2_in, s2_out):.6f}"
+    if run_step2_enrichment:
+        s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
+            url, company_name, api_key, delay, model_step2=model_step2,
+            _debug_callback=_debug_callback,
+            search_provider=search_provider, serper_key=serper_key,
+            dry_run=dry_run,
+        )
+        row.update(s2_fields)
+        row["step2_status"]        = s2_status
+        row["step2_provider_used"] = search_provider
+        row["step2_tokens_in"]     = str(s2_in)
+        row["step2_tokens_out"]    = str(s2_out)
+        row["step2_cost_usd"]      = f"{calc_cost(s2_in, s2_out):.6f}"
+    else:
+        s2_fields = _ICP_EMPTY.copy()
+        s2_raw    = {}
+        s2_in = s2_out = 0
+        s2_status = "skipped"
+        s2_err    = ""
+        s2_cache_create = s2_cache_read = 0
+        row["step2_status"]        = "skipped"
+        row["step2_provider_used"] = search_provider
+        row["step2_cost_usd"]      = "0.000000"
 
     # ── Combined metadata ─────────────────────────────────────────────────────
     total_in  = s1_in  + s2_in
