@@ -187,6 +187,120 @@ Do not invent evidence. Do not wrap in markdown.\
 """
 
 
+# ── Model-signal extraction prompt ────────────────────────────────────────────
+#
+# This prompt is sent AFTER Step 1 + Step 2 enrichment to extract structured
+# numeric signals for logistic-regression readiness.  It uses only evidence
+# already gathered — no additional web searches are performed.
+
+MODEL_SIGNAL_PROMPT_TEMPLATE = """\
+You are extracting structured model signals for a company from available enrichment context.
+Your ONLY task is to return a valid JSON object with exactly the fields listed below.
+
+Rules:
+- Use ONLY evidence from the provided enrichment context (website, search snippets, firmographic data).
+- Do NOT invent facts, infer company size, or estimate employee count.
+- Do NOT generate or fill any employee_size_score field.
+- If evidence is weak or ambiguous, score 1 or 0.
+- Use score 3 ONLY for explicit or very strong evidence.
+- Keep each evidence field to one short sentence. Use empty string if score is 0.
+- Return ONLY raw JSON — no markdown, no backticks, no explanation.
+- All score fields must be integers.
+- All binary fields must be 0 or 1.
+
+Scoring rubric (0–3):
+  0 = no evidence found
+  1 = weak or indirect evidence
+  2 = clear evidence
+  3 = strong or explicit evidence
+
+Provider category rules:
+  Category 1 direct language-training competitors (goes into has_language_competitor):
+    goFLUENT, Learnlight, Speexx, Voxy, Learnship, Berlitz, EF Corporate Solutions,
+    Babbel for Business, Rosetta Stone Enterprise, Preply Business, Talaera,
+    Busuu for Business, Lingoda for Business, Fluentify, Twenix, Cambly.
+  Category 2 online language-learning brands (goes into has_online_learning_signal ONLY
+    when found in a corporate/HR/L&D/employee-benefit/company-wide training context):
+    Duolingo, Babbel, Busuu, Rosetta Stone, Preply, Memrise, Mondly, ELSA Speak,
+    FluentU, italki, Lingoda, Open English, Mango Languages, Pimsleur, Drops,
+    HelloTalk, Tandem.
+  Category 3 broader L&D platforms (goes into has_lnd_platform_signal):
+    OpenSesame, Coursera for Business, Udemy Business, LinkedIn Learning, Skillsoft,
+    Docebo, Degreed, Cornerstone, 360Learning, Moodle Workplace, Absorb LMS,
+    TalentLMS, LearnUpon, Pluralsight.
+  has_competitor_signal = 1 if ANY provider from Cat 1, Cat 2 (in corporate context), or Cat 3 is found.
+  mYngle is NOT a competitor and must never appear in any signal field.
+
+Binary field rules:
+  is_public = 1 if the company appears publicly listed or has clear public company evidence.
+  has_funding = 1 if funding rounds, venture backing, private equity, acquisition funding, or similar evidence is found.
+
+Company: {company_name}
+Domain: {domain}
+
+Enrichment context:
+{enrichment_context}
+
+Return a JSON object with EXACTLY these fields and no others:
+{{
+  "sig_intl_footprint_score": <int 0-3>,
+  "sig_intl_footprint_evidence": <str>,
+  "sig_foreign_hq_score": <int 0-3>,
+  "sig_foreign_hq_evidence": <str>,
+  "sig_explicit_lnd_score": <int 0-3>,
+  "sig_explicit_lnd_evidence": <str>,
+  "sig_multicultural_score": <int 0-3>,
+  "sig_multicultural_evidence": <str>,
+  "sig_employer_branding_score": <int 0-3>,
+  "sig_employer_branding_evidence": <str>,
+  "sig_rapid_growth_score": <int 0-3>,
+  "sig_rapid_growth_evidence": <str>,
+  "sig_merger_acq_score": <int 0-3>,
+  "sig_merger_acq_evidence": <str>,
+  "sig_lnd_onboarding_score": <int 0-3>,
+  "sig_lnd_onboarding_evidence": <str>,
+  "ti_language_english_score": <int 0-3>,
+  "ti_language_english_evidence": <str>,
+  "ti_onboarding_score": <int 0-3>,
+  "ti_onboarding_evidence": <str>,
+  "ti_leadership_score": <int 0-3>,
+  "ti_leadership_evidence": <str>,
+  "ti_broader_professional_score": <int 0-3>,
+  "ti_broader_professional_evidence": <str>,
+  "ti_team_collab_score": <int 0-3>,
+  "ti_team_collab_evidence": <str>,
+  "ti_intercultural_score": <int 0-3>,
+  "ti_intercultural_evidence": <str>,
+  "ti_negotiation_sales_score": <int 0-3>,
+  "ti_negotiation_sales_evidence": <str>,
+  "has_competitor_signal": <0 or 1>,
+  "has_competitor_signal_evidence": <str>,
+  "has_language_competitor": <0 or 1>,
+  "has_language_competitor_evidence": <str>,
+  "has_online_learning_signal": <0 or 1>,
+  "has_online_learning_signal_evidence": <str>,
+  "has_lnd_platform_signal": <0 or 1>,
+  "has_lnd_platform_signal_evidence": <str>,
+  "is_public": <0 or 1>,
+  "is_public_evidence": <str>,
+  "has_funding": <0 or 1>,
+  "has_funding_evidence": <str>,
+  "competitor_signal_strength_score": <int 0-3>,
+  "competitor_signal_strength_evidence": <str>,
+  "language_competitor_strength_score": <int 0-3>,
+  "language_competitor_strength_evidence": <str>,
+  "online_learning_signal_strength_score": <int 0-3>,
+  "online_learning_signal_strength_evidence": <str>,
+  "lnd_platform_signal_strength_score": <int 0-3>,
+  "lnd_platform_signal_strength_evidence": <str>,
+  "model_signal_overall_confidence_score": <int 0-3>,
+  "model_signal_needs_manual_review": <0 or 1>,
+  "model_signal_manual_review_reason": <str>,
+  "model_signal_sources_used": <str>,
+  "model_signal_search_quality": <"good" or "partial" or "weak" or "failed">
+}}
+"""
+
 
 # ── Field lists ───────────────────────────────────────────────────────────────
 
@@ -282,8 +396,89 @@ LUSHA_API_META_FIELDS = [
     "lusha_api_raw_keys",
 ]
 
+# Model-signal fields — added by the structured signal-extraction layer
+# Ordinal score fields (integer 0–3)
+MODEL_SIGNAL_SCORE_FIELDS = [
+    "sig_intl_footprint_score",
+    "sig_foreign_hq_score",
+    "sig_explicit_lnd_score",
+    "sig_multicultural_score",
+    "sig_employer_branding_score",
+    "sig_rapid_growth_score",
+    "sig_merger_acq_score",
+    "sig_lnd_onboarding_score",
+    "ti_language_english_score",
+    "ti_onboarding_score",
+    "ti_leadership_score",
+    "ti_broader_professional_score",
+    "ti_team_collab_score",
+    "ti_intercultural_score",
+    "ti_negotiation_sales_score",
+    "competitor_signal_strength_score",
+    "language_competitor_strength_score",
+    "online_learning_signal_strength_score",
+    "lnd_platform_signal_strength_score",
+    "model_signal_overall_confidence_score",
+]
+
+# Binary fields (0 or 1)
+MODEL_SIGNAL_BINARY_FIELDS = [
+    "has_competitor_signal",
+    "has_language_competitor",
+    "has_online_learning_signal",
+    "has_lnd_platform_signal",
+    "is_public",
+    "has_funding",
+    "model_signal_needs_manual_review",
+]
+
+# Evidence columns (one per score/binary field, using same base name + _evidence)
+_MODEL_SIGNAL_SCORED_BASES = [
+    "sig_intl_footprint",
+    "sig_foreign_hq",
+    "sig_explicit_lnd",
+    "sig_multicultural",
+    "sig_employer_branding",
+    "sig_rapid_growth",
+    "sig_merger_acq",
+    "sig_lnd_onboarding",
+    "ti_language_english",
+    "ti_onboarding",
+    "ti_leadership",
+    "ti_broader_professional",
+    "ti_team_collab",
+    "ti_intercultural",
+    "ti_negotiation_sales",
+    "competitor_signal_strength",
+    "language_competitor_strength",
+    "online_learning_signal_strength",
+    "lnd_platform_signal_strength",
+    "has_competitor_signal",
+    "has_language_competitor",
+    "has_online_learning_signal",
+    "has_lnd_platform_signal",
+    "is_public",
+    "has_funding",
+]
+MODEL_SIGNAL_EVIDENCE_FIELDS = [f"{b}_evidence" for b in _MODEL_SIGNAL_SCORED_BASES]
+
+# QA / metadata fields
+MODEL_SIGNAL_QA_FIELDS = [
+    "model_signal_manual_review_reason",
+    "model_signal_sources_used",
+    "model_signal_search_quality",
+]
+
+MODEL_SIGNAL_FIELDS = (
+    MODEL_SIGNAL_SCORE_FIELDS
+    + MODEL_SIGNAL_BINARY_FIELDS
+    + MODEL_SIGNAL_EVIDENCE_FIELDS
+    + MODEL_SIGNAL_QA_FIELDS
+)
+
 ALL_ENRICHMENT_FIELDS = (
-    LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS + META_FIELDS
+    LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS
+    + META_FIELDS + MODEL_SIGNAL_FIELDS
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2156,6 +2351,205 @@ def _extract_icp_fields(raw: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Model-signal extraction — Step 3
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODEL_SIGNAL_EMPTY: dict = {}  # populated after field list is known at import time
+
+def _build_model_signal_empty() -> dict:
+    empty: dict = {}
+    for f in MODEL_SIGNAL_SCORE_FIELDS:
+        empty[f] = 0
+    for f in MODEL_SIGNAL_BINARY_FIELDS:
+        empty[f] = 0
+    for f in MODEL_SIGNAL_EVIDENCE_FIELDS:
+        empty[f] = ""
+    for f in MODEL_SIGNAL_QA_FIELDS:
+        empty[f] = ""
+    return empty
+
+
+def _build_enrichment_context(row: dict) -> str:
+    """Format the existing Step 1 + Step 2 enrichment data into a concise text context."""
+    lines: list[str] = []
+
+    # Step 1 firmographics
+    s1_parts = []
+    for key, label in [
+        ("lusha_description",    "Description"),
+        ("lusha_industry",       "Industry"),
+        ("lusha_sub_industry",   "Sub-industry"),
+        ("lusha_company_type",   "Company type"),
+        ("lusha_country",        "Country"),
+        ("lusha_city",           "City"),
+        ("lusha_continent",      "Continent"),
+        ("lusha_founded_year",   "Founded"),
+        ("lusha_employee_range", "Employee range"),
+        ("lusha_revenue",        "Revenue"),
+        ("lusha_specialties",    "Specialties"),
+        ("lusha_technologies",   "Technologies"),
+        ("lusha_total_funding_amount", "Total funding"),
+        ("lusha_total_funding_rounds", "Funding rounds"),
+        ("lusha_last_round_type",  "Last round type"),
+        ("lusha_last_round_amount","Last round amount"),
+        ("lusha_ipo_status",       "IPO status"),
+    ]:
+        v = str(row.get(key, "") or "").strip()
+        if v:
+            s1_parts.append(f"{label}: {v}")
+    if s1_parts:
+        lines.append("=== Step 1 firmographic data ===")
+        lines.extend(s1_parts)
+
+    # Step 2 ICP signals
+    s2_parts = []
+    for key, label in [
+        ("icp_lead_score",                        "Lead score"),
+        ("icp_buying_signals",                    "Buying signals"),
+        ("icp_competitor_signal",                 "Competitor signal (Cat 1)"),
+        ("icp_direct_language_competitor_signal", "Direct language competitor"),
+        ("icp_online_language_learning_signal",   "Online language learning signal (Cat 2)"),
+        ("icp_broader_lnd_platform_signal",       "Broader L&D platform signal (Cat 3)"),
+        ("icp_evidence",                          "ICP evidence"),
+        ("icp_likely_training_interest",          "Likely training interest"),
+        ("icp_why_relevant",                      "Why relevant"),
+        ("icp_potential_buyer_function",          "Potential buyer function"),
+    ]:
+        v = str(row.get(key, "") or "").strip()
+        if v:
+            s2_parts.append(f"{label}: {v}")
+    if s2_parts:
+        lines.append("=== Step 2 ICP signal data ===")
+        lines.extend(s2_parts)
+
+    return "\n".join(lines) if lines else "(No enrichment context available)"
+
+
+def _coerce_model_signals(raw: dict) -> dict:
+    """Validate and coerce parsed model-signal JSON into expected types."""
+    out: dict = _build_model_signal_empty()
+
+    for f in MODEL_SIGNAL_SCORE_FIELDS:
+        try:
+            v = int(raw.get(f, 0) or 0)
+            out[f] = max(0, min(3, v))
+        except (TypeError, ValueError):
+            out[f] = 0
+
+    for f in MODEL_SIGNAL_BINARY_FIELDS:
+        try:
+            v = int(raw.get(f, 0) or 0)
+            out[f] = 1 if v else 0
+        except (TypeError, ValueError):
+            out[f] = 0
+
+    for f in MODEL_SIGNAL_EVIDENCE_FIELDS:
+        out[f] = str(raw.get(f, "") or "").strip()
+
+    # QA text fields
+    out["model_signal_manual_review_reason"] = str(
+        raw.get("model_signal_manual_review_reason", "") or ""
+    ).strip()
+    out["model_signal_sources_used"] = str(
+        raw.get("model_signal_sources_used", "") or ""
+    ).strip()
+    sq = str(raw.get("model_signal_search_quality", "") or "").strip().lower()
+    out["model_signal_search_quality"] = sq if sq in ("good", "partial", "weak", "failed") else "weak"
+
+    return out
+
+
+def run_model_signal_extraction(
+    company_name: str,
+    raw_url: str,
+    enrichment_row: dict,
+    api_key: str,
+    model_id: str = MODEL_STEP2,
+    include_evidence: bool = True,
+) -> dict:
+    """
+    Extract structured model signals from already-fetched enrichment context.
+    Returns a dict with all MODEL_SIGNAL_FIELDS populated.
+    Never calls Jina, Serper, or the web_search tool — uses only provided context.
+    """
+    empty = _build_model_signal_empty()
+
+    domain = clean_domain(raw_url) or company_name
+    cache_key = f"model_signals_{domain or safe_filename(company_name or 'unknown')}"
+
+    cached = load_cache(cache_key)
+    if cached is not None and cached.get("version") == 1:
+        try:
+            return _coerce_model_signals(cached.get("signals", {}))
+        except Exception:
+            _delete_cache(cache_key)
+
+    context_text = _build_enrichment_context(enrichment_row)
+
+    prompt = MODEL_SIGNAL_PROMPT_TEMPLATE.format(
+        company_name=company_name or "(unknown)",
+        domain=domain or "(unknown)",
+        enrichment_context=context_text,
+    )
+
+    _STRICT_SUFFIX = "\n\nReturn ONLY raw JSON. No markdown, no backticks, no explanation."
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model_id,
+            max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw_text = "".join(
+            getattr(b, "text", "") for b in resp.content
+            if getattr(b, "type", "") == "text"
+        ).strip()
+
+        try:
+            raw_json = _parse_json_response(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            resp2 = client.messages.create(
+                model=model_id,
+                max_tokens=2500,
+                messages=[{"role": "user", "content": prompt + _STRICT_SUFFIX}],
+            )
+            raw_text2 = "".join(
+                getattr(b, "text", "") for b in resp2.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            raw_json = _parse_json_response(raw_text2)
+
+        signals = _coerce_model_signals(raw_json)
+        save_cache(cache_key, {"version": 1, "signals": signals})
+
+        if not include_evidence:
+            for f in MODEL_SIGNAL_EVIDENCE_FIELDS:
+                signals[f] = ""
+
+        return signals
+
+    except (json.JSONDecodeError, ValueError) as e:
+        err_empty = _build_model_signal_empty()
+        err_empty["model_signal_needs_manual_review"] = 1
+        err_empty["model_signal_manual_review_reason"] = f"JSON parse error: {str(e)[:150]}"
+        err_empty["model_signal_search_quality"] = "failed"
+        return err_empty
+    except anthropic.APIError as e:
+        err_empty = _build_model_signal_empty()
+        err_empty["model_signal_needs_manual_review"] = 1
+        err_empty["model_signal_manual_review_reason"] = f"API error: {str(e)[:150]}"
+        err_empty["model_signal_search_quality"] = "failed"
+        return err_empty
+    except Exception as e:
+        err_empty = _build_model_signal_empty()
+        err_empty["model_signal_needs_manual_review"] = 1
+        err_empty["model_signal_manual_review_reason"] = f"Error: {type(e).__name__}: {str(e)[:150]}"
+        err_empty["model_signal_search_quality"] = "failed"
+        return err_empty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Review flagging
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2561,10 +2955,12 @@ def enrich_one_row(
     dry_run: bool = False,
     enable_lusha_api: bool = False,
     lusha_api_key: str = "",
+    extract_model_signals: bool = True,
+    include_signal_evidence: bool = True,
 ) -> tuple:
     """
     Run optional Lusha API enrichment, then Step 1 (Jina + Claude extraction),
-    then Step 2 (Claude web_search ICP).
+    then Step 2 (Claude web_search ICP), then model-signal extraction (Step 3).
     Returns (combined_fields_dict, debug_record_dict).
     """
     url          = raw_url.strip() if raw_url else ""
@@ -2636,6 +3032,31 @@ def enrich_one_row(
 
     flag_review(row, company_name)
 
+    # ── Step 3 — Model-signal extraction ─────────────────────────────────────
+    if extract_model_signals and api_key and not dry_run:
+        try:
+            ms_fields = run_model_signal_extraction(
+                company_name=company_name,
+                raw_url=raw_url,
+                enrichment_row=row,
+                api_key=api_key,
+                model_id=model_step2,
+                include_evidence=include_signal_evidence,
+            )
+            row.update(ms_fields)
+        except Exception as _ms_exc:
+            # Never let Step 3 failures abort the run
+            _ms_err = _build_model_signal_empty()
+            _ms_err["model_signal_needs_manual_review"] = 1
+            _ms_err["model_signal_manual_review_reason"] = (
+                f"Step 3 extraction failed: {type(_ms_exc).__name__}: {str(_ms_exc)[:120]}"
+            )
+            _ms_err["model_signal_search_quality"] = "failed"
+            row.update(_ms_err)
+    else:
+        # Fill defaults when signal extraction is disabled or dry-run
+        row.update(_build_model_signal_empty())
+
     # Debug record
     dbg = {
         "input_company_name":       company_name,
@@ -2691,10 +3112,47 @@ def build_model_features(df_enriched: pd.DataFrame) -> pd.DataFrame:
 # Download helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_model_features_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a trimmed model_features sheet for the Excel export.
+    Contains: original input columns + all model signal score/binary columns.
+    Evidence columns are excluded here (they live in the main Enriched sheet).
+    employee_size_score is included only when it already exists in df.
+    """
+    keep: list[str] = []
+
+    # Preserve all original input columns (anything not in the enrichment field list)
+    enrichment_col_set = set(ALL_ENRICHMENT_FIELDS)
+    input_cols = [c for c in df.columns if c not in enrichment_col_set]
+    keep.extend(input_cols)
+
+    # Add score and binary signal columns (no evidence columns)
+    signal_cols = [
+        c for c in MODEL_SIGNAL_SCORE_FIELDS + MODEL_SIGNAL_BINARY_FIELDS
+        if c in df.columns
+    ]
+    keep.extend(signal_cols)
+
+    # Include employee_size_score only when already present
+    if "employee_size_score" in df.columns:
+        keep.append("employee_size_score")
+
+    keep = list(dict.fromkeys(keep))  # deduplicate, preserve order
+    available = [c for c in keep if c in df.columns]
+    return df[available].copy()
+
+
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Enriched")
+        # Second sheet: model-ready features (scores + binaries only)
+        try:
+            mf_df = _build_model_features_df(df)
+            if not mf_df.empty:
+                mf_df.to_excel(writer, index=False, sheet_name="model_features")
+        except Exception:
+            pass
     return buf.getvalue()
 
 
@@ -2867,9 +3325,15 @@ def save_to_local_folder(df: pd.DataFrame, folder: str, run_tag: str = "") -> tu
 
 
 def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
-    """Write DataFrame to an Excel file at *path* on disk."""
+    """Write DataFrame to an Excel file at *path* on disk (two sheets)."""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Enriched")
+        try:
+            mf_df = _build_model_features_df(df)
+            if not mf_df.empty:
+                mf_df.to_excel(writer, index=False, sheet_name="model_features")
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3268,7 +3732,35 @@ with st.sidebar:
 
     st.divider()
 
-    # ── 7. Advanced options ───────────────────────────────────────────────────
+    # ── 7. Model signal extraction ────────────────────────────────────────────
+    st.markdown("**Model signal extraction**")
+
+    extract_model_signals = st.checkbox(
+        "Extract model signals (Step 3)",
+        value=True,
+        key="extract_model_signals_checkbox",
+        help=(
+            "After Step 1 + Step 2, runs a structured signal-extraction pass that "
+            "produces discrete ordinal scores (0–3) and binary columns ready for "
+            "logistic-regression training.  Adds ~1 extra Claude call per company."
+        ),
+    )
+    st.session_state["_extract_model_signals"] = extract_model_signals
+
+    include_signal_evidence = st.checkbox(
+        "Include QA evidence columns",
+        value=True,
+        key="include_signal_evidence_checkbox",
+        help=(
+            "Include the *_evidence columns alongside each score/binary field. "
+            "Useful for manual QA. Disable to reduce Excel column count."
+        ),
+    )
+    st.session_state["_include_signal_evidence"] = include_signal_evidence
+
+    st.divider()
+
+    # ── 8. Advanced options ───────────────────────────────────────────────────
     st.markdown("**Advanced options**")
 
     step2_dry_run = st.checkbox(
@@ -3680,6 +4172,8 @@ if start_btn and not blocking and not currently_processing:
         _zero_cost_preview=ss("_zero_cost_preview", False),
         _enable_lusha_api=ss("_enable_lusha_api", False),
         _lusha_api_key=lusha_api_key,
+        _extract_model_signals=ss("_extract_model_signals", True),
+        _include_signal_evidence=ss("_include_signal_evidence", True),
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
         # Per-company autosave
@@ -3714,8 +4208,10 @@ if ss("processing", False):
     _serper_key_run      = ss("_serper_key", "")
     _dry_run_run         = ss("_step2_dry_run", False)
     _zero_cost_run       = ss("_zero_cost_preview", False)
-    _enable_lusha_api_run = ss("_enable_lusha_api", False)
-    _lusha_api_key_run    = ss("_lusha_api_key", "")
+    _enable_lusha_api_run      = ss("_enable_lusha_api", False)
+    _lusha_api_key_run         = ss("_lusha_api_key", "")
+    _extract_model_signals_run = ss("_extract_model_signals", True)
+    _include_signal_evidence_run = ss("_include_signal_evidence", True)
     _pca_enabled_run  = ss("_per_company_autosave_enabled", False)
     _pca_run_dir_run  = ss("_per_company_autosave_run_dir", "")
     total_in          = ss("total_tokens_in", 0)
@@ -4048,6 +4544,8 @@ if ss("processing", False):
                     fields["enrichment_status"] = "zero_cost_preview"
                     fields["step2_status"]      = _s2_status
                     fields.update(icp_fields)
+                    # Fill model-signal defaults (no API call in zero-cost mode)
+                    fields.update(_build_model_signal_empty())
                     # Increment the preview counter
                     ss_set(_dry_run_preview_count=ss("_dry_run_preview_count", 0) + 1)
                     row_cost = 0.0
@@ -4066,6 +4564,8 @@ if ss("processing", False):
                         dry_run=_dry_run_run,
                         enable_lusha_api=_enable_lusha_api_run,
                         lusha_api_key=_lusha_api_key_run,
+                        extract_model_signals=_extract_model_signals_run,
+                        include_signal_evidence=_include_signal_evidence_run,
                     )
                 if not (_zero_cost_run and _dry_run_run):
                     s1_tok   = int(fields.get("step1_tokens_in",  0) or 0) + int(fields.get("step1_tokens_out", 0) or 0)
@@ -4455,7 +4955,12 @@ if ss("enrichment_done", False):
             if c in df_enriched.columns
         ]
         st.dataframe(df_enriched[summary_cols], use_container_width=True, height=400)
-        _tabs = ["Step 1 — All firmographic columns", "Step 2 — All ICP columns"]
+        _tabs = [
+            "Step 1 — All firmographic columns",
+            "Step 2 — All ICP columns",
+            "Model signals — scores & binaries",
+            "Model signals — QA evidence",
+        ]
         if _lusha_done:
             _tabs.append("Lusha API fields")
         _tab_objs = st.tabs(_tabs)
@@ -4465,8 +4970,24 @@ if ss("enrichment_done", False):
         with _tab_objs[1]:
             st.dataframe(df_enriched[[c for c in ICP_FIELDS if c in df_enriched.columns]],
                          use_container_width=True)
-        if _lusha_done and len(_tab_objs) > 2:
-            with _tab_objs[2]:
+        with _tab_objs[2]:
+            _score_bin_cols = [
+                c for c in MODEL_SIGNAL_SCORE_FIELDS + MODEL_SIGNAL_BINARY_FIELDS
+                + MODEL_SIGNAL_QA_FIELDS
+                if c in df_enriched.columns
+            ]
+            if _score_bin_cols:
+                st.dataframe(df_enriched[_score_bin_cols], use_container_width=True)
+            else:
+                st.info("Model signal extraction was not run or is disabled.")
+        with _tab_objs[3]:
+            _evid_cols = [c for c in MODEL_SIGNAL_EVIDENCE_FIELDS if c in df_enriched.columns]
+            if _evid_cols:
+                st.dataframe(df_enriched[_evid_cols], use_container_width=True)
+            else:
+                st.info("No evidence columns found (evidence may be disabled or extraction not run).")
+        if _lusha_done and len(_tab_objs) > 4:
+            with _tab_objs[4]:
                 _lusha_display_cols = [
                     c for c in LUSHA_API_FIELDS + LUSHA_API_META_FIELDS
                     if c in df_enriched.columns
@@ -4487,7 +5008,8 @@ if ss("enrichment_done", False):
     _xl_help      = (
         "All original columns + keyword counts + normalized scores."
         if _elm_done else
-        "All original columns + Step 1 firmographics + Step 2 ICP signals + metadata."
+        "Sheet 1 (Enriched): all enrichment columns. "
+        "Sheet 2 (model_features): input columns + model signal scores + binary columns only."
     )
     _log_help     = (
         "One row per company: fetch status, pages fetched, total chars."
@@ -4523,6 +5045,22 @@ if ss("enrichment_done", False):
             use_container_width=True,
             help=_log_help,
         )
+
+    if not _elm_done:
+        _mf_df = _build_model_features_df(df_enriched)
+        if not _mf_df.empty:
+            _mf_fname = f"model_features_{_run_tag}_{ts()}.csv"
+            st.download_button(
+                "⬇ Model features CSV (scores + binaries only)",
+                data=df_to_csv_bytes(_mf_df),
+                file_name=_mf_fname,
+                mime="text/csv",
+                use_container_width=True,
+                help=(
+                    "Input columns + all model signal score/binary columns. "
+                    "No evidence columns. Ready for logistic regression."
+                ),
+            )
 
     # ── Debug section ─────────────────────────────────────────────────────────
     if debug_mode and debug_records_done:
