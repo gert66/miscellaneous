@@ -3604,7 +3604,7 @@ def reset_processing(clear_autosave: bool = False):
         total_cache_read_tokens=0, total_cache_create_tokens=0,
         autosave_last_name="",
         _jina_retry_count=0, _last_retry_msg="",
-        _local_save_enabled=False, _final_auto_saved=False,
+        _final_auto_saved=False, _last_local_save="",
         _auto_dl_count=0, _auto_dl_last_msg="",
         _step2_debug_log="", _step2_prompt_records=[],
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
@@ -4027,10 +4027,10 @@ with st.sidebar:
     st.subheader("📁 Local auto-save")
     local_save_enabled = st.checkbox(
         "Enable local auto-save",
-        value=ss("local_save_enabled", False),
+        value=ss("local_save_enabled", True),   # default: enabled
         key="local_save_enabled",
         help=(
-            f"Saves an Excel snapshot every {LOCAL_SAVE_EVERY} companies and once more "
+            f"Saves an Excel + CSV snapshot every {LOCAL_SAVE_EVERY} companies and once more "
             "on completion. Only works when the app runs locally."
         ),
     )
@@ -4044,17 +4044,17 @@ with st.sidebar:
         )
         _eff_path = (local_save_path or "").strip() or _DEFAULT_DOWNLOAD_DIR
         ss_set(_local_save_path=_eff_path, _local_save_enabled=True)
+        st.caption(f"📁 Saving to: **{_eff_path}**")
         _last_local = ss("_last_local_save", "")
         if _last_local:
-            st.caption(f"📁 Local auto-save active — saving to: **{_eff_path}**")
             st.caption(f"Last snapshot: {_last_local}")
         else:
-            st.caption(f"Will save to: **{_eff_path}**")
+            st.caption(f"Snapshot every **{LOCAL_SAVE_EVERY}** rows + on completion.")
     else:
         ss_set(_local_save_path="", _local_save_enabled=False)
         st.caption(
-            f"When disabled, the final results file is automatically saved to "
-            f"**{_DEFAULT_DOWNLOAD_DIR}** when processing completes."
+            f"When disabled, only the final results file is saved to "
+            f"**{_DEFAULT_DOWNLOAD_DIR}** on completion."
         )
 
     if debug_mode:
@@ -4311,8 +4311,8 @@ if start_btn and not blocking and not currently_processing:
         _resume_mode=resume_mode, autosave_last_name="",
         _elm_mode=_elm_mode,
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
-        _local_save_enabled=ss("_local_save_enabled", False),
-        _final_auto_saved=False,
+        _local_save_enabled=ss("_local_save_enabled", True),
+        _final_auto_saved=False, _last_local_save="",
         _use_playwright=ss("_use_playwright", True),
         _model_step1=ss("_model_step1", MODEL_STEP1),
         _model_step2=ss("_model_step2", MODEL_STEP2),
