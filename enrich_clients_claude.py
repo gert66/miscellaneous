@@ -1742,30 +1742,38 @@ def _claude_web_search_full(prompt: str, api_key: str, model_id: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_serper_queries(company_name: str, target: str) -> list:
-    """Return 5 targeted Google-style queries for Serper Standard Plus.
+    """Return 5 feature-driven queries for ICP signal extraction.
 
-    Covers language-training intent, L&D signals, and three tiers of provider
-    co-mention (direct corporate language competitors, online language brands,
-    broader L&D platforms).  A future optional Deep Search with Jina full-page
-    fetching can be layered on top of these results later.
+    Each query targets a distinct buying-signal dimension so Claude receives
+    evidence that is grouped by intent rather than by brand co-mention.
     """
-    name = company_name or target
+    name   = company_name or clean_domain(target) or target
+    domain = clean_domain(target) if target else ""
+    site_q = f'site:{domain} OR ' if domain else ""
     return [
-        f'"{name}" language training OR "business English" OR "communication training"',
-        f'"{name}" "learning and development" OR L&D OR academy OR onboarding',
+        # Q1 — General company context (anchor to official site when possible)
+        f'{site_q}"{name}" about company overview headquarters',
+        # Q2 — International footprint / HQ structure
+        f'"{name}" headquarters OR offices OR countries OR "international operations" OR "global presence" OR "regional HQ"',
+        # Q3 — L&D / employee training
+        f'"{name}" "learning and development" OR training OR academy OR onboarding OR "talent development" OR L&D',
+        # Q4 — Language / global-team signals
+        f'"{name}" English OR "language training" OR "global teams" OR multilingual OR "language program" OR intercultural',
+        # Q5 — Competitor / online learning tool co-mention
         (
-            f'"{name}" goFLUENT OR Learnlight OR Speexx OR Voxy OR Learnship'
-            f' OR Berlitz OR "EF Corporate Solutions"'
-        ),
-        (
-            f'"{name}" "Preply Business" OR "Babbel for Business"'
-            f' OR "Busuu for Business" OR "Rosetta Stone Enterprise" OR Talaera'
-        ),
-        (
-            f'"{name}" "LinkedIn Learning" OR "Udemy Business"'
-            f' OR "Coursera for Business" OR OpenSesame OR Skillsoft'
+            f'"{name}" Preply OR Learnlight OR Speexx OR goFLUENT OR Learnship OR Voxy'
+            f' OR "online learning" OR LMS OR Berlitz OR Talaera OR Busuu OR Duolingo'
         ),
     ]
+
+# Human-readable label for each query position (1-to-1 with _build_serper_queries)
+_SERPER_QUERY_LABELS = [
+    "General company context",
+    "International footprint / HQ",
+    "L&D / employee training",
+    "Language / global teams",
+    "Competitor / online learning signal",
+]
 
 
 def _call_serper(query: str, serper_key: str, timeout: int = 15):
@@ -1781,7 +1789,7 @@ def _call_serper(query: str, serper_key: str, timeout: int = 15):
         resp = requests.post(
             SERPER_SEARCH_URL,
             headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-            json={"q": query, "gl": "us", "hl": "en", "num": 10},
+            json={"q": query, "gl": "us", "hl": "en", "num": 5},
             timeout=timeout,
         )
         http_status = resp.status_code
@@ -1820,19 +1828,62 @@ def _call_serper(query: str, serper_key: str, timeout: int = 15):
     return results, http_status, raw_json, None
 
 
-def _format_serper_results(results: list) -> str:
-    """Format Serper organic results into a readable text block for Claude."""
-    if not results:
+_SERPER_CAREER_SIGNALS = frozenset([
+    "career", "/jobs", "glassdoor", "indeed", ".jobs", "workable",
+    "greenhouse.io", "lever.co", "smartrecruiters", "bamboohr",
+    "jobvite", "icims", "taleo", "recruiting",
+])
+_SERPER_NEWS_SIGNALS = frozenset([
+    "reuters", "bloomberg", "wsj.com", "ft.com", "forbes",
+    "techcrunch", "businesswire", "prnewswire", "globenewswire",
+    "marketwatch", "apnews.com", "cnbc", "wired", "theguardian",
+    "economist", "fortune", "venturebeat",
+])
+_SERPER_THIRD_PARTY_SIGNALS = frozenset([
+    "linkedin.com", "crunchbase", "zoominfo", "pitchbook",
+    "dnb.com", "hoovers", "owler", "manta", "trustpilot",
+    "clutch.co", "g2.com", "capterra", "wellfound", "angellist",
+])
+
+
+def _classify_serper_source(link: str, title: str) -> str:
+    """Return a short source-type label for a Serper result URL."""
+    u = link.lower()
+    if any(s in u for s in _SERPER_CAREER_SIGNALS):
+        return "careers"
+    if any(s in u for s in _SERPER_NEWS_SIGNALS):
+        return "news"
+    if any(s in u for s in _SERPER_THIRD_PARTY_SIGNALS):
+        return "third_party"
+    return "company_site"
+
+
+def _format_serper_results(query_groups: list) -> str:
+    """Format per-query Serper results as compact annotated text for Claude.
+
+    Args:
+        query_groups: list of (query_label, hits) tuples where hits is a list
+                      of result dicts returned by _call_serper.
+    """
+    if not query_groups or not any(hits for _, hits in query_groups):
         return "(No web search results were found.)"
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r.get('title', '(no title)')}")
-        if r.get("date"):
-            lines.append(f"    Date: {r['date']}")
-        lines.append(f"    URL: {r.get('link', '')}")
-        lines.append(f"    {r.get('snippet', '')}")
-        lines.append("")
-    return "\n".join(lines).strip()
+    blocks: list[str] = []
+    for label, hits in query_groups:
+        if not hits:
+            continue
+        lines = [f"=== {label} ==="]
+        for i, r in enumerate(hits, 1):
+            title   = (r.get("title", "") or "(no title)").strip()
+            link    = r.get("link", "")
+            snippet = (r.get("snippet", "") or "").strip()[:180]
+            stype   = _classify_serper_source(link, title)
+            lines.append(f"[{i}] {title}")
+            lines.append(f"    URL: {link}")
+            lines.append(f"    source_type: {stype}")
+            if snippet:
+                lines.append(f"    snippet: {snippet}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) if blocks else "(No web search results were found.)"
 
 
 def run_step2_serper(
@@ -1876,14 +1927,21 @@ def run_step2_serper(
 
     # DRY RUN GUARD: do not call Serper or Anthropic in prompt preview mode
     if dry_run:
-        _dry_placeholder = "[DRY RUN: Serper results would be inserted here]"
+        _dry_placeholder = "\n".join(
+            f"=== {lbl} ===\n[DRY RUN: results would appear here]"
+            for lbl in _SERPER_QUERY_LABELS
+        )
         _dry_instruction = (
             f"Now analyze this company based on the web search results provided below.\n\n"
             f"Company: {target}\n\n"
-            f"Web search results (retrieved via Serper Google Search):\n"
+            f"Web search results (retrieved via Serper Google Search, grouped by signal type):\n"
             f"{_dry_placeholder}\n\n"
-            "Base your analysis ONLY on the search results and company information above. "
-            "Do not claim to have searched the web yourself."
+            "Evidence quality rules:\n"
+            "- Only mark a buying signal as present when a result contains company-specific, "
+            "contextual evidence — not just a keyword in a URL or a generic snippet.\n"
+            "- A competitor signal requires the provider name to appear in a meaningful context.\n"
+            "- Set lead_score to High only when two or more clearly distinct strong signals appear.\n"
+            "- Base your analysis ONLY on the search results above. Do not invent evidence."
         )
         _dry_full_prompt = STEP2_STATIC_PREFIX + f"\n\n{_dry_instruction}"
         _dlog(f"DRY RUN: Serper queries that would be sent: {queries}")
@@ -1931,15 +1989,18 @@ def run_step2_serper(
             )
         return (_ICP_EMPTY.copy(), {}, 0, 0, "dry_run", "DRY RUN: no API call made", 0, 0)
 
-    all_hits: list = []
-    for qi, q in enumerate(queries, 1):
-        _dlog(f"Serper query: {q}")
+    # ── Collect results per-query, preserving query-label grouping ───────────
+    query_groups: list = []   # [(label, hits), ...]
+    labels = _SERPER_QUERY_LABELS
+    for qi, (q, label) in enumerate(zip(queries, labels), 1):
+        _dlog(f"Serper query [{label}]: {q}")
         hits, http_status, raw_json, err_str = _call_serper(q, serper_key)
         if err_str:
-            _dlog(f"Serper warning — {err_str}")
+            _dlog(f"Serper warning [{label}] — {err_str}")
+            hits = []
         else:
-            all_hits.extend(hits)
-            _dlog(f"Serper returned {len(hits)} results")
+            _dlog(f"Serper returned {len(hits)} results for [{label}]")
+        query_groups.append((label, hits))
         if _debug_callback:
             _ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -1963,26 +2024,23 @@ def run_step2_serper(
             except Exception:
                 pass
 
-    # Deduplicate by URL
-    seen: set = set()
-    deduped: list = []
-    for r in all_hits:
-        lnk = r.get("link", "")
-        if lnk and lnk not in seen:
-            seen.add(lnk)
-            deduped.append(r)
-
-    _dlog(f"Total unique Serper results for {company_name}: {len(deduped)}")
+    total_hits = sum(len(h) for _, h in query_groups)
+    _dlog(f"Total Serper results for {company_name}: {total_hits} across {len(query_groups)} queries")
 
     # ── Build Claude prompt ────────────────────────────────────────────────────
-    results_text = _format_serper_results(deduped)
+    results_text = _format_serper_results(query_groups)
     search_instruction = (
         f"Now analyze this company based on the web search results provided below.\n\n"
         f"Company: {target}\n\n"
-        f"Web search results (retrieved via Serper Google Search):\n"
+        f"Web search results (retrieved via Serper Google Search, grouped by signal type):\n"
         f"{results_text}\n\n"
-        "Base your analysis ONLY on the search results and company information above. "
-        "Do not claim to have searched the web yourself."
+        "Evidence quality rules:\n"
+        "- Only mark a buying signal as present when a result contains company-specific, "
+        "contextual evidence — not just a keyword in a URL or a generic snippet.\n"
+        "- A competitor signal requires the provider name to appear in a meaningful context "
+        "(HR case study, employee benefit page, vendor review) not just a search result title.\n"
+        "- Set lead_score to High only when two or more clearly distinct strong signals appear.\n"
+        "- Base your analysis ONLY on the search results above. Do not invent or infer evidence."
     )
     full_prompt = STEP2_STATIC_PREFIX + f"\n\n{search_instruction}"
 
@@ -1994,11 +2052,11 @@ def run_step2_serper(
             company=company_name,
             model=model_step2,
             provider=STEP2_PROVIDER_SERPER,
-            search_prompt=f"Queries: {queries}\n\nResults count: {len(deduped)}",
+            search_prompt=f"Queries: {queries}\n\nTotal results: {total_hits}",
             full_prompt=full_prompt,
             notes=[
                 f"Serper queries used: {queries}",
-                f"Unique results retrieved: {len(deduped)}",
+                f"Total results retrieved: {total_hits} across {len(query_groups)} queries",
                 f"Selected model: {model_step2}",
             ],
         )
