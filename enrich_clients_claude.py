@@ -235,14 +235,14 @@ Binary field rules:
   is_public = 1 if the company appears publicly listed or has clear public company evidence.
   has_funding = 1 if funding rounds, venture backing, private equity, acquisition funding, or similar evidence is found.
 
-Company: {company_name}
-Domain: {domain}
+Company: __COMPANY_NAME__
+Domain: __DOMAIN__
 
 Enrichment context:
-{enrichment_context}
+__ENRICHMENT_CONTEXT__
 
 Return a JSON object with EXACTLY these fields and no others:
-{{
+{
   "sig_intl_footprint_score": <int 0-3>,
   "sig_intl_footprint_evidence": <str>,
   "sig_foreign_hq_score": <int 0-3>,
@@ -298,7 +298,7 @@ Return a JSON object with EXACTLY these fields and no others:
   "model_signal_manual_review_reason": <str>,
   "model_signal_sources_used": <str>,
   "model_signal_search_quality": <"good" or "partial" or "weak" or "failed">
-}}
+}
 """
 
 
@@ -1471,7 +1471,7 @@ def _step1_has_data(fields: dict) -> bool:
 
 
 _STEP1_FALLBACK_PROMPT_TMPL = (
-    "Find company information about {company_name} ({url}). "
+    "Find company information about __COMPANY_NAME__ (__URL__). "
     "Extract: industry, employee count, founding year, headquarters location, "
     "description, international presence, specialties. "
     "Return ONLY JSON with fields: company_name, description, main_industry, "
@@ -1606,9 +1606,10 @@ def run_step1(
         _delete_cache(ck)
 
     try:
-        prompt = _STEP1_FALLBACK_PROMPT_TMPL.format(
-            company_name=company_name or target,
-            url=target,
+        prompt = (
+            _STEP1_FALLBACK_PROMPT_TMPL
+            .replace("__COMPANY_NAME__", company_name or target)
+            .replace("__URL__", target)
         )
         raw_text, in_t, out_t = _claude_web_search_loop(prompt, api_key, model_id=model_step1)
         total_in  += in_t
@@ -2490,10 +2491,11 @@ def run_model_signal_extraction(
 
     context_text = _build_enrichment_context(enrichment_row)
 
-    prompt = MODEL_SIGNAL_PROMPT_TEMPLATE.format(
-        company_name=company_name or "(unknown)",
-        domain=domain or "(unknown)",
-        enrichment_context=context_text,
+    prompt = (
+        MODEL_SIGNAL_PROMPT_TEMPLATE
+        .replace("__COMPANY_NAME__", company_name or "(unknown)")
+        .replace("__DOMAIN__", domain or "(unknown)")
+        .replace("__ENRICHMENT_CONTEXT__", context_text)
     )
 
     _STRICT_SUFFIX = "\n\nReturn ONLY raw JSON. No markdown, no backticks, no explanation."
