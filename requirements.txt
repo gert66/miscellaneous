@@ -1,3 +1,14 @@
+anthropic
+streamlit>=1.31
+pandas
+requests
+beautifulsoup4
+openpyxl
+lxml
+numpy
+matplotlib
+plotly
+scikit-learn
 streamlit
 pandas
 numpy
