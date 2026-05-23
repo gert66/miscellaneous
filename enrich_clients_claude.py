@@ -3708,17 +3708,20 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
 # UI
 # =============================================================================
 
-st.set_page_config(
-    page_title="Claude Company Enrichment",
-    page_icon="🏢",
-    layout="wide",
-)
-st.title("🏢 Claude Company Enrichment")
-st.caption(
-    "Upload a file with company names and URLs. "
-    "Each row is enriched in two passes: basic firmographics (Jina AI + Claude) "
-    "and Mingle ICP signals (Claude web search)."
-)
+if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
+    # When run directly (streamlit run enrich_clients_claude.py) set up the page.
+    # When launched via streamlit_app.py the entrypoint already called these.
+    st.set_page_config(
+        page_title="Claude Company Enrichment",
+        page_icon="🏢",
+        layout="wide",
+    )
+    st.title("🏢 Claude Company Enrichment")
+    st.caption(
+        "Upload a file with company names and URLs. "
+        "Each row is enriched in two passes: basic firmographics (Jina AI + Claude) "
+        "and Mingle ICP signals (Claude web search)."
+    )
 
 # =============================================================================
 # API KEY — secrets only, no sidebar input
