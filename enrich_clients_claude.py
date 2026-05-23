@@ -42,10 +42,11 @@ except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
 try:
-    import scoring as _scoring
+    from commercial_fit_scoring import score_dataframe as _score_dataframe, SCORE_OUTPUT_COLS as _SCORE_OUTPUT_COLS
     _SCORING_AVAILABLE = True
 except ImportError:
-    _scoring = None  # type: ignore[assignment]
+    _score_dataframe = None  # type: ignore[assignment]
+    _SCORE_OUTPUT_COLS = []
     _SCORING_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3692,7 +3693,7 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
     if _SCORING_AVAILABLE and not st.session_state.get("_elm_mode", False):
         try:
-            df_out = _scoring.apply_scoring(df_out)
+            df_out = _score_dataframe(df_out)
         except Exception:
             pass
     ss_set(
@@ -4149,14 +4150,60 @@ with st.sidebar:
         delay_sec = 1.0
 
 # =============================================================================
-# STEP 1 — Upload file
+# INPUT MODE
 # =============================================================================
 
-st.subheader("Step 1 · Upload your file")
-uploaded = st.file_uploader(
-    "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
-    type=["xlsx", "xls", "csv"],
-)
+_mode_col, _ = st.columns([2, 3])
+with _mode_col:
+    _app_mode = st.radio(
+        "Input mode",
+        ["Batch Upload", "Single Company"],
+        horizontal=True,
+        key="app_mode_radio",
+    )
+
+_sc_df: pd.DataFrame | None = None
+_sc_name_col  = "company_name"
+_sc_domain_col = "domain"
+
+if _app_mode == "Single Company":
+    st.divider()
+    st.subheader("Single company enrichment & scoring")
+    st.caption(
+        "Enter a company name and optional domain. "
+        "The app will run the full enrichment pipeline and compute the commercial fit score."
+    )
+    _sc_f1, _sc_f2 = st.columns(2)
+    with _sc_f1:
+        _sc_name_input = st.text_input(
+            "Company name *", key="sc_company_name",
+            placeholder="e.g. Acme Corp",
+        )
+    with _sc_f2:
+        _sc_url_input = st.text_input(
+            "Domain or URL (optional)", key="sc_company_url",
+            placeholder="e.g. acme.com",
+        )
+    if _sc_name_input:
+        _sc_df = pd.DataFrame([{
+            "company_name": _sc_name_input.strip(),
+            "domain": (_sc_url_input or "").strip(),
+        }])
+    else:
+        st.info("Enter a company name above to begin.")
+
+# =============================================================================
+# STEP 1 — Upload file  (Batch mode only)
+# =============================================================================
+
+uploaded = None
+if _app_mode == "Batch Upload":
+    st.divider()
+    st.subheader("Step 1 · Upload your file")
+    uploaded = st.file_uploader(
+        "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
+        type=["xlsx", "xls", "csv"],
+    )
 
 new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
 if new_file_key != ss("_file_key"):
@@ -4205,9 +4252,9 @@ elif uploaded and df_raw is not None:
 # STEP 2 — Preview
 # =============================================================================
 
-name_col     = None
-domain_col   = None
-n_to_process = 0
+name_col     = _sc_name_col if _app_mode == "Single Company" else None
+domain_col   = _sc_domain_col if _app_mode == "Single Company" else None
+n_to_process = 1 if (_app_mode == "Single Company" and _sc_df is not None) else 0
 
 if df_raw is not None:
 
@@ -4309,8 +4356,10 @@ if (
 _active_lusha_api = ss("_enable_lusha_api", False)
 if _active_lusha_api and not lusha_api_key:
     blocking.append("LUSHA_API_KEY is missing from .streamlit/secrets.toml")
-if uploaded is None:
+if _app_mode == "Batch Upload" and uploaded is None:
     blocking.append("No file uploaded yet.")
+if _app_mode == "Single Company" and (_sc_df is None or _sc_df.empty):
+    blocking.append("Enter a company name to proceed.")
 if file_error:
     blocking.append(f"File could not be read: {file_error}")
 if df_raw is not None and name_col is None:
@@ -4338,8 +4387,9 @@ elif not blocking and not currently_processing and not enrichment_done:
             f"(~${_cost_per_row:.2f}/company with current model selection)."
         )
 
+_start_label = "▶ Enrich & Score" if _app_mode == "Single Company" else "▶ Start enrichment"
 start_btn = st.button(
-    "▶ Start enrichment",
+    _start_label,
     type="primary",
     use_container_width=True,
     disabled=(bool(blocking) or currently_processing),
@@ -4347,7 +4397,12 @@ start_btn = st.button(
 )
 
 if start_btn and not blocking and not currently_processing:
-    df_work      = df_raw.head(n_to_process).copy()
+    if _app_mode == "Single Company" and _sc_df is not None:
+        df_work    = _sc_df.copy()
+        name_col   = _sc_name_col
+        domain_col = _sc_domain_col
+    else:
+        df_work    = df_raw.head(n_to_process).copy()
     resume_mode  = ss("_resume_mode", False)
     if not resume_mode:
         autosave_clear()   # wipe any previous autosave on a fresh start
@@ -5133,7 +5188,9 @@ if ss("enrichment_done", False):
             )
     else:
         _lusha_done = ss("_enable_lusha_api", False)
-        summary_cols = orig_cols + [
+        # Scoring columns first (if available)
+        _sc_summary = [c for c in (_SCORE_OUTPUT_COLS or []) if c in df_enriched.columns]
+        summary_cols = orig_cols + _sc_summary + [
             c for c in [
                 # Metadata
                 "enrichment_status", "step1_status", "step2_status",
@@ -5206,49 +5263,157 @@ if ss("enrichment_done", False):
 
     # ── Commercial Fit Scoring ────────────────────────────────────────────────
     if not _elm_done and _SCORING_AVAILABLE:
-        _score_cols = _scoring.SCORING_COLS
-        if all(c in df_enriched.columns for c in _score_cols):
+        _score_key_col = "final_commercial_fit_score"
+        _score_cols    = _SCORE_OUTPUT_COLS
+        if _score_key_col in df_enriched.columns:
             st.divider()
-            st.subheader("🎯 Commercial Fit Scoring")
 
-            with st.expander("ℹ️ About these scores", expanded=False):
-                st.markdown(
-                    "**How scores are calculated:**\n\n"
-                    "1. **Model probability** — lean logistic regression applied to the "
-                    "Step 3 model-signal fields (`sig_*`, `ti_*`, `has_*`, etc.).\n"
-                    "2. **ICP Similarity Score [1–10]** — linear rescaling of model probability.\n"
-                    "3. **Company Size Score [1–10]** — five-band mapping from employee range "
-                    "(2 = tiny < 50, 4 = small 50–199, 6 = medium 200–999, "
-                    "8 = large 1k–5k, 10 = enterprise > 5k).\n"
-                    "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + "
-                    "0.25 × Company Size Score.\n"
-                    "5. **Tier** — Tier 1 ≥ 7.5 · Tier 2 ≥ 6.0 · Tier 3 ≥ 4.5 · Pass < 4.5.\n\n"
-                    "⚠️ **Placeholder model**: coefficients, intercept, and tier thresholds are "
-                    "placeholder values. Update `LEAN_MODEL_COEFFICIENTS`, `INTERCEPT`, and "
-                    "`TIER_THRESHOLDS` in `scoring.py` with the values from `Results(3).xlsx`."
+            # ── Single company: score card ────────────────────────────────────
+            if processed == 1:
+                _sc_row = df_enriched.iloc[0]
+                _fit   = _sc_row.get(_score_key_col, 0)
+                _tier  = _sc_row.get("commercial_tier", "—")
+                _icp   = _sc_row.get("icp_similarity_score", 0)
+                _sz    = _sc_row.get("company_size_score", 0)
+                _prob  = _sc_row.get("model_probability", 0)
+                _top_d = _sc_row.get("top_score_drivers", "")
+                _wk_d  = _sc_row.get("weak_score_drivers", "")
+                _notes = _sc_row.get("scoring_notes", "")
+                _dqf   = _sc_row.get("data_quality_flag", "")
+                _gc    = _sc_row.get("global_complexity_score", "")
+                _pd_s  = _sc_row.get("people_development_score", "")
+                _cc    = _sc_row.get("commercial_complexity_score", "")
+
+                _tier_emoji = {"Tier 1": "🟢", "Tier 2": "🟡", "Tier 3": "🟠", "Pass": "🔴"}.get(str(_tier), "⚪")
+                _dq_label   = {"high": "✅ High", "medium": "⚠️ Medium", "low": "🔴 Low"}.get(str(_dqf), str(_dqf))
+
+                st.subheader("🎯 Commercial Fit Score")
+                st.caption(
+                    "The score combines ICP similarity and company size. "
+                    "ICP similarity is based on enriched buying signals. "
+                    "Company size is used as a commercial weighting factor."
+                )
+                _m1, _m2, _m3, _m4 = st.columns(4)
+                _m1.metric("Commercial Fit Score", f"{float(_fit):.2f} / 10")
+                _m2.metric("Commercial Tier", f"{_tier_emoji} {_tier}")
+                _m3.metric("ICP Similarity", f"{float(_icp):.2f} / 10")
+                _m4.metric("Company Size", f"{_sz} / 10")
+
+                _d1, _d2, _d3 = st.columns(3)
+                _d1.metric("Global Complexity", f"{_gc} / 10" if _gc != "" else "—")
+                _d2.metric("People Development", f"{_pd_s} / 10" if _pd_s != "" else "—")
+                _d3.metric("Commercial Complexity", f"{_cc} / 10" if _cc != "" else "—")
+
+                if _top_d and str(_top_d) != "none":
+                    st.markdown(f"**Top score drivers:** {_top_d}")
+                if _wk_d and str(_wk_d) != "none":
+                    st.markdown(f"**Weak / missing drivers:** {_wk_d}")
+
+                # Suggested cold-call opening angle from top driver
+                _top_driver_field = (str(_top_d) or "").split(";")[0].split("=")[0].strip()
+                _opening_map = {
+                    "sig_explicit_lnd_score":    "I saw that {name} has a strong L&D programme — we help companies like yours scale language training across global teams.",
+                    "sig_lnd_onboarding_score":  "Your structured onboarding process caught my attention — we specialise in language-ready onboarding for international hires.",
+                    "sig_intl_footprint_score":  "{name}'s international presence is exactly the profile we work with — multilingual communication across offices is our core focus.",
+                    "sig_foreign_hq_score":      "With {name}'s cross-border structure, language alignment between HQ and local teams is often a real friction point — that's where we come in.",
+                    "sig_rapid_growth_score":    "{name}'s growth trajectory often brings language challenges — we help scaling companies maintain communication quality across markets.",
+                    "sig_multicultural_score":   "The diverse workforce at {name} is a strong fit for our language learning programmes tailored for multicultural teams.",
+                    "language_competitor_strength_score": "I noticed a competitor in your space is already investing in language training — this is a strong signal we can help {name} stay ahead.",
+                }
+                _company_display = str(df_enriched.iloc[0].get("company_name", "your company"))
+                _opening = _opening_map.get(
+                    _top_driver_field,
+                    "Based on {name}'s profile, your team could benefit from targeted language and communication training across international operations.",
+                ).replace("{name}", _company_display)
+                with st.expander("💬 Suggested cold-call opening angle", expanded=True):
+                    st.markdown(f"_{_opening}_")
+                    st.caption("Generated from top score driver. Customise before use.")
+
+                if _notes:
+                    with st.expander("ℹ️ Scoring notes", expanded=False):
+                        st.caption(str(_notes))
+                if _dqf:
+                    st.caption(f"Data quality: {_dq_label} · Model probability: {float(_prob):.1%}")
+
+            else:
+                # ── Batch: filtered + sorted score table ──────────────────────
+                st.subheader("🎯 Commercial Fit Scoring")
+                st.caption(
+                    "The score combines ICP similarity and company size. "
+                    "ICP similarity is based on enriched buying signals. "
+                    "Company size is used as a commercial weighting factor. "
+                    "Final Commercial Fit Score = 0.75 × ICP Similarity + 0.25 × Company Size."
                 )
 
-            _tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
-            _tier_counts = df_enriched["commercial_tier"].value_counts()
-            _tier_colors = ["🟢", "🟡", "🟠", "🔴"]
-            _tc = st.columns(4)
-            for _i, (_tier, _emoji) in enumerate(zip(_tier_order, _tier_colors)):
-                _cnt = int(_tier_counts.get(_tier, 0))
-                _pct = f"{_cnt / max(processed, 1):.0%}"
-                _tc[_i].metric(f"{_emoji} {_tier}", _cnt, delta=_pct,
-                               delta_color="off")
+                with st.expander("ℹ️ About these scores", expanded=False):
+                    st.markdown(
+                        "1. **Model probability** — lean logistic regression on 7 key model-signal fields.\n"
+                        "2. **ICP Similarity Score [1–10]** — rescaled sigmoid output.\n"
+                        "3. **Company Size Score [1–10]** — 5-band employee-count mapping.\n"
+                        "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + 0.25 × Company Size.\n"
+                        "5. **Tier** — Tier 1 ≥ 7.5 · Tier 2 ≥ 6.0 · Tier 3 ≥ 4.5 · Pass < 4.5.\n"
+                        "6. **Composite scores** — global complexity, people development, commercial complexity "
+                        "(each 0–10, from signal groupings).\n\n"
+                        "⚠️ Coefficients are placeholder values — update `LEAN_COEFFICIENTS` and `INTERCEPT` "
+                        "in `commercial_fit_scoring.py` with fitted values from Results(3).xlsx."
+                    )
 
-            _id_cols_sc = [
-                c for c in df_enriched.columns
-                if c not in set(ALL_ENRICHMENT_FIELDS + _score_cols)
-            ][:2]
-            _disp_cols = _id_cols_sc + _score_cols
-            _score_disp_df = (
-                df_enriched[[c for c in _disp_cols if c in df_enriched.columns]]
-                .copy()
-                .sort_values("commercial_fit_score", ascending=False)
-            )
-            st.dataframe(_score_disp_df, use_container_width=True, height=400)
+                _tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
+                _tier_counts = df_enriched["commercial_tier"].value_counts()
+                _tier_colors = ["🟢", "🟡", "🟠", "🔴"]
+                _tc = st.columns(4)
+                for _i, (_tier, _emoji) in enumerate(zip(_tier_order, _tier_colors)):
+                    _cnt = int(_tier_counts.get(_tier, 0))
+                    _pct = f"{_cnt / max(processed, 1):.0%}"
+                    _tc[_i].metric(f"{_emoji} {_tier}", _cnt, delta=_pct, delta_color="off")
+
+                _fc1, _fc2, _fc3 = st.columns([2, 2, 2])
+                with _fc1:
+                    _tier_filter = st.selectbox(
+                        "Show tiers",
+                        ["All", "Tier 1 only", "Tier 1 & 2"],
+                        key="score_tier_filter",
+                    )
+                with _fc2:
+                    _min_score = st.slider(
+                        "Minimum fit score",
+                        min_value=0.0, max_value=10.0,
+                        value=0.0, step=0.5,
+                        key="score_min_slider",
+                    )
+                with _fc3:
+                    _sort_by = st.selectbox(
+                        "Sort by",
+                        ["final_commercial_fit_score", "model_probability", "company_size_score"],
+                        key="score_sort_col",
+                    )
+
+                _id_cols_sc = [
+                    c for c in df_enriched.columns
+                    if c not in set(ALL_ENRICHMENT_FIELDS + list(_score_cols))
+                ][:2]
+                _disp_core = [
+                    "final_commercial_fit_score", "commercial_tier",
+                    "model_probability", "icp_similarity_score", "company_size_score",
+                    "top_score_drivers", "scoring_notes",
+                    "global_complexity_score", "people_development_score",
+                    "commercial_complexity_score", "data_quality_flag",
+                ]
+                _disp_cols = _id_cols_sc + [c for c in _disp_core if c in df_enriched.columns]
+                _score_disp_df = df_enriched[[c for c in _disp_cols if c in df_enriched.columns]].copy()
+
+                if _tier_filter == "Tier 1 only":
+                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"] == "Tier 1"]
+                elif _tier_filter == "Tier 1 & 2":
+                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"].isin(["Tier 1", "Tier 2"])]
+                if _min_score > 0 and "final_commercial_fit_score" in _score_disp_df.columns:
+                    _score_disp_df = _score_disp_df[_score_disp_df["final_commercial_fit_score"] >= _min_score]
+                if _sort_by in _score_disp_df.columns:
+                    _score_disp_df = _score_disp_df.sort_values(_sort_by, ascending=False)
+
+                st.dataframe(_score_disp_df, use_container_width=True, height=420)
+                st.caption(f"Showing {len(_score_disp_df)} of {processed} companies.")
+
         elif not ss("_extract_model_signals", True):
             st.info(
                 "ℹ️ Commercial fit scoring requires Step 3 model signal extraction. "
@@ -5495,7 +5660,8 @@ if not ss("processing", False) and _SCORING_AVAILABLE:
                 )
 
                 # Check for required signal columns
-                _req_sig = [c for c in _scoring.LEAN_MODEL_COEFFICIENTS if c in _sa_df.columns]
+                from commercial_fit_scoring import LEAN_COEFFICIENTS as _sa_lean_coeffs
+                _req_sig = [c for c in _sa_lean_coeffs if c in _sa_df.columns]
                 if not _req_sig:
                     st.warning(
                         "⚠️ No model-signal columns found (`sig_*`, `ti_*`, `has_*`). "
@@ -5503,8 +5669,8 @@ if not ss("processing", False) and _SCORING_AVAILABLE:
                         "enabled first, then upload that output here."
                     )
                 else:
-                    st.caption(f"Signal columns found: {len(_req_sig)} / {len(_scoring.LEAN_MODEL_COEFFICIENTS)}")
-                    _sa_df_scored = _scoring.apply_scoring(_sa_df.copy())
+                    st.caption(f"Signal columns found: {len(_req_sig)} / {len(_sa_lean_coeffs)}")
+                    _sa_df_scored = _score_dataframe(_sa_df.copy())
 
                     _sa_tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
                     _sa_tier_counts = _sa_df_scored["commercial_tier"].value_counts()
@@ -5516,14 +5682,14 @@ if not ss("processing", False) and _SCORING_AVAILABLE:
                             int(_sa_tier_counts.get(_st_tier, 0)),
                         )
 
-                    _sa_score_cols = _scoring.SCORING_COLS
+                    _sa_score_cols = list(_SCORE_OUTPUT_COLS)
                     _sa_id_cols    = [c for c in _sa_df_scored.columns
                                       if c not in set(ALL_ENRICHMENT_FIELDS + _sa_score_cols)][:2]
                     _sa_disp_cols  = _sa_id_cols + _sa_score_cols
                     _sa_disp_df    = (
                         _sa_df_scored[[c for c in _sa_disp_cols if c in _sa_df_scored.columns]]
                         .copy()
-                        .sort_values("commercial_fit_score", ascending=False)
+                        .sort_values("final_commercial_fit_score", ascending=False)
                     )
                     st.dataframe(_sa_disp_df, use_container_width=True, height=400)
 
