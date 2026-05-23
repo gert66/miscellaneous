@@ -41,6 +41,13 @@ try:
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
+try:
+    import scoring as _scoring
+    _SCORING_AVAILABLE = True
+except ImportError:
+    _scoring = None  # type: ignore[assignment]
+    _SCORING_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3683,6 +3690,11 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
     enriched_df = pd.DataFrame(results)
     for col in flist:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
+    if _SCORING_AVAILABLE and not st.session_state.get("_elm_mode", False):
+        try:
+            df_out = _scoring.apply_scoring(df_out)
+        except Exception:
+            pass
     ss_set(
         processing=False, stop_requested=False,
         enrichment_done=True, df_enriched=df_out,
@@ -5192,6 +5204,57 @@ if ss("enrichment_done", False):
                 ]
                 st.dataframe(df_enriched[_lusha_display_cols], use_container_width=True)
 
+    # ── Commercial Fit Scoring ────────────────────────────────────────────────
+    if not _elm_done and _SCORING_AVAILABLE:
+        _score_cols = _scoring.SCORING_COLS
+        if all(c in df_enriched.columns for c in _score_cols):
+            st.divider()
+            st.subheader("🎯 Commercial Fit Scoring")
+
+            with st.expander("ℹ️ About these scores", expanded=False):
+                st.markdown(
+                    "**How scores are calculated:**\n\n"
+                    "1. **Model probability** — lean logistic regression applied to the "
+                    "Step 3 model-signal fields (`sig_*`, `ti_*`, `has_*`, etc.).\n"
+                    "2. **ICP Similarity Score [1–10]** — linear rescaling of model probability.\n"
+                    "3. **Company Size Score [1–10]** — five-band mapping from employee range "
+                    "(2 = tiny < 50, 4 = small 50–199, 6 = medium 200–999, "
+                    "8 = large 1k–5k, 10 = enterprise > 5k).\n"
+                    "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + "
+                    "0.25 × Company Size Score.\n"
+                    "5. **Tier** — Tier 1 ≥ 7.5 · Tier 2 ≥ 6.0 · Tier 3 ≥ 4.5 · Pass < 4.5.\n\n"
+                    "⚠️ **Placeholder model**: coefficients, intercept, and tier thresholds are "
+                    "placeholder values. Update `LEAN_MODEL_COEFFICIENTS`, `INTERCEPT`, and "
+                    "`TIER_THRESHOLDS` in `scoring.py` with the values from `Results(3).xlsx`."
+                )
+
+            _tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
+            _tier_counts = df_enriched["commercial_tier"].value_counts()
+            _tier_colors = ["🟢", "🟡", "🟠", "🔴"]
+            _tc = st.columns(4)
+            for _i, (_tier, _emoji) in enumerate(zip(_tier_order, _tier_colors)):
+                _cnt = int(_tier_counts.get(_tier, 0))
+                _pct = f"{_cnt / max(processed, 1):.0%}"
+                _tc[_i].metric(f"{_emoji} {_tier}", _cnt, delta=_pct,
+                               delta_color="off")
+
+            _id_cols_sc = [
+                c for c in df_enriched.columns
+                if c not in set(ALL_ENRICHMENT_FIELDS + _score_cols)
+            ][:2]
+            _disp_cols = _id_cols_sc + _score_cols
+            _score_disp_df = (
+                df_enriched[[c for c in _disp_cols if c in df_enriched.columns]]
+                .copy()
+                .sort_values("commercial_fit_score", ascending=False)
+            )
+            st.dataframe(_score_disp_df, use_container_width=True, height=400)
+        elif not ss("_extract_model_signals", True):
+            st.info(
+                "ℹ️ Commercial fit scoring requires Step 3 model signal extraction. "
+                "Enable **Extract model signals (Step 3)** in the sidebar and re-run."
+            )
+
     # ── Downloads ─────────────────────────────────────────────────────────────
     st.subheader("Download results")
     log_df = make_log_df(debug_records_done, elm_mode=_elm_done)
@@ -5399,3 +5462,87 @@ if ss("enrichment_done", False):
     if st.button("↺ Start a new enrichment", use_container_width=True, key="restart_btn"):
         reset_processing(clear_autosave=True)
         st.rerun()
+
+# =============================================================================
+# STANDALONE COMMERCIAL FIT SCORER
+# Score a previously enriched file without running enrichment again.
+# =============================================================================
+
+if not ss("processing", False) and _SCORING_AVAILABLE:
+    st.divider()
+    with st.expander("🎯 Score an existing enrichment file", expanded=False):
+        st.caption(
+            "Upload a previously enriched Excel or CSV file to apply commercial fit scoring "
+            "without re-running the enrichment pipeline.  The file must contain the Step 3 "
+            "model-signal columns (`sig_*`, `ti_*`, `has_*`, `is_public`, `has_funding`)."
+        )
+        _sa_upload = st.file_uploader(
+            "Upload enriched file (.xlsx · .xls · .csv)",
+            type=["xlsx", "xls", "csv"],
+            key="standalone_scorer_upload",
+        )
+        if _sa_upload is not None:
+            try:
+                _sa_fname = _sa_upload.name
+                _sa_df = (
+                    pd.read_csv(_sa_upload)
+                    if _sa_fname.lower().endswith(".csv")
+                    else pd.read_excel(_sa_upload)
+                )
+                st.success(
+                    f"**{_sa_fname}** loaded — "
+                    f"{len(_sa_df):,} rows, {len(_sa_df.columns)} columns"
+                )
+
+                # Check for required signal columns
+                _req_sig = [c for c in _scoring.LEAN_MODEL_COEFFICIENTS if c in _sa_df.columns]
+                if not _req_sig:
+                    st.warning(
+                        "⚠️ No model-signal columns found (`sig_*`, `ti_*`, `has_*`). "
+                        "Run the enrichment pipeline with **Extract model signals (Step 3)** "
+                        "enabled first, then upload that output here."
+                    )
+                else:
+                    st.caption(f"Signal columns found: {len(_req_sig)} / {len(_scoring.LEAN_MODEL_COEFFICIENTS)}")
+                    _sa_df_scored = _scoring.apply_scoring(_sa_df.copy())
+
+                    _sa_tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
+                    _sa_tier_counts = _sa_df_scored["commercial_tier"].value_counts()
+                    _sa_tc = st.columns(4)
+                    _sa_emojis = ["🟢", "🟡", "🟠", "🔴"]
+                    for _si, (_st_tier, _se) in enumerate(zip(_sa_tier_order, _sa_emojis)):
+                        _sa_tc[_si].metric(
+                            f"{_se} {_st_tier}",
+                            int(_sa_tier_counts.get(_st_tier, 0)),
+                        )
+
+                    _sa_score_cols = _scoring.SCORING_COLS
+                    _sa_id_cols    = [c for c in _sa_df_scored.columns
+                                      if c not in set(ALL_ENRICHMENT_FIELDS + _sa_score_cols)][:2]
+                    _sa_disp_cols  = _sa_id_cols + _sa_score_cols
+                    _sa_disp_df    = (
+                        _sa_df_scored[[c for c in _sa_disp_cols if c in _sa_df_scored.columns]]
+                        .copy()
+                        .sort_values("commercial_fit_score", ascending=False)
+                    )
+                    st.dataframe(_sa_disp_df, use_container_width=True, height=400)
+
+                    _sa_stamp = ts()
+                    st.download_button(
+                        "⬇ Download scored file (.xlsx)",
+                        data=df_to_excel_bytes(_sa_df_scored),
+                        file_name=f"scored_{_sa_fname.rsplit('.', 1)[0]}_{_sa_stamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="sa_dl_xlsx",
+                    )
+                    st.download_button(
+                        "⬇ Download scored file (.csv)",
+                        data=df_to_csv_bytes(_sa_df_scored),
+                        file_name=f"scored_{_sa_fname.rsplit('.', 1)[0]}_{_sa_stamp}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="sa_dl_csv",
+                    )
+            except Exception as _sa_exc:
+                st.error(f"Could not process file: {_sa_exc}")
