@@ -9,3 +9,9 @@ numpy
 matplotlib
 plotly
 scikit-learn
+streamlit
+pandas
+numpy
+matplotlib
+scikit-learn
+seaborn
