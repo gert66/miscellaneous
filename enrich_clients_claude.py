@@ -3883,43 +3883,147 @@ def _xl_write_scoring_settings(ws) -> None:
 
 # Human-readable labels for model signal field names.
 _SIGNAL_READABLE: dict[str, str] = {
+    # Global complexity
     "sig_foreign_hq_score":                  "Foreign headquarters or group structure",
-    "sig_explicit_lnd_score":                "Learning and development evidence",
     "sig_intl_footprint_score":              "International footprint",
-    "sig_employer_branding_score":           "Employer branding and employee experience",
-    "sig_lnd_onboarding_score":              "Learning, development, and onboarding",
-    "ti_onboarding_score":                   "Onboarding training interest",
-    "sig_rapid_growth_score":                "Rapid growth trajectory",
     "sig_multicultural_score":               "Multicultural workforce",
-    "sig_merger_acq_score":                  "M&A activity",
-    "competitor_signal_strength_score":      "Direct competitor signal",
-    "language_competitor_strength_score":    "Language competitor signal",
-    "online_learning_signal_strength_score": "Online learning platform signal",
-    "lnd_platform_signal_strength_score":    "L&D platform signal",
+    # People development
+    "sig_explicit_lnd_score":                "Explicit learning and development focus",
+    "sig_lnd_onboarding_score":              "Learning, development, and onboarding programmes",
+    "sig_employer_branding_score":           "Employer branding and employee experience",
+    # Growth and context
+    "sig_rapid_growth_score":                "Rapid growth trajectory",
+    "sig_merger_acq_score":                  "Mergers and acquisitions activity",
+    # Training intent
     "ti_language_english_score":             "English language training interest",
+    "ti_onboarding_score":                   "Onboarding training interest",
     "ti_leadership_score":                   "Leadership development training interest",
-    "ti_team_collab_score":                  "Team collaboration training interest",
-    "ti_intercultural_score":                "Intercultural / cross-cultural training interest",
+    "ti_intercultural_score":                "Intercultural and cross-cultural training interest",
     "ti_negotiation_sales_score":            "Negotiation and sales training interest",
+    "ti_team_collab_score":                  "Team collaboration training interest",
     "ti_broader_professional_score":         "Broader professional skills training interest",
-    "model_signal_overall_confidence_score": "Overall model signal confidence",
+    # Competitor signals
+    "competitor_signal_strength_score":      "Direct language training competitor signal",
+    "language_competitor_strength_score":    "Language-specific competitor signal",
+    "online_learning_signal_strength_score": "Online learning platform signal",
+    "lnd_platform_signal_strength_score":    "Broader L&D platform signal",
 }
 
-_GAP_DEFAULTS = [
-    "No clear learning and development evidence found",
-    "No clear onboarding evidence found",
-    "No direct language training provider signal found",
+# Ordered list of all signal fields used for profile and evidence output.
+_SIGNAL_FIELDS_ORDERED: list[str] = [
+    "sig_foreign_hq_score",
+    "sig_intl_footprint_score",
+    "sig_multicultural_score",
+    "sig_explicit_lnd_score",
+    "sig_lnd_onboarding_score",
+    "sig_employer_branding_score",
+    "sig_rapid_growth_score",
+    "sig_merger_acq_score",
+    "ti_language_english_score",
+    "ti_onboarding_score",
+    "ti_leadership_score",
+    "ti_intercultural_score",
+    "ti_negotiation_sales_score",
+    "ti_team_collab_score",
+    "ti_broader_professional_score",
+    "competitor_signal_strength_score",
+    "language_competitor_strength_score",
+    "online_learning_signal_strength_score",
+    "lnd_platform_signal_strength_score",
 ]
+
+# Signal category mapping for Advanced Evidence sheet.
+_SIGNAL_CATEGORY: dict[str, str] = {
+    "sig_foreign_hq_score":                  "Global Complexity",
+    "sig_intl_footprint_score":              "Global Complexity",
+    "sig_multicultural_score":               "Global Complexity",
+    "sig_explicit_lnd_score":                "People Development",
+    "sig_lnd_onboarding_score":              "People Development",
+    "sig_employer_branding_score":           "People Development",
+    "sig_rapid_growth_score":                "Growth and Context",
+    "sig_merger_acq_score":                  "Growth and Context",
+    "ti_language_english_score":             "Training Intent",
+    "ti_onboarding_score":                   "Training Intent",
+    "ti_leadership_score":                   "Training Intent",
+    "ti_intercultural_score":                "Training Intent",
+    "ti_negotiation_sales_score":            "Training Intent",
+    "ti_team_collab_score":                  "Training Intent",
+    "ti_broader_professional_score":         "Training Intent",
+    "competitor_signal_strength_score":      "Competitor Signals",
+    "language_competitor_strength_score":    "Competitor Signals",
+    "online_learning_signal_strength_score": "Competitor Signals",
+    "lnd_platform_signal_strength_score":    "Competitor Signals",
+}
+
+# Fields with model coefficients >= 0.10 — meaningful for gap detection.
+_GAP_CANDIDATE_FIELDS: frozenset[str] = frozenset({
+    "sig_foreign_hq_score",
+    "sig_explicit_lnd_score",
+    "sig_intl_footprint_score",
+    "sig_employer_branding_score",
+    "sig_lnd_onboarding_score",
+    "ti_onboarding_score",
+})
+
+
+def _signal_strength_label(score: float) -> str:
+    if score >= 3:
+        return "Strong"
+    if score >= 2:
+        return "Medium"
+    if score >= 1:
+        return "Weak"
+    return "Missing"
+
+
+def _build_profile_signals_gaps(rd: dict) -> tuple[str, str]:
+    """Build Top Positive Signals and Gaps from actual sig_*/ti_* score values.
+
+    A signal appears in positives if its score >= 2 (Medium or Strong).
+    A signal appears in gaps only if its score == 0 AND it is a gap candidate field
+    AND it is not already in positives.  No signal ever appears in both lists.
+    """
+    scored: list[tuple[str, float]] = []
+    for field in _SIGNAL_FIELDS_ORDERED:
+        try:
+            val = float(rd.get(field, 0) or 0)
+        except (ValueError, TypeError):
+            val = 0.0
+        scored.append((field, val))
+
+    # Sort strongest first
+    scored.sort(key=lambda x: -x[1])
+
+    positive_fields: set[str] = set()
+    positives: list[str] = []
+    for field, val in scored:
+        if val >= 2:
+            label = _SIGNAL_READABLE.get(field, field)
+            strength = "Strong" if val >= 3 else "Medium"
+            positives.append(f"{label} ({strength})")
+            positive_fields.add(field)
+
+    gaps: list[str] = []
+    for field in _SIGNAL_FIELDS_ORDERED:
+        if field not in _GAP_CANDIDATE_FIELDS:
+            continue
+        if field in positive_fields:
+            continue
+        try:
+            val = float(rd.get(field, 0) or 0)
+        except (ValueError, TypeError):
+            val = 0.0
+        if val == 0:
+            label = _SIGNAL_READABLE.get(field, field)
+            gaps.append(f"No clear {label.lower()} found")
+
+    signals_str = "; ".join(positives) if positives else ""
+    gaps_str    = "; ".join(gaps) if gaps else "No significant gaps identified"
+    return signals_str, gaps_str
 
 
 def _format_score_drivers(raw: str) -> str:
-    """Convert top_score_drivers text to human-readable labels.
-
-    Input examples:
-      'sig_foreign_hq_score=3 (+0.2488); sig_explicit_lnd_score=3 (+0.0728)'
-    Output:
-      'Foreign headquarters or group structure; Learning and development evidence'
-    """
+    """Convert top_score_drivers text to human-readable labels (legacy helper)."""
     if not raw or str(raw).lower() in ("none", "nan", ""):
         return ""
     parts = []
@@ -3930,40 +4034,6 @@ def _format_score_drivers(raw: str) -> str:
         field = token.split("=")[0].split("(")[0].strip()
         label = _SIGNAL_READABLE.get(field, field)
         parts.append(label)
-    return "; ".join(parts) if parts else ""
-
-
-def _format_gap_drivers(raw: str, missing_fields: str = "") -> str:
-    """Convert weak_score_drivers / missing_scoring_fields text to human-readable labels.
-
-    Input examples:
-      'sig_foreign_hq_score (coeff=0.7465, current=0.0)'
-    Output:
-      'No clear foreign headquarters or group structure signal found'
-    """
-    if (not raw or str(raw).lower() in ("none", "nan", "")) and not missing_fields:
-        return ""
-    parts: list[str] = []
-    for token in str(raw or "").split(";"):
-        token = token.strip()
-        if not token or token.lower() in ("none", "nan"):
-            continue
-        field = token.split("(")[0].split("=")[0].strip()
-        label = _SIGNAL_READABLE.get(field)
-        if label:
-            parts.append(f"No clear {label.lower()} signal found")
-        elif field:
-            parts.append(field)
-    # Also surface missing input fields
-    for mf in str(missing_fields or "").split(","):
-        mf = mf.strip()
-        if not mf:
-            continue
-        label = _SIGNAL_READABLE.get(mf)
-        if label:
-            gap = f"No clear {label.lower()} signal found"
-            if gap not in parts:
-                parts.append(gap)
     return "; ".join(parts) if parts else ""
 
 
@@ -4017,20 +4087,8 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         country   = _xl_get(rd, "lusha_country",        "lusha_api_country")
         employees = _xl_get(rd, "lusha_employee_range", "lusha_api_employee_range")
         why       = _xl_get(rd, "icp_why_relevant")
-        # Use natural-language signals if available; otherwise convert field-name text
-        _raw_signals = _xl_get(rd, "icp_buying_signals")
-        signals = _raw_signals if _raw_signals else _format_score_drivers(
-            _xl_get(rd, "top_score_drivers")
-        )
-        # Gaps: prefer natural language; convert field-name text as fallback
-        _raw_gaps = _xl_get(rd, "icp_gaps")
-        if _raw_gaps:
-            gaps = _raw_gaps
-        else:
-            gaps = _format_gap_drivers(
-                _xl_get(rd, "weak_score_drivers"),
-                _xl_get(rd, "missing_scoring_fields"),
-            )
+        # Build signals/gaps from actual sig_*/ti_* scores — single consistent source.
+        signals, gaps = _build_profile_signals_gaps(rd)
         evidence  = _xl_get(rd, "icp_evidence")
         interp    = _xl_get(rd, "scoring_notes")
 
@@ -4202,6 +4260,90 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             pass
 
 
+def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
+    """Write the Advanced Evidence sheet in long format: one row per company per signal.
+
+    Columns: Company Name | Company Domain/URL | Final Score | Commercial Tier |
+             Signal Category | Signal Name | Signal Score | Signal Strength |
+             Evidence | Commercial Interpretation
+    Uses canonical company identity only — no contact-level fields.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    headers = [
+        "Company Name",
+        "Company Domain / URL",
+        "Final Score",
+        "Commercial Tier",
+        "Signal Category",
+        "Signal Name",
+        "Signal Score",
+        "Signal Strength",
+        "Evidence",
+        "Commercial Interpretation",
+    ]
+    col_widths = [30, 32, 12, 14, 20, 38, 12, 14, 60, 50]
+
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    wrap_aln = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    ctr_aln  = Alignment(horizontal="center", vertical="top")
+
+    for ci, (hdr, w) in enumerate(zip(headers, col_widths), 1):
+        c = ws.cell(row=1, column=ci, value=hdr)
+        c.fill = hdr_fill
+        c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[1].height = 20
+    ws.freeze_panes = "A2"
+
+    xrow = 2
+    for _, row in df.iterrows():
+        rd = row.to_dict()
+        company = str(rd.get("canonical_company_name", "") or "").strip()
+        domain  = str(rd.get("canonical_company_url",  "") or
+                      rd.get("canonical_company_domain", "") or "").strip()
+        try:
+            score_val = float(rd.get("final_commercial_fit_score", 0) or 0)
+            score_str = f"{score_val:.2f}"
+        except (ValueError, TypeError):
+            score_str = ""
+        tier    = str(rd.get("commercial_tier", "") or "").strip()
+        interp  = str(rd.get("scoring_notes", "") or "").strip()
+
+        for field in _SIGNAL_FIELDS_ORDERED:
+            try:
+                sig_score = float(rd.get(field, 0) or 0)
+            except (ValueError, TypeError):
+                sig_score = 0.0
+            strength = _signal_strength_label(sig_score)
+            ev_field = field.replace("_score", "_evidence")
+            evidence = str(rd.get(ev_field, "") or "").strip()
+            label    = _SIGNAL_READABLE.get(field, field)
+            category = _SIGNAL_CATEGORY.get(field, "")
+
+            vals = [
+                company, domain, score_str, tier,
+                category, label, int(sig_score) if sig_score else "",
+                strength, evidence, interp,
+            ]
+            alt = (xrow % 2 == 0)
+            row_fill = PatternFill(
+                start_color="F7F9FC", end_color="F7F9FC", fill_type="solid"
+            ) if alt else None
+
+            for ci, val in enumerate(vals, 1):
+                c = ws.cell(row=xrow, column=ci, value=val)
+                c.font = Font(size=9)
+                c.alignment = wrap_aln if ci in (9, 10) else ctr_aln
+                if row_fill:
+                    c.fill = row_fill
+            ws.row_dimensions[xrow].height = 40 if evidence else 15
+            xrow += 1
+
+
 def build_rich_excel_bytes(
     df: pd.DataFrame,
     name_col: str | None = None,
@@ -4336,16 +4478,11 @@ def build_rich_excel_bytes(
     # Re-order: Input → Summary → Company Profiles
     wb._sheets = [ws_input, ws_summary, ws_profiles]
 
-    # ── Advanced Evidence (hidden) ────────────────────────────────────────────
+    # ── Advanced Evidence (hidden) — long-format, one row per company per signal ─
     try:
-        ev_cols = [c for c in df.columns if c.endswith("_evidence")]
-        if ev_cols:
-            id_cols = input_cols_list[:3]
-            qa_cols = list(dict.fromkeys(id_cols + ev_cols))
-            qa_df   = df[[c for c in qa_cols if c in df.columns]]
-            ws_ev   = wb.create_sheet("Advanced Evidence")
-            _xl_write_df(ws_ev, qa_df)
-            ws_ev.sheet_state = "hidden"
+        ws_ev = wb.create_sheet("Advanced Evidence")
+        _xl_write_advanced_evidence(ws_ev, df)
+        ws_ev.sheet_state = "hidden"
     except Exception:
         pass
 
