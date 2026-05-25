@@ -4935,9 +4935,12 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
     )
 
     def _ensure_padded_logo_standalone() -> "_pl.Path":
-        base = _pl.Path(__file__).parent
-        src  = base / "Mynglelogofinal.jpg"
-        dst  = base / "Mynglelogofinal_padded.png"
+        base  = _pl.Path(__file__).parent
+        fixed = base / "Mynglelogofinal_fixed.png"
+        if fixed.exists():
+            return fixed
+        src = base / "Mynglelogofinal.jpg"
+        dst = base / "Mynglelogofinal_padded.png"
         if dst.exists():
             return dst
         if not src.exists():
@@ -4955,6 +4958,20 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         return dst
 
     _logo = _ensure_padded_logo_standalone()
+    # Debug: logo verification — remove once confirmed correct
+    if _logo.exists():
+        import numpy as _np_dbg2
+        from PIL import Image as _PIL_dbg2
+        _dbg2_img = _PIL_dbg2.open(_logo).convert("RGBA")
+        _dbg2_arr = _np_dbg2.array(_dbg2_img)
+        _dbg2_w, _dbg2_h = _dbg2_img.size
+        _dbg2_top_y = None
+        for _dbg2_y in range(_dbg2_h):
+            _row2 = _dbg2_arr[_dbg2_y]
+            if _np_dbg2.any((_row2[:,0]>150) & (_row2[:,1]<100) & (_row2[:,2]<50) & (_row2[:,3]>200)):
+                _dbg2_top_y = _dbg2_y
+                break
+        st.caption(f"Logo file: {_logo.name} | size: {_dbg2_w}×{_dbg2_h} | top orange y: {_dbg2_top_y}")
     _mime = "image/png" if _logo.suffix.lower() == ".png" else "image/jpeg"
     _logo_src = (
         f"data:{_mime};base64," + _b64.b64encode(_logo.read_bytes()).decode()
