@@ -94,7 +94,7 @@ st.markdown(
         display: block;
         object-fit: contain;
         overflow: visible;
-        transform: translateY(8px);
+        transform: translateY(18px);
     }}
     </style>
     <div class="brand-header">
