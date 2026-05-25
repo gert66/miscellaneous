@@ -1211,6 +1211,121 @@ def deduplicate_lucia_export(df: pd.DataFrame) -> pd.DataFrame:
     return df_dedup.reset_index(drop=True)
 
 
+def normalize_input_to_company_df(
+    raw_input_df: pd.DataFrame,
+    detected_input_type: str,
+    company_name_col: str | None = None,
+    domain_col: str | None = None,
+) -> dict:
+    """Convert raw input into a canonical company-level dataframe.
+
+    Adds canonical_company_name, canonical_company_domain, canonical_company_url
+    to the returned company_df. For pre_enriched_lucia_export also deduplicates
+    and pre-maps all Lucia 'Company X' columns to lusha_api_* fields so the
+    processing loop and scoring engine see them immediately.
+
+    Returns:
+        {
+          "company_df":           pd.DataFrame,
+          "raw_input_df":         pd.DataFrame (original unchanged),
+          "input_type":           str,
+          "company_name_col":     str | None,
+          "domain_col":           str | None,
+          "contact_row_count":    int,
+          "unique_company_count": int,
+          "mapping_notes":        str,
+        }
+    """
+    contact_row_count = len(raw_input_df)
+    notes: list[str] = []
+
+    if detected_input_type == "pre_enriched_lucia_export":
+        # Step 1: deduplicate contact rows → one row per company
+        company_df = deduplicate_lucia_export(raw_input_df)
+
+        # Step 2: resolve company-level columns
+        name_col_use   = company_name_col or get_lucia_name_col(raw_input_df)
+        domain_col_use = domain_col       or get_lucia_domain_col(raw_input_df)
+
+        # Step 3: pre-map all Lucia 'Company X' columns → lusha_api_* fields
+        mapped_rows = [map_lucia_export_row(row.to_dict())
+                       for _, row in company_df.iterrows()]
+        all_lusha_keys: set[str] = set()
+        for m in mapped_rows:
+            all_lusha_keys.update(m.keys())
+        for lusha_col in all_lusha_keys:
+            company_df[lusha_col] = [m.get(lusha_col, "") for m in mapped_rows]
+
+        # Step 4: add canonical identity columns
+        if name_col_use and name_col_use in company_df.columns:
+            company_df["canonical_company_name"] = (
+                company_df[name_col_use].astype(str).str.strip()
+            )
+        else:
+            company_df["canonical_company_name"] = ""
+
+        if domain_col_use and domain_col_use in company_df.columns:
+            company_df["canonical_company_domain"] = company_df[domain_col_use].apply(
+                lambda x: clean_domain(str(x)) if pd.notna(x) else ""
+            )
+            company_df["canonical_company_url"] = company_df[domain_col_use].apply(
+                lambda x: normalize_url(str(x)) if pd.notna(x) and str(x).strip() else ""
+            )
+        else:
+            company_df["canonical_company_domain"] = ""
+            company_df["canonical_company_url"]    = ""
+
+        company_df["input_type"] = "pre_enriched_lucia_export"
+        unique_company_count = len(company_df)
+        notes.append(
+            f"Deduplicated {contact_row_count} contact rows → {unique_company_count} companies."
+        )
+
+    else:  # simple_company_list
+        company_df     = raw_input_df.copy()
+        name_col_use   = company_name_col
+        domain_col_use = domain_col
+
+        if name_col_use and name_col_use in company_df.columns:
+            company_df["canonical_company_name"] = (
+                company_df[name_col_use].astype(str).str.strip()
+            )
+        elif company_df.columns.tolist():
+            name_col_use = company_df.columns[0]
+            company_df["canonical_company_name"] = (
+                company_df[name_col_use].astype(str).str.strip()
+            )
+        else:
+            company_df["canonical_company_name"] = ""
+
+        if domain_col_use and domain_col_use in company_df.columns:
+            company_df["canonical_company_domain"] = company_df[domain_col_use].apply(
+                lambda x: clean_domain(str(x)) if pd.notna(x) else ""
+            )
+            company_df["canonical_company_url"] = company_df[domain_col_use].apply(
+                lambda x: normalize_url(str(x)) if pd.notna(x) and str(x).strip() else ""
+            )
+        else:
+            company_df["canonical_company_domain"] = ""
+            company_df["canonical_company_url"]    = ""
+
+        if "source_contact_count" not in company_df.columns:
+            company_df["source_contact_count"] = 1
+        company_df["input_type"] = "simple_company_list"
+        unique_company_count = len(company_df)
+
+    return {
+        "company_df":           company_df,
+        "raw_input_df":         raw_input_df,
+        "input_type":           detected_input_type,
+        "company_name_col":     name_col_use,
+        "domain_col":           domain_col_use,
+        "contact_row_count":    contact_row_count,
+        "unique_company_count": unique_company_count,
+        "mapping_notes":        " ".join(notes),
+    }
+
+
 def detect_columns(df: pd.DataFrame) -> tuple:
     """Detect company name and domain/URL columns in df.
 
@@ -3705,7 +3820,7 @@ def _xl_write_scoring_settings(ws) -> None:
     try:
         from commercial_fit_scoring import (
             INTERCEPT as _INT, LEAN_COEFFICIENTS as _LC,
-            SIZE_BANDS as _SB, TIER_THRESHOLDS as _TT,
+            SIZE_BAND_LOOKUP as _SB, TIER_THRESHOLDS as _TT,
         )
     except ImportError:
         ws.cell(row=1, column=1, value="Scoring module not available")
@@ -3739,13 +3854,13 @@ def _xl_write_scoring_settings(ws) -> None:
 
     ws.cell(row=r, column=1, value="Size Bands").font = bold
     r += 1
-    for h, c in (("Max Employees", 1), ("Score", 2)):
+    for h, c in (("Employee Range", 1), ("Score", 2)):
         cell = ws.cell(row=r, column=c, value=h)
         cell.fill = hdr_fill
         cell.font = hdr_font
     r += 1
-    for upper, score in _SB:
-        ws.cell(row=r, column=1, value=str(upper)).font = norm
+    for rng, score in _SB.items():
+        ws.cell(row=r, column=1, value=rng).font = norm
         ws.cell(row=r, column=2, value=score).font = norm
         r += 1
     r += 1
@@ -3764,6 +3879,92 @@ def _xl_write_scoring_settings(ws) -> None:
 
     ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 20
+
+
+# Human-readable labels for model signal field names.
+_SIGNAL_READABLE: dict[str, str] = {
+    "sig_foreign_hq_score":                  "Foreign headquarters or group structure",
+    "sig_explicit_lnd_score":                "Learning and development evidence",
+    "sig_intl_footprint_score":              "International footprint",
+    "sig_employer_branding_score":           "Employer branding and employee experience",
+    "sig_lnd_onboarding_score":              "Learning, development, and onboarding",
+    "ti_onboarding_score":                   "Onboarding training interest",
+    "sig_rapid_growth_score":                "Rapid growth trajectory",
+    "sig_multicultural_score":               "Multicultural workforce",
+    "sig_merger_acq_score":                  "M&A activity",
+    "competitor_signal_strength_score":      "Direct competitor signal",
+    "language_competitor_strength_score":    "Language competitor signal",
+    "online_learning_signal_strength_score": "Online learning platform signal",
+    "lnd_platform_signal_strength_score":    "L&D platform signal",
+    "ti_language_english_score":             "English language training interest",
+    "ti_leadership_score":                   "Leadership development training interest",
+    "ti_team_collab_score":                  "Team collaboration training interest",
+    "ti_intercultural_score":                "Intercultural / cross-cultural training interest",
+    "ti_negotiation_sales_score":            "Negotiation and sales training interest",
+    "ti_broader_professional_score":         "Broader professional skills training interest",
+    "model_signal_overall_confidence_score": "Overall model signal confidence",
+}
+
+_GAP_DEFAULTS = [
+    "No clear learning and development evidence found",
+    "No clear onboarding evidence found",
+    "No direct language training provider signal found",
+]
+
+
+def _format_score_drivers(raw: str) -> str:
+    """Convert top_score_drivers text to human-readable labels.
+
+    Input examples:
+      'sig_foreign_hq_score=3 (+0.2488); sig_explicit_lnd_score=3 (+0.0728)'
+    Output:
+      'Foreign headquarters or group structure; Learning and development evidence'
+    """
+    if not raw or str(raw).lower() in ("none", "nan", ""):
+        return ""
+    parts = []
+    for token in str(raw).split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        field = token.split("=")[0].split("(")[0].strip()
+        label = _SIGNAL_READABLE.get(field, field)
+        parts.append(label)
+    return "; ".join(parts) if parts else ""
+
+
+def _format_gap_drivers(raw: str, missing_fields: str = "") -> str:
+    """Convert weak_score_drivers / missing_scoring_fields text to human-readable labels.
+
+    Input examples:
+      'sig_foreign_hq_score (coeff=0.7465, current=0.0)'
+    Output:
+      'No clear foreign headquarters or group structure signal found'
+    """
+    if (not raw or str(raw).lower() in ("none", "nan", "")) and not missing_fields:
+        return ""
+    parts: list[str] = []
+    for token in str(raw or "").split(";"):
+        token = token.strip()
+        if not token or token.lower() in ("none", "nan"):
+            continue
+        field = token.split("(")[0].split("=")[0].strip()
+        label = _SIGNAL_READABLE.get(field)
+        if label:
+            parts.append(f"No clear {label.lower()} signal found")
+        elif field:
+            parts.append(field)
+    # Also surface missing input fields
+    for mf in str(missing_fields or "").split(","):
+        mf = mf.strip()
+        if not mf:
+            continue
+        label = _SIGNAL_READABLE.get(mf)
+        if label:
+            gap = f"No clear {label.lower()} signal found"
+            if gap not in parts:
+                parts.append(gap)
+    return "; ".join(parts) if parts else ""
 
 
 def _xl_write_company_profiles(ws, df: pd.DataFrame,
@@ -3802,8 +4003,10 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         rd = row.to_dict()
         profile_start_rows[df_idx] = cur
 
-        company = _xl_get(rd, name_col or "", "lusha_company_name", "lusha_api_company_name")
-        domain  = _xl_get(rd, domain_col or "", "lusha_domain", "lusha_api_domain")
+        company = _xl_get(rd, "canonical_company_name",
+                          name_col or "", "lusha_company_name", "lusha_api_company_name")
+        domain  = _xl_get(rd, "canonical_company_domain",
+                          domain_col or "", "lusha_domain", "lusha_api_domain")
         tier    = _xl_get(rd, "commercial_tier")
         try:
             score_val = float(rd.get("final_commercial_fit_score", 0) or 0)
@@ -3814,8 +4017,20 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         country   = _xl_get(rd, "lusha_country",        "lusha_api_country")
         employees = _xl_get(rd, "lusha_employee_range", "lusha_api_employee_range")
         why       = _xl_get(rd, "icp_why_relevant")
-        signals   = _xl_get(rd, "icp_buying_signals",   "top_score_drivers")
-        gaps      = _xl_get(rd, "weak_score_drivers",   "missing_scoring_fields")
+        # Use natural-language signals if available; otherwise convert field-name text
+        _raw_signals = _xl_get(rd, "icp_buying_signals")
+        signals = _raw_signals if _raw_signals else _format_score_drivers(
+            _xl_get(rd, "top_score_drivers")
+        )
+        # Gaps: prefer natural language; convert field-name text as fallback
+        _raw_gaps = _xl_get(rd, "icp_gaps")
+        if _raw_gaps:
+            gaps = _raw_gaps
+        else:
+            gaps = _format_gap_drivers(
+                _xl_get(rd, "weak_score_drivers"),
+                _xl_get(rd, "missing_scoring_fields"),
+            )
         evidence  = _xl_get(rd, "icp_evidence")
         interp    = _xl_get(rd, "scoring_notes")
 
@@ -3941,8 +4156,10 @@ def _xl_write_summary(ws, df: pd.DataFrame,
         rd   = row.to_dict()
         xrow = df_idx + 2   # Excel row (1-indexed header + offset)
 
-        company = _xl_get(rd, name_col or "", "lusha_company_name", "lusha_api_company_name")
-        domain  = _xl_get(rd, domain_col or "", "lusha_domain", "lusha_api_domain")
+        company = _xl_get(rd, "canonical_company_name",
+                          name_col or "", "lusha_company_name", "lusha_api_company_name")
+        domain  = _xl_get(rd, "canonical_company_domain",
+                          domain_col or "", "lusha_domain", "lusha_api_domain")
         tier    = _xl_get(rd, "commercial_tier")
         try:
             score = float(rd.get("final_commercial_fit_score", "") or "")
@@ -4013,13 +4230,15 @@ def build_rich_excel_bytes(
     _all_enrich = set(ALL_ENRICHMENT_FIELDS + list(_SCORE_OUTPUT_COLS or []))
     input_cols_list = [c for c in df.columns if c not in _all_enrich]
 
-    # Determine name / domain columns for Summary and Company Profiles
-    if name_col is not None:
-        # Explicit columns passed in — use them directly
-        _name_guess   = name_col
-        _domain_guess = domain_col
+    # Determine name / domain columns for Summary and Company Profiles.
+    # Priority: canonical columns (from normalize_input_to_company_df) > explicit
+    # params > Lucia exact columns > heuristic fallback.
+    _df_cols = set(df.columns)
+    if "canonical_company_name" in _df_cols:
+        _name_guess = "canonical_company_name"
+    elif name_col is not None:
+        _name_guess = name_col
     else:
-        # Prefer exact Lucia/Lusha company columns before falling back to heuristics
         _col_set = set(input_cols_list)
         if "Company Name" in _col_set:
             _name_guess = "Company Name"
@@ -4027,7 +4246,22 @@ def build_rich_excel_bytes(
             _name_guess = "lusha_api_company_name"
         else:
             _name_guess = None
+        _person_prefixes = ("first ", "last ", "middle ", "contact ")
+        if _name_guess is None:
+            for c in input_cols_list:
+                cl = c.lower()
+                if any(h in cl for h in _COMPANY_HINTS) and not cl.startswith(_person_prefixes):
+                    _name_guess = c
+                    break
+        if _name_guess is None and input_cols_list:
+            _name_guess = input_cols_list[0]
 
+    if "canonical_company_domain" in _df_cols:
+        _domain_guess = "canonical_company_domain"
+    elif domain_col is not None:
+        _domain_guess = domain_col
+    else:
+        _col_set = set(input_cols_list)
         if "Company Domain" in _col_set:
             _domain_guess = "Company Domain"
         elif "Company Website" in _col_set:
@@ -4036,24 +4270,12 @@ def build_rich_excel_bytes(
             _domain_guess = "lusha_api_domain"
         else:
             _domain_guess = None
-
-        # Heuristic fallback: substring match, skipping person-level column names
-        _person_prefixes = ("first ", "last ", "middle ", "contact ")
-        if _name_guess is None:
-            for c in input_cols_list:
-                cl = c.lower()
-                if any(h in cl for h in _COMPANY_HINTS) and not cl.startswith(_person_prefixes):
-                    _name_guess = c
-                    break
         if _domain_guess is None:
             for c in input_cols_list:
                 cl = c.lower()
                 if any(h in cl for h in _DOMAIN_HINTS) and "linkedin" not in cl:
                     _domain_guess = c
                     break
-
-        if _name_guess is None and input_cols_list:
-            _name_guess = input_cols_list[0]
         if _domain_guess is None and len(input_cols_list) > 1:
             _domain_guess = input_cols_list[1]
 
@@ -5017,16 +5239,11 @@ elif uploaded and df_raw is not None:
             _dedup_keys = pd.Series(range(len(df_raw))).astype(str)
         _n_contacts   = len(df_raw)
         _n_companies  = _dedup_keys.nunique()
-        if _n_contacts == _n_companies:
-            st.success(
-                f"✅ **{ss('file_name')}** loaded — "
-                f"{_n_contacts:,} unique companies ready"
-            )
-        else:
-            st.success(
-                f"✅ **{ss('file_name')}** loaded — "
-                f"{_n_contacts:,} contact rows · {_n_companies:,} unique companies ready"
-            )
+        # Always show both counts for Type 2 so users understand deduplication
+        st.success(
+            f"✅ **{ss('file_name')}** loaded — "
+            f"{_n_contacts:,} contact rows · {_n_companies:,} unique companies ready"
+        )
     else:
         # Type 1 simple company list: count unique non-empty company names
         _t1_name_col, _ = detect_columns(df_raw)
@@ -5214,18 +5431,23 @@ if start_btn and not blocking and not currently_processing:
         domain_col = _sc_domain_col
         _df_raw_for_input = None
     else:
-        _is_lucia_run = ss("_is_lucia_export", False)
-        if _is_lucia_run and df_raw is not None:
-            # Deduplicate to company level; keep original for Input sheet
-            _df_deduped = deduplicate_lucia_export(df_raw)
-            df_work = _df_deduped.head(n_to_process).copy()
-            _df_raw_for_input = df_raw.copy()
-            # Ensure correct company columns are used
-            name_col   = get_lucia_name_col(df_raw) or name_col
-            domain_col = get_lucia_domain_col(df_raw) or domain_col
-        else:
-            df_work = df_raw.head(n_to_process).copy()
-            _df_raw_for_input = None
+        _is_lucia_run  = ss("_is_lucia_export", False)
+        _input_type    = "pre_enriched_lucia_export" if _is_lucia_run else "simple_company_list"
+        _norm_result   = normalize_input_to_company_df(
+            df_raw, _input_type, name_col, domain_col
+        )
+        df_work            = _norm_result["company_df"].head(n_to_process).copy()
+        name_col           = _norm_result["company_name_col"] or name_col
+        domain_col         = _norm_result["domain_col"]       or domain_col
+        _df_raw_for_input  = df_raw.copy() if _is_lucia_run else None
+        # Store normalization metadata for downstream validation
+        _norm_meta = {
+            "input_type":           _norm_result["input_type"],
+            "contact_row_count":    _norm_result["contact_row_count"],
+            "unique_company_count": _norm_result["unique_company_count"],
+            "mapping_notes":        _norm_result["mapping_notes"],
+        }
+        ss_set(_input_norm_meta=_norm_meta)
     resume_mode  = ss("_resume_mode", False)
     if not resume_mode:
         autosave_clear()   # wipe any previous autosave on a fresh start
@@ -5495,25 +5717,32 @@ if ss("processing", False):
     if ss("stop_requested", False) or idx >= _n:
         build_and_finish(results, debug_records, df_work, _active_fields)
     else:
-        input_row    = df_work.iloc[idx]
-        company_name = str(input_row.get(_name_col, "")).strip()
-        raw_url      = str(input_row.get(_domain_col, "")).strip() if _domain_col else ""
+        input_row = df_work.iloc[idx]
 
+        # Prefer canonical columns (added by normalize_input_to_company_df);
+        # fall back to the original detected columns for Type 1 files that
+        # pre-date the normalization step.
+        company_name = str(
+            input_row.get("canonical_company_name",
+                          input_row.get(_name_col, ""))
+        ).strip()
+        _canonical_url = str(input_row.get("canonical_company_url", "")).strip()
+        raw_url = _canonical_url or (
+            str(input_row.get(_domain_col, "")).strip() if _domain_col else ""
+        )
         # Normalize domain-only values to a URL (prepend https:// if needed)
         if raw_url and not raw_url.startswith(("http://", "https://")):
             raw_url = normalize_url(raw_url)
 
-        # Extract existing Lusha/Lucia field values from the input row
+        # Extract existing Lusha/Lucia field values from the input row.
+        # For Type 2 the lusha_api_* fields were already mapped upfront by
+        # normalize_input_to_company_df — no second map_lucia_export_row call needed.
         _lusha_field_set = set(LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS)
         _existing_lusha = {
             k: (str(v) if not isinstance(v, str) else v)
             for k, v in input_row.items()
             if k in _lusha_field_set and v is not None and str(v).strip() not in ("", "nan", "NaN", "None")
         }
-        # For Lucia/Lusha contact exports map "Company X" columns to lusha_api_* names
-        if ss("_is_lucia_export", False):
-            _lucia_mapped = map_lucia_export_row(input_row.to_dict())
-            _existing_lusha.update(_lucia_mapped)
 
         # ── Resume: skip rows already in autosave ─────────────────────────────
         if _resume_mode and autosave_already_done(
