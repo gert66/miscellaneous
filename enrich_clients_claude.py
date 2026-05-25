@@ -4376,7 +4376,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
     # When launched via streamlit_app.py the entrypoint already called these.
     import pathlib as _pl
     st.set_page_config(
-        page_title="mYngle company enrichment",
+        page_title="mYngle · Company Enrichment",
         page_icon="🏢",
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -4396,9 +4396,12 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         unsafe_allow_html=True,
     )
     _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
-    if _logo.exists():
-        st.image(str(_logo), width=260)
-    st.title("mYngle company enrichment")
+    _hdr_logo, _hdr_title = st.columns([1, 3], vertical_alignment="center")
+    with _hdr_logo:
+        if _logo.exists():
+            st.image(str(_logo), width=180)
+    with _hdr_title:
+        st.title("Company Enrichment")
     st.caption(
         "Upload a company file. "
         "The app will enrich and score the companies, "
