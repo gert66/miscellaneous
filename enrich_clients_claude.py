@@ -5033,9 +5033,23 @@ elif uploaded and df_raw is not None:
                 f"{_n_contacts:,} contact rows · {_n_companies:,} unique companies ready"
             )
     else:
+        # Type 1 simple company list: count unique non-empty company names
+        _t1_name_col, _ = detect_columns(df_raw)
+        if _t1_name_col and _t1_name_col in df_raw.columns:
+            _t1_count = int(
+                df_raw[_t1_name_col]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .nunique()
+            )
+        else:
+            _t1_count = len(df_raw)
         st.success(
             f"✅ **{ss('file_name')}** loaded — "
-            f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
+            f"{_t1_count:,} {'company' if _t1_count == 1 else 'companies'} ready"
         )
     if _show_adv:
         if _elm_mode:
@@ -5316,73 +5330,84 @@ if ss("processing", False):
     total_cache_read  = ss("total_cache_read_tokens", 0)
     total_cache_create = ss("total_cache_create_tokens", 0)
 
-    if st.button("⏹ Stop after current row", key="stop_button"):
+    if _show_adv and st.button("⏹ Stop after current row", key="stop_button"):
         ss_set(stop_requested=True)
         st.rerun()
 
-    st.progress(idx / _n if _n else 1.0, text=f"Row {idx} of {_n}")
+    # Look ahead to get the current company name for the status line
+    _cur_company = ""
+    if idx < _n and df_work is not None:
+        try:
+            _cur_company = str(df_work.iloc[idx].get(_name_col, "")).strip()
+        except Exception:
+            pass
+    _progress_text = (
+        f"Processing {idx + 1} of {_n}"
+        + (f" · {_cur_company}" if _cur_company else "")
+    )
+    st.progress(idx / _n if _n else 1.0, text=_progress_text)
 
-    if _elm_mode_run:
-        cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
-        cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
-        cnt_failed  = sum(1 for r in results if r.get("elm_fetch_status") == "failed")
-        avg_score   = (
-            sum(float(r.get("elm_score_overall_icp", 0) or 0) for r in results) / len(results)
-            if results else 0.0
-        )
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("Fetched OK",  cnt_ok)
-        mc2.metric("Partial",     cnt_partial)
-        mc3.metric("Failed",      cnt_failed)
-        mc4.metric("Processed",   len(results))
-        mc5.metric("Avg ICP score", f"{avg_score:.1f}/10")
-    else:
-        cnt_jina       = sum(1 for r in results if "enriched_jina"       in r.get("enrichment_status", ""))
-        cnt_playwright = sum(1 for r in results if "enriched_playwright" in r.get("enrichment_status", ""))
-        cnt_google     = sum(1 for r in results if "enriched_search"     in r.get("enrichment_status", ""))
-        cnt_nodata     = sum(1 for r in results if r.get("enrichment_status") == "no_data")
-        cnt_error      = sum(1 for r in results
-                             if r.get("enrichment_status") not in
-                             ("enriched_jina", "enriched_jina_step1_only",
-                              "enriched_playwright", "enriched_playwright_step1_only",
-                              "enriched_search", "enriched_search_step1_only",
-                              "no_data", "skipped_resume", "zero_cost_preview", ""))
-        cnt_retries    = ss("_jina_retry_count", 0)
-        cnt_previews   = ss("_dry_run_preview_count", 0)
-
-        if _zero_cost_run and _dry_run_run:
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Dry-run previews generated", cnt_previews)
-            mc2.metric("Errors",                     cnt_error)
-            mc3.metric("Est. cost",                  "$0.00")
+    if _show_adv:
+        if _elm_mode_run:
+            cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
+            cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
+            cnt_failed  = sum(1 for r in results if r.get("elm_fetch_status") == "failed")
+            avg_score   = (
+                sum(float(r.get("elm_score_overall_icp", 0) or 0) for r in results) / len(results)
+                if results else 0.0
+            )
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("Fetched OK",  cnt_ok)
+            mc2.metric("Partial",     cnt_partial)
+            mc3.metric("Failed",      cnt_failed)
+            mc4.metric("Processed",   len(results))
+            mc5.metric("Avg ICP score", f"{avg_score:.1f}/10")
         else:
-            mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
-            mc1.metric("Enriched (Jina)",    cnt_jina)
-            mc2.metric("Enriched (Browser)", cnt_playwright)
-            mc3.metric("Enriched (Google)",  cnt_google)
-            mc4.metric("429 Retries",        cnt_retries)
-            mc5.metric("No data",            cnt_nodata)
-            mc6.metric("Errors",             cnt_error)
-            mc7.metric("Est. cost",          f"${total_cost:.4f}")
+            cnt_jina       = sum(1 for r in results if "enriched_jina"       in r.get("enrichment_status", ""))
+            cnt_playwright = sum(1 for r in results if "enriched_playwright" in r.get("enrichment_status", ""))
+            cnt_google     = sum(1 for r in results if "enriched_search"     in r.get("enrichment_status", ""))
+            cnt_nodata     = sum(1 for r in results if r.get("enrichment_status") == "no_data")
+            cnt_error      = sum(1 for r in results
+                                 if r.get("enrichment_status") not in
+                                 ("enriched_jina", "enriched_jina_step1_only",
+                                  "enriched_playwright", "enriched_playwright_step1_only",
+                                  "enriched_search", "enriched_search_step1_only",
+                                  "no_data", "skipped_resume", "zero_cost_preview", ""))
+            cnt_retries    = ss("_jina_retry_count", 0)
+            cnt_previews   = ss("_dry_run_preview_count", 0)
 
-        _retry_msg = ss("_last_retry_msg", "")
-        if _retry_msg:
-            st.info(_retry_msg)
+            if _zero_cost_run and _dry_run_run:
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Dry-run previews generated", cnt_previews)
+                mc2.metric("Errors",                     cnt_error)
+                mc3.metric("Est. cost",                  "$0.00")
+            else:
+                mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
+                mc1.metric("Enriched (Jina)",    cnt_jina)
+                mc2.metric("Enriched (Browser)", cnt_playwright)
+                mc3.metric("Enriched (Google)",  cnt_google)
+                mc4.metric("429 Retries",        cnt_retries)
+                mc5.metric("No data",            cnt_nodata)
+                mc6.metric("Errors",             cnt_error)
+                mc7.metric("Est. cost",          f"${total_cost:.4f}")
 
-    if _zero_cost_run and _dry_run_run and not _elm_mode_run:
-        st.warning(
-            "⚠️ **ZERO-COST PREVIEW ACTIVE**: no Step 1 or Step 2 API calls are being made. "
-            "Using only uploaded row data and existing cache to generate Step 2 prompt previews."
-        )
-    elif _dry_run_run and not _elm_mode_run:
-        st.warning(
-            "⚠️ **DRY RUN ACTIVE**: no Anthropic or Serper API calls are being made "
-            "for Step 2. Prompts and search queries are generated and displayed only."
-        )
+            _retry_msg = ss("_last_retry_msg", "")
+            if _retry_msg:
+                st.info(_retry_msg)
 
-    # ── Intermediate download buttons (visible whenever ≥1 row is done) ───────
-    # Uses HTML anchors so clicking does NOT trigger a Streamlit rerun / freeze.
-    if results:
+        if _zero_cost_run and _dry_run_run and not _elm_mode_run:
+            st.warning(
+                "⚠️ **ZERO-COST PREVIEW ACTIVE**: no Step 1 or Step 2 API calls are being made. "
+                "Using only uploaded row data and existing cache to generate Step 2 prompt previews."
+            )
+        elif _dry_run_run and not _elm_mode_run:
+            st.warning(
+                "⚠️ **DRY RUN ACTIVE**: no Anthropic or Serper API calls are being made "
+                "for Step 2. Prompts and search queries are generated and displayed only."
+            )
+
+    # ── Intermediate download buttons — advanced mode only ─────────────────────
+    if _show_adv and results:
         _partial_df = build_partial_df(results, df_work, _active_fields)
         _n_done     = len(_partial_df)
         _stamp      = ts()
@@ -5393,7 +5418,7 @@ if ss("processing", False):
             _html_dl_buttons(_partial_df, _n_done, _stamp)
 
     # ── Step 2 dry run preview ────────────────────────────────────────────────
-    if _dry_run_run and not _elm_mode_run:
+    if _show_adv and _dry_run_run and not _elm_mode_run:
         _dry_recs = ss("_dry_run_records", [])
         with st.expander("Step 2 Dry Run Preview", expanded=True):
             if not _dry_recs:
@@ -5608,7 +5633,7 @@ if ss("processing", False):
         )
 
         with st.status(
-            f"Row {idx + 1} / {_n}: **{company_name or '(empty)'}**",
+            f"**{company_name or '(empty)'}**  ({idx + 1} of {_n})",
             expanded=False,
         ) as status_box:
             if _elm_mode_run:
@@ -6363,25 +6388,27 @@ if ss("enrichment_done", False):
     _done_fields = ELM_ALL_FIELDS if _elm_done else ALL_ENRICHMENT_FIELDS
 
     st.divider()
-    if ss("stop_requested", False):
-        st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
-    else:
-        st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
-
     _done_dry_run   = ss("_step2_dry_run",     False)
     _done_zero_cost = ss("_zero_cost_preview", False)
-    if _done_zero_cost and _done_dry_run and not _elm_done:
-        _preview_count = ss("_dry_run_preview_count", 0)
-        st.info(
-            f"ℹ️ **Zero-cost preview completed.** No Step 1 or Step 2 API calls were made — "
-            f"**{_preview_count}** dry-run previews generated. "
-            "Disable zero-cost preview and dry run, then re-run to perform real enrichment."
-        )
-    elif _done_dry_run and not _elm_done:
-        st.info(
-            "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
-            "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
-        )
+    _processed_word = "company" if processed == 1 else "companies"
+    if ss("stop_requested", False):
+        st.warning(f"Enrichment stopped — **{processed:,}** {_processed_word} processed (partial).")
+    else:
+        st.success(f"✅ Ready · **{processed:,}** {_processed_word} processed")
+
+    if _show_adv:
+        if _done_zero_cost and _done_dry_run and not _elm_done:
+            _preview_count = ss("_dry_run_preview_count", 0)
+            st.info(
+                f"ℹ️ **Zero-cost preview completed.** No Step 1 or Step 2 API calls were made — "
+                f"**{_preview_count}** dry-run previews generated. "
+                "Disable zero-cost preview and dry run, then re-run to perform real enrichment."
+            )
+        elif _done_dry_run and not _elm_done:
+            st.info(
+                "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
+                "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
+            )
 
     # ── Auto-save final file into run folder (runs exactly once per completed run) ─
     _pca_done_enabled = ss("_per_company_autosave_enabled", False)
