@@ -4989,6 +4989,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             display: block;
             object-fit: contain;
             overflow: visible;
+            transform: translateY(6px);
         }}
         </style>
         <div class="brand-header">
