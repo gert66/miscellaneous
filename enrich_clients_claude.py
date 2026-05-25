@@ -4605,6 +4605,12 @@ def reset_processing(clear_autosave: bool = False):
     )
 
 
+def apply_results_compatible_scoring(df: pd.DataFrame) -> pd.DataFrame:
+    """Single source of truth for scoring — always routes through Results(8).xlsx formula."""
+    from commercial_fit_scoring import score_dataframe as _cfs_score_df
+    return _cfs_score_df(df)
+
+
 def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
                      field_list: list | None = None) -> None:
     flist       = field_list if field_list is not None else ALL_ENRICHMENT_FIELDS
@@ -4612,9 +4618,9 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
     enriched_df = pd.DataFrame(results)
     for col in flist:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
-    if _SCORING_AVAILABLE and not st.session_state.get("_elm_mode", False):
+    if not st.session_state.get("_elm_mode", False):
         try:
-            df_out = _score_dataframe(df_out)
+            df_out = apply_results_compatible_scoring(df_out)
         except Exception:
             pass
     ss_set(
@@ -4623,6 +4629,154 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
         debug_records=debug_records,
     )
     st.rerun()
+
+
+def _validate_type1_type2_pipeline() -> None:
+    """Offline smoke test — run with:
+        python -c "import enrich_clients_claude as e; e._validate_type1_type2_pipeline()"
+
+    Checks normalization, canonical columns, scoring, and that build_and_finish
+    routes through apply_results_compatible_scoring (not the old _score_dataframe).
+    """
+    import sys
+    from pathlib import Path
+    import pandas as pd
+    from commercial_fit_scoring import score_company
+
+    PASS = "\033[92m✓\033[0m"
+    FAIL = "\033[91m✗\033[0m"
+    failures: list[str] = []
+
+    def chk(label: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            print(f"  {PASS}  {label}")
+        else:
+            failures.append(label)
+            print(f"  {FAIL}  {label}" + (f"  [{detail}]" if detail else ""))
+
+    print("\n=== Pipeline validation ===\n")
+
+    # ── Type 1 ──
+    print("Type 1: Capgemini synthetic row")
+    t1_df = pd.DataFrame([{
+        "Company": "Capgemini Nederland B.V.",
+        "Website": "https://www.capgemini.com/",
+    }])
+    r1 = normalize_input_to_company_df(t1_df, "simple_company_list", "Company", "Website")
+    chk("T1 input_type = simple_company_list", r1["input_type"] == "simple_company_list")
+    chk("T1 company_df 1 row",               len(r1["company_df"]) == 1)
+    chk("T1 canonical_company_name",
+        r1["company_df"].iloc[0]["canonical_company_name"] == "Capgemini Nederland B.V.",
+        repr(r1["company_df"].iloc[0]["canonical_company_name"]))
+    chk("T1 canonical_company_domain = capgemini.com",
+        r1["company_df"].iloc[0]["canonical_company_domain"] == "capgemini.com",
+        repr(r1["company_df"].iloc[0]["canonical_company_domain"]))
+
+    # Scoring
+    cap_signals = {
+        "sig_foreign_hq_score": 3, "sig_explicit_lnd_score": 3,
+        "sig_intl_footprint_score": 3, "sig_employer_branding_score": 2,
+        "sig_lnd_onboarding_score": 2, "ti_onboarding_score": 2,
+        "sig_rapid_growth_score": 1, "lusha_api_employee_range": "100001 - 10000000",
+    }
+    rs = score_company(cap_signals)
+    chk("T1 lean_model_prob ≈ 0.7285", abs(rs["lean_model_prob"] - 0.7285) < 0.001,
+        str(round(rs["lean_model_prob"], 4)))
+    chk("T1 final ≈ 9.54",             abs(rs["final_commercial_fit_score"] - 9.54) < 0.05,
+        str(rs["final_commercial_fit_score"]))
+    chk("T1 tier = 🥇 Hot",            rs["commercial_tier"] == "🥇 Hot",
+        rs["commercial_tier"])
+    chk("T1 NOT 9.99",                 abs(rs["final_commercial_fit_score"] - 9.99) > 0.1)
+    chk("T1 NOT Tier 1",               rs["commercial_tier"] != "Tier 1")
+    chk("T1 model_probability == lean_model_prob",
+        abs(rs["model_probability"] - rs["lean_model_prob"]) < 0.001,
+        f"{rs['model_probability']} vs {rs['lean_model_prob']}")
+
+    # ── Type 2 ──
+    print("\nType 2: Cold Caller CSV fixture")
+    csv_path = Path(__file__).parent / "Example_Cold_Caller.csv"
+    if not csv_path.exists():
+        csv_path = Path(__file__).parent / "test.csv"
+    assert csv_path.exists(), f"Fixture not found: {csv_path}"
+    t2_df = pd.read_csv(csv_path)
+
+    chk("T2 is_lucia_contact_export = True", is_lucia_contact_export(t2_df))
+    nc, dc = detect_columns(t2_df)
+    chk("T2 detect_columns → Company Name",   nc == "Company Name", repr(nc))
+    chk("T2 detect_columns → Company Domain", dc == "Company Domain", repr(dc))
+
+    r2 = normalize_input_to_company_df(t2_df, "pre_enriched_lucia_export",
+                                       "Company Name", "Company Domain")
+    chk("T2 input_type = pre_enriched_lucia_export",
+        r2["input_type"] == "pre_enriched_lucia_export")
+    chk("T2 contact_row_count = 3",     r2["contact_row_count"] == 3,
+        str(r2["contact_row_count"]))
+    chk("T2 unique_company_count = 3",  r2["unique_company_count"] == 3,
+        str(r2["unique_company_count"]))
+    chk("T2 company_df 3 rows",         len(r2["company_df"]) == 3,
+        str(len(r2["company_df"])))
+
+    cdf2 = r2["company_df"]
+    names2   = cdf2["canonical_company_name"].tolist()
+    domains2 = [clean_domain(str(d)) for d in cdf2["canonical_company_domain"].tolist()]
+
+    for expected_name in ["Ali Lavoro", "Renovit", "S&you Italia"]:
+        chk(f"T2 canonical_company_name contains '{expected_name}'",
+            expected_name in names2, str(names2))
+    for expected_dom in ["alilavoro.it", "renovit.it", "sandyou.it"]:
+        chk(f"T2 canonical_company_domain contains '{expected_dom}'",
+            expected_dom in domains2, str(domains2))
+
+    row0 = cdf2.iloc[0].to_dict()
+    chk("T2 lucia_api_called = False",
+        str(row0.get("lucia_api_called", "")) == "False",
+        repr(row0.get("lucia_api_called")))
+    chk("T2 lusha_api_status = reused_existing_lucia_data",
+        row0.get("lusha_api_status") == "reused_existing_lucia_data",
+        repr(row0.get("lusha_api_status")))
+    chk("T2 source_contact_count present",
+        "source_contact_count" in row0)
+
+    for pn in ("Anna", "Michela", "Annalisa"):
+        chk(f"T2 '{pn}' NOT in canonical_company_name", pn not in names2)
+    for d in cdf2["canonical_company_domain"].astype(str):
+        chk(f"T2 no linkedin.com in canonical_company_domain: {d!r}",
+            "linkedin.com" not in d.lower(), d)
+    for u in cdf2["canonical_company_url"].astype(str):
+        chk(f"T2 no linkedin.com/in/ in canonical_company_url: {u!r}",
+            "linkedin.com/in/" not in u.lower(), u)
+
+    # ── Scoring shared engine ──
+    print("\nShared scoring engine")
+    chk("apply_results_compatible_scoring is callable",
+        callable(apply_results_compatible_scoring))
+    # Confirm build_and_finish does NOT call _score_dataframe directly
+    import inspect
+    baf_src = inspect.getsource(build_and_finish)
+    chk("build_and_finish does NOT call _score_dataframe",
+        "_score_dataframe" not in baf_src, "old _score_dataframe still present")
+    chk("build_and_finish calls apply_results_compatible_scoring",
+        "apply_results_compatible_scoring" in baf_src)
+
+    # ── Filename convention ──
+    print("\nFilename convention")
+    from datetime import datetime
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    for prefix in ("enrichedResults_", "enrichedResults_partial_", "enrichedResults_snapshot_"):
+        fname = f"{prefix}{stamp}.xlsx"
+        chk(f"'{prefix}...' starts with enrichedResults_", fname.startswith("enrichedResults_"))
+        for bad in ("enriched_results", "_sg_", "_hq_", "lusha", "lucia"):
+            chk(f"  no '{bad}' in '{prefix}...'", bad not in fname.lower())
+
+    print(f"\n{'═'*60}")
+    if failures:
+        print(f"  FAILURES ({len(failures)}):")
+        for f in failures:
+            print(f"    • {f}")
+        sys.exit(1)
+    else:
+        print("  ✅ All pipeline validation checks passed.")
+    print("═" * 60)
 
 
 # =============================================================================
@@ -5476,9 +5630,32 @@ if start_btn and not blocking and not currently_processing:
         # After deduplication Type 2 may have fewer rows than n_to_process;
         # update so the processing loop bound matches the actual work df.
         n_to_process       = len(df_work)
-        name_col           = _norm_result["company_name_col"] or name_col
-        domain_col         = _norm_result["domain_col"]       or domain_col
-        _df_raw_for_input  = df_raw.copy() if _is_lucia_run else None
+
+        # After normalization, ALL downstream processing uses canonical columns.
+        # Preserve the original detected cols in metadata only.
+        name_col   = "canonical_company_name"
+        domain_col = "canonical_company_url"
+
+        # Always preserve the original uploaded df for the Input sheet.
+        _df_raw_for_input = df_raw.copy()
+
+        # ── Hard validation: canonical columns must be present ────────────────
+        _missing_canonical = [
+            c for c in ("canonical_company_name", "canonical_company_domain",
+                        "canonical_company_url", "input_type", "source_contact_count")
+            if c not in df_work.columns
+        ]
+        if _missing_canonical:
+            st.error(
+                "❌ Normalization error — required canonical columns missing: "
+                + ", ".join(_missing_canonical)
+            )
+            st.stop()
+
+        _empty_names = df_work["canonical_company_name"].astype(str).str.strip().replace("", pd.NA).isna().sum()
+        if _empty_names:
+            st.error(f"❌ {_empty_names} row(s) have an empty canonical_company_name after normalization.")
+            st.stop()
 
         # ── Canonical identity validation (Type 2) ────────────────────────────
         if _is_lucia_run:
@@ -5627,12 +5804,12 @@ if ss("processing", False):
     _cur_company = ""
     if idx < _n and df_work is not None:
         try:
-            _cur_company = str(df_work.iloc[idx].get(_name_col, "")).strip()
+            _cur_company = str(df_work.iloc[idx].get("canonical_company_name", "")).strip()
         except Exception:
             pass
     _progress_text = (
         f"Processing {idx + 1} of {_n}"
-        + (f" · {_cur_company}" if _cur_company else "")
+        + (f" · Current company: {_cur_company}" if _cur_company else "")
     )
     st.progress(idx / _n if _n else 1.0, text=_progress_text)
 
@@ -5791,17 +5968,11 @@ if ss("processing", False):
     else:
         input_row = df_work.iloc[idx]
 
-        # Prefer canonical columns (added by normalize_input_to_company_df);
-        # fall back to the original detected columns for Type 1 files that
-        # pre-date the normalization step.
-        company_name = str(
-            input_row.get("canonical_company_name",
-                          input_row.get(_name_col, ""))
-        ).strip()
-        _canonical_url = str(input_row.get("canonical_company_url", "")).strip()
-        raw_url = _canonical_url or (
-            str(input_row.get(_domain_col, "")).strip() if _domain_col else ""
-        )
+        # Use only canonical columns set by normalize_input_to_company_df.
+        # No fallback to original detected columns — canonical columns are
+        # mandatory after the start handler validation passes.
+        company_name = str(input_row.get("canonical_company_name", "")).strip()
+        raw_url      = str(input_row.get("canonical_company_url",    "")).strip()
         # Normalize domain-only values to a URL (prepend https:// if needed)
         if raw_url and not raw_url.startswith(("http://", "https://")):
             raw_url = normalize_url(raw_url)
@@ -5815,6 +5986,12 @@ if ss("processing", False):
             for k, v in input_row.items()
             if k in _lusha_field_set and v is not None and str(v).strip() not in ("", "nan", "NaN", "None")
         }
+
+        # For Type 2, skip the external Lusha/Lucia API regardless of the
+        # sidebar setting — company data is already pre-mapped from the CSV.
+        _row_input_type = str(input_row.get("input_type", "")).strip()
+        _is_lucia_row   = (_row_input_type == "pre_enriched_lucia_export")
+        _effective_lusha_api = _enable_lusha_api_run and not _is_lucia_row
 
         # ── Resume: skip rows already in autosave ─────────────────────────────
         if _resume_mode and autosave_already_done(
@@ -5996,7 +6173,7 @@ if ss("processing", False):
                         search_provider=_step2_provider_run,
                         serper_key=_serper_key_run,
                         dry_run=_dry_run_run,
-                        enable_lusha_api=_enable_lusha_api_run,
+                        enable_lusha_api=_effective_lusha_api,
                         lusha_api_key=_lusha_api_key_run,
                         extract_model_signals=_extract_model_signals_run,
                         include_signal_evidence=_include_signal_evidence_run,
