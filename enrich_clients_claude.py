@@ -4933,15 +4933,33 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    # Prefer padded PNG (60 px top whitespace baked in); fall back to original JPG
-    _logo = _pl.Path(__file__).parent / "Mynglelogofinal_padded.png"
-    if not _logo.exists():
-        _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
-    if _logo.exists():
-        _mime = "image/png" if _logo.suffix.lower() == ".png" else "image/jpeg"
-        _logo_src = f"data:{_mime};base64," + _b64.b64encode(_logo.read_bytes()).decode()
-    else:
-        _logo_src = ""
+
+    def _ensure_padded_logo_standalone() -> "_pl.Path":
+        base = _pl.Path(__file__).parent
+        src  = base / "Mynglelogofinal.jpg"
+        dst  = base / "Mynglelogofinal_padded.png"
+        if dst.exists():
+            return dst
+        if not src.exists():
+            return src
+        from PIL import Image as _PIL_Image
+        img = _PIL_Image.open(src).convert("RGBA")
+        pad_top, pad_bottom, pad_left, pad_right = 70, 30, 25, 25
+        canvas = _PIL_Image.new(
+            "RGBA",
+            (img.width + pad_left + pad_right, img.height + pad_top + pad_bottom),
+            (255, 255, 255, 255),
+        )
+        canvas.paste(img, (pad_left, pad_top))
+        canvas.save(dst)
+        return dst
+
+    _logo = _ensure_padded_logo_standalone()
+    _mime = "image/png" if _logo.suffix.lower() == ".png" else "image/jpeg"
+    _logo_src = (
+        f"data:{_mime};base64," + _b64.b64encode(_logo.read_bytes()).decode()
+        if _logo.exists() else ""
+    )
     _img_tag = (
         f'<img src="{_logo_src}" class="brand-logo" alt="mYngle" />'
         if _logo_src else ""
@@ -4963,15 +4981,14 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         .brand-header {{
             display: grid;
             grid-template-columns: 40% 60%;
-            align-items: end;
-            min-height: 170px;
-            padding-top: 20px;
+            align-items: center;
+            padding-top: 24px;
             padding-bottom: 16px;
             overflow: visible !important;
         }}
         .brand-title-block {{
             display: flex;
-            align-items: end;
+            align-items: center;
             justify-content: flex-start;
             overflow: visible !important;
         }}
@@ -4987,16 +5004,20 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         .brand-logo-block {{
             display: flex;
             justify-content: flex-end;
-            align-items: end;
+            align-items: center;
+            padding-top: 24px;
             overflow: visible !important;
+            outline: 2px solid red;
         }}
         .brand-logo {{
-            width: 420px;
+            width: 405px;
             max-width: 100%;
             height: auto;
             display: block;
             object-fit: contain;
+            object-position: center center;
             overflow: visible !important;
+            outline: 2px solid blue;
         }}
         </style>
         <div class="brand-header">
