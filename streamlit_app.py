@@ -32,25 +32,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── Compact centred layout ────────────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-    .block-container {
-        max-width: 880px;
-        padding-top: 2.5rem;
-        padding-bottom: 3rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 import base64
 
-# ── Logo + header (inline flex, tight gap, lowercase title) ──────────────────
+# ── Logo + header (single markdown block, inline image, word-space gap) ───────
 _logo_path = pathlib.Path(__file__).parent / "Mynglelogofinal.jpg"
 if _logo_path.exists():
     _logo_b64 = base64.b64encode(_logo_path.read_bytes()).decode()
@@ -58,50 +42,56 @@ if _logo_path.exists():
 else:
     _logo_src  = ""
 
+_img_tag = (
+    f'<img src="{_logo_src}" class="brand-logo" alt="mYngle" />'
+    if _logo_src else ""
+)
+
 st.markdown(
     f"""
     <style>
-    /* Let Streamlit's markdown wrapper pass through overflow */
+    .block-container {{
+        max-width: 880px;
+        padding-top: 2.5rem;
+        padding-bottom: 3rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }}
+    /* Zero out Streamlit's wrapper margin on the brand block */
     div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
         overflow: visible;
+        margin-bottom: 0;
     }}
     .brand-header {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 12px;
-        padding-top: 6px;
-        overflow: visible;
-    }}
-    .brand-logo {{
-        width: 145px;
-        height: auto;
-        display: block;
-        flex-shrink: 0;
-        overflow: visible;
-        object-fit: contain;
-    }}
-    .brand-title {{
         font-size: 34px;
         font-weight: 700;
         color: #0B1F3A;
-        line-height: 1.05;
+        line-height: 1.3;
+        margin: 0.4rem 0 0.15rem 0;
+        padding-top: 6px;
+        overflow: visible;
         white-space: nowrap;
-        margin: 0;
+    }}
+    /* Logo as an inline element so the gap is exactly one word-space */
+    .brand-logo {{
+        height: 1.1em;
+        width: auto;
+        display: inline;
+        vertical-align: middle;
+        margin-right: 0.12em;
+        overflow: visible;
+    }}
+    .brand-subtitle {{
+        font-size: 0.875rem;
+        color: #6b7280;
+        margin: 0 0 0.5rem 0;
         padding: 0;
     }}
     </style>
-    <div class="brand-header">
-        {'<img src="' + _logo_src + '" class="brand-logo" alt="mYngle">' if _logo_src else ''}
-        <div class="brand-title">company enrichment</div>
-    </div>
+    <p class="brand-header">{_img_tag}company enrichment</p>
+    <p class="brand-subtitle">Upload a company file. The app will enrich and score the companies, then generate an Excel report.</p>
     """,
     unsafe_allow_html=True,
-)
-st.caption(
-    "Upload a company file. "
-    "The app will enrich and score the companies, "
-    "then generate an Excel report."
 )
 
 # ── Delegate to the main application ─────────────────────────────────────────
