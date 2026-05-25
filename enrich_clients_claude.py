@@ -3769,7 +3769,7 @@ def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rich Excel report builder
-# Creates: Input | Summary | Company Profiles (visible)
+# Creates: Lead Scores | Company Profiles (visible); Input hidden
 #          Advanced Evidence | Scoring Settings | Enriched |
 #          model_features | qa_evidence (hidden)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4353,8 +4353,8 @@ def build_rich_excel_bytes(
     """
     Build a fully formatted multi-sheet Excel workbook.
 
-    Visible sheets  : Input | Summary | Company Profiles
-    Hidden sheets   : Advanced Evidence | Scoring Settings |
+    Visible sheets  : Lead Scores | Company Profiles
+    Hidden sheets   : Input | Advanced Evidence | Scoring Settings |
                       Enriched | model_features | qa_evidence
 
     name_col / domain_col: when provided (e.g. from detect_columns), these are
@@ -4457,26 +4457,28 @@ def build_rich_excel_bytes(
                 "Export guardrail failed — workbook not written:\n" + "\n".join(_guard_errors)
             )
 
-    # ── Input (visible) ───────────────────────────────────────────────────────
+    # ── Input (hidden) — kept for audit; not shown by default ───────────────────
     ws_input = wb.create_sheet("Input")
     if df_input_original is not None:
         # Lucia exports: write the original contact-level CSV unchanged
         _xl_write_df(ws_input, df_input_original)
     else:
         _xl_write_df(ws_input, df[input_cols_list] if input_cols_list else df)
+    ws_input.sheet_state = "hidden"
+
+    # ── Lead Scores (visible) ─────────────────────────────────────────────────
+    ws_lead_scores = wb.create_sheet("Lead Scores")
+    profile_rows = None   # filled below after Company Profiles is built
 
     # ── Company Profiles (visible) ────────────────────────────────────────────
     ws_profiles = wb.create_sheet("Company Profiles")
     profile_rows = _xl_write_company_profiles(
         ws_profiles, df, _name_guess, _domain_guess
     )
+    _xl_write_summary(ws_lead_scores, df, _name_guess, _domain_guess, profile_rows)
 
-    # ── Summary (visible) ─────────────────────────────────────────────────────
-    ws_summary = wb.create_sheet("Summary")
-    _xl_write_summary(ws_summary, df, _name_guess, _domain_guess, profile_rows)
-
-    # Re-order: Input → Summary → Company Profiles
-    wb._sheets = [ws_input, ws_summary, ws_profiles]
+    # Visible order: Lead Scores → Company Profiles; hidden sheets appended after
+    wb._sheets = [ws_lead_scores, ws_profiles, ws_input]
 
     # ── Advanced Evidence (hidden) — long-format, one row per company per signal ─
     try:
@@ -4547,7 +4549,7 @@ def _validate_rich_excel(xl_bytes: bytes) -> dict:
     hidden  = [ws.title for ws in wb.worksheets if ws.sheet_state != "visible"]
     issues  = []
 
-    expected_visible = {"Input", "Summary", "Company Profiles"}
+    expected_visible = {"Lead Scores", "Company Profiles"}
     for s in expected_visible - set(visible):
         issues.append(f"'{s}' should be visible but is missing or hidden")
     for s in set(visible) - expected_visible:
@@ -4977,15 +4979,8 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             line-height: 1.1;
             white-space: nowrap;
         }}
-        .brand-subtitle {{
-            font-size: 0.875rem;
-            color: #6b7280;
-            margin: 0 0 0.5rem 0;
-            padding: 0;
-        }}
         </style>
         <div class="brand-header">{_img_tag}<span class="brand-title">lead prioritizer</span></div>
-        <p class="brand-subtitle">Upload a company list. The app will rank your leads and generate an Excel report.</p>
         """,
         unsafe_allow_html=True,
     )
@@ -5568,7 +5563,7 @@ elif uploaded and df_raw is not None:
         _n_companies  = _dedup_keys.nunique()
         # Always show both counts for Type 2 so users understand deduplication
         st.success(
-            f"✅ **{ss('file_name')}** loaded — "
+            f"✓ **{ss('file_name')}** loaded · "
             f"{_n_contacts:,} contact rows · {_n_companies:,} unique companies ready"
         )
     else:
@@ -5587,7 +5582,7 @@ elif uploaded and df_raw is not None:
         else:
             _t1_count = len(df_raw)
         st.success(
-            f"✅ **{ss('file_name')}** loaded — "
+            f"✓ **{ss('file_name')}** loaded · "
             f"{_t1_count:,} {'company' if _t1_count == 1 else 'companies'} ready"
         )
     if _show_adv:
@@ -5711,7 +5706,7 @@ _active_lusha_api = ss("_enable_lusha_api", False)
 if _active_lusha_api and not lusha_api_key:
     blocking.append("LUSHA_API_KEY is missing from .streamlit/secrets.toml")
 if _app_mode == "Batch Upload" and uploaded is None:
-    blocking.append("No file uploaded yet.")
+    blocking.append("Upload a file to start.")
 if _app_mode == "Single Company" and (_sc_df is None or _sc_df.empty):
     blocking.append("Enter a company name to proceed.")
 if file_error:
@@ -7099,7 +7094,7 @@ if ss("enrichment_done", False):
             df_input_original=ss("_df_raw_original"),
         )
     st.download_button(
-        label="⬇ Download results",
+        label="⬇ Download lead scores",
         data=_dl_bytes,
         file_name=_fname_dl,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
