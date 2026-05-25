@@ -3781,10 +3781,10 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         ws.column_dimensions[get_column_letter(ci)].width = w
 
     tier_fills = {
-        "Tier 1": PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid"),
-        "Tier 2": PatternFill(start_color="1F7AC4", end_color="1F7AC4", fill_type="solid"),
-        "Tier 3": PatternFill(start_color="E47228", end_color="E47228", fill_type="solid"),
-        "Pass":   PatternFill(start_color="7F7F7F", end_color="7F7F7F", fill_type="solid"),
+        "🥇 Hot":  PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid"),
+        "🥈 Warm": PatternFill(start_color="1F7AC4", end_color="1F7AC4", fill_type="solid"),
+        "🥉 Cool": PatternFill(start_color="E47228", end_color="E47228", fill_type="solid"),
+        "❄️ Pass": PatternFill(start_color="7F7F7F", end_color="7F7F7F", fill_type="solid"),
     }
     default_fill = PatternFill(start_color="2B4C7E", end_color="2B4C7E", fill_type="solid")
     label_font  = Font(bold=True,  size=10, color="1A1A1A")
@@ -3922,10 +3922,10 @@ def _xl_write_summary(ws, df: pd.DataFrame,
     hdr_font = Font(bold=True, color="FFFFFF", size=11)
     link_font = Font(color="0B4A92", underline="single", size=10)
     tier_colors = {
-        "Tier 1": "D6E4F7",
-        "Tier 2": "D9EAD3",
-        "Tier 3": "FCE5CD",
-        "Pass":   "F4CCCC",
+        "🥇 Hot":  "D6E4F7",
+        "🥈 Warm": "D9EAD3",
+        "🥉 Cool": "FCE5CD",
+        "❄️ Pass": "F4CCCC",
     }
 
     for ci, (hdr, w) in enumerate(zip(headers, widths), 1):
@@ -6026,7 +6026,7 @@ def _render_advanced_results(
                 _pd_s  = _sc_row.get("people_development_score", "")
                 _cc    = _sc_row.get("commercial_complexity_score", "")
 
-                _tier_emoji = {"Tier 1": "🟢", "Tier 2": "🟡", "Tier 3": "🟠", "Pass": "🔴"}.get(str(_tier), "⚪")
+                _tier_emoji = {"🥇 Hot": "🟢", "🥈 Warm": "🟡", "🥉 Cool": "🟠", "❄️ Pass": "🔴"}.get(str(_tier), "⚪")
                 _dq_label   = {"high": "✅ High", "medium": "⚠️ Medium", "low": "🔴 Low"}.get(str(_dqf), str(_dqf))
 
                 st.subheader("🎯 Commercial Fit Score")
@@ -6089,18 +6089,17 @@ def _render_advanced_results(
 
                 with st.expander("ℹ️ About these scores", expanded=False):
                     st.markdown(
-                        "1. **Model probability** — lean logistic regression on 7 key model-signal fields.\n"
-                        "2. **ICP Similarity Score [1–10]** — rescaled sigmoid output.\n"
-                        "3. **Company Size Score [1–10]** — 5-band employee-count mapping.\n"
+                        "1. **Model probability** — lean logistic regression on 7 key model-signal fields "
+                        "(normalised 0–3 → 0–1).\n"
+                        "2. **ICP Similarity Score [1–10]** — sigmoid-stretched model probability.\n"
+                        "3. **Company Size Score [1–10]** — 9-band employee-count mapping.\n"
                         "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + 0.25 × Company Size.\n"
-                        "5. **Tier** — Tier 1 ≥ 7.5 · Tier 2 ≥ 6.0 · Tier 3 ≥ 4.5 · Pass < 4.5.\n"
+                        "5. **Tier** — 🥇 Hot ≥ 8.66 · 🥈 Warm ≥ 7.19 · 🥉 Cool ≥ 4.23 · ❄️ Pass < 4.23.\n"
                         "6. **Composite scores** — global complexity, people development, commercial complexity "
-                        "(each 0–10, from signal groupings).\n\n"
-                        "⚠️ Coefficients are placeholder values — update `LEAN_COEFFICIENTS` and `INTERCEPT` "
-                        "in `commercial_fit_scoring.py` with fitted values from Results(3).xlsx."
+                        "(each 0–10, from signal groupings).\n"
                     )
 
-                _tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
+                _tier_order  = ["🥇 Hot", "🥈 Warm", "🥉 Cool", "❄️ Pass"]
                 _tier_counts = df_enriched["commercial_tier"].value_counts()
                 _tier_colors = ["🟢", "🟡", "🟠", "🔴"]
                 _tc = st.columns(4)
@@ -6113,7 +6112,7 @@ def _render_advanced_results(
                 with _fc1:
                     _tier_filter = st.selectbox(
                         "Show tiers",
-                        ["All", "Tier 1 only", "Tier 1 & 2"],
+                        ["All", "🥇 Hot only", "🥇 Hot + 🥈 Warm"],
                         key="score_tier_filter",
                     )
                 with _fc2:
@@ -6144,10 +6143,10 @@ def _render_advanced_results(
                 _disp_cols = _id_cols_sc + [c for c in _disp_core if c in df_enriched.columns]
                 _score_disp_df = df_enriched[[c for c in _disp_cols if c in df_enriched.columns]].copy()
 
-                if _tier_filter == "Tier 1 only":
-                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"] == "Tier 1"]
-                elif _tier_filter == "Tier 1 & 2":
-                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"].isin(["Tier 1", "Tier 2"])]
+                if _tier_filter == "🥇 Hot only":
+                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"] == "🥇 Hot"]
+                elif _tier_filter == "🥇 Hot + 🥈 Warm":
+                    _score_disp_df = _score_disp_df[_score_disp_df["commercial_tier"].isin(["🥇 Hot", "🥈 Warm"])]
                 if _min_score > 0 and "final_commercial_fit_score" in _score_disp_df.columns:
                     _score_disp_df = _score_disp_df[_score_disp_df["final_commercial_fit_score"] >= _min_score]
                 if _sort_by in _score_disp_df.columns:
@@ -6548,13 +6547,12 @@ if not ss("processing", False) and _SCORING_AVAILABLE and _show_adv:
                     st.caption(f"Signal columns found: {len(_req_sig)} / {len(_sa_lean_coeffs)}")
                     _sa_df_scored = _score_dataframe(_sa_df.copy())
 
-                    _sa_tier_order  = ["Tier 1", "Tier 2", "Tier 3", "Pass"]
+                    _sa_tier_order  = ["🥇 Hot", "🥈 Warm", "🥉 Cool", "❄️ Pass"]
                     _sa_tier_counts = _sa_df_scored["commercial_tier"].value_counts()
                     _sa_tc = st.columns(4)
-                    _sa_emojis = ["🟢", "🟡", "🟠", "🔴"]
-                    for _si, (_st_tier, _se) in enumerate(zip(_sa_tier_order, _sa_emojis)):
+                    for _si, _st_tier in enumerate(_sa_tier_order):
                         _sa_tc[_si].metric(
-                            f"{_se} {_st_tier}",
+                            _st_tier,
                             int(_sa_tier_counts.get(_st_tier, 0)),
                         )
 

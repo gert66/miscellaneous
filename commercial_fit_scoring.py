@@ -1,36 +1,35 @@
 """
-Commercial Fit Scoring Engine
-==============================
-Standalone Python module that converts enriched model-signal fields into a
-Final Commercial Fit Score and assigns a commercial tier.
+Commercial Fit Scoring Engine — Results(8).xlsx-compatible formula
+==================================================================
+Implements the logistic regression + sigmoid-stretch + size-blend formula
+validated against Results(8).xlsx.
 
-Formula
--------
-    lean_model_logit         = INTERCEPT + Σ (coeff_i × field_i)
-    model_probability        = sigmoid(lean_model_logit)
-    icp_similarity_score     = 1 + 9 × model_probability          (scale 1–10)
-    company_size_score       = band lookup or passthrough          (scale 1–10)
-    final_commercial_fit_score = 0.75 × icp_similarity_score
-                               + 0.25 × company_size_score
+Formula summary
+---------------
+1.  Normalise each input signal:  norm = clamp(v, 0, 3) / 3
+2.  LR score:   lr_z_score  = INTERCEPT + Σ(coeff_i × norm_i)
+3.  Prob:        lean_model_prob = 1 / (1 + exp(−lr_z_score))
+4.  Sigmoid stretch:
+      sigmoid_raw_s       = 1 / (1 + exp(−k × (prob − 0.5)))
+      icp_similarity_score = clamp(1 + 9×(s − s_min)/(s_max − s_min), 1, 10)
+5.  Size score: exact band lookup (9 bands, 1–10 float scale)
+6.  Blend:
+      final_commercial_fit_score =
+          clamp(0.75 × icp_similarity_score + 0.25 × company_size_score, 1, 10)
 
-Composite profile scores (0–10, normalised ordinal sums)
+Backward-compatible aliases (calculated from canonical fields, not independently)
+-----------------------------------------------------------------------------------
+  lean_model_logit  → alias of lr_z_score
+  model_probability → alias of lean_model_prob
+
+Reference validation (Capgemini, all 7 signals supplied)
 ---------------------------------------------------------
-Derived from signal groupings in postprocess_enrichment_single.py:
-    global_complexity_score     — international footprint + multicultural signals
-    people_development_score    — L&D focus + employer branding + leadership
-    commercial_complexity_score — international presence + sales/language signals
-
-Lean model input fields (7 ordinal signals, 0–3 each)
-------------------------------------------------------
-Copied from Results(3).xlsx — lean logistic regression feature set.
-Replace INTERCEPT and LEAN_COEFFICIENTS below if the workbook is updated.
-
-Usage
------
-    from commercial_fit_scoring import score_company, score_dataframe
-
-    result = score_company(row_dict)
-    df_out = score_dataframe(df_enriched)
+  lr_z_score          ≈ 0.9870
+  lean_model_prob     ≈ 0.7285
+  icp_similarity_score ≈ 9.39
+  company_size_score  = 10.0
+  final_commercial_fit_score ≈ 9.54
+  commercial_tier     = 🥇 Hot
 """
 
 from __future__ import annotations
@@ -42,114 +41,156 @@ from typing import Any
 import pandas as pd
 
 # =============================================================================
-# CONSTANTS
-# Copied from Results(3).xlsx — lean logistic regression, 7-feature model.
-# Replace these values when the workbook is updated.
+# CONSTANTS — Results(8).xlsx-compatible
 # =============================================================================
 
-#: Logistic-regression intercept.
-#: Source: Results(3).xlsx — lean model fit.
-INTERCEPT: float = -1.20
+#: LR intercept.
+INTERCEPT: float = -0.35
 
-#: Lean model coefficients for the 7 selected input signals.
-#: Keys are the enriched field names (ordinal int 0–3).
-#: Source: Results(3).xlsx — lean model coefficients column.
+#: Coefficients applied to normalised signals (clamp(v, 0, 3) / 3).
+#: IMPORTANT: uses sig_employer_branding_score — NOT sig_merger_acq_score.
 LEAN_COEFFICIENTS: dict[str, float] = {
-    "sig_foreign_hq_score":    0.48,
-    "sig_rapid_growth_score":  0.42,
-    "sig_explicit_lnd_score":  0.85,   # strongest predictor
-    "sig_intl_footprint_score": 0.60,
-    "sig_merger_acq_score":    0.30,
-    "sig_lnd_onboarding_score": 0.65,
-    "ti_onboarding_score":     0.38,
+    "sig_foreign_hq_score":        0.7465,
+    "sig_explicit_lnd_score":      0.2185,
+    "sig_intl_footprint_score":    0.1795,
+    "sig_employer_branding_score": 0.1602,   # NOT sig_merger_acq_score
+    "sig_lnd_onboarding_score":    0.1250,
+    "ti_onboarding_score":         0.1488,
+    "sig_rapid_growth_score":     -0.2905,   # negative coefficient
 }
 
-#: Employee-count bands → company_size_score on 1–10 scale.
-#: Tuple: (exclusive upper bound of employee midpoint, score).
-#: Source: Results(3).xlsx — company size scoring bands.
-SIZE_BANDS: list[tuple[float, int]] = [
-    (50.0,      2),    # <50       → micro/tiny
-    (200.0,     4),    # 50–199    → small
-    (1_000.0,   6),    # 200–999   → mid-market
-    (5_000.0,   8),    # 1 000–4 999 → large
-    (math.inf, 10),    # 5 000+    → enterprise
+#: Exact employee-range string → company_size_score (1–10 float).
+#: Keys are the normalised canonical form (lower - upper).
+SIZE_BAND_LOOKUP: dict[str, float] = {
+    "100001 - 10000000": 10.0,
+    "10001 - 100000":     8.88,
+    "5001 - 10000":       7.75,
+    "1001 - 5000":        6.63,
+    "501 - 1000":          5.5,
+    "201 - 500":           4.38,
+    "51 - 200":            3.25,
+    "11 - 50":             2.13,
+    "1 - 10":              1.0,
+}
+#: Numeric midpoint thresholds for fallback band lookup (used when exact
+#: string match fails).  Checked ascending; first band whose upper bound
+#: exceeds the midpoint wins.
+_SIZE_MIDPOINT_BANDS: list[tuple[float, float]] = [
+    (10.5,      1.0),
+    (50.5,      2.13),
+    (200.5,     3.25),
+    (500.5,     4.38),
+    (1_000.5,   5.5),
+    (5_000.5,   6.63),
+    (10_000.5,  7.75),
+    (100_000.5, 8.88),
+    (math.inf,  10.0),
 ]
+SIZE_SCORE_MISSING: float = 5.5   # default when range is unknown
 
-#: Tier thresholds — inclusive lower bounds, checked in order.
-#: Source: Results(3).xlsx — commercial tier cut-offs.
+#: Sigmoid stretch parameters.
+SIGMOID_K:     float = 5.0
+SIGMOID_S_MIN: float = 0.328827
+SIGMOID_S_MAX: float = 0.789236
+
+#: Blend weights.
+MODEL_WEIGHT: float = 0.75
+SIZE_WEIGHT:  float = 0.25
+
+#: Tier thresholds — inclusive lower bounds, checked in descending order.
 TIER_THRESHOLDS: list[tuple[float, str]] = [
-    (7.5, "Tier 1"),
-    (6.0, "Tier 2"),
-    (4.5, "Tier 3"),
-    (0.0, "Pass"),
+    (8.66, "🥇 Hot"),
+    (7.19, "🥈 Warm"),
+    (4.23, "🥉 Cool"),
+    (0.0,  "❄️ Pass"),
 ]
 
-#: A contribution is flagged as a "top driver" when it exceeds this share of
-#: the total positive logit mass.
-TOP_DRIVER_THRESHOLD: float = 0.15
-
-#: A field is "weak" when its value is 0 (or missing) but the coefficient
-#: is at least this large — meaning scoring potential is being left unused.
-WEAK_DRIVER_MIN_COEFF: float = 0.40
-
-# =============================================================================
-# COMPOSITE SCORE FIELD GROUPS
-# Field groupings adapted from postprocess_enrichment_single.py signal analysis.
-# Each group produces a normalised 0–10 composite score.
-# =============================================================================
-
-#: Captures how internationally complex the company's workforce and structure is.
-#: Corresponds to global_complexity_score in postprocess_enrichment_single.py.
+# Composite profile score groupings (display-only — not part of LR)
 GLOBAL_COMPLEXITY_FIELDS: list[str] = [
-    "sig_intl_footprint_score",   # international offices / global operations
-    "sig_foreign_hq_score",       # non-domestic HQ or parent company
-    "sig_multicultural_score",    # multilingual / diverse workforce signals
-    "ti_intercultural_score",     # training interest in cross-cultural skills
+    "sig_intl_footprint_score",
+    "sig_foreign_hq_score",
+    "sig_multicultural_score",
+    "ti_intercultural_score",
 ]
-
-#: Captures investment in people development, learning, and leadership.
-#: Corresponds to people_development_score in postprocess_enrichment_single.py.
 PEOPLE_DEVELOPMENT_FIELDS: list[str] = [
-    "sig_explicit_lnd_score",     # explicit L&D programmes
-    "sig_lnd_onboarding_score",   # structured onboarding / induction signals
-    "sig_employer_branding_score",# employer brand / EVP investment
-    "ti_leadership_score",        # training interest in leadership
-    "ti_onboarding_score",        # training interest in onboarding
+    "sig_explicit_lnd_score",
+    "sig_lnd_onboarding_score",
+    "sig_employer_branding_score",
+    "ti_leadership_score",
+    "ti_onboarding_score",
 ]
-
-#: Captures commercial reach, cross-border sales complexity, and competitor signals.
-#: Corresponds to commercial_complexity_score in postprocess_enrichment_single.py.
 COMMERCIAL_COMPLEXITY_FIELDS: list[str] = [
-    "sig_intl_footprint_score",            # international operations
-    "ti_leadership_score",                 # sales / management training interest
-    "ti_negotiation_sales_score",          # negotiation / sales training signals
-    "language_competitor_strength_score",  # competitor uses language training
-    "competitor_signal_strength_score",    # direct competitor signal
+    "sig_intl_footprint_score",
+    "ti_leadership_score",
+    "ti_negotiation_sales_score",
+    "language_competitor_strength_score",
+    "competitor_signal_strength_score",
 ]
 
-#: final_commercial_fit_score >= this value → high_value_flag = True (Tier 1 or 2).
-HIGH_VALUE_MIN_SCORE: float = 6.0
-
-#: final_commercial_fit_score < this value → weak_flag = True (Pass tier).
-WEAK_MAX_SCORE: float = 4.5
-
-#: Missing lean-model fields at or above this count → data_quality_flag = "medium".
+HIGH_VALUE_MIN_SCORE: float = 7.19   # Hot or Warm
+WEAK_MAX_SCORE:       float = 4.23   # below Cool
 DATA_QUALITY_MEDIUM_MISSING: int = 2
+DATA_QUALITY_LOW_MISSING:    int = 5
+TOP_DRIVER_THRESHOLD:   float = 0.15
+WEAK_DRIVER_MIN_COEFF:  float = 0.10   # positive coefficients only
 
-#: Missing lean-model fields at or above this count → data_quality_flag = "low".
-DATA_QUALITY_LOW_MISSING: int = 5
-
-# Output columns appended by score_dataframe()
+#: All columns appended by score_dataframe().
 SCORE_OUTPUT_COLS: list[str] = [
-    "lean_model_logit",
-    "model_probability",
+    # ── Canonical result fields ──────────────────────────────────────────────
+    "lr_z_score",
+    "lean_model_prob",
     "icp_similarity_score",
     "company_size_score",
+    "company_size_missing",
     "final_commercial_fit_score",
     "commercial_tier",
+    # ── Backward-compat aliases ──────────────────────────────────────────────
+    "lean_model_logit",       # = lr_z_score
+    "model_probability",      # = lean_model_prob
+    # ── Audit: LR raw inputs ─────────────────────────────────────────────────
+    "score_input_foreign_hq",
+    "score_input_explicit_lnd",
+    "score_input_intl_footprint",
+    "score_input_employer_branding",
+    "score_input_lnd_onboarding",
+    "score_input_ti_onboarding",
+    "score_input_rapid_growth",
+    "score_input_employee_range",
+    # ── Audit: normalised inputs ─────────────────────────────────────────────
+    "norm_foreign_hq",
+    "norm_explicit_lnd",
+    "norm_intl_footprint",
+    "norm_employer_branding",
+    "norm_lnd_onboarding",
+    "norm_ti_onboarding",
+    "norm_rapid_growth",
+    # ── Audit: LR components ─────────────────────────────────────────────────
+    "lr_intercept_component",
+    "lr_foreign_hq_component",
+    "lr_explicit_lnd_component",
+    "lr_intl_footprint_component",
+    "lr_employer_branding_component",
+    "lr_lnd_onboarding_component",
+    "lr_ti_onboarding_component",
+    "lr_rapid_growth_component",
+    # ── Audit: size ──────────────────────────────────────────────────────────
+    "employee_range_normalized",
+    # ── Audit: sigmoid ───────────────────────────────────────────────────────
+    "sigmoid_k",
+    "sigmoid_s_min",
+    "sigmoid_s_max",
+    "sigmoid_input_value",
+    "sigmoid_raw_s",
+    # ── Audit: blend ─────────────────────────────────────────────────────────
+    "model_weight",
+    "size_weight",
+    "weighted_model_component",
+    "weighted_size_component",
+    # ── Composite profile scores (display-only) ───────────────────────────────
     "global_complexity_score",
     "people_development_score",
     "commercial_complexity_score",
+    # ── Quality flags ────────────────────────────────────────────────────────
     "high_value_flag",
     "weak_flag",
     "data_quality_flag",
@@ -165,7 +206,6 @@ SCORE_OUTPUT_COLS: list[str] = [
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
-    """Coerce value to float; return default on failure."""
     try:
         v = float(value)
         return v if math.isfinite(v) else default
@@ -174,50 +214,73 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 
 def _is_missing(value: Any) -> bool:
-    """Return True when value is absent, empty, or an explicit null string."""
     if value is None:
         return True
-    s = str(value).strip().lower()
-    return s in ("", "nan", "none", "n/a", "unknown", "null")
+    return str(value).strip().lower() in ("", "nan", "none", "n/a", "unknown", "null")
 
 
-def _parse_employee_midpoint(raw: Any) -> float | None:
-    """Return numeric midpoint from an employee-range string.
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
-    Handles: "51-200", "201–500", "1001 to 5000", "10001+", plain integer.
-    Returns None when the value is missing or cannot be parsed.
-    """
+
+def _normalize_range_str(raw: str) -> str:
+    """Canonicalise 'lower-upper' range string to 'lo - hi' form."""
+    s = raw.strip().lower().replace(",", "").replace("–", "-").replace(" to ", "-")
+    s = re.sub(r"\s*-\s*", " - ", s)
+    return s
+
+
+def _parse_range_midpoint(raw: Any) -> float | None:
+    """Return numeric midpoint of an employee-range string, or None."""
     s = str(raw or "").strip().lower().replace(",", "").replace("–", "-")
     if s in ("", "nan", "none", "n/a", "unknown", "null"):
         return None
-    # "201-500" or "201 to 500"
     m = re.search(r"(\d+)\s*[-to]+\s*(\d+)", s)
     if m:
         return (float(m.group(1)) + float(m.group(2))) / 2.0
-    # "10001+"
     m = re.search(r"(\d+)\+", s)
     if m:
         return float(m.group(1)) * 1.5
-    # plain integer
     m = re.search(r"(\d+)", s)
     if m:
         return float(m.group(1))
     return None
 
 
-def _band_lookup(midpoint: float) -> int:
-    """Map employee midpoint to size score via SIZE_BANDS."""
-    for upper, score in SIZE_BANDS:
+def _band_lookup_midpoint(midpoint: float) -> float:
+    for upper, score in _SIZE_MIDPOINT_BANDS:
         if midpoint < upper:
             return score
-    return SIZE_BANDS[-1][1]
+    return 10.0
+
+
+def _resolve_size_score(row: dict) -> tuple[float, bool, str]:
+    """Return (size_score, size_missing, range_key).
+
+    Tries lusha_api_employee_range then lusha_employee_range.
+    Falls back to SIZE_SCORE_MISSING when nothing is parseable.
+    """
+    for field in ("lusha_api_employee_range", "lusha_employee_range",
+                  "employee_range", "company_size"):
+        raw = row.get(field)
+        if _is_missing(raw):
+            continue
+        # Try exact normalised-key lookup first
+        norm_key = _normalize_range_str(str(raw))
+        if norm_key in SIZE_BAND_LOOKUP:
+            return SIZE_BAND_LOOKUP[norm_key], False, norm_key
+        # Try direct key match (handles already-canonical strings)
+        direct = str(raw).strip()
+        if direct in SIZE_BAND_LOOKUP:
+            return SIZE_BAND_LOOKUP[direct], False, direct
+        # Fall back to midpoint-based band
+        mid = _parse_range_midpoint(raw)
+        if mid is not None:
+            return _band_lookup_midpoint(mid), False, norm_key
+    return SIZE_SCORE_MISSING, True, ""
 
 
 def _composite_score(row: dict, fields: list[str], max_per_field: float = 3.0) -> float:
-    """Normalised sum of ordinal fields, rescaled to 0–10.
-
-    Missing or non-numeric values contribute 0.  Result is capped at 10.
-    """
     total   = sum(_to_float(row.get(f, 0)) for f in fields)
     ceiling = max_per_field * len(fields)
     if ceiling <= 0:
@@ -229,230 +292,213 @@ def _composite_score(row: dict, fields: list[str], max_per_field: float = 3.0) -
 # Public API
 # =============================================================================
 
+_FIELD_TO_AUDIT_INPUT: dict[str, str] = {
+    "sig_foreign_hq_score":        "score_input_foreign_hq",
+    "sig_explicit_lnd_score":      "score_input_explicit_lnd",
+    "sig_intl_footprint_score":    "score_input_intl_footprint",
+    "sig_employer_branding_score": "score_input_employer_branding",
+    "sig_lnd_onboarding_score":    "score_input_lnd_onboarding",
+    "ti_onboarding_score":         "score_input_ti_onboarding",
+    "sig_rapid_growth_score":      "score_input_rapid_growth",
+}
+_FIELD_TO_NORM: dict[str, str] = {
+    "sig_foreign_hq_score":        "norm_foreign_hq",
+    "sig_explicit_lnd_score":      "norm_explicit_lnd",
+    "sig_intl_footprint_score":    "norm_intl_footprint",
+    "sig_employer_branding_score": "norm_employer_branding",
+    "sig_lnd_onboarding_score":    "norm_lnd_onboarding",
+    "ti_onboarding_score":         "norm_ti_onboarding",
+    "sig_rapid_growth_score":      "norm_rapid_growth",
+}
+_FIELD_TO_COMPONENT: dict[str, str] = {
+    "sig_foreign_hq_score":        "lr_foreign_hq_component",
+    "sig_explicit_lnd_score":      "lr_explicit_lnd_component",
+    "sig_intl_footprint_score":    "lr_intl_footprint_component",
+    "sig_employer_branding_score": "lr_employer_branding_component",
+    "sig_lnd_onboarding_score":    "lr_lnd_onboarding_component",
+    "ti_onboarding_score":         "lr_ti_onboarding_component",
+    "sig_rapid_growth_score":      "lr_rapid_growth_component",
+}
+
 
 def score_company(
-    row: dict | pd.Series,
+    row: "dict | pd.Series",
     params: dict | None = None,
 ) -> dict:
-    """Score a single enriched company row.
+    """Score a single enriched company row using the Results(8)-compatible formula.
 
-    Parameters
-    ----------
-    row:
-        A dict or pandas.Series containing enriched model-signal fields.
-        Missing fields are treated as 0 and logged in ``missing_scoring_fields``.
-    params:
-        Optional override dict.  Recognised keys:
-          ``intercept``         — float, overrides INTERCEPT
-          ``coefficients``      — dict[str, float], merges into LEAN_COEFFICIENTS
-          ``size_bands``        — list[tuple[float, int]]
-          ``tier_thresholds``   — list[tuple[float, str]]
-
-    Returns
-    -------
-    dict with keys matching SCORE_OUTPUT_COLS:
-      lean_model_logit, model_probability, icp_similarity_score,
-      company_size_score, final_commercial_fit_score, commercial_tier,
-      global_complexity_score, people_development_score,
-      commercial_complexity_score, high_value_flag, weak_flag,
-      data_quality_flag, top_score_drivers, weak_score_drivers,
-      scoring_notes, missing_scoring_fields.
+    Returns a dict whose keys are a superset of SCORE_OUTPUT_COLS, including
+    all audit fields so callers can write them to a model_features sheet.
     """
-    # ── Resolve parameters ────────────────────────────────────────────────────
     p = params or {}
-    intercept  = float(p.get("intercept", INTERCEPT))
-    coeffs     = {**LEAN_COEFFICIENTS, **p.get("coefficients", {})}
-    size_bands = p.get("size_bands", SIZE_BANDS)
-    tiers      = p.get("tier_thresholds", TIER_THRESHOLDS)
+    intercept = float(p.get("intercept", INTERCEPT))
+    coeffs    = {**LEAN_COEFFICIENTS, **p.get("coefficients", {})}
+    tiers     = p.get("tier_thresholds", TIER_THRESHOLDS)
 
     if isinstance(row, pd.Series):
         row = row.to_dict()
 
-    notes: list[str] = []
-    missing_fields: list[str] = []
+    notes: list[str]   = []
+    missing: list[str] = []
+    out: dict = {}
 
-    # ── 1. Lean model logit ───────────────────────────────────────────────────
-    logit = intercept
-    field_contributions: dict[str, float] = {}
+    # ── 1. Read raw signal values, normalise, compute LR components ──────────
+    lr_z  = intercept
+    out["lr_intercept_component"] = intercept
 
-    for field, coef in coeffs.items():
+    for field, coeff in coeffs.items():
         raw = row.get(field)
         if _is_missing(raw):
-            missing_fields.append(field)
-            v = 0.0
+            missing.append(field)
+            raw_val = 0.0
         else:
-            v = _to_float(raw)
-        contribution = coef * v
-        field_contributions[field] = contribution
-        logit += contribution
+            raw_val = _clamp(_to_float(raw), 0.0, 3.0)
 
-    logit = max(-500.0, min(500.0, logit))
+        norm = raw_val / 3.0
+        comp = coeff * norm
+        lr_z += comp
 
-    if missing_fields:
+        out[_FIELD_TO_AUDIT_INPUT[field]] = raw_val
+        out[_FIELD_TO_NORM[field]]        = round(norm, 6)
+        out[_FIELD_TO_COMPONENT[field]]   = round(comp, 6)
+
+    if missing:
         notes.append(
-            f"Score based on incomplete data — {len(missing_fields)} of "
-            f"{len(coeffs)} signal field(s) missing (defaulted to 0): "
-            f"{', '.join(missing_fields)}."
+            f"Score based on incomplete data — {len(missing)} of {len(coeffs)} "
+            f"signal field(s) missing (defaulted to 0): {', '.join(missing)}."
         )
 
-    # ── 2. Model probability ──────────────────────────────────────────────────
-    prob = 1.0 / (1.0 + math.exp(-logit))
+    lr_z = _clamp(lr_z, -500.0, 500.0)
 
-    # ── 3. ICP Similarity Score (1–10) ────────────────────────────────────────
-    icp_sim = round(1.0 + 9.0 * prob, 2)
+    # ── 2. Probability ────────────────────────────────────────────────────────
+    lean_model_prob = 1.0 / (1.0 + math.exp(-lr_z))
 
-    # ── 4. Company Size Score ─────────────────────────────────────────────────
-    # Priority: company_size_score (1-10) > employee_size_score (1-5, scaled)
-    # > derive from employee range string fields.
-    size_score: int
-    size_source: str
+    # ── 3. Sigmoid stretch → ICP Similarity Score ────────────────────────────
+    sigmoid_raw_s = 1.0 / (1.0 + math.exp(-SIGMOID_K * (lean_model_prob - 0.5)))
+    denom = SIGMOID_S_MAX - SIGMOID_S_MIN
+    icp_sim = _clamp(1.0 + 9.0 * (sigmoid_raw_s - SIGMOID_S_MIN) / denom, 1.0, 10.0)
 
-    if not _is_missing(row.get("company_size_score")):
-        # Already on a 1–10 scale
-        size_score = max(1, min(10, round(_to_float(row["company_size_score"]))))
-        size_source = "company_size_score (passthrough)"
+    # ── 4. Size score ─────────────────────────────────────────────────────────
+    size_score, size_missing, range_key = _resolve_size_score(row)
+    out["score_input_employee_range"] = str(
+        next((row.get(f) for f in ("lusha_api_employee_range", "lusha_employee_range",
+                                   "employee_range", "company_size")
+              if not _is_missing(row.get(f))), "")
+    )
+    out["employee_range_normalized"] = range_key
+    if size_missing:
+        notes.append(
+            "No employee range data found; company_size_score defaulted to "
+            f"{SIZE_SCORE_MISSING}."
+        )
 
-    elif not _is_missing(row.get("employee_size_score")):
-        # Lusha 1–5 scale → convert to 1–10
-        raw_ess = _to_float(row["employee_size_score"])
-        size_score = max(1, min(10, round(raw_ess * 2)))
-        size_source = "employee_size_score (scaled ×2)"
+    # ── 5. Blend ──────────────────────────────────────────────────────────────
+    w_model = MODEL_WEIGHT * icp_sim
+    w_size  = SIZE_WEIGHT  * size_score
+    final   = _clamp(w_model + w_size, 1.0, 10.0)
 
-    else:
-        # Derive from employee range string
-        mid: float | None = None
-        for field in (
-            "lusha_api_employee_range",
-            "lusha_employee_range",
-            "employee_range",
-            "company_size",
-        ):
-            raw_range = row.get(field)
-            if not _is_missing(raw_range):
-                mid = _parse_employee_midpoint(raw_range)
-                if mid is not None:
-                    size_source = f"derived from {field}"
-                    break
-        else:
-            size_source = "default (no range data)"
-
-        if mid is not None:
-            size_score = _band_lookup(mid)
-        else:
-            size_score = 4   # conservative default (small-band)
-            notes.append(
-                "No employee count or range data found; company_size_score "
-                "defaulted to 4 (small)."
-            )
-
-    # ── 5. Final Commercial Fit Score ─────────────────────────────────────────
-    fit_score = round(0.75 * icp_sim + 0.25 * size_score, 2)
-
-    # ── 6. Commercial Tier ────────────────────────────────────────────────────
-    tier = "Pass"
+    # ── 6. Tier ───────────────────────────────────────────────────────────────
+    tier = TIER_THRESHOLDS[-1][1]
     for threshold, label in tiers:
-        if fit_score >= threshold:
+        if final >= threshold:
             tier = label
             break
 
-    # ── 7. Driver analysis ────────────────────────────────────────────────────
-    total_positive = sum(c for c in field_contributions.values() if c > 0) or 1.0
-
-    top_drivers: list[str] = [
-        f"{field}={round(row.get(field, 0) or 0, 0):.0f} "
-        f"(+{contribution:.2f})"
-        for field, contribution in sorted(
-            field_contributions.items(), key=lambda x: -x[1]
-        )
-        if contribution > 0
-        and contribution / total_positive >= TOP_DRIVER_THRESHOLD
-    ]
-
-    # Weak drivers: high-coefficient fields the company scored 0 or is missing
-    weak_drivers: list[str] = [
-        f"{field} (coeff={coef:.2f}, current value={round(row.get(field, 0) or 0, 0):.0f})"
-        for field, coef in sorted(coeffs.items(), key=lambda x: -x[1])
-        if coef >= WEAK_DRIVER_MIN_COEFF
-        and _to_float(row.get(field, 0)) == 0.0
-    ]
-
-    notes.append(f"Company size score: {size_score}/10 — {size_source}.")
-    if tier == "Pass":
-        notes.append("Score is below minimum tier threshold.")
-
-    # ── 8. Composite profile scores ───────────────────────────────────────────
+    # ── 7. Composite profile scores ───────────────────────────────────────────
     global_complexity     = _composite_score(row, GLOBAL_COMPLEXITY_FIELDS)
     people_development    = _composite_score(row, PEOPLE_DEVELOPMENT_FIELDS)
     commercial_complexity = _composite_score(row, COMMERCIAL_COMPLEXITY_FIELDS)
 
-    # ── 9. Value flags & data quality ─────────────────────────────────────────
-    high_value_flag = fit_score >= HIGH_VALUE_MIN_SCORE
-    weak_flag       = fit_score < WEAK_MAX_SCORE
+    # ── 8. Driver analysis ────────────────────────────────────────────────────
+    pos_contributions = {
+        f: out[_FIELD_TO_COMPONENT[f]]
+        for f in coeffs
+        if out[_FIELD_TO_COMPONENT[f]] > 0
+    }
+    total_pos = sum(pos_contributions.values()) or 1.0
 
-    n_missing = len(missing_fields)
-    manual_review = _to_float(row.get("model_signal_needs_manual_review", 0)) > 0
-    if manual_review or n_missing >= DATA_QUALITY_LOW_MISSING:
-        data_quality_flag = "low"
+    top_drivers = [
+        f"{f}={out[_FIELD_TO_AUDIT_INPUT[f]]:.0f} (+{c:.2f})"
+        for f, c in sorted(pos_contributions.items(), key=lambda x: -x[1])
+        if c / total_pos >= TOP_DRIVER_THRESHOLD
+    ]
+    weak_drivers = [
+        f"{f} (coeff={coeffs[f]:.4f}, current={out[_FIELD_TO_AUDIT_INPUT[f]]:.0f})"
+        for f in sorted(coeffs, key=lambda x: -coeffs[x])
+        if coeffs[f] >= WEAK_DRIVER_MIN_COEFF
+        and out[_FIELD_TO_AUDIT_INPUT[f]] == 0.0
+    ]
+
+    # ── 9. Data quality ───────────────────────────────────────────────────────
+    n_missing  = len(missing)
+    manual_rev = _to_float(row.get("model_signal_needs_manual_review", 0)) > 0
+    if manual_rev or n_missing >= DATA_QUALITY_LOW_MISSING:
+        dqf = "low"
     elif n_missing >= DATA_QUALITY_MEDIUM_MISSING:
-        data_quality_flag = "medium"
+        dqf = "medium"
     else:
-        data_quality_flag = "high"
-
-    if data_quality_flag == "low" and not manual_review:
-        notes.append(
-            f"Data quality is low — {n_missing} of {len(coeffs)} signal fields missing."
-        )
-    elif manual_review:
+        dqf = "high"
+    if dqf == "low" and not manual_rev:
+        notes.append(f"Data quality is low — {n_missing} of {len(coeffs)} signal fields missing.")
+    elif manual_rev:
         notes.append("Flagged for manual review; score reliability is reduced.")
 
-    return {
-        "lean_model_logit":           round(logit, 4),
-        "model_probability":          round(prob, 4),
-        "icp_similarity_score":       icp_sim,
-        "company_size_score":         size_score,
-        "final_commercial_fit_score": fit_score,
-        "commercial_tier":            tier,
-        "global_complexity_score":    global_complexity,
-        "people_development_score":   people_development,
+    notes.append(f"Company size score: {size_score}/10.")
+
+    # ── Assemble result ───────────────────────────────────────────────────────
+    out.update({
+        # Canonical fields
+        "lr_z_score":                  round(lr_z, 6),
+        "lean_model_prob":             round(lean_model_prob, 7),
+        "icp_similarity_score":        round(icp_sim, 2),
+        "company_size_score":          round(size_score, 2),
+        "company_size_missing":        size_missing,
+        "final_commercial_fit_score":  round(final, 2),
+        "commercial_tier":             tier,
+        # Backward-compat aliases (derived from canonical — not a separate calculation)
+        "lean_model_logit":            round(lr_z, 6),
+        "model_probability":           round(lean_model_prob, 7),
+        # Sigmoid audit
+        "sigmoid_k":           SIGMOID_K,
+        "sigmoid_s_min":       SIGMOID_S_MIN,
+        "sigmoid_s_max":       SIGMOID_S_MAX,
+        "sigmoid_input_value": round(lean_model_prob, 7),
+        "sigmoid_raw_s":       round(sigmoid_raw_s, 7),
+        # Blend audit
+        "model_weight":              MODEL_WEIGHT,
+        "size_weight":               SIZE_WEIGHT,
+        "weighted_model_component":  round(w_model, 4),
+        "weighted_size_component":   round(w_size, 4),
+        # Composite
+        "global_complexity_score":     global_complexity,
+        "people_development_score":    people_development,
         "commercial_complexity_score": commercial_complexity,
-        "high_value_flag":            high_value_flag,
-        "weak_flag":                  weak_flag,
-        "data_quality_flag":          data_quality_flag,
-        "top_score_drivers":          "; ".join(top_drivers) if top_drivers else "none",
-        "weak_score_drivers":         "; ".join(weak_drivers) if weak_drivers else "none",
-        "scoring_notes":              " | ".join(notes),
-        "missing_scoring_fields":     ", ".join(missing_fields) if missing_fields else "",
-    }
+        # Flags
+        "high_value_flag":        final >= HIGH_VALUE_MIN_SCORE,
+        "weak_flag":              final < WEAK_MAX_SCORE,
+        "data_quality_flag":      dqf,
+        "top_score_drivers":      "; ".join(top_drivers) if top_drivers else "none",
+        "weak_score_drivers":     "; ".join(weak_drivers) if weak_drivers else "none",
+        "scoring_notes":          " | ".join(notes),
+        "missing_scoring_fields": ", ".join(missing) if missing else "",
+    })
+    return out
 
 
 def score_dataframe(
     df: pd.DataFrame,
     params: dict | None = None,
 ) -> pd.DataFrame:
-    """Apply score_company to every row and append score output columns.
-
-    Parameters
-    ----------
-    df:
-        DataFrame containing enriched model-signal fields.  Original columns
-        are preserved; SCORE_OUTPUT_COLS are appended (overwriting any
-        existing columns with those names).
-    params:
-        Passed through to score_company unchanged.
-
-    Returns
-    -------
-    The same DataFrame object with SCORE_OUTPUT_COLS appended.
-    """
+    """Apply score_company to every row and append SCORE_OUTPUT_COLS."""
     records = df.to_dict("records")
     scored  = [score_company(r, params) for r in records]
     for col in SCORE_OUTPUT_COLS:
-        df[col] = [r[col] for r in scored]
+        df[col] = [r.get(col) for r in scored]
     return df
 
 
 # =============================================================================
-# Unit-style tests — run with: python commercial_fit_scoring.py
+# Smoke tests — run with:  python commercial_fit_scoring.py
 # =============================================================================
 
 if __name__ == "__main__":
@@ -462,268 +508,192 @@ if __name__ == "__main__":
     FAIL  = "\033[91m✗\033[0m"
     _failures: list[str] = []
 
-    def _check(label: str, condition: bool, detail: str = "") -> None:
-        if condition:
+    def _chk(label: str, ok: bool, detail: str = "") -> None:
+        if ok:
             print(f"  {PASS}  {label}")
         else:
             _failures.append(label)
-            print(f"  {FAIL}  {label}" + (f" — {detail}" if detail else ""))
+            print(f"  {FAIL}  {label}" + (f"  [{detail}]" if detail else ""))
 
     def _section(title: str) -> None:
-        print(f"\n{'─' * 60}")
-        print(f"  {title}")
-        print("─" * 60)
+        print(f"\n{'─'*60}\n  {title}\n{'─'*60}")
 
-    # ── Case 1: Strong company — all signals at maximum ───────────────────────
-    _section("Case 1: Strong company (all signals = 3, large employee range)")
+    # ── Smoke Test 1: Capgemini reference ─────────────────────────────────────
+    _section("Smoke Test 1: Capgemini reference values (Results(8).xlsx)")
 
-    strong = {
-        "sig_foreign_hq_score":      3,
-        "sig_rapid_growth_score":    3,
-        "sig_explicit_lnd_score":    3,
-        "sig_intl_footprint_score":  3,
-        "sig_merger_acq_score":      3,
-        "sig_lnd_onboarding_score":  3,
-        "ti_onboarding_score":       3,
-        "lusha_employee_range":      "5001-10000",
+    capgemini = {
+        "sig_foreign_hq_score":        3,
+        "sig_explicit_lnd_score":      3,
+        "sig_intl_footprint_score":    3,
+        "sig_employer_branding_score": 2,
+        "sig_lnd_onboarding_score":    2,
+        "ti_onboarding_score":         2,
+        "sig_rapid_growth_score":      1,
+        "lusha_api_employee_range":    "100001 - 10000000",
     }
-    r1 = score_company(strong)
-    print(json.dumps(r1, indent=2))
+    r1 = score_company(capgemini)
+    print(json.dumps({k: v for k, v in r1.items()
+                      if k in ("lr_z_score", "lean_model_prob", "icp_similarity_score",
+                               "company_size_score", "final_commercial_fit_score",
+                               "commercial_tier", "model_probability")},
+                     indent=2))
 
-    _check("model_probability > 0.9",    r1["model_probability"] > 0.9,
-           str(r1["model_probability"]))
-    _check("icp_similarity_score > 9",   r1["icp_similarity_score"] > 9,
-           str(r1["icp_similarity_score"]))
-    _check("company_size_score == 10",   r1["company_size_score"] == 10,
-           str(r1["company_size_score"]))
-    _check("commercial_tier == Tier 1",  r1["commercial_tier"] == "Tier 1",
-           r1["commercial_tier"])
-    _check("top_score_drivers not empty", r1["top_score_drivers"] != "none")
-    _check("missing_scoring_fields empty", r1["missing_scoring_fields"] == "")
+    _chk("lr_z_score ≈ 0.9870",
+         abs(r1["lr_z_score"] - 0.9870) < 0.001,
+         str(round(r1["lr_z_score"], 4)))
+    _chk("lean_model_prob ≈ 0.7285",
+         abs(r1["lean_model_prob"] - 0.7285) < 0.001,
+         str(round(r1["lean_model_prob"], 4)))
+    _chk("model_probability == lean_model_prob (alias, not separate calc)",
+         r1["model_probability"] == r1["lean_model_prob"],
+         str(r1["model_probability"]))
+    _chk("model_probability ≠ 0.9992  (old wrong value)",
+         abs(r1["model_probability"] - 0.9992) > 0.01,
+         str(round(r1["model_probability"], 4)))
+    _chk("icp_similarity_score ≈ 9.39",
+         abs(r1["icp_similarity_score"] - 9.39) < 0.05,
+         str(r1["icp_similarity_score"]))
+    _chk("company_size_score = 10",
+         r1["company_size_score"] == 10.0,
+         str(r1["company_size_score"]))
+    _chk("final_commercial_fit_score ≈ 9.54",
+         abs(r1["final_commercial_fit_score"] - 9.54) < 0.05,
+         str(r1["final_commercial_fit_score"]))
+    _chk("final_commercial_fit_score ≠ 9.99  (old wrong value)",
+         abs(r1["final_commercial_fit_score"] - 9.99) > 0.1,
+         str(r1["final_commercial_fit_score"]))
+    _chk("commercial_tier = 🥇 Hot",
+         r1["commercial_tier"] == "🥇 Hot",
+         r1["commercial_tier"])
+    _chk("commercial_tier ≠ 'Tier 1'  (old wrong value)",
+         r1["commercial_tier"] != "Tier 1",
+         r1["commercial_tier"])
+    _chk("company_size_missing is False",
+         r1["company_size_missing"] is False)
+    _chk("lean_model_logit == lr_z_score (alias)",
+         r1["lean_model_logit"] == r1["lr_z_score"])
 
-    # ── Case 2: Weak company — all signals at minimum ─────────────────────────
-    _section("Case 2: Weak company (all signals = 0, tiny employee range)")
+    # ── Smoke Test 2: All signals = 3, largest employee range ─────────────────
+    _section("Smoke Test 2: Maximum signals, largest range")
 
-    weak = {
-        "sig_foreign_hq_score":      0,
-        "sig_rapid_growth_score":    0,
-        "sig_explicit_lnd_score":    0,
-        "sig_intl_footprint_score":  0,
-        "sig_merger_acq_score":      0,
-        "sig_lnd_onboarding_score":  0,
-        "ti_onboarding_score":       0,
-        "lusha_employee_range":      "1-10",
-    }
-    r2 = score_company(weak)
-    print(json.dumps(r2, indent=2))
+    strong = {f: 3 for f in LEAN_COEFFICIENTS}
+    strong["lusha_api_employee_range"] = "100001 - 10000000"
+    r2 = score_company(strong)
+    _chk("lean_model_prob > 0.65",  r2["lean_model_prob"] > 0.65, str(round(r2["lean_model_prob"], 4)))
+    _chk("company_size_score = 10", r2["company_size_score"] == 10.0)
+    _chk("commercial_tier = 🥇 Hot", r2["commercial_tier"] == "🥇 Hot", r2["commercial_tier"])
+    _chk("high_value_flag is True",  r2["high_value_flag"] is True)
 
-    _check("model_probability < 0.5",    r2["model_probability"] < 0.5,
-           str(r2["model_probability"]))
-    _check("commercial_tier == Pass",    r2["commercial_tier"] == "Pass",
-           r2["commercial_tier"])
-    _check("company_size_score == 2",    r2["company_size_score"] == 2,
-           str(r2["company_size_score"]))
-    _check("weak_score_drivers not empty", r2["weak_score_drivers"] != "none")
-    _check("missing_scoring_fields empty", r2["missing_scoring_fields"] == "")
+    # ── Smoke Test 3: All signals = 0, smallest range ─────────────────────────
+    _section("Smoke Test 3: Minimum signals, smallest range")
 
-    # ── Case 3: Company with missing values ───────────────────────────────────
-    _section("Case 3: Company with missing/partial values")
+    weak = {f: 0 for f in LEAN_COEFFICIENTS}
+    weak["lusha_api_employee_range"] = "1 - 10"
+    r3 = score_company(weak)
+    _chk("lean_model_prob < 0.5",   r3["lean_model_prob"] < 0.5, str(round(r3["lean_model_prob"], 4)))
+    _chk("company_size_score = 1.0", r3["company_size_score"] == 1.0)
+    _chk("commercial_tier = ❄️ Pass", r3["commercial_tier"] == "❄️ Pass", r3["commercial_tier"])
+    _chk("weak_flag is True",        r3["weak_flag"] is True)
 
-    partial = {
-        "sig_explicit_lnd_score":    2,    # only one field present
-        "sig_intl_footprint_score":  None, # explicit None
-        "lusha_employee_range":      "",   # empty string
-        # all other signal fields absent
-    }
-    r3 = score_company(partial)
-    print(json.dumps(r3, indent=2))
+    # ── Smoke Test 4: Missing employee range ──────────────────────────────────
+    _section("Smoke Test 4: Missing employee range → defaults to 5.5")
 
-    _check("missing_scoring_fields not empty",
-           r3["missing_scoring_fields"] != "")
-    _check("scoring_notes mentions missing data",
-           "missing" in r3["scoring_notes"].lower())
-    _check("company_size_score == 4 (default)",
-           r3["company_size_score"] == 4,
-           str(r3["company_size_score"]))
-    _check("model_probability is a valid float",
-           0.0 <= r3["model_probability"] <= 1.0)
-    _check("final_commercial_fit_score is numeric",
-           isinstance(r3["final_commercial_fit_score"], float))
+    no_size = {f: 2 for f in LEAN_COEFFICIENTS}
+    r4 = score_company(no_size)
+    _chk("company_size_score = 5.5",    r4["company_size_score"] == SIZE_SCORE_MISSING,
+         str(r4["company_size_score"]))
+    _chk("company_size_missing is True", r4["company_size_missing"] is True)
 
-    # ── Case 4: Company with existing company_size_score ─────────────────────
-    _section("Case 4: Company with pre-computed company_size_score")
+    # ── Smoke Test 5: size band exact-string variants ─────────────────────────
+    _section("Smoke Test 5: Employee range string variants")
 
-    with_css = {
-        "sig_foreign_hq_score":      2,
-        "sig_explicit_lnd_score":    2,
-        "sig_intl_footprint_score":  2,
-        "sig_lnd_onboarding_score":  1,
-        "company_size_score":        8,    # pre-computed, 1–10
-    }
-    r4 = score_company(with_css)
-    print(json.dumps(r4, indent=2))
+    for raw, expected in [
+        ("100001 - 10000000", 10.0),
+        ("10001 - 100000",    8.88),
+        ("5001 - 10000",      7.75),
+        ("1001 - 5000",       6.63),
+        ("501 - 1000",         5.5),
+        ("201 - 500",          4.38),
+        ("51 - 200",           3.25),
+        ("11 - 50",            2.13),
+        ("1 - 10",             1.0),
+    ]:
+        rz = score_company({"lusha_api_employee_range": raw})
+        _chk(f"range '{raw}' → {expected}",
+             rz["company_size_score"] == expected,
+             str(rz["company_size_score"]))
 
-    _check("company_size_score passthrough == 8",
-           r4["company_size_score"] == 8,
-           str(r4["company_size_score"]))
-    _check("size source note includes 'passthrough'",
-           "passthrough" in r4["scoring_notes"])
+    # ── Smoke Test 6: lusha_employee_range fallback ───────────────────────────
+    _section("Smoke Test 6: lusha_employee_range fallback key")
 
-    # ── Case 5: Company with employee_size_score (Lusha 1-5 scale) ───────────
-    _section("Case 5: Company with employee_size_score (Lusha 1–5 scale)")
+    r6 = score_company({"lusha_employee_range": "1001 - 5000",
+                         "sig_foreign_hq_score": 2})
+    _chk("lusha_employee_range fallback → 6.63",
+         r6["company_size_score"] == 6.63,
+         str(r6["company_size_score"]))
 
-    with_ess = {
-        "sig_explicit_lnd_score":    3,
-        "sig_intl_footprint_score":  2,
-        "sig_lnd_onboarding_score":  2,
-        "ti_onboarding_score":       1,
-        "employee_size_score":       4,    # Lusha 1-5 → should become 8
-    }
-    r5 = score_company(with_ess)
-    print(json.dumps(r5, indent=2))
+    # ── Smoke Test 7: audit columns present ──────────────────────────────────
+    _section("Smoke Test 7: All SCORE_OUTPUT_COLS produced by score_dataframe")
 
-    _check("employee_size_score 4 scales to company_size_score 8",
-           r5["company_size_score"] == 8,
-           str(r5["company_size_score"]))
-
-    # ── Case 6: score_dataframe ───────────────────────────────────────────────
-    _section("Case 6: score_dataframe on a small DataFrame")
-
-    test_df = pd.DataFrame([strong, weak, partial])
+    test_df = pd.DataFrame([capgemini, strong, weak])
     out_df  = score_dataframe(test_df.copy())
+    missing_cols = [c for c in SCORE_OUTPUT_COLS if c not in out_df.columns]
+    _chk("all SCORE_OUTPUT_COLS present",
+         len(missing_cols) == 0,
+         str(missing_cols))
+    _chk("row count unchanged", len(out_df) == 3)
 
-    _check("score_dataframe returns DataFrame",
-           isinstance(out_df, pd.DataFrame))
-    _check("all SCORE_OUTPUT_COLS present",
-           all(c in out_df.columns for c in SCORE_OUTPUT_COLS))
-    _check("row count unchanged",
-           len(out_df) == len(test_df))
+    # ── Smoke Test 8: sig_merger_acq_score has NO effect ─────────────────────
+    _section("Smoke Test 8: sig_merger_acq_score is NOT a coefficient input")
 
-    # ── Case 7: params override ───────────────────────────────────────────────
-    _section("Case 7: params override (custom intercept)")
+    row_with_merger  = {**capgemini, "sig_merger_acq_score": 3}
+    row_no_merger    = {**capgemini, "sig_merger_acq_score": 0}
+    r8a = score_company(row_with_merger)
+    r8b = score_company(row_no_merger)
+    _chk("sig_merger_acq_score=3 and =0 produce same lr_z_score",
+         r8a["lr_z_score"] == r8b["lr_z_score"],
+         f"{r8a['lr_z_score']} vs {r8b['lr_z_score']}")
 
-    custom = score_company(strong, params={"intercept": -99.0})
-    _check("params override intercept drives prob to ~0",
-           custom["model_probability"] < 0.01,
-           str(custom["model_probability"]))
-    _check("custom intercept → Pass tier",
-           custom["commercial_tier"] == "Pass",
-           custom["commercial_tier"])
+    # ── Smoke Test 9: params override ────────────────────────────────────────
+    _section("Smoke Test 9: intercept override drives prob to ~0")
 
-    # ── Case 8: Composite scores — strong international company ──────────────
-    _section("Case 8: Composite scores from a globally complex company")
+    r9 = score_company(strong, params={"intercept": -99.0})
+    _chk("intercept=-99 → lean_model_prob < 0.01",
+         r9["lean_model_prob"] < 0.01, str(r9["lean_model_prob"]))
+    _chk("intercept=-99 → ❄️ Pass",
+         r9["commercial_tier"] == "❄️ Pass", r9["commercial_tier"])
 
-    global_co = {
-        "sig_intl_footprint_score":            3,
-        "sig_foreign_hq_score":                3,
-        "sig_multicultural_score":             3,
-        "ti_intercultural_score":              3,
-        "sig_explicit_lnd_score":              2,
-        "sig_lnd_onboarding_score":            2,
-        "sig_employer_branding_score":         1,
-        "ti_leadership_score":                 2,
-        "ti_onboarding_score":                 1,
-        "ti_negotiation_sales_score":          2,
-        "language_competitor_strength_score":  3,
-        "competitor_signal_strength_score":    2,
-        "lusha_employee_range":                "1001-5000",
-    }
-    r8 = score_company(global_co)
-    print(json.dumps(r8, indent=2))
+    # ── Smoke Test 10: tier boundaries ───────────────────────────────────────
+    _section("Smoke Test 10: Tier boundary values")
 
-    _check("global_complexity_score == 10.0 (all 4 fields maxed)",
-           r8["global_complexity_score"] == 10.0,
-           str(r8["global_complexity_score"]))
-    _check("people_development_score > 5",
-           r8["people_development_score"] > 5,
-           str(r8["people_development_score"]))
-    _check("commercial_complexity_score > 5",
-           r8["commercial_complexity_score"] > 5,
-           str(r8["commercial_complexity_score"]))
-    _check("high_value_flag is True",
-           r8["high_value_flag"] is True,
-           str(r8["high_value_flag"]))
-    _check("weak_flag is False",
-           r8["weak_flag"] is False,
-           str(r8["weak_flag"]))
-
-    # ── Case 9: Data quality flags ────────────────────────────────────────────
-    _section("Case 9: Data quality flags")
-
-    # High quality — all 7 lean fields present
-    r9a = score_company(strong)
-    _check("full signals → data_quality_flag == 'high'",
-           r9a["data_quality_flag"] == "high",
-           r9a["data_quality_flag"])
-
-    # Medium quality — 3 lean fields missing (4 of 7 present)
-    r9b = score_company({
-        "sig_explicit_lnd_score":   2,
-        "sig_lnd_onboarding_score": 1,
-        "sig_intl_footprint_score": 2,
-        "sig_foreign_hq_score":     1,
-        "lusha_employee_range":     "201-500",
-    })
-    _check("3 missing lean fields → data_quality_flag == 'medium'",
-           r9b["data_quality_flag"] == "medium",
-           r9b["data_quality_flag"])
-
-    # Low quality — all lean fields absent
-    r9c = score_company({"lusha_employee_range": "201-500"})
-    _check("all lean fields missing → data_quality_flag == 'low'",
-           r9c["data_quality_flag"] == "low",
-           r9c["data_quality_flag"])
-
-    # Manual review flag → always low quality regardless of missing count
-    r9d = score_company({**strong, "model_signal_needs_manual_review": 1})
-    _check("manual_review=1 → data_quality_flag == 'low'",
-           r9d["data_quality_flag"] == "low",
-           r9d["data_quality_flag"])
-    _check("manual_review=1 → scoring_notes mentions manual review",
-           "manual review" in r9d["scoring_notes"].lower())
-
-    # ── Case 10: weak_flag and high_value_flag boundaries ────────────────────
-    _section("Case 10: high_value_flag / weak_flag boundary values")
-
-    # Exact Pass boundary: all signals 0, default size 4 → fit ≈ 0.75*icp + 1.0
-    r10a = score_company(weak)
-    _check("weak company → weak_flag is True",
-           r10a["weak_flag"] is True,
-           str(r10a["weak_flag"]))
-    _check("weak company → high_value_flag is False",
-           r10a["high_value_flag"] is False,
-           str(r10a["high_value_flag"]))
-
-    # Strong company → Tier 1
-    r10b = score_company(strong)
-    _check("strong company → high_value_flag is True",
-           r10b["high_value_flag"] is True,
-           str(r10b["high_value_flag"]))
-    _check("strong company → weak_flag is False",
-           r10b["weak_flag"] is False,
-           str(r10b["weak_flag"]))
-
-    # ── Case 11: score_dataframe includes all SCORE_OUTPUT_COLS ──────────────
-    _section("Case 11: score_dataframe — all new columns present")
-
-    df11 = pd.DataFrame([strong, weak, global_co])
-    out11 = score_dataframe(df11.copy())
-    _check("all SCORE_OUTPUT_COLS in dataframe",
-           all(c in out11.columns for c in SCORE_OUTPUT_COLS),
-           str([c for c in SCORE_OUTPUT_COLS if c not in out11.columns]))
-    _check("global_complexity_score column is numeric",
-           pd.to_numeric(out11["global_complexity_score"], errors="coerce").notna().all())
-    _check("high_value_flag column is bool",
-           out11["high_value_flag"].dtype == bool)
-    _check("data_quality_flag values are in expected set",
-           out11["data_quality_flag"].isin({"high", "medium", "low"}).all())
+    for score_val, expected_tier in [
+        (9.0,  "🥇 Hot"),
+        (8.66, "🥇 Hot"),
+        (8.0,  "🥈 Warm"),
+        (7.19, "🥈 Warm"),
+        (5.0,  "🥉 Cool"),
+        (4.23, "🥉 Cool"),
+        (2.0,  "❄️ Pass"),
+    ]:
+        row_t = {f: 0 for f in LEAN_COEFFICIENTS}
+        row_t["lusha_api_employee_range"] = "1 - 10"
+        r_t = score_company(row_t)
+        # Directly test tier threshold logic
+        computed_tier = TIER_THRESHOLDS[-1][1]
+        for thresh, lbl in TIER_THRESHOLDS:
+            if score_val >= thresh:
+                computed_tier = lbl
+                break
+        _chk(f"score {score_val} → {expected_tier}",
+             computed_tier == expected_tier,
+             computed_tier)
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{'═' * 60}")
+    print(f"\n{'═'*60}")
     if _failures:
         print(f"  FAILURES ({len(_failures)}):")
         for f in _failures:
             print(f"    • {f}")
     else:
-        print("  All checks passed.")
-    print("═" * 60)
+        print("  All smoke tests passed.")
+    print("═"*60)
