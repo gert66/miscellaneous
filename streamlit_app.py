@@ -69,7 +69,7 @@ st.markdown(
         overflow: visible;
     }}
     .brand-title-block {{
-        flex: 0 0 40%;
+        flex: 0 0 45%;
     }}
     .brand-title {{
         font-size: 42px;
@@ -81,7 +81,7 @@ st.markdown(
         padding: 0;
     }}
     .brand-logo-block {{
-        flex: 0 0 58%;
+        flex: 0 0 55%;
         display: flex;
         justify-content: flex-end;
         align-items: center;
