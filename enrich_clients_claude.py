@@ -4377,7 +4377,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
     import pathlib as _pl
     import base64 as _b64
     st.set_page_config(
-        page_title="mYngle · Company Enrichment",
+        page_title="mYngle · lead prioritizer",
         page_icon="🏢",
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -4430,8 +4430,8 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             padding: 0;
         }}
         </style>
-        <p class="brand-header">{_img_tag}company enrichment</p>
-        <p class="brand-subtitle">Upload a company file. The app will enrich and score the companies, then generate an Excel report.</p>
+        <p class="brand-header">{_img_tag}lead prioritizer</p>
+        <p class="brand-subtitle">Upload a company list. The app will rank your leads and generate an Excel report.</p>
         """,
         unsafe_allow_html=True,
     )
