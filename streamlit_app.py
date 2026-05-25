@@ -105,7 +105,7 @@ st.markdown(
 
     div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
         overflow: visible !important;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.0rem;
     }}
 
     .brand-header {{
@@ -114,7 +114,7 @@ st.markdown(
         align-items: center;
         min-height: 140px;
         padding-top: 10px;
-        padding-bottom: 12px;
+        padding-bottom: 6px;
         overflow: visible !important;
     }}
 
