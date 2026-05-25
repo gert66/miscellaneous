@@ -18,43 +18,32 @@ main file during the "Deploy an app" wizard.
 import os
 import pathlib
 
-# Tell enrich_clients_claude.py that st.set_page_config / st.title / st.caption
-# are already handled here, so it must skip its own calls.
+# Tell enrich_clients_claude.py that set_page_config / title / caption
+# are already handled here, so it must skip its own header calls.
 os.environ.setdefault("_STREAMLIT_ENTRYPOINT", "1")
 
 import streamlit as st
 
-# ── Page config — must be first Streamlit call ────────────────────────────────
+# ── Page config — must be the very first Streamlit call ───────────────────────
 st.set_page_config(
     page_title="Company Enrichment — mYngle",
     page_icon="🏢",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Logo + header ─────────────────────────────────────────────────────────────
 _logo_path = pathlib.Path(__file__).parent / "Mynglelogofinal.jpg"
 if _logo_path.exists():
-    col_logo, col_title = st.columns([1, 4])
-    with col_logo:
-        st.image(str(_logo_path), width=240)
-    with col_title:
-        st.title("Company Enrichment")
-        st.caption(
-            "Upload a company file. "
-            "The app will enrich and score the companies, "
-            "then generate an Excel report."
-        )
-else:
-    st.title("Company Enrichment")
-    st.caption(
-        "Upload a company file. "
-        "The app will enrich and score the companies, "
-        "then generate an Excel report."
-    )
+    st.image(str(_logo_path), width=280)
+st.title("Company Enrichment")
+st.caption(
+    "Upload a company file. "
+    "The app will enrich and score the companies, "
+    "then generate an Excel report."
+)
 
 # ── Delegate to the main application ─────────────────────────────────────────
-# runpy.run_path executes enrich_clients_claude.py in-process, setting __file__
-# correctly so all relative path logic in that file continues to work.
 import runpy
 
 _MAIN = pathlib.Path(__file__).parent / "enrich_clients_claude.py"

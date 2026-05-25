@@ -4181,16 +4181,21 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
 if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
     # When run directly (streamlit run enrich_clients_claude.py) set up the page.
     # When launched via streamlit_app.py the entrypoint already called these.
+    import pathlib as _pl
     st.set_page_config(
-        page_title="Claude Company Enrichment",
+        page_title="Company Enrichment — mYngle",
         page_icon="🏢",
         layout="wide",
+        initial_sidebar_state="collapsed",
     )
-    st.title("🏢 Claude Company Enrichment")
+    _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
+    if _logo.exists():
+        st.image(str(_logo), width=280)
+    st.title("Company Enrichment")
     st.caption(
-        "Upload a file with company names and URLs. "
-        "Each row is enriched in two passes: basic firmographics (Jina AI + Claude) "
-        "and Mingle ICP signals (Claude web search)."
+        "Upload a company file. "
+        "The app will enrich and score the companies, "
+        "then generate an Excel report."
     )
 
 # =============================================================================
@@ -4883,21 +4888,22 @@ if blocking and not currently_processing:
     for reason in blocking:
         st.warning(f"⚠️ {reason}")
 elif not blocking and not currently_processing and not enrichment_done:
-    _s1 = ss("_model_step1", MODEL_STEP1)
-    _s2 = ss("_model_step2", MODEL_STEP2)
-    if _is_preview_mode or _elm_mode:
-        st.info(
-            f"Ready to preview **{n_to_process:,}** rows. "
-            "Estimated cost: **$0.00** — no API calls will be made."
-        )
-    else:
-        _cost_per_row = _COST_EST.get((_s1, _s2), 0.05)
-        est = n_to_process * _cost_per_row
-        st.info(
-            f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
-            f"Rough estimated cost: ~${est:.2f} "
-            f"(~${_cost_per_row:.2f}/company with current model selection)."
-        )
+    if _show_adv:
+        _s1 = ss("_model_step1", MODEL_STEP1)
+        _s2 = ss("_model_step2", MODEL_STEP2)
+        if _is_preview_mode or _elm_mode:
+            st.info(
+                f"Ready to preview **{n_to_process:,}** rows. "
+                "Estimated cost: **$0.00** — no API calls will be made."
+            )
+        else:
+            _cost_per_row = _COST_EST.get((_s1, _s2), 0.05)
+            est = n_to_process * _cost_per_row
+            st.info(
+                f"Ready to enrich **{n_to_process:,}** rows with two enrichment steps each. "
+                f"Rough estimated cost: ~${est:.2f} "
+                f"(~${_cost_per_row:.2f}/company with current model selection)."
+            )
 
 _start_label = "▶ Enrich & Score" if _app_mode == "Single Company" else "▶ Start enrichment"
 start_btn = st.button(
