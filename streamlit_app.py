@@ -1,5 +1,5 @@
 """
-Streamlit Cloud entry point — Commercial Fit Scoring App.
+Streamlit Cloud entry point — Company Enrichment App.
 
 DEPLOYMENT INSTRUCTIONS
 -----------------------
@@ -16,6 +16,7 @@ main file during the "Deploy an app" wizard.
 """
 
 import os
+import pathlib
 
 # Tell enrich_clients_claude.py that st.set_page_config / st.title / st.caption
 # are already handled here, so it must skip its own calls.
@@ -25,18 +26,35 @@ import streamlit as st
 
 # ── Page config — must be first Streamlit call ────────────────────────────────
 st.set_page_config(
-    page_title="Commercial Fit Scoring — Mingle",
+    page_title="Company Enrichment — mYngle",
     page_icon="🏢",
     layout="wide",
 )
 
-st.title("Commercial Fit Scoring App")
-st.caption("App loaded successfully.")
+# ── Logo + header ─────────────────────────────────────────────────────────────
+_logo_path = pathlib.Path(__file__).parent / "Mynglelogofinal.jpg"
+if _logo_path.exists():
+    col_logo, col_title = st.columns([1, 4])
+    with col_logo:
+        st.image(str(_logo_path), width=240)
+    with col_title:
+        st.title("Company Enrichment")
+        st.caption(
+            "Upload a company file. "
+            "The app will enrich and score the companies, "
+            "then generate an Excel report."
+        )
+else:
+    st.title("Company Enrichment")
+    st.caption(
+        "Upload a company file. "
+        "The app will enrich and score the companies, "
+        "then generate an Excel report."
+    )
 
 # ── Delegate to the main application ─────────────────────────────────────────
 # runpy.run_path executes enrich_clients_claude.py in-process, setting __file__
 # correctly so all relative path logic in that file continues to work.
-import pathlib
 import runpy
 
 _MAIN = pathlib.Path(__file__).parent / "enrich_clients_claude.py"

@@ -70,6 +70,11 @@ MODEL_STEP2      = "claude-haiku-4-5-20251001"
 MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
+# Set to True (or via SHOW_ADVANCED_SETTINGS env var / Streamlit secret) to show
+# the full sidebar, column picker, preview, debug sections, and technical logs.
+# Normal users should always see False (the minimal flow).
+SHOW_ADVANCED_SETTINGS: bool = False
+
 SERPER_SEARCH_URL    = "https://google.serper.dev/search"
 STEP2_PROVIDER_CLAUDE = "Claude Web Search"
 STEP2_PROVIDER_SERPER = "Serper Google Search"
@@ -3499,6 +3504,471 @@ def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Rich Excel report builder
+# Creates: Input | Summary | Company Profiles (visible)
+#          Advanced Evidence | Scoring Settings | Enriched |
+#          model_features | qa_evidence (hidden)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _xl_get(row_dict: dict, *keys: str, default: str = "") -> str:
+    """Return first non-blank string value from row_dict for any of *keys."""
+    _null = {"", "nan", "none", "n/a", "unknown", "null", "nat"}
+    for k in keys:
+        v = row_dict.get(k, "")
+        if v is not None and str(v).strip().lower() not in _null:
+            return str(v).strip()
+    return default
+
+
+def _xl_write_df(ws, df: pd.DataFrame) -> None:
+    """Write DataFrame to worksheet with a styled header row."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    for ci, col in enumerate(df.columns, 1):
+        cell = ws.cell(row=1, column=ci, value=str(col))
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    for ri, record in enumerate(df.to_dict("records"), 2):
+        for ci, col in enumerate(df.columns, 1):
+            val = record[col]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                val = ""
+            ws.cell(row=ri, column=ci, value=val)
+
+    for col_cells in ws.columns:
+        try:
+            max_len = max((len(str(c.value or "")) for c in col_cells), default=8)
+            ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(
+                max(max_len + 2, 10), 60
+            )
+        except Exception:
+            pass
+
+
+def _xl_write_scoring_settings(ws) -> None:
+    """Write scoring constants to the Scoring Settings sheet."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    try:
+        from commercial_fit_scoring import (
+            INTERCEPT as _INT, LEAN_COEFFICIENTS as _LC,
+            SIZE_BANDS as _SB, TIER_THRESHOLDS as _TT,
+        )
+    except ImportError:
+        ws.cell(row=1, column=1, value="Scoring module not available")
+        return
+
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    bold = Font(bold=True, size=10)
+    norm = Font(size=10)
+
+    r = 1
+    ws.cell(row=r, column=1, value="Scoring Settings").font = Font(bold=True, size=13)
+    r += 2
+
+    ws.cell(row=r, column=1, value="Intercept").font = bold
+    ws.cell(row=r, column=2, value=_INT).font = norm
+    r += 2
+
+    ws.cell(row=r, column=1, value="Lean Model Coefficients").font = bold
+    r += 1
+    for h, c in (("Field", 1), ("Coefficient", 2)):
+        cell = ws.cell(row=r, column=c, value=h)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+    r += 1
+    for field, coef in sorted(_LC.items(), key=lambda x: -x[1]):
+        ws.cell(row=r, column=1, value=field).font = norm
+        ws.cell(row=r, column=2, value=coef).font = norm
+        r += 1
+    r += 1
+
+    ws.cell(row=r, column=1, value="Size Bands").font = bold
+    r += 1
+    for h, c in (("Max Employees", 1), ("Score", 2)):
+        cell = ws.cell(row=r, column=c, value=h)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+    r += 1
+    for upper, score in _SB:
+        ws.cell(row=r, column=1, value=str(upper)).font = norm
+        ws.cell(row=r, column=2, value=score).font = norm
+        r += 1
+    r += 1
+
+    ws.cell(row=r, column=1, value="Tier Thresholds").font = bold
+    r += 1
+    for h, c in (("Min Score", 1), ("Tier", 2)):
+        cell = ws.cell(row=r, column=c, value=h)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+    r += 1
+    for threshold, label in _TT:
+        ws.cell(row=r, column=1, value=threshold).font = norm
+        ws.cell(row=r, column=2, value=label).font = norm
+        r += 1
+
+    ws.column_dimensions["A"].width = 45
+    ws.column_dimensions["B"].width = 20
+
+
+def _xl_write_company_profiles(ws, df: pd.DataFrame,
+                                name_col: str | None,
+                                domain_col: str | None) -> dict:
+    """
+    Write one formatted block per company.
+    Returns {df_row_index: profile_start_row} (0-based index → 1-based Excel row).
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    # Column widths: A=28, B=80, C=14, D=18, E=70, F=75
+    for ci, w in enumerate([28, 80, 14, 18, 70, 75], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    tier_fills = {
+        "Tier 1": PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid"),
+        "Tier 2": PatternFill(start_color="1F7AC4", end_color="1F7AC4", fill_type="solid"),
+        "Tier 3": PatternFill(start_color="E47228", end_color="E47228", fill_type="solid"),
+        "Pass":   PatternFill(start_color="7F7F7F", end_color="7F7F7F", fill_type="solid"),
+    }
+    default_fill = PatternFill(start_color="2B4C7E", end_color="2B4C7E", fill_type="solid")
+    label_font  = Font(bold=True,  size=10, color="1A1A1A")
+    value_font  = Font(bold=False, size=10, color="1A1A1A")
+    header_font = Font(bold=True,  size=12, color="FFFFFF")
+    wrap_align  = Alignment(horizontal="left", vertical="top",  wrap_text=True)
+    left_align  = Alignment(horizontal="left", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+    alt_fill    = PatternFill(start_color="F7F9FC", end_color="F7F9FC", fill_type="solid")
+
+    profile_start_rows: dict = {}
+    cur = 1
+
+    for df_idx, (_, row) in enumerate(df.iterrows()):
+        rd = row.to_dict()
+        profile_start_rows[df_idx] = cur
+
+        company = _xl_get(rd, name_col or "", "lusha_company_name", "lusha_api_company_name")
+        domain  = _xl_get(rd, domain_col or "", "lusha_domain", "lusha_api_domain")
+        tier    = _xl_get(rd, "commercial_tier")
+        try:
+            score_val = float(rd.get("final_commercial_fit_score", 0) or 0)
+            score_str = f"{score_val:.1f}"
+        except (ValueError, TypeError):
+            score_str = ""
+        industry  = _xl_get(rd, "lusha_industry",       "lusha_api_industry")
+        country   = _xl_get(rd, "lusha_country",        "lusha_api_country")
+        employees = _xl_get(rd, "lusha_employee_range", "lusha_api_employee_range")
+        why       = _xl_get(rd, "icp_why_relevant")
+        signals   = _xl_get(rd, "icp_buying_signals",   "top_score_drivers")
+        gaps      = _xl_get(rd, "weak_score_drivers",   "missing_scoring_fields")
+        evidence  = _xl_get(rd, "icp_evidence")
+        interp    = _xl_get(rd, "scoring_notes")
+
+        hdr_text = company
+        if tier:
+            hdr_text = f"{company}  [{tier}]"
+        if domain:
+            hdr_text += f"  —  {domain}"
+        fill = tier_fills.get(tier, default_fill)
+
+        # ── Header row (merged A:F) ──────────────────────────────────────────
+        ws.cell(row=cur, column=1, value=hdr_text)
+        ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=6)
+        for ci in range(1, 7):
+            ws.cell(row=cur, column=ci).fill = fill
+        ws.cell(row=cur, column=1).font = header_font
+        ws.cell(row=cur, column=1).alignment = Alignment(
+            horizontal="left", vertical="center", indent=1
+        )
+        ws.row_dimensions[cur].height = 24
+        cur += 1
+
+        # ── Score / Tier / Employees row ─────────────────────────────────────
+        _compact = [
+            (1, "Score",     label_font, right_align),
+            (2, score_str,   value_font, left_align),
+            (3, "Tier",      label_font, right_align),
+            (4, tier,        value_font, left_align),
+            (5, "Employees", label_font, right_align),
+            (6, employees,   value_font, left_align),
+        ]
+        for ci, val, fnt, aln in _compact:
+            c = ws.cell(row=cur, column=ci, value=val)
+            c.font = fnt
+            c.alignment = aln
+            c.fill = alt_fill
+        ws.row_dimensions[cur].height = 20
+        cur += 1
+
+        # ── Industry / Country row ────────────────────────────────────────────
+        _ic = [
+            (1, "Industry", label_font, right_align),
+            (2, industry,   value_font, left_align),
+            (3, "Country",  label_font, right_align),
+            (4, country,    value_font, left_align),
+        ]
+        for ci, val, fnt, aln in _ic:
+            c = ws.cell(row=cur, column=ci, value=val)
+            c.font = fnt
+            c.alignment = aln
+        ws.row_dimensions[cur].height = 20
+        cur += 1
+
+        # ── Long-text rows ────────────────────────────────────────────────────
+        long_rows = [
+            ("Why Relevant",             why,      55),
+            ("Top Positive Signals",     signals,  55),
+            ("Gaps / Missing Signals",   gaps,     45),
+            ("Evidence",                 evidence, 70),
+            ("Commercial Interpretation", interp,  50),
+        ]
+        for label, content, height in long_rows:
+            lc = ws.cell(row=cur, column=1, value=label)
+            lc.font = label_font
+            lc.alignment = Alignment(horizontal="left", vertical="top")
+
+            vc = ws.cell(row=cur, column=2, value=content)
+            vc.font = value_font
+            vc.alignment = wrap_align
+            try:
+                ws.merge_cells(start_row=cur, start_column=2,
+                               end_row=cur, end_column=6)
+            except Exception:
+                pass
+            ws.row_dimensions[cur].height = height
+            cur += 1
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        ws.row_dimensions[cur].height = 10
+        cur += 1
+
+    return profile_start_rows
+
+
+def _xl_write_summary(ws, df: pd.DataFrame,
+                      name_col: str | None,
+                      domain_col: str | None,
+                      profile_start_rows: dict) -> None:
+    """Write the Summary sheet with company scores and Open Profile hyperlinks."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.formatting.rule import DataBarRule
+    from openpyxl.utils import get_column_letter
+
+    headers = [
+        "Company Name",
+        "Company Domain / URL",
+        "Final Commercial Fit Score",
+        "Commercial Tier",
+        "Open Profile",
+    ]
+    widths = [30, 35, 24, 16, 18]
+
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    link_font = Font(color="0B4A92", underline="single", size=10)
+    tier_colors = {
+        "Tier 1": "D6E4F7",
+        "Tier 2": "D9EAD3",
+        "Tier 3": "FCE5CD",
+        "Pass":   "F4CCCC",
+    }
+
+    for ci, (hdr, w) in enumerate(zip(headers, widths), 1):
+        c = ws.cell(row=1, column=ci, value=hdr)
+        c.fill = hdr_fill
+        c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[1].height = 24
+    ws.freeze_panes = "A2"
+
+    for df_idx, (_, row) in enumerate(df.iterrows()):
+        rd   = row.to_dict()
+        xrow = df_idx + 2   # Excel row (1-indexed header + offset)
+
+        company = _xl_get(rd, name_col or "", "lusha_company_name", "lusha_api_company_name")
+        domain  = _xl_get(rd, domain_col or "", "lusha_domain", "lusha_api_domain")
+        tier    = _xl_get(rd, "commercial_tier")
+        try:
+            score = float(rd.get("final_commercial_fit_score", "") or "")
+        except (ValueError, TypeError):
+            score = ""
+
+        row_fill = PatternFill(
+            start_color=tier_colors.get(tier, "FFFFFF"),
+            end_color=tier_colors.get(tier, "FFFFFF"),
+            fill_type="solid",
+        ) if tier else None
+
+        for ci, val in enumerate([company, domain, score, tier], 1):
+            c = ws.cell(row=xrow, column=ci, value=val)
+            if row_fill:
+                c.fill = row_fill
+            c.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Open Profile hyperlink — jump a few rows below the profile header
+        prof_start = profile_start_rows.get(df_idx, 1)
+        link_target_row = prof_start + 4   # lands near "Why Relevant"
+        lc = ws.cell(row=xrow, column=5, value="Open Profile")
+        lc.hyperlink = f"#'Company Profiles'!A{link_target_row}"
+        lc.font = link_font
+        lc.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.row_dimensions[xrow].height = 20
+
+    # Blue data bar on score column (C)
+    n = len(df)
+    if n > 0:
+        try:
+            rule = DataBarRule(
+                start_type="num", start_value=0,
+                end_type="num", end_value=10,
+                color="0070C0",
+            )
+            ws.conditional_formatting.add(f"C2:C{n + 1}", rule)
+        except Exception:
+            pass
+
+
+def build_rich_excel_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Build a fully formatted multi-sheet Excel workbook.
+
+    Visible sheets  : Input | Summary | Company Profiles
+    Hidden sheets   : Advanced Evidence | Scoring Settings |
+                      Enriched | model_features | qa_evidence
+    """
+    import openpyxl
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.remove(wb.active)   # discard the default empty sheet
+
+    # Identify original input columns (not added by enrichment pipeline)
+    _all_enrich = set(ALL_ENRICHMENT_FIELDS + list(_SCORE_OUTPUT_COLS or []))
+    input_cols_list = [c for c in df.columns if c not in _all_enrich]
+
+    # Guess name / domain columns from the input set
+    _name_guess   = None
+    _domain_guess = None
+    for c in input_cols_list:
+        cl = c.lower()
+        if _name_guess is None and any(h in cl for h in _COMPANY_HINTS):
+            _name_guess = c
+        elif _domain_guess is None and any(h in cl for h in _DOMAIN_HINTS):
+            _domain_guess = c
+    if _name_guess is None and input_cols_list:
+        _name_guess = input_cols_list[0]
+    if _domain_guess is None and len(input_cols_list) > 1:
+        _domain_guess = input_cols_list[1]
+
+    # ── Input (visible) ───────────────────────────────────────────────────────
+    ws_input = wb.create_sheet("Input")
+    _xl_write_df(ws_input, df[input_cols_list] if input_cols_list else df)
+
+    # ── Company Profiles (visible) ────────────────────────────────────────────
+    ws_profiles = wb.create_sheet("Company Profiles")
+    profile_rows = _xl_write_company_profiles(
+        ws_profiles, df, _name_guess, _domain_guess
+    )
+
+    # ── Summary (visible) ─────────────────────────────────────────────────────
+    ws_summary = wb.create_sheet("Summary")
+    _xl_write_summary(ws_summary, df, _name_guess, _domain_guess, profile_rows)
+
+    # Re-order: Input → Summary → Company Profiles
+    wb._sheets = [ws_input, ws_summary, ws_profiles]
+
+    # ── Advanced Evidence (hidden) ────────────────────────────────────────────
+    try:
+        ev_cols = [c for c in df.columns if c.endswith("_evidence")]
+        if ev_cols:
+            id_cols = input_cols_list[:3]
+            qa_cols = list(dict.fromkeys(id_cols + ev_cols))
+            qa_df   = df[[c for c in qa_cols if c in df.columns]]
+            ws_ev   = wb.create_sheet("Advanced Evidence")
+            _xl_write_df(ws_ev, qa_df)
+            ws_ev.sheet_state = "hidden"
+    except Exception:
+        pass
+
+    # ── Scoring Settings (hidden) ─────────────────────────────────────────────
+    try:
+        ws_sc = wb.create_sheet("Scoring Settings")
+        _xl_write_scoring_settings(ws_sc)
+        ws_sc.sheet_state = "hidden"
+    except Exception:
+        pass
+
+    # ── Enriched (hidden) ─────────────────────────────────────────────────────
+    try:
+        ws_en = wb.create_sheet("Enriched")
+        _xl_write_df(ws_en, df)
+        ws_en.sheet_state = "hidden"
+    except Exception:
+        pass
+
+    # ── model_features (hidden) ───────────────────────────────────────────────
+    try:
+        mf = _build_model_features_df(df)
+        if not mf.empty:
+            ws_mf = wb.create_sheet("model_features")
+            _xl_write_df(ws_mf, mf)
+            ws_mf.sheet_state = "hidden"
+    except Exception:
+        pass
+
+    # ── qa_evidence (hidden) ──────────────────────────────────────────────────
+    try:
+        ev_cols = [c for c in df.columns if c.endswith("_evidence")]
+        if ev_cols:
+            id_cols = input_cols_list[:3]
+            qa_cols = list(dict.fromkeys(id_cols + ev_cols))
+            qa_df   = df[[c for c in qa_cols if c in df.columns]]
+            ws_qa   = wb.create_sheet("qa_evidence")
+            _xl_write_df(ws_qa, qa_df)
+            ws_qa.sheet_state = "hidden"
+    except Exception:
+        pass
+
+    # ── Validate and return bytes ─────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _validate_rich_excel(xl_bytes: bytes) -> dict:
+    """
+    Reload workbook and verify sheet visibility.
+    Returns {"valid": bool, "visible": [...], "hidden": [...], "issues": [...]}.
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(xl_bytes))
+    except Exception as exc:
+        return {"valid": False, "visible": [], "hidden": [], "issues": [str(exc)]}
+
+    visible = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+    hidden  = [ws.title for ws in wb.worksheets if ws.sheet_state != "visible"]
+    issues  = []
+
+    expected_visible = {"Input", "Summary", "Company Profiles"}
+    for s in expected_visible - set(visible):
+        issues.append(f"'{s}' should be visible but is missing or hidden")
+    for s in set(visible) - expected_visible:
+        issues.append(f"'{s}' is visible but should be hidden")
+
+    return {"valid": not issues, "visible": visible, "hidden": hidden, "issues": issues}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Auto-save helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3758,10 +4228,18 @@ except Exception:
     pass
 
 # =============================================================================
-# SIDEBAR
+# SIDEBAR — shown only when SHOW_ADVANCED_SETTINGS is True
 # =============================================================================
 
-with st.sidebar:
+# Re-check at runtime so the Streamlit secret can override the module constant.
+_show_adv: bool = SHOW_ADVANCED_SETTINGS
+try:
+    _show_adv = bool(st.secrets.get("SHOW_ADVANCED_SETTINGS", SHOW_ADVANCED_SETTINGS))
+except Exception:
+    pass
+
+if _show_adv:
+ with st.sidebar:
     # ── 1. Enrichment mode ────────────────────────────────────────────────────
     enrichment_mode = st.radio(
         "Enrichment mode",
@@ -4152,48 +4630,76 @@ with st.sidebar:
     else:
         delay_sec = 1.0
 
+else:
+    # ── Simplified mode: no sidebar shown — use sensible defaults ─────────────
+    _elm_mode  = False
+    debug_mode = False
+    delay_sec  = 1.0
+    ss_set(
+        _enable_lusha_api          = True,
+        _run_step1_enrichment      = not ss("_has_lusha_input", False),
+        _run_step2_enrichment      = True,
+        _extract_model_signals     = True,
+        _include_signal_evidence   = True,
+        _step2_dry_run             = False,
+        _zero_cost_preview         = False,
+        _show_step2_debug          = False,
+        _save_step2_debug          = True,
+        _use_playwright            = _PLAYWRIGHT_AVAILABLE,
+        _local_save_enabled        = False,
+        _local_save_path           = _DEFAULT_DOWNLOAD_DIR,
+        _model_step1               = MODEL_STEP1,
+        _model_step2               = MODEL_STEP2,
+        _step2_provider            = STEP2_PROVIDER_SERPER,
+        _elm_mode                  = False,
+        _per_company_autosave_enabled = False,
+    )
+
 # =============================================================================
 # INPUT MODE
 # =============================================================================
 
-_mode_col, _ = st.columns([2, 3])
-with _mode_col:
-    _app_mode = st.radio(
-        "Input mode",
-        ["Batch Upload", "Single Company"],
-        horizontal=True,
-        key="app_mode_radio",
-    )
-
 _sc_df: pd.DataFrame | None = None
-_sc_name_col  = "company_name"
+_sc_name_col   = "company_name"
 _sc_domain_col = "domain"
 
-if _app_mode == "Single Company":
-    st.divider()
-    st.subheader("Single company enrichment & scoring")
-    st.caption(
-        "Enter a company name and optional domain. "
-        "The app will run the full enrichment pipeline and compute the commercial fit score."
-    )
-    _sc_f1, _sc_f2 = st.columns(2)
-    with _sc_f1:
-        _sc_name_input = st.text_input(
-            "Company name *", key="sc_company_name",
-            placeholder="e.g. Acme Corp",
+if _show_adv:
+    _mode_col, _ = st.columns([2, 3])
+    with _mode_col:
+        _app_mode = st.radio(
+            "Input mode",
+            ["Batch Upload", "Single Company"],
+            horizontal=True,
+            key="app_mode_radio",
         )
-    with _sc_f2:
-        _sc_url_input = st.text_input(
-            "Domain or URL (optional)", key="sc_company_url",
-            placeholder="e.g. acme.com",
+
+    if _app_mode == "Single Company":
+        st.divider()
+        st.subheader("Single company enrichment & scoring")
+        st.caption(
+            "Enter a company name and optional domain. "
+            "The app will run the full enrichment pipeline and compute the commercial fit score."
         )
-    if _sc_name_input:
-        _sc_df = pd.DataFrame([{
-            "company_name": _sc_name_input.strip(),
-            "domain": (_sc_url_input or "").strip(),
-        }])
-    else:
-        st.info("Enter a company name above to begin.")
+        _sc_f1, _sc_f2 = st.columns(2)
+        with _sc_f1:
+            _sc_name_input = st.text_input(
+                "Company name *", key="sc_company_name",
+                placeholder="e.g. Acme Corp",
+            )
+        with _sc_f2:
+            _sc_url_input = st.text_input(
+                "Domain or URL (optional)", key="sc_company_url",
+                placeholder="e.g. acme.com",
+            )
+        if _sc_name_input:
+            _sc_df = pd.DataFrame([{
+                "company_name": _sc_name_input.strip(),
+                "domain": (_sc_url_input or "").strip(),
+            }])
+        else:
+            st.info("Enter a company name above to begin.")
+else:
+    _app_mode = "Batch Upload"
 
 # =============================================================================
 # STEP 1 — Upload file  (Batch mode only)
@@ -4202,10 +4708,12 @@ if _app_mode == "Single Company":
 uploaded = None
 if _app_mode == "Batch Upload":
     st.divider()
-    st.subheader("Step 1 · Upload your file")
+    if _show_adv:
+        st.subheader("Step 1 · Upload your file")
     uploaded = st.file_uploader(
         "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
         type=["xlsx", "xls", "csv"],
+        label_visibility="collapsed" if not _show_adv else "visible",
     )
 
 new_file_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
@@ -4237,97 +4745,98 @@ if file_error:
     st.error(f"Could not read the file: {file_error}")
 elif uploaded and df_raw is not None:
     st.success(
-        f"**{ss('file_name')}** loaded — "
+        f"✅ **{ss('file_name')}** loaded — "
         f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
     )
-    if _elm_mode:
-        st.info(
-            "💡 **Extreme Light Mode** — no API calls. "
-            "Fetches company pages with requests/BeautifulSoup and extracts keyword signals."
-        )
-    else:
-        st.info(
-            "💡 Each row makes **two** Claude API calls (Step 1 + Step 2). "
-            "Use the row limiter below to test with a small batch first."
-        )
+    if _show_adv:
+        if _elm_mode:
+            st.info(
+                "💡 **Extreme Light Mode** — no API calls. "
+                "Fetches company pages with requests/BeautifulSoup and extracts keyword signals."
+            )
+        else:
+            st.info(
+                "💡 Each row makes **two** Claude API calls (Step 1 + Step 2). "
+                "Use the row limiter below to test with a small batch first."
+            )
 
-# =============================================================================
-# STEP 2 — Preview
-# =============================================================================
+# ── Column detection and processing scope ─────────────────────────────────────
 
 name_col     = _sc_name_col if _app_mode == "Single Company" else None
 domain_col   = _sc_domain_col if _app_mode == "Single Company" else None
 n_to_process = 1 if (_app_mode == "Single Company" and _sc_df is not None) else 0
 
 if df_raw is not None:
+    if _show_adv:
+        st.divider()
+        st.subheader("Step 2 · Preview")
+        st.dataframe(df_raw.head(), use_container_width=True)
+        st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
 
-    st.divider()
-    st.subheader("Step 2 · Preview")
-    st.dataframe(df_raw.head(), use_container_width=True)
-    st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
+        st.divider()
+        st.subheader("Step 3 · Select columns")
 
-    # ── Column selection ──────────────────────────────────────────────────────
+        auto_name_col, auto_domain_col = detect_columns(df_raw)
+        cols = df_raw.columns.tolist()
 
-    st.divider()
-    st.subheader("Step 3 · Select columns")
+        sel_l, sel_r = st.columns(2)
+        with sel_l:
+            name_col = st.selectbox(
+                "Company name column *",
+                options=cols,
+                index=cols.index(auto_name_col) if auto_name_col in cols else 0,
+                help="Auto-detected — change if the wrong column is selected.",
+            )
+        with sel_r:
+            _NO_DOMAIN = "(none — use company name only)"
+            dom_opts   = [_NO_DOMAIN] + cols
+            def_dom    = (
+                dom_opts.index(auto_domain_col)
+                if auto_domain_col and auto_domain_col in dom_opts else 0
+            )
+            dom_choice = st.selectbox(
+                "Website / URL column (optional)",
+                options=dom_opts,
+                index=def_dom,
+                help=(
+                    "Used for Jina Reader (Step 1) and Claude web search (Step 2). "
+                    "Falls back to company name search when URL is absent or unreachable."
+                ),
+            )
+        domain_col = dom_choice if dom_choice != _NO_DOMAIN else None
 
-    auto_name_col, auto_domain_col = detect_columns(df_raw)
-    cols = df_raw.columns.tolist()
-
-    sel_l, sel_r = st.columns(2)
-    with sel_l:
-        name_col = st.selectbox(
-            "Company name column *",
-            options=cols,
-            index=cols.index(auto_name_col) if auto_name_col in cols else 0,
-            help="Auto-detected — change if the wrong column is selected.",
+        note_parts = []
+        if auto_name_col:
+            note_parts.append(f"company name → **{auto_name_col}**")
+        if auto_domain_col:
+            note_parts.append(f"URL → **{auto_domain_col}**")
+        st.caption(
+            ("Auto-detected: " + ",  ".join(note_parts))
+            if note_parts
+            else "Could not auto-detect columns — please select them manually."
         )
-    with sel_r:
-        _NO_DOMAIN = "(none — use company name only)"
-        dom_opts   = [_NO_DOMAIN] + cols
-        def_dom    = (
-            dom_opts.index(auto_domain_col)
-            if auto_domain_col and auto_domain_col in dom_opts else 0
-        )
-        dom_choice = st.selectbox(
-            "Website / URL column (optional)",
-            options=dom_opts,
-            index=def_dom,
-            help=(
-                "Used for Jina Reader (Step 1) and Claude web search (Step 2). "
-                "Falls back to company name search when URL is absent or unreachable."
-            ),
-        )
-    domain_col = dom_choice if dom_choice != _NO_DOMAIN else None
 
-    note_parts = []
-    if auto_name_col:
-        note_parts.append(f"company name → **{auto_name_col}**")
-    if auto_domain_col:
-        note_parts.append(f"URL → **{auto_domain_col}**")
-    st.caption(
-        ("Auto-detected: " + ",  ".join(note_parts))
-        if note_parts
-        else "Could not auto-detect columns — please select them manually."
-    )
+        st.divider()
+        st.subheader("Step 4 · Processing scope")
 
-    # ── Processing scope ──────────────────────────────────────────────────────
-
-    st.divider()
-    st.subheader("Step 4 · Processing scope")
-
-    limit_rows = st.checkbox("Limit rows for testing", value=False)
-    if limit_rows:
-        row_limit = st.number_input(
-            "Number of rows to process",
-            min_value=1, max_value=len(df_raw),
-            value=min(5, len(df_raw)), step=1,
-        )
-        n_to_process = int(row_limit)
-        st.caption(f"Will process the first **{n_to_process}** of {len(df_raw):,} rows.")
+        limit_rows = st.checkbox("Limit rows for testing", value=False)
+        if limit_rows:
+            row_limit = st.number_input(
+                "Number of rows to process",
+                min_value=1, max_value=len(df_raw),
+                value=min(5, len(df_raw)), step=1,
+            )
+            n_to_process = int(row_limit)
+            st.caption(f"Will process the first **{n_to_process}** of {len(df_raw):,} rows.")
+        else:
+            n_to_process = len(df_raw)
+            st.info(f"All **{n_to_process:,}** rows will be processed.")
     else:
+        # Auto-detect columns silently
+        auto_name_col, auto_domain_col = detect_columns(df_raw)
+        name_col   = auto_name_col
+        domain_col = auto_domain_col
         n_to_process = len(df_raw)
-        st.info(f"All **{n_to_process:,}** rows will be processed.")
 
 # =============================================================================
 # STEP 5 — Start enrichment
@@ -4978,115 +5487,17 @@ if ss("processing", False):
 # RESULTS
 # =============================================================================
 
-if ss("enrichment_done", False):
-    df_enriched: pd.DataFrame = ss("df_enriched")
-    debug_records_done: list  = ss("debug_records", [])
-    processed = len(df_enriched)
-    _elm_done = ss("_elm_mode", False)
+
+
+def _render_advanced_results(
+    df_enriched, debug_records_done, processed, _elm_done, debug_mode
+):
+    """Render advanced result sections — only shown when SHOW_ADVANCED_SETTINGS is True.
+
+    Sections: status metrics, token cost, results table, commercial fit scoring,
+    download buttons, debug details.
+    """
     _done_fields = ELM_ALL_FIELDS if _elm_done else ALL_ENRICHMENT_FIELDS
-
-    st.divider()
-    if ss("stop_requested", False):
-        st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
-    else:
-        st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
-
-    _done_dry_run   = ss("_step2_dry_run",     False)
-    _done_zero_cost = ss("_zero_cost_preview", False)
-    if _done_zero_cost and _done_dry_run and not _elm_done:
-        _preview_count = ss("_dry_run_preview_count", 0)
-        st.info(
-            f"ℹ️ **Zero-cost preview completed.** No Step 1 or Step 2 API calls were made — "
-            f"**{_preview_count}** dry-run previews generated. "
-            "Disable zero-cost preview and dry run, then re-run to perform real enrichment."
-        )
-    elif _done_dry_run and not _elm_done:
-        st.info(
-            "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
-            "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
-        )
-
-    # ── Auto-save final file into run folder (runs exactly once per completed run) ─
-    _pca_done_enabled = ss("_per_company_autosave_enabled", False)
-    _pca_done_dir     = ss("_per_company_autosave_run_dir", "")
-    if not ss("_final_auto_saved", False):
-        if _pca_done_enabled and _pca_done_dir:
-            try:
-                _pca_rdir = Path(_pca_done_dir)
-                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "final_results.xlsx"))
-                df_enriched.to_csv(_pca_rdir / "final_results.csv", index=False, encoding="utf-8-sig")
-                # overwrite latest_results.* with the complete dataset too
-                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "latest_results.xlsx"))
-                df_enriched.to_csv(_pca_rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
-                ss_set(_final_auto_saved=True, _final_save_path=str(_pca_rdir / "final_results.xlsx"))
-                st.info(f"📂 Final results saved to **{_pca_done_dir}**")
-            except Exception as _fin_err:
-                ss_set(_final_auto_saved=True, _final_save_path="",
-                       _final_save_error=str(_fin_err))
-        else:
-            ss_set(_final_auto_saved=True)
-
-    _final_xl_error = ss("_final_save_error", "")
-    if _final_xl_error:
-        st.warning(f"⚠ Final auto-save failed: {_final_xl_error}")
-
-    # ── Step 2 debug files — download + preview ───────────────────────────────
-    if not _elm_done:
-        _all_dbg_files = ss("_step2_debug_files", [])
-        if _all_dbg_files:
-            with st.expander(
-                f"🔍 Step 2 debug files ({len(_all_dbg_files)} file(s))",
-                expanded=True,
-            ):
-                # ── ZIP download (all files in one click) ─────────────────────
-                try:
-                    _zip_bytes = build_debug_zip(_all_dbg_files)
-                    st.download_button(
-                        label="⬇ Download all Step 2 debug files as ZIP",
-                        data=_zip_bytes,
-                        file_name=f"step2_debug_{build_run_tag()}_{ts()}.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                        key="dl_all_debug_zip",
-                    )
-                except Exception as _ze:
-                    st.warning(f"Could not build ZIP: {_ze}")
-
-                st.divider()
-
-                # ── Per-file: download button + preview ───────────────────────
-                for _fi, _frec in enumerate(_all_dbg_files):
-                    _tag  = " [DRY RUN]" if _frec.get("dry_run") else ""
-                    _kind = _frec.get("kind", "")
-                    _kind_label = {
-                        "prompt":          "Prompt file",
-                        "prompt_dry_run":  "Prompt file (dry run)",
-                        "search":          "Search I/O file",
-                    }.get(_kind, "Debug file")
-                    st.markdown(
-                        f"**{_kind_label}{_tag}** — {_frec.get('company', '')} "
-                        f"· {_frec.get('provider', '')}"
-                    )
-                    st.caption(f"`{_frec.get('filename','')}`")
-                    _debug_file_download_button(_frec, f"done_{_fi}")
-                    _debug_file_preview_expander(_frec, f"done_{_fi}")
-                    if _fi < len(_all_dbg_files) - 1:
-                        st.divider()
-
-    # ── Primary browser download ──────────────────────────────────────────────
-    if _elm_done:
-        _fname_dl = f"elm_results_{ts()}.xlsx"
-    else:
-        _fname_dl = f"enriched_results_{build_run_tag()}_{ts()}.xlsx"
-    st.download_button(
-        label="⬇ Download results to your local Downloads folder",
-        data=df_to_excel_bytes(df_enriched),
-        file_name=_fname_dl,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
-    )
-
     # ── Status summary ────────────────────────────────────────────────────────
     status_counts  = (
         df_enriched["elm_fetch_status"].value_counts().to_dict()
@@ -5446,11 +5857,12 @@ if ss("enrichment_done", False):
         "One row per company: step statuses, token counts, costs, review flags."
     )
 
+    _rich_xl = build_rich_excel_bytes(df_enriched) if not _elm_done else df_to_excel_bytes(df_enriched)
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button(
             "⬇ Results Excel (.xlsx)",
-            data=df_to_excel_bytes(df_enriched),
+            data=_rich_xl,
             file_name=f"{_fname_prefix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -5625,6 +6037,124 @@ if ss("enrichment_done", False):
         else:
             st.info("Cache is empty. Run an enrichment first.")
 
+
+
+if ss("enrichment_done", False):
+    df_enriched: pd.DataFrame = ss("df_enriched")
+    debug_records_done: list  = ss("debug_records", [])
+    processed = len(df_enriched)
+    _elm_done = ss("_elm_mode", False)
+    _done_fields = ELM_ALL_FIELDS if _elm_done else ALL_ENRICHMENT_FIELDS
+
+    st.divider()
+    if ss("stop_requested", False):
+        st.warning(f"Enrichment stopped after **{processed}** rows. Partial results below.")
+    else:
+        st.success(f"✅ Enrichment complete — **{processed:,}** rows processed.")
+
+    _done_dry_run   = ss("_step2_dry_run",     False)
+    _done_zero_cost = ss("_zero_cost_preview", False)
+    if _done_zero_cost and _done_dry_run and not _elm_done:
+        _preview_count = ss("_dry_run_preview_count", 0)
+        st.info(
+            f"ℹ️ **Zero-cost preview completed.** No Step 1 or Step 2 API calls were made — "
+            f"**{_preview_count}** dry-run previews generated. "
+            "Disable zero-cost preview and dry run, then re-run to perform real enrichment."
+        )
+    elif _done_dry_run and not _elm_done:
+        st.info(
+            "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
+            "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
+        )
+
+    # ── Auto-save final file into run folder (runs exactly once per completed run) ─
+    _pca_done_enabled = ss("_per_company_autosave_enabled", False)
+    _pca_done_dir     = ss("_per_company_autosave_run_dir", "")
+    if not ss("_final_auto_saved", False):
+        if _pca_done_enabled and _pca_done_dir:
+            try:
+                _pca_rdir = Path(_pca_done_dir)
+                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "final_results.xlsx"))
+                df_enriched.to_csv(_pca_rdir / "final_results.csv", index=False, encoding="utf-8-sig")
+                # overwrite latest_results.* with the complete dataset too
+                df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "latest_results.xlsx"))
+                df_enriched.to_csv(_pca_rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
+                ss_set(_final_auto_saved=True, _final_save_path=str(_pca_rdir / "final_results.xlsx"))
+                st.info(f"📂 Final results saved to **{_pca_done_dir}**")
+            except Exception as _fin_err:
+                ss_set(_final_auto_saved=True, _final_save_path="",
+                       _final_save_error=str(_fin_err))
+        else:
+            ss_set(_final_auto_saved=True)
+
+    _final_xl_error = ss("_final_save_error", "")
+    if _final_xl_error:
+        st.warning(f"⚠ Final auto-save failed: {_final_xl_error}")
+
+    # ── Step 2 debug files — download + preview ───────────────────────────────
+    if _show_adv and not _elm_done:
+        _all_dbg_files = ss("_step2_debug_files", [])
+        if _all_dbg_files:
+            with st.expander(
+                f"🔍 Step 2 debug files ({len(_all_dbg_files)} file(s))",
+                expanded=True,
+            ):
+                # ── ZIP download (all files in one click) ─────────────────────
+                try:
+                    _zip_bytes = build_debug_zip(_all_dbg_files)
+                    st.download_button(
+                        label="⬇ Download all Step 2 debug files as ZIP",
+                        data=_zip_bytes,
+                        file_name=f"step2_debug_{build_run_tag()}_{ts()}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="dl_all_debug_zip",
+                    )
+                except Exception as _ze:
+                    st.warning(f"Could not build ZIP: {_ze}")
+
+                st.divider()
+
+                # ── Per-file: download button + preview ───────────────────────
+                for _fi, _frec in enumerate(_all_dbg_files):
+                    _tag  = " [DRY RUN]" if _frec.get("dry_run") else ""
+                    _kind = _frec.get("kind", "")
+                    _kind_label = {
+                        "prompt":          "Prompt file",
+                        "prompt_dry_run":  "Prompt file (dry run)",
+                        "search":          "Search I/O file",
+                    }.get(_kind, "Debug file")
+                    st.markdown(
+                        f"**{_kind_label}{_tag}** — {_frec.get('company', '')} "
+                        f"· {_frec.get('provider', '')}"
+                    )
+                    st.caption(f"`{_frec.get('filename','')}`")
+                    _debug_file_download_button(_frec, f"done_{_fi}")
+                    _debug_file_preview_expander(_frec, f"done_{_fi}")
+                    if _fi < len(_all_dbg_files) - 1:
+                        st.divider()
+
+    # ── Primary browser download ──────────────────────────────────────────────
+    if _elm_done:
+        _fname_dl  = f"elm_results_{ts()}.xlsx"
+        _dl_bytes  = df_to_excel_bytes(df_enriched)
+    else:
+        _fname_dl  = f"enriched_results_{build_run_tag()}_{ts()}.xlsx"
+        _dl_bytes  = build_rich_excel_bytes(df_enriched)
+    st.download_button(
+        label="⬇ Download results",
+        data=_dl_bytes,
+        file_name=_fname_dl,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
+
+    if _show_adv:
+        _render_advanced_results(
+            df_enriched, debug_records_done, processed, _elm_done, debug_mode
+        )
+
     # ── Restart ───────────────────────────────────────────────────────────────
     st.divider()
     if st.button("↺ Start a new enrichment", use_container_width=True, key="restart_btn"):
@@ -5636,7 +6166,7 @@ if ss("enrichment_done", False):
 # Score a previously enriched file without running enrichment again.
 # =============================================================================
 
-if not ss("processing", False) and _SCORING_AVAILABLE:
+if not ss("processing", False) and _SCORING_AVAILABLE and _show_adv:
     st.divider()
     with st.expander("🎯 Score an existing enrichment file", expanded=False):
         st.caption(
