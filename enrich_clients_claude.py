@@ -4375,6 +4375,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
     # When run directly (streamlit run enrich_clients_claude.py) set up the page.
     # When launched via streamlit_app.py the entrypoint already called these.
     import pathlib as _pl
+    import base64 as _b64
     st.set_page_config(
         page_title="mYngle · Company Enrichment",
         page_icon="🏢",
@@ -4396,12 +4397,41 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         unsafe_allow_html=True,
     )
     _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
-    _hdr_logo, _hdr_title = st.columns([1, 3], vertical_alignment="center")
-    with _hdr_logo:
-        if _logo.exists():
-            st.image(str(_logo), width=180)
-    with _hdr_title:
-        st.title("Company Enrichment")
+    _logo_src = (
+        "data:image/jpeg;base64," + _b64.b64encode(_logo.read_bytes()).decode()
+        if _logo.exists() else ""
+    )
+    st.markdown(
+        f"""
+        <style>
+        .brand-header {{
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 0.25rem;
+        }}
+        .brand-logo {{
+            height: 52px;
+            width: auto;
+            display: block;
+            flex-shrink: 0;
+        }}
+        .brand-title {{
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1;
+            margin: 0;
+            padding: 0;
+            color: inherit;
+        }}
+        </style>
+        <div class="brand-header">
+            {'<img src="' + _logo_src + '" class="brand-logo" alt="mYngle">' if _logo_src else ''}
+            <div class="brand-title">company enrichment</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.caption(
         "Upload a company file. "
         "The app will enrich and score the companies, "

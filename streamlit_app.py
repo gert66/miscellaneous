@@ -48,14 +48,47 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Logo + header (logo left, title right, on one line) ───────────────────────
+import base64
+
+# ── Logo + header (inline flex, tight gap, lowercase title) ──────────────────
 _logo_path = pathlib.Path(__file__).parent / "Mynglelogofinal.jpg"
-_hdr_logo, _hdr_title = st.columns([1, 3], vertical_alignment="center")
-with _hdr_logo:
-    if _logo_path.exists():
-        st.image(str(_logo_path), width=180)
-with _hdr_title:
-    st.title("Company Enrichment")
+if _logo_path.exists():
+    _logo_b64 = base64.b64encode(_logo_path.read_bytes()).decode()
+    _logo_src  = f"data:image/jpeg;base64,{_logo_b64}"
+else:
+    _logo_src  = ""
+
+st.markdown(
+    f"""
+    <style>
+    .brand-header {{
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 0.25rem;
+    }}
+    .brand-logo {{
+        height: 52px;
+        width: auto;
+        display: block;
+        flex-shrink: 0;
+    }}
+    .brand-title {{
+        font-size: 2rem;
+        font-weight: 700;
+        line-height: 1;
+        margin: 0;
+        padding: 0;
+        color: inherit;
+    }}
+    </style>
+    <div class="brand-header">
+        {'<img src="' + _logo_src + '" class="brand-logo" alt="mYngle">' if _logo_src else ''}
+        <div class="brand-title">company enrichment</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.caption(
     "Upload a company file. "
     "The app will enrich and score the companies, "
