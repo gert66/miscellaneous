@@ -4933,11 +4933,15 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
-    _logo_src = (
-        "data:image/jpeg;base64," + _b64.b64encode(_logo.read_bytes()).decode()
-        if _logo.exists() else ""
-    )
+    # Prefer padded PNG (60 px top whitespace baked in); fall back to original JPG
+    _logo = _pl.Path(__file__).parent / "Mynglelogofinal_padded.png"
+    if not _logo.exists():
+        _logo = _pl.Path(__file__).parent / "Mynglelogofinal.jpg"
+    if _logo.exists():
+        _mime = "image/png" if _logo.suffix.lower() == ".png" else "image/jpeg"
+        _logo_src = f"data:{_mime};base64," + _b64.b64encode(_logo.read_bytes()).decode()
+    else:
+        _logo_src = ""
     _img_tag = (
         f'<img src="{_logo_src}" class="brand-logo" alt="mYngle" />'
         if _logo_src else ""
@@ -4953,19 +4957,23 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             padding-right: 2rem;
         }}
         div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
-            overflow: visible;
+            overflow: visible !important;
             margin-bottom: 1.5rem;
         }}
         .brand-header {{
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
-            padding-top: 32px;
-            padding-bottom: 8px;
-            overflow: visible;
+            display: grid;
+            grid-template-columns: 40% 60%;
+            align-items: end;
+            min-height: 170px;
+            padding-top: 20px;
+            padding-bottom: 16px;
+            overflow: visible !important;
         }}
         .brand-title-block {{
-            flex: 0 0 40%;
+            display: flex;
+            align-items: end;
+            justify-content: flex-start;
+            overflow: visible !important;
         }}
         .brand-title {{
             font-size: 42px;
@@ -4977,23 +4985,27 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             padding: 0;
         }}
         .brand-logo-block {{
-            flex: 0 0 60%;
             display: flex;
             justify-content: flex-end;
-            align-items: flex-end;
-            overflow: visible;
+            align-items: end;
+            overflow: visible !important;
         }}
         .brand-logo {{
-            width: 450px;
+            width: 420px;
+            max-width: 100%;
             height: auto;
             display: block;
             object-fit: contain;
-            overflow: visible;
+            overflow: visible !important;
         }}
         </style>
         <div class="brand-header">
-          <div class="brand-title-block"><span class="brand-title">lead prioritizer</span></div>
-          <div class="brand-logo-block">{_img_tag}</div>
+          <div class="brand-title-block">
+            <span class="brand-title">lead prioritizer</span>
+          </div>
+          <div class="brand-logo-block">
+            {_img_tag}
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
