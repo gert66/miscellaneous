@@ -80,7 +80,7 @@ st.markdown(
     <style>
     .block-container {{
         max-width: 880px;
-        padding-top: 2.5rem;
+        padding-top: 2.2rem;
         padding-bottom: 3rem;
         padding-left: 2rem;
         padding-right: 2rem;
@@ -93,10 +93,11 @@ st.markdown(
 
     .brand-header {{
         display: grid;
-        grid-template-columns: 40% 60%;
+        grid-template-columns: 43% 57%;
         align-items: center;
-        padding-top: 24px;
-        padding-bottom: 16px;
+        min-height: 140px;
+        padding-top: 10px;
+        padding-bottom: 12px;
         overflow: visible !important;
     }}
 
@@ -121,20 +122,19 @@ st.markdown(
         display: flex;
         justify-content: flex-end;
         align-items: center;
-        padding-top: 24px;
+        padding: 0;
+        line-height: 0;
         overflow: visible !important;
-        outline: 2px solid red;
     }}
 
     .brand-logo {{
-        width: 405px;
+        width: 430px;
         max-width: 100%;
         height: auto;
         display: block;
         object-fit: contain;
         object-position: center center;
         overflow: visible !important;
-        outline: 2px solid blue;
     }}
     </style>
 
