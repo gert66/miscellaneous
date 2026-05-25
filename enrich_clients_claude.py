@@ -4989,7 +4989,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             display: block;
             object-fit: contain;
             overflow: visible;
-            transform: translateY(6px);
+            transform: translateY(8px);
         }}
         </style>
         <div class="brand-header">
@@ -5877,6 +5877,7 @@ if start_btn and not blocking and not currently_processing:
         total_tokens_in=0, total_tokens_out=0, total_cost_usd=0.0,
         total_cache_read_tokens=0, total_cache_create_tokens=0,
         _resume_mode=resume_mode, autosave_last_name="",
+        _run_start_time=__import__("time").time(),
         _elm_mode=_elm_mode,
         _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
         _local_save_enabled=ss("_local_save_enabled", True),
@@ -5959,6 +5960,26 @@ if ss("processing", False):
         + (f" · Current company: {_cur_company}" if _cur_company else "")
     )
     st.progress(idx / _n if _n else 1.0, text=_progress_text)
+
+    # ── ETA display ───────────────────────────────────────────────────────────
+    _completed  = len(results)
+    _start_time = ss("_run_start_time", None)
+    if _start_time is not None and _n > 0:
+        import time as _time_mod
+        _elapsed = _time_mod.time() - _start_time
+        if _completed >= 2:
+            _avg_sec      = _elapsed / _completed
+            _remaining    = max(_n - _completed, 0)
+            _eta_sec      = int(_avg_sec * _remaining)
+            if _eta_sec < 60:
+                _eta_str = f"about {_eta_sec} sec"
+            elif _eta_sec < 3600:
+                _eta_str = f"about {_eta_sec // 60} min {_eta_sec % 60} sec"
+            else:
+                _eta_str = f"about {_eta_sec // 3600} hr {(_eta_sec % 3600) // 60} min"
+            st.caption(f"Estimated time remaining: {_eta_str}")
+        else:
+            st.caption("Estimating time remaining…")
 
     if _show_adv:
         if _elm_mode_run:
