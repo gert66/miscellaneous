@@ -3624,11 +3624,11 @@ def _html_dl_buttons(partial_df: pd.DataFrame, n_done: int, stamp: str) -> None:
     components.html(
         f"""<div style="display:flex;gap:10px;margin:2px 0;">
             <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{xl_b64}"
-               download="enriched_partial_{stamp}.xlsx" style="{_style}">
+               download="enrichedResults_partial_{stamp}.xlsx" style="{_style}">
                ⬇ Excel ({n_done} rows, ~{xl_kb} KB)
             </a>
             <a href="data:text/csv;base64,{csv_b64}"
-               download="enriched_partial_{stamp}.csv" style="{_style}">
+               download="enrichedResults_partial_{stamp}.csv" style="{_style}">
                ⬇ CSV ({n_done} rows, ~{csv_kb} KB)
             </a>
         </div>""",
@@ -3738,8 +3738,8 @@ def save_to_local_folder(df: pd.DataFrame, folder: str, run_tag: str = "") -> tu
     folder_path.mkdir(parents=True, exist_ok=True)
     stamp      = ts()
     tag        = f"_{run_tag}" if run_tag else ""
-    excel_path = folder_path / f"enriched_results{tag}_{stamp}.xlsx"
-    csv_path   = folder_path / f"enriched_results{tag}_{stamp}.csv"
+    excel_path = folder_path / f"enrichedResults_{stamp}.xlsx"
+    csv_path   = folder_path / f"enrichedResults_{stamp}.csv"
     df_to_excel_bytes_write(df, str(excel_path))
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     return str(excel_path), str(csv_path)
@@ -4278,6 +4278,42 @@ def build_rich_excel_bytes(
                     break
         if _domain_guess is None and len(input_cols_list) > 1:
             _domain_guess = input_cols_list[1]
+
+    # ── Export-time guardrails ────────────────────────────────────────────────
+    _export_input_type = (
+        str(df["input_type"].iloc[0])
+        if "input_type" in df.columns and not df.empty
+        else ""
+    )
+    _is_lucia_export_guard = (_export_input_type == "pre_enriched_lucia_export")
+    if _is_lucia_export_guard:
+        _guard_bad_domains = [
+            str(d) for d in df.get("canonical_company_domain", pd.Series(dtype=str))
+            if "linkedin.com" in str(d).lower()
+        ]
+        _guard_bad_urls = [
+            str(u) for u in df.get("canonical_company_url", pd.Series(dtype=str))
+            if "linkedin.com/in/" in str(u).lower()
+        ]
+        _guard_missing = [
+            str(n) for n in df.get("canonical_company_name", pd.Series(dtype=str))
+            if not str(n).strip() or str(n).strip().lower() in ("nan", "none", "")
+        ]
+        _guard_errors: list[str] = []
+        if _guard_bad_domains:
+            _guard_errors.append(f"LinkedIn URLs in canonical_company_domain: {_guard_bad_domains}")
+        if _guard_bad_urls:
+            _guard_errors.append(f"LinkedIn URLs in canonical_company_url: {_guard_bad_urls}")
+        if _guard_missing:
+            _guard_errors.append(f"Missing canonical_company_name in {len(_guard_missing)} row(s)")
+        if "source_contact_count" not in df.columns:
+            _guard_errors.append("source_contact_count column missing for Lucia export")
+        if df_input_original is not None and len(df_input_original) == 0:
+            _guard_errors.append("Input sheet has 0 rows — original CSV not preserved")
+        if _guard_errors:
+            raise ValueError(
+                "Export guardrail failed — workbook not written:\n" + "\n".join(_guard_errors)
+            )
 
     # ── Input (visible) ───────────────────────────────────────────────────────
     ws_input = wb.create_sheet("Input")
@@ -5437,9 +5473,45 @@ if start_btn and not blocking and not currently_processing:
             df_raw, _input_type, name_col, domain_col
         )
         df_work            = _norm_result["company_df"].head(n_to_process).copy()
+        # After deduplication Type 2 may have fewer rows than n_to_process;
+        # update so the processing loop bound matches the actual work df.
+        n_to_process       = len(df_work)
         name_col           = _norm_result["company_name_col"] or name_col
         domain_col         = _norm_result["domain_col"]       or domain_col
         _df_raw_for_input  = df_raw.copy() if _is_lucia_run else None
+
+        # ── Canonical identity validation (Type 2) ────────────────────────────
+        if _is_lucia_run:
+            _person_names = set(
+                df_raw.get("First Name", pd.Series(dtype=str))
+                .dropna().astype(str).str.strip()
+                .replace("", pd.NA).dropna()
+            )
+            _canon_names  = set(df_work["canonical_company_name"].astype(str).str.strip())
+            _leaked_names = _person_names & _canon_names
+            _bad_domains  = [
+                d for d in df_work["canonical_company_domain"].astype(str)
+                if "linkedin.com" in d.lower()
+            ]
+            _bad_urls = [
+                u for u in df_work["canonical_company_url"].astype(str)
+                if "linkedin.com/in/" in u.lower()
+            ]
+            if _leaked_names or _bad_domains or _bad_urls:
+                _detail = []
+                if _leaked_names:
+                    _detail.append(f"Person names in company identity: {sorted(_leaked_names)}")
+                if _bad_domains:
+                    _detail.append(f"LinkedIn URLs in canonical_company_domain: {_bad_domains}")
+                if _bad_urls:
+                    _detail.append(f"LinkedIn URLs in canonical_company_url: {_bad_urls}")
+                st.error(
+                    "❌ Canonical identity validation failed — contact fields leaked into "
+                    "company identity. Fix the normalization layer before proceeding.\n\n"
+                    + "\n".join(_detail)
+                )
+                st.stop()
+
         # Store normalization metadata for downstream validation
         _norm_meta = {
             "input_type":           _norm_result["input_type"],
@@ -6010,7 +6082,7 @@ if ss("processing", False):
         _auto_dl_done = ss("_auto_dl_count", 0)
         if _new_idx % _AUTO_DL_EVERY == 0 and _new_idx // _AUTO_DL_EVERY > _auto_dl_done:
             _dl_snap = build_partial_df(results, df_work, _active_fields)
-            _dl_name = f"enriched_snapshot_{_new_idx}.xlsx"
+            _dl_name = f"enrichedResults_snapshot_{_new_idx}.xlsx"
             _js_auto_download(_dl_snap, _dl_name)
             ss_set(
                 _auto_dl_count=_new_idx // _AUTO_DL_EVERY,

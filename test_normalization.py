@@ -332,11 +332,123 @@ def test_output_filename() -> None:
 
     from datetime import datetime
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname = f"enrichedResults_{stamp}.xlsx"
-    _chk("filename starts with enrichedResults_", fname.startswith("enrichedResults_"))
-    _chk("filename ends with .xlsx",              fname.endswith(".xlsx"))
-    for bad in ("sg", "hq", "lusha", "lucia"):
-        _chk(f"filename does not contain '{bad}'", bad not in fname.lower())
+    for prefix in ("enrichedResults_", "enrichedResults_partial_", "enrichedResults_snapshot_"):
+        fname = f"{prefix}{stamp}.xlsx"
+        _chk(f"'{prefix}...' starts with enrichedResults_", fname.startswith("enrichedResults_"))
+        _chk(f"'{prefix}...' ends with .xlsx",              fname.endswith(".xlsx"))
+        for bad in ("enriched_results", "_sg_", "_hq_", "lusha", "lucia"):
+            _chk(f"'{prefix}...' does not contain '{bad}'", bad not in fname.lower())
+
+
+# =============================================================================
+# Test E: n_to_process correction for multi-contact Type 2 input
+# =============================================================================
+
+def test_type2_n_to_process_correction() -> None:
+    _sec("Test E: n_to_process corrected to unique_company_count for Type 2")
+
+    # Build a 5-contact CSV with only 2 unique companies (simulates 5-row upload)
+    df_multi = pd.DataFrame([
+        {"First Name": "Anna",     "Last Name": "Rossi",    "Company Name": "Ali Lavoro",
+         "Company Domain": "alilavoro.it", "Company Website": "https://alilavoro.it",
+         "Number of Employees": "51-200", "LinkedIn URL": "linkedin.com/in/anna"},
+        {"First Name": "Michela",  "Last Name": "Bianchi",  "Company Name": "Ali Lavoro",
+         "Company Domain": "alilavoro.it", "Company Website": "https://alilavoro.it",
+         "Number of Employees": "51-200", "LinkedIn URL": "linkedin.com/in/michela"},
+        {"First Name": "Carlo",    "Last Name": "Ferrari",  "Company Name": "Renovit",
+         "Company Domain": "renovit.it",  "Company Website": "https://renovit.it",
+         "Number of Employees": "51-200", "LinkedIn URL": "linkedin.com/in/carlo"},
+        {"First Name": "Giulia",   "Last Name": "Conti",    "Company Name": "Renovit",
+         "Company Domain": "renovit.it",  "Company Website": "https://renovit.it",
+         "Number of Employees": "51-200", "LinkedIn URL": "linkedin.com/in/giulia"},
+        {"First Name": "Sara",     "Last Name": "Moretti",  "Company Name": "Renovit",
+         "Company Domain": "renovit.it",  "Company Website": "https://renovit.it",
+         "Number of Employees": "51-200", "LinkedIn URL": "linkedin.com/in/sara"},
+    ])
+    result = normalize_input_to_company_df(df_multi, "pre_enriched_lucia_export",
+                                           "Company Name", "Company Domain")
+    cdf = result["company_df"]
+
+    _chk("contact_row_count = 5",    result["contact_row_count"] == 5,
+         str(result["contact_row_count"]))
+    _chk("unique_company_count = 2", result["unique_company_count"] == 2,
+         str(result["unique_company_count"]))
+    _chk("company_df has 2 rows",    len(cdf) == 2, str(len(cdf)))
+    # head(5) on a 2-row df should still give 2 rows (not 5)
+    _chk("head(5) on company_df = 2 rows (n_to_process correction)",
+         len(cdf.head(5)) == 2, str(len(cdf.head(5))))
+    # No person names in canonical_company_name
+    names = set(cdf["canonical_company_name"].astype(str).str.strip())
+    for person in ("Anna", "Michela", "Carlo", "Giulia", "Sara"):
+        _chk(f"'{person}' NOT in canonical_company_name after multi-contact dedup",
+             person not in names, str(names))
+    # Canonical domains must not contain linkedin
+    for d in cdf["canonical_company_domain"].astype(str):
+        _chk(f"No linkedin.com in canonical_company_domain: {d!r}",
+             "linkedin.com" not in d.lower(), d)
+
+
+# =============================================================================
+# Test F: Canonical identity validation catches leakage
+# =============================================================================
+
+def test_canonical_validation_rejects_leakage() -> None:
+    _sec("Test F: Canonical validation rejects person-name leakage")
+
+    # Simulate a broken normalization that puts a person name as canonical_company_name
+    df_broken = pd.DataFrame([{
+        "canonical_company_name":   "Anna",
+        "canonical_company_domain": "alilavoro.it",
+        "canonical_company_url":    "https://alilavoro.it",
+        "input_type":               "pre_enriched_lucia_export",
+        "source_contact_count":     1,
+    }])
+    df_raw_with_first = pd.DataFrame([{"First Name": "Anna"}])
+
+    # Reproduce the validation logic from the start handler
+    _person_names = set(
+        df_raw_with_first.get("First Name", pd.Series(dtype=str))
+        .dropna().astype(str).str.strip()
+        .replace("", pd.NA).dropna()
+    )
+    _canon_names  = set(df_broken["canonical_company_name"].astype(str).str.strip())
+    _leaked = _person_names & _canon_names
+    _chk("Validation detects 'Anna' as leaked person name", "Anna" in _leaked, str(_leaked))
+
+    # Simulate linkedin.com in domain
+    df_bad_domain = pd.DataFrame([{
+        "canonical_company_name":   "Ali Lavoro",
+        "canonical_company_domain": "linkedin.com/in/anna",
+        "canonical_company_url":    "https://linkedin.com/in/anna",
+        "input_type":               "pre_enriched_lucia_export",
+    }])
+    _bad_domains = [d for d in df_bad_domain["canonical_company_domain"].astype(str)
+                    if "linkedin.com" in d.lower()]
+    _bad_urls    = [u for u in df_bad_domain["canonical_company_url"].astype(str)
+                    if "linkedin.com/in/" in u.lower()]
+    _chk("Validation detects linkedin.com in canonical_company_domain",
+         bool(_bad_domains), str(_bad_domains))
+    _chk("Validation detects linkedin.com/in/ in canonical_company_url",
+         bool(_bad_urls), str(_bad_urls))
+
+    # Confirm clean Type 2 data passes validation
+    df2_good = load_cold_caller_csv()
+    result_good = normalize_input_to_company_df(
+        df2_good, "pre_enriched_lucia_export", "Company Name", "Company Domain"
+    )
+    cdf_good = result_good["company_df"]
+    _person_names_good = set(
+        df2_good.get("First Name", pd.Series(dtype=str))
+        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+    )
+    _leaked_good = _person_names_good & set(
+        cdf_good["canonical_company_name"].astype(str).str.strip()
+    )
+    _bad_dom_good = [d for d in cdf_good["canonical_company_domain"].astype(str)
+                     if "linkedin.com" in d.lower()]
+    _chk("Clean Type 2 data: zero person-name leakage", not _leaked_good, str(_leaked_good))
+    _chk("Clean Type 2 data: no linkedin.com in canonical_company_domain",
+         not _bad_dom_good, str(_bad_dom_good))
 
 
 # =============================================================================
@@ -363,6 +475,10 @@ def run_all() -> None:
 
     # Filename
     test_output_filename()
+
+    # Pipeline robustness
+    test_type2_n_to_process_correction()
+    test_canonical_validation_rejects_leakage()
 
     print(f"\n{'═'*65}")
     if _failures:
