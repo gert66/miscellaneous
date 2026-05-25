@@ -591,6 +591,45 @@ _LUSHA_COL_NAMES_EXACT = frozenset([
     "founded_year", "country", "city", "linkedin_url",
 ])
 
+# Lucia/Lusha contact export column signatures (company-level fields)
+_LUCIA_EXPORT_COMPANY_COLS = frozenset([
+    "Company Name", "Company Domain", "Company Description",
+    "Company Year Founded", "Company Website",
+    "Company Number of Employees", "Company Revenue",
+    "Company linkedin URL", "Total Funding Amount",
+    "Total Number of Rounds", "Last Round/Event Amount",
+    "Last Round/Event Type", "Last Round/Event Date",
+    "IPO Status", "Company Main Industry", "Company Sub Industry",
+    "Company Technologies", "Company Specialties",
+    "Company Continent", "Company Country", "Company State",
+    "Company City", "Company Country ISO",
+])
+
+# Mapping: Lucia/Lusha CSV column name → internal lusha_api_* field name
+_LUCIA_COL_MAP = {
+    "Company Name":                "lusha_api_company_name",
+    "Company Domain":              "lusha_api_domain",
+    "Company Website":             "lusha_api_domain",   # fallback if no Company Domain
+    "Company Description":         "lusha_api_description",
+    "Company Year Founded":        "lusha_api_founded_year",
+    "Company Number of Employees": "lusha_api_employee_range",
+    "Company Revenue":             "lusha_api_revenue_range",
+    "Company Main Industry":       "lusha_api_industry",
+    "Company Sub Industry":        "lusha_api_sub_industry",
+    "Company Country":             "lusha_api_country",
+    "Company City":                "lusha_api_city",
+    "Company Continent":           "lusha_api_continent",
+    "Company linkedin URL":        "lusha_api_linkedin_url",
+    "Company Specialties":         "lusha_api_specialties",
+    "Company Technologies":        "lusha_api_technologies",
+    "Total Funding Amount":        "lusha_api_total_funding_amount",
+    "Total Number of Rounds":      "lusha_api_total_funding_rounds",
+    "Last Round/Event Type":       "lusha_api_last_round_type",
+    "Last Round/Event Amount":     "lusha_api_last_round_amount",
+    "Last Round/Event Date":       "lusha_api_last_round_date",
+    "IPO Status":                  "lusha_api_ipo_status",
+}
+
 _STATUS_LABELS = {
     "enriched_jina":                 "Enriched via Jina",
     "enriched_search":               "Enriched via Google",
@@ -1077,7 +1116,113 @@ def _legal_suffix(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", hits[-1].lower()) if hits else ""
 
 
+def is_lucia_contact_export(df: pd.DataFrame) -> bool:
+    """Return True if df is a pre-enriched Lucia/Lusha contact export (Type 2).
+
+    Requires: 'Company Name' AND ('Company Domain' OR 'Company Website')
+    plus at least 2 additional Lucia-specific company-level columns.
+    """
+    cols = set(df.columns.tolist())
+    if "Company Name" not in cols:
+        return False
+    if not (cols & {"Company Domain", "Company Website"}):
+        return False
+    extra = _LUCIA_EXPORT_COMPANY_COLS - {"Company Name", "Company Domain", "Company Website"}
+    return len(cols & extra) >= 2
+
+
+def get_lucia_name_col(df: pd.DataFrame) -> str | None:
+    """Return 'Company Name' if present, else None."""
+    return "Company Name" if "Company Name" in df.columns else None
+
+
+def get_lucia_domain_col(df: pd.DataFrame) -> str | None:
+    """Return 'Company Domain' or 'Company Website' for Lucia exports, else None."""
+    if "Company Domain" in df.columns:
+        return "Company Domain"
+    if "Company Website" in df.columns:
+        return "Company Website"
+    return None
+
+
+def map_lucia_export_row(row_dict: dict) -> dict:
+    """Map a Lucia/Lusha CSV export row to internal lusha_api_* field names.
+
+    'Company Domain' takes priority over 'Company Website' for lusha_api_domain.
+    Always adds status fields marking the data as reused (no API call needed).
+    """
+    mapped: dict = {}
+    domain_set = False
+    for src_col, tgt_field in _LUCIA_COL_MAP.items():
+        val = row_dict.get(src_col)
+        if val is None or str(val).strip().lower() in ("", "nan", "none"):
+            continue
+        val_str = str(val).strip()
+        if tgt_field == "lusha_api_domain":
+            if src_col == "Company Domain":
+                mapped[tgt_field] = val_str
+                domain_set = True
+            elif src_col == "Company Website" and not domain_set:
+                mapped[tgt_field] = val_str
+        else:
+            mapped[tgt_field] = val_str
+    mapped["lusha_api_status"]    = "reused_existing_lucia_data"
+    mapped["lucia_data_status"]   = "existing_lucia_export_reused"
+    mapped["lucia_api_called"]    = "False"
+    mapped["lusha_api_match_notes"] = (
+        "Existing Lucia/Lusha export data reused; API call skipped."
+    )
+    return mapped
+
+
+def deduplicate_lucia_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Deduplicate a Lucia contact export to one row per unique company.
+
+    Primary dedup key: cleaned Company Domain.
+    Fallback: cleaned Company Name.
+    Adds 'source_contact_count' column.
+    """
+    df = df.copy()
+    domain_col = (
+        "Company Domain" if "Company Domain" in df.columns else
+        "Company Website" if "Company Website" in df.columns else None
+    )
+    name_col = "Company Name" if "Company Name" in df.columns else None
+
+    if domain_col:
+        df["_dedup_key"] = df[domain_col].apply(
+            lambda x: clean_domain(str(x)) if pd.notna(x) else ""
+        )
+        if name_col:
+            df["_dedup_key"] = df.apply(
+                lambda r: r["_dedup_key"] if r["_dedup_key"]
+                else str(r.get(name_col, "")).strip().lower(),
+                axis=1,
+            )
+    elif name_col:
+        df["_dedup_key"] = df[name_col].apply(lambda x: str(x).strip().lower())
+    else:
+        df["_dedup_key"] = df.index.astype(str)
+
+    counts = df.groupby("_dedup_key").size().rename("source_contact_count")
+    df_dedup = df.drop_duplicates(subset=["_dedup_key"], keep="first").copy()
+    df_dedup = df_dedup.merge(counts, on="_dedup_key", how="left")
+    df_dedup = df_dedup.drop(columns=["_dedup_key"])
+    return df_dedup.reset_index(drop=True)
+
+
 def detect_columns(df: pd.DataFrame) -> tuple:
+    """Detect company name and domain/URL columns in df.
+
+    For Lucia/Lusha contact exports the exact 'Company Name' and
+    'Company Domain'/'Company Website' columns are returned directly —
+    fuzzy matching is bypassed so person fields like 'First Name' or
+    'LinkedIn URL' can never be chosen.
+    """
+    # Exact match for Lucia/Lusha contact exports
+    if is_lucia_contact_export(df):
+        return get_lucia_name_col(df), get_lucia_domain_col(df)
+
     cols      = df.columns.tolist()
     col_lower = [str(c).lower() for c in cols]
 
@@ -1097,6 +1242,10 @@ def detect_columns(df: pd.DataFrame) -> tuple:
 
 def detect_lusha_columns(df: pd.DataFrame) -> list:
     """Return list of column names in df that look like existing Lusha/Lucia enrichment fields."""
+    # Lucia/Lusha contact export: return all recognised company-level columns
+    if is_lucia_contact_export(df):
+        return [c for c in df.columns if c in _LUCIA_EXPORT_COMPANY_COLS]
+
     found = []
     for col in df.columns:
         col_l = col.lower().strip()
@@ -3836,13 +3985,23 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             pass
 
 
-def build_rich_excel_bytes(df: pd.DataFrame) -> bytes:
+def build_rich_excel_bytes(
+    df: pd.DataFrame,
+    name_col: str | None = None,
+    domain_col: str | None = None,
+    df_input_original: pd.DataFrame | None = None,
+) -> bytes:
     """
     Build a fully formatted multi-sheet Excel workbook.
 
     Visible sheets  : Input | Summary | Company Profiles
     Hidden sheets   : Advanced Evidence | Scoring Settings |
                       Enriched | model_features | qa_evidence
+
+    name_col / domain_col: when provided (e.g. from detect_columns), these are
+    used directly so person-level columns in Lucia exports are never chosen.
+    df_input_original: original contact-level df to write to the Input sheet
+    (for Lucia exports where df is already deduplicated to company level).
     """
     import openpyxl
     from openpyxl import Workbook
@@ -3854,23 +4013,57 @@ def build_rich_excel_bytes(df: pd.DataFrame) -> bytes:
     _all_enrich = set(ALL_ENRICHMENT_FIELDS + list(_SCORE_OUTPUT_COLS or []))
     input_cols_list = [c for c in df.columns if c not in _all_enrich]
 
-    # Guess name / domain columns from the input set
-    _name_guess   = None
-    _domain_guess = None
-    for c in input_cols_list:
-        cl = c.lower()
-        if _name_guess is None and any(h in cl for h in _COMPANY_HINTS):
-            _name_guess = c
-        elif _domain_guess is None and any(h in cl for h in _DOMAIN_HINTS):
-            _domain_guess = c
-    if _name_guess is None and input_cols_list:
-        _name_guess = input_cols_list[0]
-    if _domain_guess is None and len(input_cols_list) > 1:
-        _domain_guess = input_cols_list[1]
+    # Determine name / domain columns for Summary and Company Profiles
+    if name_col is not None:
+        # Explicit columns passed in — use them directly
+        _name_guess   = name_col
+        _domain_guess = domain_col
+    else:
+        # Prefer exact Lucia/Lusha company columns before falling back to heuristics
+        _col_set = set(input_cols_list)
+        if "Company Name" in _col_set:
+            _name_guess = "Company Name"
+        elif "lusha_api_company_name" in _col_set:
+            _name_guess = "lusha_api_company_name"
+        else:
+            _name_guess = None
+
+        if "Company Domain" in _col_set:
+            _domain_guess = "Company Domain"
+        elif "Company Website" in _col_set:
+            _domain_guess = "Company Website"
+        elif "lusha_api_domain" in _col_set:
+            _domain_guess = "lusha_api_domain"
+        else:
+            _domain_guess = None
+
+        # Heuristic fallback: substring match, skipping person-level column names
+        _person_prefixes = ("first ", "last ", "middle ", "contact ")
+        if _name_guess is None:
+            for c in input_cols_list:
+                cl = c.lower()
+                if any(h in cl for h in _COMPANY_HINTS) and not cl.startswith(_person_prefixes):
+                    _name_guess = c
+                    break
+        if _domain_guess is None:
+            for c in input_cols_list:
+                cl = c.lower()
+                if any(h in cl for h in _DOMAIN_HINTS) and "linkedin" not in cl:
+                    _domain_guess = c
+                    break
+
+        if _name_guess is None and input_cols_list:
+            _name_guess = input_cols_list[0]
+        if _domain_guess is None and len(input_cols_list) > 1:
+            _domain_guess = input_cols_list[1]
 
     # ── Input (visible) ───────────────────────────────────────────────────────
     ws_input = wb.create_sheet("Input")
-    _xl_write_df(ws_input, df[input_cols_list] if input_cols_list else df)
+    if df_input_original is not None:
+        # Lucia exports: write the original contact-level CSV unchanged
+        _xl_write_df(ws_input, df_input_original)
+    else:
+        _xl_write_df(ws_input, df[input_cols_list] if input_cols_list else df)
 
     # ── Company Profiles (visible) ────────────────────────────────────────────
     ws_profiles = wb.create_sheet("Company Profiles")
@@ -4749,13 +4942,19 @@ if new_file_key != ss("_file_key"):
             )
             ss_set(df_raw=df_loaded, file_name=fname)
             # Detect existing Lusha/Lucia enrichment columns
-            _detected_lusha = detect_lusha_columns(df_loaded)
+            _detected_lusha  = detect_lusha_columns(df_loaded)
+            _is_lucia_loaded = is_lucia_contact_export(df_loaded)
             ss_set(
                 _lusha_cols_in_input=_detected_lusha,
                 _has_lusha_input=bool(_detected_lusha),
+                _is_lucia_export=_is_lucia_loaded,
             )
         except Exception as exc:
-            ss_set(file_error=str(exc), _lusha_cols_in_input=[], _has_lusha_input=False)
+            ss_set(
+                file_error=str(exc),
+                _lusha_cols_in_input=[], _has_lusha_input=False,
+                _is_lucia_export=False,
+            )
 
 df_raw: pd.DataFrame | None = ss("df_raw")
 file_error: str | None      = ss("file_error")
@@ -4763,10 +4962,40 @@ file_error: str | None      = ss("file_error")
 if file_error:
     st.error(f"Could not read the file: {file_error}")
 elif uploaded and df_raw is not None:
-    st.success(
-        f"✅ **{ss('file_name')}** loaded — "
-        f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
-    )
+    if ss("_is_lucia_export", False):
+        # Count unique companies for the friendly message
+        _l_domain_col = get_lucia_domain_col(df_raw)
+        _l_name_col   = get_lucia_name_col(df_raw)
+        if _l_domain_col:
+            _dedup_keys = df_raw[_l_domain_col].apply(
+                lambda x: clean_domain(str(x)) if pd.notna(x) else ""
+            )
+            if _l_name_col:
+                _dedup_keys = _dedup_keys.where(
+                    _dedup_keys != "",
+                    df_raw[_l_name_col].apply(lambda x: str(x).strip().lower()),
+                )
+        elif _l_name_col:
+            _dedup_keys = df_raw[_l_name_col].apply(lambda x: str(x).strip().lower())
+        else:
+            _dedup_keys = pd.Series(range(len(df_raw))).astype(str)
+        _n_contacts   = len(df_raw)
+        _n_companies  = _dedup_keys.nunique()
+        if _n_contacts == _n_companies:
+            st.success(
+                f"✅ **{ss('file_name')}** loaded — "
+                f"{_n_contacts:,} unique companies ready"
+            )
+        else:
+            st.success(
+                f"✅ **{ss('file_name')}** loaded — "
+                f"{_n_contacts:,} contact rows · {_n_companies:,} unique companies ready"
+            )
+    else:
+        st.success(
+            f"✅ **{ss('file_name')}** loaded — "
+            f"{len(df_raw):,} rows, {len(df_raw.columns)} columns"
+        )
     if _show_adv:
         if _elm_mode:
             st.info(
@@ -4933,8 +5162,20 @@ if start_btn and not blocking and not currently_processing:
         df_work    = _sc_df.copy()
         name_col   = _sc_name_col
         domain_col = _sc_domain_col
+        _df_raw_for_input = None
     else:
-        df_work    = df_raw.head(n_to_process).copy()
+        _is_lucia_run = ss("_is_lucia_export", False)
+        if _is_lucia_run and df_raw is not None:
+            # Deduplicate to company level; keep original for Input sheet
+            _df_deduped = deduplicate_lucia_export(df_raw)
+            df_work = _df_deduped.head(n_to_process).copy()
+            _df_raw_for_input = df_raw.copy()
+            # Ensure correct company columns are used
+            name_col   = get_lucia_name_col(df_raw) or name_col
+            domain_col = get_lucia_domain_col(df_raw) or domain_col
+        else:
+            df_work = df_raw.head(n_to_process).copy()
+            _df_raw_for_input = None
     resume_mode  = ss("_resume_mode", False)
     if not resume_mode:
         autosave_clear()   # wipe any previous autosave on a fresh start
@@ -4987,6 +5228,8 @@ if start_btn and not blocking and not currently_processing:
         _run_step2_enrichment=ss("_run_step2_enrichment", True),
         _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
         _dry_run_preview_count=0,
+        # Lucia export: original (contact-level) df for the Input sheet
+        _df_raw_original=_df_raw_for_input,
         # Per-company autosave
         _per_company_autosave_run_dir=_pca_run_dir_new,
         _per_company_autosave_last_saved="",
@@ -5206,6 +5449,10 @@ if ss("processing", False):
             for k, v in input_row.items()
             if k in _lusha_field_set and v is not None and str(v).strip() not in ("", "nan", "NaN", "None")
         }
+        # For Lucia/Lusha contact exports map "Company X" columns to lusha_api_* names
+        if ss("_is_lucia_export", False):
+            _lucia_mapped = map_lucia_export_row(input_row.to_dict())
+            _existing_lusha.update(_lucia_mapped)
 
         # ── Resume: skip rows already in autosave ─────────────────────────────
         if _resume_mode and autosave_already_done(
@@ -5863,7 +6110,7 @@ def _render_advanced_results(
         _log_fname    = "elm_fetch_log.csv"
     else:
         _run_tag      = build_run_tag()
-        _fname_prefix = f"enriched_results_{_run_tag}_{ts()}"
+        _fname_prefix = f"enrichedResults_{ts()}"
         _log_fname    = f"processing_log_{_run_tag}_{ts()}.csv"
     _xl_help      = (
         "All original columns + keyword counts + normalized scores."
@@ -5877,7 +6124,15 @@ def _render_advanced_results(
         "One row per company: step statuses, token counts, costs, review flags."
     )
 
-    _rich_xl = build_rich_excel_bytes(df_enriched) if not _elm_done else df_to_excel_bytes(df_enriched)
+    _rich_xl = (
+        build_rich_excel_bytes(
+            df_enriched,
+            name_col=ss("_name_col"),
+            domain_col=ss("_domain_col"),
+            df_input_original=ss("_df_raw_original"),
+        )
+        if not _elm_done else df_to_excel_bytes(df_enriched)
+    )
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button(
@@ -6159,8 +6414,13 @@ if ss("enrichment_done", False):
         _fname_dl  = f"elm_results_{ts()}.xlsx"
         _dl_bytes  = df_to_excel_bytes(df_enriched)
     else:
-        _fname_dl  = f"enriched_results_{build_run_tag()}_{ts()}.xlsx"
-        _dl_bytes  = build_rich_excel_bytes(df_enriched)
+        _fname_dl  = f"enrichedResults_{ts()}.xlsx"
+        _dl_bytes  = build_rich_excel_bytes(
+            df_enriched,
+            name_col=ss("_name_col"),
+            domain_col=ss("_domain_col"),
+            df_input_original=ss("_df_raw_original"),
+        )
     st.download_button(
         label="⬇ Download results",
         data=_dl_bytes,
