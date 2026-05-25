@@ -26,17 +26,33 @@ import streamlit as st
 
 # ── Page config — must be the very first Streamlit call ───────────────────────
 st.set_page_config(
-    page_title="Company Enrichment — mYngle",
+    page_title="mYngle company enrichment",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+# ── Compact centred layout ────────────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    .block-container {
+        max-width: 880px;
+        padding-top: 2.5rem;
+        padding-bottom: 3rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ── Logo + header ─────────────────────────────────────────────────────────────
 _logo_path = pathlib.Path(__file__).parent / "Mynglelogofinal.jpg"
 if _logo_path.exists():
-    st.image(str(_logo_path), width=280)
-st.title("Company Enrichment")
+    st.image(str(_logo_path), width=260)
+st.title("mYngle company enrichment")
 st.caption(
     "Upload a company file. "
     "The app will enrich and score the companies, "
