@@ -4960,11 +4960,11 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding-top: 12px;
+            padding-top: 20px;
             overflow: visible;
         }}
         .brand-title-block {{
-            flex: 0 0 45%;
+            flex: 0 0 40%;
         }}
         .brand-title {{
             font-size: 42px;
@@ -4976,14 +4976,15 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
             padding: 0;
         }}
         .brand-logo-block {{
-            flex: 0 0 55%;
+            flex: 0 0 60%;
             display: flex;
             justify-content: flex-end;
             align-items: center;
             overflow: visible;
+            padding-top: 12px;
         }}
         .brand-logo {{
-            width: 300px;
+            width: 450px;
             height: auto;
             display: block;
             object-fit: contain;
