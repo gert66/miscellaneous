@@ -52,34 +52,37 @@ st.markdown(
     <style>
     .block-container {{
         max-width: 880px;
-        padding-top: 2.5rem;
+        padding-top: 3rem;
         padding-bottom: 3rem;
         padding-left: 2rem;
         padding-right: 2rem;
     }}
-    /* Zero out Streamlit's wrapper margin on the brand block */
     div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
         overflow: visible;
         margin-bottom: 0;
     }}
     .brand-header {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 0;
+        margin-bottom: 12px;
+        padding-top: 12px;
+        overflow: visible;
+    }}
+    .brand-logo {{
+        width: 150px;
+        height: auto;
+        display: block;
+        object-fit: contain;
+        overflow: visible;
+    }}
+    .brand-title {{
         font-size: 34px;
         font-weight: 700;
         color: #0B1F3A;
-        line-height: 1.3;
-        margin: 0.4rem 0 0.15rem 0;
-        padding-top: 6px;
-        overflow: visible;
+        line-height: 1.1;
         white-space: nowrap;
-    }}
-    /* Logo as an inline element so the gap is exactly one word-space */
-    .brand-logo {{
-        height: 1.1em;
-        width: auto;
-        display: inline;
-        vertical-align: middle;
-        margin-right: 0.12em;
-        overflow: visible;
     }}
     .brand-subtitle {{
         font-size: 0.875rem;
@@ -88,7 +91,7 @@ st.markdown(
         padding: 0;
     }}
     </style>
-    <p class="brand-header">{_img_tag}lead prioritizer</p>
+    <div class="brand-header">{_img_tag}<span class="brand-title">lead prioritizer</span></div>
     <p class="brand-subtitle">Upload a company list. The app will rank your leads and generate an Excel report.</p>
     """,
     unsafe_allow_html=True,
