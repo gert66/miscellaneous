@@ -52,47 +52,53 @@ st.markdown(
     <style>
     .block-container {{
         max-width: 880px;
-        padding-top: 3rem;
+        padding-top: 2.5rem;
         padding-bottom: 3rem;
         padding-left: 2rem;
         padding-right: 2rem;
     }}
     div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
         overflow: visible;
-        margin-bottom: 0;
+        margin-bottom: 1.5rem;
     }}
     .brand-header {{
         display: flex;
         align-items: center;
-        gap: 10px;
-        margin-top: 0;
-        margin-bottom: 12px;
+        justify-content: space-between;
         padding-top: 12px;
         overflow: visible;
     }}
+    .brand-title-block {{
+        flex: 0 0 40%;
+    }}
+    .brand-title {{
+        font-size: 42px;
+        font-weight: 700;
+        color: #0B1F3A;
+        line-height: 1.1;
+        white-space: nowrap;
+        margin: 0;
+        padding: 0;
+    }}
+    .brand-logo-block {{
+        flex: 0 0 58%;
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        overflow: visible;
+    }}
     .brand-logo {{
-        width: 150px;
+        width: 300px;
         height: auto;
         display: block;
         object-fit: contain;
         overflow: visible;
     }}
-    .brand-title {{
-        font-size: 34px;
-        font-weight: 700;
-        color: #0B1F3A;
-        line-height: 1.1;
-        white-space: nowrap;
-    }}
-    .brand-subtitle {{
-        font-size: 0.875rem;
-        color: #6b7280;
-        margin: 0 0 0.5rem 0;
-        padding: 0;
-    }}
     </style>
-    <div class="brand-header">{_img_tag}<span class="brand-title">lead prioritizer</span></div>
-    <p class="brand-subtitle">Upload a company list. The app will rank your leads and generate an Excel report.</p>
+    <div class="brand-header">
+      <div class="brand-title-block"><span class="brand-title">lead prioritizer</span></div>
+      <div class="brand-logo-block">{_img_tag}</div>
+    </div>
     """,
     unsafe_allow_html=True,
 )
