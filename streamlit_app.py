@@ -63,9 +63,10 @@ st.markdown(
     }}
     .brand-header {{
         display: flex;
-        align-items: center;
+        align-items: flex-end;
         justify-content: space-between;
-        padding-top: 20px;
+        padding-top: 32px;
+        padding-bottom: 8px;
         overflow: visible;
     }}
     .brand-title-block {{
@@ -84,9 +85,8 @@ st.markdown(
         flex: 0 0 60%;
         display: flex;
         justify-content: flex-end;
-        align-items: center;
+        align-items: flex-end;
         overflow: visible;
-        padding-top: 12px;
     }}
     .brand-logo {{
         width: 450px;
@@ -94,7 +94,6 @@ st.markdown(
         display: block;
         object-fit: contain;
         overflow: visible;
-        transform: translateY(18px);
     }}
     </style>
     <div class="brand-header">
