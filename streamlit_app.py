@@ -61,25 +61,34 @@ else:
 st.markdown(
     f"""
     <style>
+    /* Let Streamlit's markdown wrapper pass through overflow */
+    div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
+        overflow: visible;
+    }}
     .brand-header {{
         display: flex;
         align-items: center;
-        gap: 14px;
-        margin-bottom: 0.25rem;
+        gap: 8px;
+        margin-bottom: 12px;
+        padding-top: 6px;
+        overflow: visible;
     }}
     .brand-logo {{
-        height: 52px;
-        width: auto;
+        width: 145px;
+        height: auto;
         display: block;
         flex-shrink: 0;
+        overflow: visible;
+        object-fit: contain;
     }}
     .brand-title {{
-        font-size: 2rem;
+        font-size: 34px;
         font-weight: 700;
-        line-height: 1;
+        color: #0B1F3A;
+        line-height: 1.05;
+        white-space: nowrap;
         margin: 0;
         padding: 0;
-        color: inherit;
     }}
     </style>
     <div class="brand-header">
