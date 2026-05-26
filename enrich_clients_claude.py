@@ -62,6 +62,9 @@ AUTOSAVE_PATH         = "/tmp/enrichment_autosave.csv"
 CHECKPOINT_EVERY      = 50   # write checkpoint_NNN.xlsx every N companies
 _AUTO_DL_EVERY        = 100  # auto browser-download every N companies
 _DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
+_XL_AUTOSAVE_DIR     = "enrichment_outputs"   # folder next to the app
+_XL_AUTOSAVE_DEFAULT = "Enriched results.xlsx"
+_XL_AUTOSAVE_EVERY   = 5                       # default: save every 5 companies
 _PER_COMPANY_AUTOSAVE_DEFAULT_DIR = os.path.expanduser(
     "~/Downloads/company_enrichment_runs"
 )
@@ -4589,6 +4592,50 @@ def autosave_clear() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Simple local Excel autosave  (enrichment_outputs/Enriched results.xlsx)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _xl_autosave_output_dir(folder: str = _XL_AUTOSAVE_DIR) -> Path:
+    """Return (and create if needed) the output folder next to the app file."""
+    p = Path(__file__).parent / folder
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _xl_autosave_path(filename: str) -> Path:
+    return _xl_autosave_output_dir() / filename
+
+
+def _xl_autosave_write(df: pd.DataFrame, filename: str) -> tuple[bool, str]:
+    """
+    Atomically write df to Excel.
+    Returns (ok, message):
+      ok=True  → message is the full path + HH:MM:SS timestamp
+      ok=False → message is the human-readable error (PermissionError gets
+                 a friendly hint about closing the file in Excel)
+    """
+    try:
+        dst = _xl_autosave_path(filename)
+        tmp = dst.with_suffix(".tmp.xlsx")
+        df_to_excel_bytes_write(df, str(tmp))
+        tmp.replace(dst)
+        from datetime import datetime as _dt
+        return True, f"{dst}  ({_dt.now().strftime('%H:%M:%S')})"
+    except PermissionError:
+        return (
+            False,
+            "Autosave failed because the Excel file may be open. "
+            "Close it and the next autosave will try again.",
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _xl_should_autosave(processed: int, every_n: int) -> bool:
+    return every_n > 0 and processed > 0 and processed % every_n == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-company run-folder autosave
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4741,6 +4788,7 @@ def reset_processing(clear_autosave: bool = False):
         _per_company_autosave_last_saved="",
         _per_company_autosave_last_error="",
         _final_save_path="", _final_save_error="",
+        _xl_autosave_last_msg="", _xl_autosave_final_done=False,
     )
 
 
@@ -5467,6 +5515,44 @@ if _show_adv:
         ss_set(_local_save_path="", _local_save_enabled=False)
         st.caption("When disabled, only the in-browser download button is available.")
 
+    # ── Simple Excel autosave ─────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📄 Excel autosave")
+    _xl_enabled = st.checkbox(
+        "Enable Excel autosave",
+        value=ss("_xl_autosave_enabled", True),
+        key="_xl_autosave_enabled",
+        help=(
+            "Writes intermediate results to a local Excel file while the app is running. "
+            f"Saves to  {_XL_AUTOSAVE_DIR}/{_XL_AUTOSAVE_DEFAULT}  next to the app."
+        ),
+    )
+    if _xl_enabled:
+        _xl_every = st.number_input(
+            "Autosave every N companies",
+            min_value=1,
+            value=int(ss("_xl_autosave_every", _XL_AUTOSAVE_EVERY)),
+            step=1,
+            key="_xl_autosave_every",
+            help="Writes intermediate results to a local Excel file while the app is running.",
+        )
+        _xl_fname = st.text_input(
+            "Autosave Excel filename",
+            value=ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT),
+            key="_xl_autosave_filename",
+        )
+        st.caption(
+            f"📁 Saves to: **{_XL_AUTOSAVE_DIR}/{_xl_fname or _XL_AUTOSAVE_DEFAULT}**"
+        )
+        _xl_last = ss("_xl_autosave_last_msg", "")
+        if _xl_last:
+            if _xl_last.startswith("⚠"):
+                st.warning(_xl_last)
+            else:
+                st.caption(f"Last save: {_xl_last}")
+    else:
+        ss_set(_xl_autosave_every=_XL_AUTOSAVE_EVERY, _xl_autosave_filename=_XL_AUTOSAVE_DEFAULT)
+
     if debug_mode:
         st.divider()
         st.subheader("Debug settings")
@@ -5509,6 +5595,9 @@ else:
         _step2_provider            = STEP2_PROVIDER_SERPER,
         _elm_mode                  = False,
         _per_company_autosave_enabled = False,
+        _xl_autosave_enabled       = True,
+        _xl_autosave_every         = _XL_AUTOSAVE_EVERY,
+        _xl_autosave_filename      = _XL_AUTOSAVE_DEFAULT,
     )
 
 # =============================================================================
@@ -6472,6 +6561,19 @@ if ss("processing", False):
                     _last_local_save=f"⚠ Save failed: {_pca_msg2[:120]}",
                 )
 
+        # ── Simple Excel autosave every N companies ───────────────────────────
+        if ss("_xl_autosave_enabled", True) and _xl_should_autosave(
+            _new_idx, int(ss("_xl_autosave_every", _XL_AUTOSAVE_EVERY))
+        ):
+            _xl_snap = build_partial_df(results, df_work, _active_fields)
+            _xl_ok, _xl_msg = _xl_autosave_write(
+                _xl_snap, ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
+            )
+            ss_set(_xl_autosave_last_msg=(
+                f"Autosaved {_new_idx} rows to: {_xl_msg}"
+                if _xl_ok else f"⚠ {_xl_msg}"
+            ))
+
         # ── Auto browser-download every _AUTO_DL_EVERY companies ─────────────
         _auto_dl_done = ss("_auto_dl_count", 0)
         if _new_idx % _AUTO_DL_EVERY == 0 and _new_idx // _AUTO_DL_EVERY > _auto_dl_done:
@@ -7098,6 +7200,24 @@ if ss("enrichment_done", False):
                 "ℹ️ **Dry run completed.** No Step 2 enrichment results were written — "
                 "Step 2 ICP columns are empty. Disable dry run and re-run to perform real enrichment."
             )
+
+    # ── Simple Excel autosave — final write (runs exactly once per run) ─────────
+    if not ss("_xl_autosave_final_done", False) and ss("_xl_autosave_enabled", True) and processed > 0:
+        _xl_fin_ok, _xl_fin_msg = _xl_autosave_write(
+            df_enriched, ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
+        )
+        if _xl_fin_ok:
+            _xl_fin_fname = ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
+            ss_set(
+                _xl_autosave_last_msg=f"Autosaved {processed} rows to: {_xl_fin_msg}",
+                _xl_autosave_final_done=True,
+            )
+            st.caption(
+                f"📄 Autosaved to **{_XL_AUTOSAVE_DIR}/{_xl_fin_fname}**"
+            )
+        else:
+            ss_set(_xl_autosave_final_done=True)
+            st.warning(f"⚠ Excel autosave failed: {_xl_fin_msg}")
 
     # ── Auto-save final file into run folder (runs exactly once per completed run) ─
     _pca_done_enabled = ss("_per_company_autosave_enabled", False)
