@@ -71,6 +71,8 @@ _PER_COMPANY_AUTOSAVE_DEFAULT_DIR = os.path.expanduser(
 MODEL_STEP1      = "claude-haiku-4-5-20251001"
 MODEL_STEP2      = "claude-haiku-4-5-20251001"
 MODEL_ID         = MODEL_STEP1   # legacy alias used in a few places
+# WEB_SEARCH_TOOL is retained only for audit/reference — it must NEVER be passed
+# to any Anthropic API call. Serper is the only permitted Step 2 search provider.
 WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 # Set to True (or via SHOW_ADVANCED_SETTINGS env var / Streamlit secret) to show
@@ -380,6 +382,9 @@ META_FIELDS = [
     "total_tokens_in",
     "total_tokens_out",
     "total_cost_usd",
+    "anthropic_web_search_used",
+    "anthropic_tools_used",
+    "serper_search_used",
 ]
 
 # Real Lusha API enrichment fields (prefix "lusha_api_")
@@ -1943,12 +1948,27 @@ def run_step1(
 _ICP_EMPTY = {f: "" for f in ICP_FIELDS}
 
 
+def _assert_no_web_search_tool(tools=None) -> None:
+    """Hard safety check — raise immediately if web_search_20250305 is present."""
+    if not tools:
+        return
+    for t in tools:
+        if isinstance(t, dict) and t.get("type") == "web_search_20250305":
+            raise RuntimeError(
+                "Blocked: Anthropic web_search is disabled. Use Serper only."
+            )
+
+
 def _claude_web_search_loop(prompt: str, api_key: str, model_id: str = None) -> tuple:
     """
-    Run Claude with web_search_20250305 (server-side built-in tool).
-    Anthropic executes the search automatically — no tool_result needed.
-    Returns (final_text, total_input_tokens, total_output_tokens).
+    DISABLED — Anthropic web_search_20250305 is blocked in this app.
+    All Step 2 web search is performed via Serper Google Search.
     """
+    raise RuntimeError(
+        "Blocked: _claude_web_search_loop is disabled. "
+        "Anthropic web_search_20250305 must not be called. Use Serper only."
+    )
+    # Dead code below — kept for reference only, never executed.
     if model_id is None:
         raise ValueError("model_id must be provided to _claude_web_search_loop")
 
@@ -2433,33 +2453,35 @@ def run_step2(
     delay: float,
     model_step2: str = MODEL_STEP2,
     _debug_callback=None,
-    search_provider: str = STEP2_PROVIDER_CLAUDE,
+    search_provider: str = STEP2_PROVIDER_SERPER,
     serper_key: str = "",
     dry_run: bool = False,
 ) -> tuple:
     """
-    Research ICP signals — dispatches to either the Claude web_search route
-    or the Serper Google Search route depending on search_provider.
+    Research ICP signals via Serper Google Search + Claude analysis.
+    Serper is the ONLY permitted provider. Any attempt to use Claude web_search
+    (STEP2_PROVIDER_CLAUDE) raises RuntimeError immediately.
+
     Returns (icp_fields_dict, raw_json, in_tok, out_tok, status, error_msg,
              cache_creation_tokens, cache_read_tokens).
-
-    dry_run=True: generate and log prompts/queries without calling any API.
-    _debug_callback: optional callable(event, **kwargs).
-      Events: "status" (msg=str), "prompt" (company, model, provider, search_prompt,
-              full_prompt, notes, dry_run, queries).
     """
-    if search_provider == STEP2_PROVIDER_SERPER:
-        # In dry run mode the Serper key is not needed — skip the key guard.
-        if not dry_run and not serper_key:
-            return (
-                _ICP_EMPTY.copy(), {}, 0, 0, "api_error",
-                "SERPER_API_KEY is missing from .streamlit/secrets.toml", 0, 0,
-            )
-        return run_step2_serper(
-            url, company_name, api_key, serper_key, delay,
-            model_step2=model_step2, _debug_callback=_debug_callback,
-            dry_run=dry_run,
+    if search_provider == STEP2_PROVIDER_CLAUDE:
+        raise RuntimeError(
+            f"Blocked: '{STEP2_PROVIDER_CLAUDE}' is disabled. "
+            "Anthropic web_search must not be called. Use Serper only."
         )
+
+    # Serper path — the only valid route
+    if not dry_run and not serper_key:
+        return (
+            _ICP_EMPTY.copy(), {}, 0, 0, "api_error",
+            "SERPER_API_KEY is missing from .streamlit/secrets.toml", 0, 0,
+        )
+    return run_step2_serper(
+        url, company_name, api_key, serper_key, delay,
+        model_step2=model_step2, _debug_callback=_debug_callback,
+        dry_run=dry_run,
+    )
 
     def _dlog(msg: str) -> None:
         if _debug_callback:
@@ -3318,7 +3340,7 @@ def enrich_one_row(
     model_step1: str = MODEL_STEP1,
     model_step2: str = MODEL_STEP2,
     _debug_callback=None,
-    search_provider: str = STEP2_PROVIDER_CLAUDE,
+    search_provider: str = STEP2_PROVIDER_SERPER,
     serper_key: str = "",
     dry_run: bool = False,
     enable_lusha_api: bool = False,
@@ -3409,10 +3431,13 @@ def enrich_one_row(
             dry_run=dry_run,
         )
         row.update(s2_fields)
-        row["step2_status"]        = s2_status
-        row["step2_provider_used"] = search_provider
-        row["step2_tokens_in"]     = str(s2_in)
-        row["step2_tokens_out"]    = str(s2_out)
+        row["step2_status"]               = s2_status
+        row["step2_provider_used"]        = search_provider
+        row["anthropic_web_search_used"]  = False
+        row["anthropic_tools_used"]       = ""
+        row["serper_search_used"]         = (search_provider == STEP2_PROVIDER_SERPER)
+        row["step2_tokens_in"]            = str(s2_in)
+        row["step2_tokens_out"]           = str(s2_out)
         row["step2_cost_usd"]      = f"{calc_cost(s2_in, s2_out):.6f}"
     else:
         s2_fields = _ICP_EMPTY.copy()
@@ -5175,6 +5200,14 @@ _adv_main: bool = False
 
 if _show_adv:
  with st.sidebar:
+    # Correct any stale session state that still holds the disabled provider
+    if st.session_state.get("_step2_provider") == STEP2_PROVIDER_CLAUDE:
+        st.session_state["_step2_provider"] = STEP2_PROVIDER_SERPER
+        st.warning(
+            "⚠ Step 2 provider was 'Claude Web Search' (disabled). "
+            "Reset to Serper Google Search."
+        )
+
     # ── 1. Enrichment mode ────────────────────────────────────────────────────
     enrichment_mode = st.radio(
         "Enrichment mode",
@@ -5289,28 +5322,15 @@ if _show_adv:
     st.divider()
 
     # ── 5. Step 2 web search provider ─────────────────────────────────────────
-    _provider_options = [STEP2_PROVIDER_SERPER, STEP2_PROVIDER_CLAUDE]
-    step2_provider = st.selectbox(
-        "Step 2 web search provider",
-        options=_provider_options,
-        index=0,                        # default: Serper Google Search
-        key="step2_provider_selectbox",
-        help=(
-            f"**{STEP2_PROVIDER_SERPER}** (default): calls the Serper API for Google "
-            "results, then Claude analyzes the snippets. "
-            "Requires `SERPER_API_KEY` in `.streamlit/secrets.toml`.\n\n"
-            f"**{STEP2_PROVIDER_CLAUDE}**: uses Anthropic's built-in web_search tool — "
-            "no extra API key needed, but costs more tokens per company."
-        ),
-    )
+    # Anthropic web_search (Claude Web Search) is permanently disabled.
+    # Serper Google Search is the only permitted provider.
+    step2_provider = STEP2_PROVIDER_SERPER
     st.session_state["_step2_provider"] = step2_provider
-    if step2_provider == STEP2_PROVIDER_SERPER and not serper_key:
+    st.caption(f"Step 2 search provider: **{STEP2_PROVIDER_SERPER}**")
+    if not serper_key:
         st.error(
-            "⚠️ SERPER_API_KEY missing — add it to `.streamlit/secrets.toml` "
-            "or switch to Claude Web Search."
+            "⚠️ SERPER_API_KEY missing — add it to `.streamlit/secrets.toml`."
         )
-    elif step2_provider == STEP2_PROVIDER_CLAUDE:
-        st.info("ℹ️ Claude Web Search: uses Anthropic web_search tool, no Serper key needed.")
 
     st.divider()
 
@@ -5600,6 +5620,35 @@ if _show_adv:
                     f.unlink()
             st.success("Cache cleared.")
             st.rerun()
+
+        st.divider()
+        st.subheader("Web-search audit")
+        _AUDIT_STRINGS = [
+            "web_search_20250305",
+            "Claude Web Search",
+            "WEB_SEARCH_TOOL",
+            "PROVIDER: Claude Web Search",
+            "STEP 2 CLAUDE WEB SEARCH",
+        ]
+        if st.button("Scan source for blocked patterns", use_container_width=True):
+            _audit_src = pathlib.Path(__file__).resolve()
+            try:
+                _audit_lines = _audit_src.read_text(encoding="utf-8").splitlines()
+            except Exception as _ae:
+                st.error(f"Could not read source: {_ae}")
+                _audit_lines = []
+            for _pat in _AUDIT_STRINGS:
+                _hits = [
+                    (i + 1, ln.strip())
+                    for i, ln in enumerate(_audit_lines)
+                    if _pat in ln
+                ]
+                if _hits:
+                    with st.expander(f"⚠️ `{_pat}` — {len(_hits)} hit(s)", expanded=False):
+                        for _lineno, _text in _hits:
+                            st.code(f"L{_lineno}: {_text}", language="python")
+                else:
+                    st.success(f"✅ `{_pat}` — 0 hits")
     else:
         delay_sec = 1.0
 
@@ -5817,6 +5866,10 @@ _is_preview_mode     = _active_dry_run or _active_zero_cost
 # (4) Zero-cost      → no API keys required
 if _api_key_error and not _elm_mode and not _is_preview_mode:
     blocking.append(_api_key_error)
+if _active_provider == STEP2_PROVIDER_CLAUDE:
+    blocking.append(
+        "Claude Web Search is disabled. Serper Google Search is the only permitted provider."
+    )
 if (
     _active_provider == STEP2_PROVIDER_SERPER
     and not serper_key
