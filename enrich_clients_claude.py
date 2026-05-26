@@ -75,8 +75,9 @@ WEB_SEARCH_TOOL  = {"type": "web_search_20250305", "name": "web_search"}
 
 # Set to True (or via SHOW_ADVANCED_SETTINGS env var / Streamlit secret) to show
 # the full sidebar, column picker, preview, debug sections, and technical logs.
-# Normal users should always see False (the minimal flow).
-SHOW_ADVANCED_SETTINGS: bool = False
+# Cloud deployments set SHOW_ADVANCED_SETTINGS = false in Streamlit secrets to
+# hide the sidebar and show only the minimal user flow.
+SHOW_ADVANCED_SETTINGS: bool = True
 
 SERPER_SEARCH_URL    = "https://google.serper.dev/search"
 STEP2_PROVIDER_CLAUDE = "Claude Web Search"
@@ -4979,7 +4980,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         page_title="mYngle · lead prioritizer",
         page_icon="🏢",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
 
     def _ensure_padded_logo_standalone() -> "_pl.Path":
