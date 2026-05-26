@@ -7210,7 +7210,6 @@ if ss("enrichment_done", False):
                 df_to_excel_bytes_write(df_enriched, str(_pca_rdir / "latest_results.xlsx"))
                 df_enriched.to_csv(_pca_rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
                 ss_set(_final_auto_saved=True, _final_save_path=str(_pca_rdir / "final_results.xlsx"))
-                st.info(f"📂 Final results saved to **{_pca_done_dir}**")
             except Exception as _fin_err:
                 ss_set(_final_auto_saved=True, _final_save_path="",
                        _final_save_error=str(_fin_err))
