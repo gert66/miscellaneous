@@ -4980,7 +4980,7 @@ if not os.environ.get("_STREAMLIT_ENTRYPOINT"):
         page_title="mYngle · lead prioritizer",
         page_icon="🏢",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
 
     def _ensure_padded_logo_standalone() -> "_pl.Path":
@@ -5142,6 +5142,12 @@ try:
     _show_adv = bool(st.secrets.get("SHOW_ADVANCED_SETTINGS", SHOW_ADVANCED_SETTINGS))
 except Exception:
     pass
+
+# _adv_main gates verbose sections on the MAIN PAGE (step previews, column
+# selectors, live metrics, intermediate downloads, cost estimates, etc.).
+# Kept False so the main page stays clean even when the sidebar is visible.
+# Column/row controls live in the sidebar "Advanced data options" expander.
+_adv_main: bool = False
 
 if _show_adv:
  with st.sidebar:
@@ -5739,18 +5745,6 @@ elif uploaded and df_raw is not None:
             f"✓ **{ss('file_name')}** loaded · "
             f"{_t1_count:,} {'company' if _t1_count == 1 else 'companies'} ready"
         )
-    if _show_adv:
-        if _elm_mode:
-            st.info(
-                "💡 **Extreme Light Mode** — no API calls. "
-                "Fetches company pages with requests/BeautifulSoup and extracts keyword signals."
-            )
-        else:
-            st.info(
-                "💡 Each row makes **two** Claude API calls (Step 1 + Step 2). "
-                "Use the row limiter below to test with a small batch first."
-            )
-
 # ── Column detection and processing scope ─────────────────────────────────────
 
 name_col     = _sc_name_col if _app_mode == "Single Company" else None
@@ -5758,75 +5752,60 @@ domain_col   = _sc_domain_col if _app_mode == "Single Company" else None
 n_to_process = 1 if (_app_mode == "Single Company" and _sc_df is not None) else 0
 
 if df_raw is not None:
+    # ── Sidebar: Advanced data options (column selector + row limiter) ─────────
     if _show_adv:
-        st.divider()
-        st.subheader("Step 2 · Preview")
-        st.dataframe(df_raw.head(), use_container_width=True)
-        st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
+        with st.sidebar:
+            st.divider()
+            with st.expander("⚙ Advanced data options", expanded=False):
+                st.caption(f"{len(df_raw):,} rows · {len(df_raw.columns)} columns")
+                _adv_cols = df_raw.columns.tolist()
+                _adv_auto_n, _adv_auto_d = detect_columns(df_raw)
+                _adv_n_idx = _adv_cols.index(_adv_auto_n) if _adv_auto_n in _adv_cols else 0
+                st.selectbox(
+                    "Company name column",
+                    options=_adv_cols,
+                    index=_adv_n_idx,
+                    key="adv_name_col",
+                )
+                _NODOM = "(none — auto)"
+                _adv_dom_opts = [_NODOM] + _adv_cols
+                _adv_dom_def = (
+                    _adv_dom_opts.index(_adv_auto_d)
+                    if _adv_auto_d and _adv_auto_d in _adv_dom_opts else 0
+                )
+                st.selectbox(
+                    "URL column (optional)",
+                    options=_adv_dom_opts,
+                    index=_adv_dom_def,
+                    key="adv_domain_col_sel",
+                )
+                st.checkbox("Limit rows for testing", value=False, key="adv_limit_rows")
+                if ss("adv_limit_rows", False):
+                    st.number_input(
+                        "Number of rows",
+                        min_value=1, max_value=len(df_raw),
+                        value=min(5, len(df_raw)), step=1,
+                        key="adv_row_limit_n",
+                    )
 
-        st.divider()
-        st.subheader("Step 3 · Select columns")
-
-        auto_name_col, auto_domain_col = detect_columns(df_raw)
-        cols = df_raw.columns.tolist()
-
-        sel_l, sel_r = st.columns(2)
-        with sel_l:
-            name_col = st.selectbox(
-                "Company name column *",
-                options=cols,
-                index=cols.index(auto_name_col) if auto_name_col in cols else 0,
-                help="Auto-detected — change if the wrong column is selected.",
-            )
-        with sel_r:
-            _NO_DOMAIN = "(none — use company name only)"
-            dom_opts   = [_NO_DOMAIN] + cols
-            def_dom    = (
-                dom_opts.index(auto_domain_col)
-                if auto_domain_col and auto_domain_col in dom_opts else 0
-            )
-            dom_choice = st.selectbox(
-                "Website / URL column (optional)",
-                options=dom_opts,
-                index=def_dom,
-                help=(
-                    "Used for Jina Reader (Step 1) and Claude web search (Step 2). "
-                    "Falls back to company name search when URL is absent or unreachable."
-                ),
-            )
-        domain_col = dom_choice if dom_choice != _NO_DOMAIN else None
-
-        note_parts = []
-        if auto_name_col:
-            note_parts.append(f"company name → **{auto_name_col}**")
-        if auto_domain_col:
-            note_parts.append(f"URL → **{auto_domain_col}**")
-        st.caption(
-            ("Auto-detected: " + ",  ".join(note_parts))
-            if note_parts
-            else "Could not auto-detect columns — please select them manually."
+    # ── Silently resolve columns and row count ─────────────────────────────────
+    _det_name, _det_dom = detect_columns(df_raw)
+    if _show_adv:
+        _sid_n = ss("adv_name_col", None)
+        name_col = _sid_n if (_sid_n and _sid_n in df_raw.columns) else _det_name
+        _sid_d = ss("adv_domain_col_sel", None)
+        domain_col = (
+            _sid_d if (_sid_d and _sid_d not in ("(none — auto)", None)
+                       and _sid_d in df_raw.columns)
+            else _det_dom
         )
-
-        st.divider()
-        st.subheader("Step 4 · Processing scope")
-
-        limit_rows = st.checkbox("Limit rows for testing", value=False)
-        if limit_rows:
-            row_limit = st.number_input(
-                "Number of rows to process",
-                min_value=1, max_value=len(df_raw),
-                value=min(5, len(df_raw)), step=1,
-            )
-            n_to_process = int(row_limit)
-            st.caption(f"Will process the first **{n_to_process}** of {len(df_raw):,} rows.")
+        if ss("adv_limit_rows", False):
+            n_to_process = int(ss("adv_row_limit_n", len(df_raw)) or len(df_raw))
         else:
             n_to_process = len(df_raw)
-            st.info(f"All **{n_to_process:,}** rows will be processed.")
     else:
-        # Auto-detect columns silently
-        auto_name_col, auto_domain_col = detect_columns(df_raw)
-        name_col   = auto_name_col
-        domain_col = auto_domain_col
+        name_col     = _det_name
+        domain_col   = _det_dom
         n_to_process = len(df_raw)
 
 # =============================================================================
@@ -5874,7 +5853,7 @@ if blocking and not currently_processing:
     for reason in blocking:
         st.warning(f"⚠️ {reason}")
 elif not blocking and not currently_processing and not enrichment_done:
-    if _show_adv:
+    if _adv_main:
         _s1 = ss("_model_step1", MODEL_STEP1)
         _s2 = ss("_model_step2", MODEL_STEP2)
         if _is_preview_mode or _elm_mode:
@@ -6083,7 +6062,7 @@ if ss("processing", False):
     total_cache_read  = ss("total_cache_read_tokens", 0)
     total_cache_create = ss("total_cache_create_tokens", 0)
 
-    if _show_adv and st.button("⏹ Stop after current row", key="stop_button"):
+    if st.button("⏹ Stop", key="stop_button"):
         ss_set(stop_requested=True)
         st.rerun()
 
@@ -6120,7 +6099,15 @@ if ss("processing", False):
         else:
             st.caption("Estimating time remaining…")
 
-    if _show_adv:
+    # ── Autosave status (show only when a save has occurred or failed) ─────────
+    _xl_in_progress_msg = ss("_xl_autosave_last_msg", "")
+    if _xl_in_progress_msg:
+        if _xl_in_progress_msg.startswith("⚠"):
+            st.warning(_xl_in_progress_msg)
+        else:
+            st.caption(f"💾 {_xl_in_progress_msg}")
+
+    if _adv_main:
         if _elm_mode_run:
             cnt_ok      = sum(1 for r in results if r.get("elm_fetch_status") == "ok")
             cnt_partial = sum(1 for r in results if r.get("elm_fetch_status") == "partial")
@@ -6168,6 +6155,7 @@ if ss("processing", False):
             if _retry_msg:
                 st.info(_retry_msg)
 
+    if _show_adv:
         if _zero_cost_run and _dry_run_run and not _elm_mode_run:
             st.warning(
                 "⚠️ **ZERO-COST PREVIEW ACTIVE**: no Step 1 or Step 2 API calls are being made. "
@@ -6179,8 +6167,8 @@ if ss("processing", False):
                 "for Step 2. Prompts and search queries are generated and displayed only."
             )
 
-    # ── Intermediate download buttons — advanced mode only ─────────────────────
-    if _show_adv and results:
+    # ── Intermediate download buttons — advanced/debug only ───────────────────
+    if _adv_main and results:
         _partial_df = build_partial_df(results, df_work, _active_fields)
         _n_done     = len(_partial_df)
         _stamp      = ts()
@@ -6191,7 +6179,7 @@ if ss("processing", False):
             _html_dl_buttons(_partial_df, _n_done, _stamp)
 
     # ── Step 2 dry run preview ────────────────────────────────────────────────
-    if _show_adv and _dry_run_run and not _elm_mode_run:
+    if _adv_main and _dry_run_run and not _elm_mode_run:
         _dry_recs = ss("_dry_run_records", [])
         with st.expander("Step 2 Dry Run Preview", expanded=True):
             if not _dry_recs:

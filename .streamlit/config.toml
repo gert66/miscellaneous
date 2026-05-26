@@ -2,5 +2,8 @@
 base = "light"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F7F9FC"
-textColor = "#0B1F3A"
+textColor = "#111827"
 primaryColor = "#0B4A92"
+
+[client]
+showSidebarNavigation = false
