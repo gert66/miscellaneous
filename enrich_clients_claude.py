@@ -3558,7 +3558,30 @@ def _build_model_features_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[available].copy()
 
 
+def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with all duplicate column names made unique.
+
+    Later occurrences of a repeated name are renamed  col__2, col__3, …
+    No data is dropped or reordered.
+    """
+    seen: dict[str, int] = {}
+    new_cols = []
+    for col in df.columns:
+        if col not in seen:
+            seen[col] = 1
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            new_cols.append(f"{col}__{seen[col]}")
+    if new_cols == list(df.columns):
+        return df
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    df = make_unique_columns(df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Enriched")
@@ -3751,6 +3774,7 @@ def save_to_local_folder(df: pd.DataFrame, folder: str, run_tag: str = "") -> tu
 
 def df_to_excel_bytes_write(df: pd.DataFrame, path: str) -> None:
     """Write DataFrame to an Excel file at *path* on disk (two sheets)."""
+    df = make_unique_columns(df)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Enriched")
         try:
@@ -5418,7 +5442,7 @@ if _show_adv:
     )
     save_step2_debug = st.checkbox(
         "Save Step 2 debug logs to files",
-        value=True,
+        value=False,
         help=(
             f"Saves one .txt file per company to the `{DEBUG_LOG_DIR}/` folder. "
             "Includes model, prompt, provider, and status notes."
@@ -5593,7 +5617,7 @@ else:
         _step2_dry_run             = False,
         _zero_cost_preview         = False,
         _show_step2_debug          = False,
-        _save_step2_debug          = True,
+        _save_step2_debug          = False,
         _use_playwright            = _PLAYWRIGHT_AVAILABLE,
         _local_save_enabled        = False,
         _local_save_path           = _DEFAULT_DOWNLOAD_DIR,
@@ -5615,43 +5639,8 @@ _sc_df: pd.DataFrame | None = None
 _sc_name_col   = "company_name"
 _sc_domain_col = "domain"
 
-if _show_adv:
-    _mode_col, _ = st.columns([2, 3])
-    with _mode_col:
-        _app_mode = st.radio(
-            "Input mode",
-            ["Batch Upload", "Single Company"],
-            horizontal=True,
-            key="app_mode_radio",
-        )
-
-    if _app_mode == "Single Company":
-        st.divider()
-        st.subheader("Single company enrichment & scoring")
-        st.caption(
-            "Enter a company name and optional domain. "
-            "The app will run the full enrichment pipeline and compute the commercial fit score."
-        )
-        _sc_f1, _sc_f2 = st.columns(2)
-        with _sc_f1:
-            _sc_name_input = st.text_input(
-                "Company name *", key="sc_company_name",
-                placeholder="e.g. Acme Corp",
-            )
-        with _sc_f2:
-            _sc_url_input = st.text_input(
-                "Domain or URL (optional)", key="sc_company_url",
-                placeholder="e.g. acme.com",
-            )
-        if _sc_name_input:
-            _sc_df = pd.DataFrame([{
-                "company_name": _sc_name_input.strip(),
-                "domain": (_sc_url_input or "").strip(),
-            }])
-        else:
-            st.info("Enter a company name above to begin.")
-else:
-    _app_mode = "Batch Upload"
+# Input mode is always Batch Upload for the normal user flow.
+_app_mode = "Batch Upload"
 
 # =============================================================================
 # STEP 1 — Upload file  (Batch mode only)
@@ -6308,7 +6297,7 @@ if ss("processing", False):
 
         # ── Build Step 2 debug callback if either debug option is enabled ────────
         _show_debug_ui = ss("_show_step2_debug", False)
-        _save_debug_fs = ss("_save_step2_debug", True)
+        _save_debug_fs = ss("_save_step2_debug", False)
 
         def _make_step2_callback(cname: str, dry_run_mode: bool = False):
             def _cb(event: str, **kwargs) -> None:
@@ -7296,7 +7285,7 @@ if ss("enrichment_done", False):
         type="primary",
     )
 
-    if _show_adv:
+    if _adv_main:
         _render_advanced_results(
             df_enriched, debug_records_done, processed, _elm_done, debug_mode
         )
@@ -7312,7 +7301,7 @@ if ss("enrichment_done", False):
 # Score a previously enriched file without running enrichment again.
 # =============================================================================
 
-if not ss("processing", False) and _SCORING_AVAILABLE and _show_adv:
+if _adv_main and not ss("processing", False) and _SCORING_AVAILABLE:
     st.divider()
     with st.expander("🎯 Score an existing enrichment file", expanded=False):
         st.caption(
