@@ -139,37 +139,42 @@ RADAR_CACHE_DIR = pathlib.Path("radar_cache")
 QUERY_GROUPS = [
     (
         "Annual Report / Financial",
-        '"{name}" annual report fiscal year results investor',
+        '"{name}" annual report fiscal year results revenue 2024 2025',
     ),
     (
-        "Hiring / Careers",
-        '"{name}" hiring careers jobs vacancies 2024 2025',
+        "International Hiring / Growth",
+        '"{name}" hiring international careers jobs "new office" global expansion 2024 2025',
     ),
     (
-        "L&D / HR / Talent",
-        '"{name}" "learning and development" OR "talent development" OR training OR academy HR',
+        "Language / Communication / L&D",
+        '"{name}" "language training" OR "business English" OR "communication training" '
+        'OR "learning and development" OR "talent development" OR training academy HR',
     ),
     (
-        "Growth / Expansion",
-        '"{name}" expansion "new office" OR international OR "new market" OR global',
+        "Sales / Customer Success Expansion",
+        '"{name}" "sales team" OR "customer success" OR "account management" '
+        'OR "sales enablement" OR "client-facing" international expansion',
     ),
     (
-        "M&A / Funding",
-        '"{name}" acquisition OR merger OR funding OR investment OR "private equity"',
+        "M&A / Funding / Integration",
+        '"{name}" acquisition OR merger OR integration OR funding OR investment OR "private equity"',
     ),
 ]
 
 ALLOWED_TRIGGER_TYPES = [
-    "Hiring wave",
-    "International expansion",
-    "New office",
+    "International hiring",
+    "Client-facing team expansion",
+    "Sales / customer success growth",
+    "New market or office expansion",
+    "Multilingual workforce growth",
     "M&A / integration",
-    "Funding / growth",
-    "L&D hiring",
-    "Sales / customer success expansion",
-    "Employer branding",
-    "Annual planning signal",
-    "None",
+    "Funding / growth investment",
+    "HR / L&D hiring",
+    "Onboarding pressure",
+    "Foreign HQ / group communication",
+    "Employer branding / retention",
+    "Annual planning / budget window",
+    "No clear trigger",
     "Other",
 ]
 
@@ -179,6 +184,7 @@ ALLOWED_ROUTES = [
     "International HR",
     "Sales Enablement",
     "Customer Success",
+    "People Operations",
     "Operations",
     "Procurement",
     "Unknown",
@@ -554,8 +560,19 @@ def _collect_raw_sources(company_name: str, grouped: dict, input_type: str = "")
 # =============================================================================
 
 _PROMPT_TEMPLATE = """\
-You are a B2B sales intelligence analyst. Analyze the following web search results \
-for {name} and extract structured buying-window signals.
+You are a B2B sales intelligence analyst working for mYngle, a company that sells \
+online language training and business communication support to international companies.
+
+mYngle's target buyers are companies that have:
+- International or multilingual teams
+- Foreign HQ or group structures
+- Client-facing international roles (sales, customer success, account management)
+- Fast hiring or onboarding of international employees
+- Post-merger or cross-border communication challenges
+- Expanding into new countries or markets
+
+mYngle does NOT sell: generic L&D platforms, e-learning tools, or broad HR software.
+mYngle sells: language training, Business English, business communication coaching.
 
 TODAY'S DATE: {today}
 
@@ -570,21 +587,95 @@ COMPANY PROFILE:
 WEB SEARCH RESULTS:
 {search_text}
 
-INSTRUCTIONS:
-- trigger_score: 0=no signal, 1=weak, 2=moderate, 3=strong
-- buying_window_score: 0=unclear/none, 1=possible, 2=likely, 3=imminent
-- All *_signal scores: 0=none, 1=weak, 2=moderate, 3=strong
-- preferred_buyer_route must be one of: {routes}
-- trigger_type must be one of: {trigger_types}
-- suggested_opener: a specific 1-2 sentence cold-call opener referencing an actual signal found
-- why_now: 1-2 sentences on why this company is worth calling right now
-- IMPORTANT: likely_buying_window must be a FUTURE date relative to today ({today}).
-  If the best evidence points to a window that has already passed, project forward to the
-  next likely planning cycle (e.g. next fiscal Q1, next budget season) and set
-  buying_window_confidence to "Low". Do not leave buying_window empty if you can estimate
-  a future window from fiscal year or annual report patterns.
-- If evidence is absent for a field, use false / empty string / 0 / "Unknown" as appropriate
-- Return ONLY the JSON object below — no markdown, no explanation
+ANALYSIS INSTRUCTIONS:
+
+1. TRIGGER IDENTIFICATION
+   Look for signals that a company is likely to need language or communication training:
+   - International hiring, new foreign offices, global expansion
+   - Growth of sales, customer success, or account management teams
+   - M&A, integration activity, foreign group/HQ structure
+   - Onboarding pressure from fast hiring
+   - L&D or HR team growth suggesting new training budget
+   - Annual report published (signals planning cycle timing)
+   trigger_score: 0=no relevant signal, 1=weak/indirect, 2=clear signal, 3=strong + recent
+
+2. BUYING WINDOW
+   - If annual report found, estimate next budget planning window
+   - If fiscal year is non-calendar, adjust accordingly
+   - IMPORTANT: likely_buying_window must be FUTURE relative to today ({today})
+   - If best evidence points to a past window, project forward one year and set
+     buying_window_confidence to "Low"
+   - Use plain language: e.g. "Q3/Q4 2026, assuming calendar-year budgeting"
+     or "Possible H2 2026 planning window, confidence low"
+   - Do NOT invent a specific window without any supporting evidence
+   buying_window_score: 0=no basis, 1=possible, 2=likely, 3=imminent
+
+3. BUYER ROUTE — choose based on the dominant trigger signal:
+   - "L&D / Talent Development": training, onboarding, people development, academy signals
+   - "HR / People": general HR, people, workforce signals without strong L&D angle
+   - "International HR": foreign HQ, global teams, multilingual workforce, cross-border structure
+   - "Sales Enablement": sales expansion, account management, negotiation, international sales
+   - "Customer Success": customer success growth, international client support
+   - "People Operations": fast onboarding, operational employee growth, multi-site rollout
+   - "Operations": only when operational coordination is the clearest angle
+   - "Procurement": last resort only — never preferred first route
+   - "Unknown": truly no signal to guide route choice
+   preferred_buyer_route must be one of: {routes}
+
+4. SUGGESTED TITLE SEARCHES (for LinkedIn Sales Navigator)
+   Match to preferred and backup buyer routes. Use OR syntax:
+   - L&D route: '"Learning Development" OR "Talent Development" OR "L&D"'
+   - HR/People route: '"HR Director" OR "People Director" OR "Head of People"'
+   - International HR route: '"International HR" OR "Global HR" OR "People Operations"'
+   - Sales Enablement route: '"Sales Enablement" OR "Revenue Enablement"'
+   - Customer Success route: '"Customer Success Director" OR "VP Customer Success"'
+   - People Operations route: '"Onboarding" OR "People Operations" OR "HR Operations"'
+
+5. WHY NOW — must connect evidence to mYngle's value proposition
+   Focus on: language training, Business English, business communication, client-facing
+   communication, international team communication, onboarding of international employees,
+   multilingual workforce support, intercultural communication, foreign HQ communication.
+   DO NOT write: "learning platform", "digital learning", "talent tools", "workforce solution".
+   Example: "Capgemini is expanding internationally and hiring at scale — this often creates
+   language and communication training needs across new hires and client-facing teams."
+
+6. CALLER OPENER — short, natural, specific
+   - Mention one concrete signal from the search results
+   - Connect it to language or communication training
+   - End with a soft discovery question
+   - Do NOT say "learning platform" or "digital learning"
+   - Examples by trigger:
+     * International hiring: "I noticed you're expanding internationally and hiring across
+       new markets. Companies often use that moment to review language and communication
+       support for new teams. Is this already part of your L&D planning?"
+     * Customer-facing growth: "I noticed growth in your international customer-facing
+       teams. That often creates pressure around Business English and client communication.
+       Is this something your team is already looking at?"
+     * M&A/integration: "I noticed recent integration activity at {name}. Those transitions
+       often bring communication and language alignment challenges across teams and countries.
+       Is language training part of the integration plan?"
+     * Annual planning: "I noticed your annual planning cycle may be coming up. Many
+       companies review language and communication training before finalizing their L&D
+       budget. Is this already on your agenda?"
+
+7. CONFIDENCE AND EVIDENCE QUALITY
+   - evidence_quality: Strong=multiple recent specific sources, Medium=1-2 relevant sources,
+     Weak=snippets only or indirect signals, Insufficient=no relevant evidence
+   - confidence_level: High only if Strong evidence + clear trigger + clear buyer route,
+     Medium if some evidence present, Low/Unknown if mostly snippets or indirect
+   - manual_review_needed: true if evidence is Weak/Insufficient OR buyer route unclear
+     OR company seems relevant but signals are ambiguous
+
+SCORING FIELD INSTRUCTIONS:
+- trigger_score: 0-3 as above
+- buying_window_score: 0-3 as above
+- hiring_signal_score: 0-3 (overall hiring volume signal)
+- international_hiring_signal: 0-3 (international/multilingual hiring specifically)
+- lnd_hr_hiring_signal: 0-3 (L&D or HR hiring that signals training budget)
+- sales_cs_hiring_signal: 0-3 (sales or customer success growth)
+- onboarding_pressure_signal: 0-3 (fast hiring, headcount growth, new site openings)
+
+Return ONLY the JSON object below — no markdown fences, no explanation text.
 
 {schema}"""
 
@@ -630,7 +721,7 @@ def _call_claude(
     try:
         msg = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
         raw_text = msg.content[0].text if msg.content else ""
@@ -678,11 +769,11 @@ def _fit_bucket(fit_score_raw, tier_raw) -> int:
 
 def _contact_route_score(preferred_route: str) -> int:
     route = str(preferred_route or "").lower()
-    if any(k in route for k in ("l&d", "talent", "sales enablement", "international hr")):
+    if any(k in route for k in ("l&d", "talent development", "sales enablement", "international hr")):
         return 3
-    if any(k in route for k in ("hr", "people", "customer success")):
+    if any(k in route for k in ("hr / people", "customer success", "people operations")):
         return 2
-    if any(k in route for k in ("operations",)):
+    if any(k in route for k in ("hr", "people", "operations")):
         return 1
     return 0  # Unknown or Procurement
 
@@ -716,19 +807,24 @@ def _call_recommendation(
     opp: float,
     manual: bool,
     input_type: str,
+    evidence_quality: str = "",
 ) -> str:
+    eq = evidence_quality.lower()
+    eq_strong = eq in ("strong", "medium")
+
     if input_type == "enriched_export":
         # ICP fit is known — use full decision matrix
         if fit == 0:
             return "Low priority"
-        if trigger >= 3 and fit >= 2:
+        # Call now only when fit is strong, trigger is strong, AND evidence is credible
+        if trigger >= 3 and fit >= 2 and eq_strong:
             return "Call now"
-        if fit >= 2 and (trigger >= 2 or window >= 2):
+        if fit >= 2 and trigger >= 2 and eq_strong:
             return "Call this month"
-        if window >= 2 and fit >= 2:
-            return "Call before budget cycle"
-        if trigger >= 2 and fit >= 1:
+        if fit >= 2 and window >= 2:
             return "Call this month"
+        if fit >= 2 and trigger >= 1:
+            return "Call before budget cycle" if window >= 1 else "Monitor"
         if manual:
             return "Manual research needed"
         if trigger == 0 and window == 0:
@@ -835,16 +931,21 @@ def _compute_scores(
     window  = int(adj.get("buying_window_score", 0) or 0)
     route   = _contact_route_score(adj.get("preferred_buyer_route", ""))
     opp     = _opportunity_score(fit, trigger, window, route, input_type)
+    eq      = str(adj.get("evidence_quality", ""))
     manual  = bool(adj.get("manual_review_needed", False))
 
-    # For simple lists with weak evidence, cap recommendation conservatively
+    # For simple lists: cap confidence and force manual when evidence is weak
     if input_type == "simple_company_list":
-        eq = str(adj.get("evidence_quality", "")).lower()
+        eq_low = eq.lower()
+        if eq_low in ("weak", "insufficient"):
+            manual = True
         cl = str(adj.get("confidence_level", "")).lower()
-        if eq in ("weak", "insufficient") or cl in ("low", "unknown"):
-            manual = True  # force manual review path in _call_recommendation
+        if cl == "high":
+            # Simple inputs can't be High confidence without enriched ICP context
+            adj = dict(adj)
+            adj["confidence_level"] = "Medium"
 
-    rec = _call_recommendation(fit, trigger, window, opp, manual, input_type)
+    rec = _call_recommendation(fit, trigger, window, opp, manual, input_type, eq)
 
     scores = {
         "trigger_score":        trigger,
@@ -1041,13 +1142,19 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
             c = r.get("claude", {})
             s = r.get("scores", {})
             brief_rows.append({
-                "company_name":      r.get("company_name", ""),
-                "call_recommendation": s.get("call_recommendation", ""),
-                "why_now":           c.get("why_now", ""),
-                "opener":            c.get("suggested_opener", ""),
-                "buyer_route":       c.get("preferred_buyer_route", ""),
-                "title_searches":    c.get("suggested_title_searches", ""),
-                "evidence_summary":  c.get("trigger_evidence", ""),
+                "company_name":         r.get("company_name", ""),
+                "domain":               r.get("domain", ""),
+                "call_recommendation":  s.get("call_recommendation", ""),
+                "why_now":              c.get("why_now", ""),
+                "trigger_type":         c.get("trigger_type", ""),
+                "buying_window":        c.get("likely_buying_window", ""),
+                "preferred_buyer_route": c.get("preferred_buyer_route", ""),
+                "backup_buyer_route":   c.get("backup_buyer_route", ""),
+                "title_searches":       c.get("suggested_title_searches", ""),
+                "opener":               c.get("suggested_opener", ""),
+                "evidence_summary":     c.get("trigger_evidence", ""),
+                "evidence_quality":     c.get("evidence_quality", ""),
+                "confidence_level":     c.get("confidence_level", ""),
             })
         pd.DataFrame(brief_rows).to_excel(
             writer, index=False, sheet_name="Caller Brief"
