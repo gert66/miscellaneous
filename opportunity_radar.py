@@ -449,14 +449,15 @@ def _detect_input_type(df: pd.DataFrame) -> str:
 # CACHE
 # =============================================================================
 
-def _cache_key(name: str, domain: str) -> str:
-    raw = f"{name.lower().strip()}|{domain.lower().strip()}"
+def _cache_key(name: str, domain: str, input_type: str = "") -> str:
+    # input_type is part of the key so enriched/simple runs never share a cache file
+    raw = f"{name.lower().strip()}|{domain.lower().strip()}|{input_type}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def _cache_load(name: str, domain: str) -> dict | None:
+def _cache_load(name: str, domain: str, input_type: str = "") -> dict | None:
     RADAR_CACHE_DIR.mkdir(exist_ok=True)
-    p = RADAR_CACHE_DIR / f"{_cache_key(name, domain)}.json"
+    p = RADAR_CACHE_DIR / f"{_cache_key(name, domain, input_type)}.json"
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -465,9 +466,9 @@ def _cache_load(name: str, domain: str) -> dict | None:
     return None
 
 
-def _cache_save(name: str, domain: str, data: dict) -> None:
+def _cache_save(name: str, domain: str, input_type: str, data: dict) -> None:
     RADAR_CACHE_DIR.mkdir(exist_ok=True)
-    p = RADAR_CACHE_DIR / f"{_cache_key(name, domain)}.json"
+    p = RADAR_CACHE_DIR / f"{_cache_key(name, domain, input_type)}.json"
     try:
         p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     except Exception:
@@ -531,12 +532,13 @@ def _format_results_for_prompt(grouped: dict) -> str:
     return "\n".join(parts)
 
 
-def _collect_raw_sources(company_name: str, grouped: dict) -> list:
+def _collect_raw_sources(company_name: str, grouped: dict, input_type: str = "") -> list:
     rows = []
     for group_label, results in grouped.items():
         for r in results:
             rows.append({
                 "company_name": company_name,
+                "input_type":   input_type,
                 "query_group":  group_label,
                 "title":        r.get("title", ""),
                 "url":          r.get("url", ""),
@@ -733,18 +735,21 @@ def _call_recommendation(
             return "Monitor"
         return "Monitor"
     else:
-        # ICP fit unknown — never recommend "Call now" without very strong timing signal
-        if trigger >= 3 and window >= 2:
-            return "Call this month"   # best we can say without ICP context
-        if trigger >= 2 or window >= 2:
-            return "Call this month"
-        if window >= 1 and trigger >= 1:
-            return "Call before budget cycle"
-        if manual:
-            return "Manual research needed"
+        # ICP fit unknown — conservative; weak evidence always routes to manual review
         if trigger == 0 and window == 0:
             return "Monitor"
-        return "Monitor"
+        # Only the very strongest signal overrides a manual/weak-evidence flag
+        if trigger >= 3 and window >= 2:
+            return "Call this month"
+        if manual:
+            return "Manual research needed"
+        if trigger >= 2 and window >= 1:
+            return "Call this month"
+        if trigger >= 2 or window >= 2:
+            return "Call before budget cycle"
+        if window >= 1 and trigger >= 1:
+            return "Call before budget cycle"
+        return "Manual research needed"
 
 
 _QUARTER_RE = re.compile(
@@ -817,23 +822,38 @@ def _compute_scores(
     fit_score_raw,
     tier_raw,
     input_type: str = "enriched_export",
-) -> dict:
-    claude_result = _adjust_past_buying_window(claude_result)
-    fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
-    trigger = int(claude_result.get("trigger_score", 0) or 0)
-    window  = int(claude_result.get("buying_window_score", 0) or 0)
-    route   = _contact_route_score(claude_result.get("preferred_buyer_route", ""))
-    opp     = _opportunity_score(fit, trigger, window, route, input_type)
-    manual  = bool(claude_result.get("manual_review_needed", False))
-    rec     = _call_recommendation(fit, trigger, window, opp, manual, input_type)
+) -> tuple:
+    """
+    Returns (adjusted_claude_result, scores_dict).
+    adjusted_claude_result has any expired buying window projected forward.
+    """
+    adj = _adjust_past_buying_window(dict(claude_result))
 
-    return {
+    # For simple lists, never use commercial fit in scoring
+    fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
+    trigger = int(adj.get("trigger_score", 0) or 0)
+    window  = int(adj.get("buying_window_score", 0) or 0)
+    route   = _contact_route_score(adj.get("preferred_buyer_route", ""))
+    opp     = _opportunity_score(fit, trigger, window, route, input_type)
+    manual  = bool(adj.get("manual_review_needed", False))
+
+    # For simple lists with weak evidence, cap recommendation conservatively
+    if input_type == "simple_company_list":
+        eq = str(adj.get("evidence_quality", "")).lower()
+        cl = str(adj.get("confidence_level", "")).lower()
+        if eq in ("weak", "insufficient") or cl in ("low", "unknown"):
+            manual = True  # force manual review path in _call_recommendation
+
+    rec = _call_recommendation(fit, trigger, window, opp, manual, input_type)
+
+    scores = {
         "trigger_score":        trigger,
         "buying_window_score":  window,
         "contact_route_score":  route,
         "opportunity_score":    opp,
         "call_recommendation":  rec,
     }
+    return adj, scores
 
 
 # =============================================================================
@@ -1035,7 +1055,7 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
 
         # ── Sheet 6: Raw Sources ──────────────────────────────────────────────
         raw_cols = [
-            "company_name", "query_group", "title", "url",
+            "company_name", "input_type", "query_group", "title", "url",
             "snippet", "date", "source_type",
         ]
         pd.DataFrame(raw_sources or [], columns=raw_cols).to_excel(
@@ -1259,43 +1279,60 @@ if _processing and not _done:
             }
             results.append(record)
         else:
-            # Check cache first
-            cached = _cache_load(name, domain)
+            # Check cache first — key is scoped to input_type so enriched/simple never collide
+            cached = _cache_load(name, domain, c_itype)
             if cached is not None:
-                # Freshen input_type/fit_available in case they changed since caching
+                # Enforce correct fit data for this input type
                 cached["input_type"]              = c_itype
                 cached["commercial_fit_available"] = c_fit_avail
+                if c_itype == "simple_company_list":
+                    # Strip any enriched fit values that crept into the cache
+                    cached["fit_score"] = ""
+                    cached["tier"]      = ""
+                # Re-apply window adjustment and recompute scores (in case window aged)
+                adj_claude, fresh_scores = _compute_scores(
+                    cached.get("claude", {}),
+                    cached.get("fit_score", ""),
+                    cached.get("tier", ""),
+                    c_itype,
+                )
+                cached["claude"] = adj_claude
+                cached["scores"] = fresh_scores
                 results.append(cached)
                 # Restore raw sources stored in cache (if any)
                 raw_sources.extend(cached.get("raw_sources", []))
             else:
                 # Run Serper searches
                 grouped_results = _run_searches(name or domain, domain, _serper_key)
-                sources         = _collect_raw_sources(name, grouped_results)
+                sources         = _collect_raw_sources(name, grouped_results, c_itype)
 
                 # Call Claude
                 client = _anthropic_mod.Anthropic(api_key=_anthropic_key)
-                claude_result = _call_claude(
+                raw_claude = _call_claude(
                     name, domain, country, fit_score, tier, icp_ev,
                     grouped_results, client,
                 )
 
-                # Compute scores — formula depends on input type
-                scores = _compute_scores(claude_result, fit_score, tier, c_itype)
+                # Adjust window + compute scores; formula depends on input type
+                adj_claude, scores = _compute_scores(raw_claude, fit_score, tier, c_itype)
+
+                # For simple lists: never carry commercial fit values
+                out_fit_score = fit_score if c_itype == "enriched_export" else ""
+                out_tier      = tier      if c_itype == "enriched_export" else ""
 
                 record = {
                     "company_name":             name,
                     "domain":                   domain,
                     "country":                  country,
-                    "fit_score":                fit_score,
-                    "tier":                     tier,
+                    "fit_score":                out_fit_score,
+                    "tier":                     out_tier,
                     "input_type":               c_itype,
                     "commercial_fit_available": c_fit_avail,
-                    "claude":                   claude_result,
+                    "claude":                   adj_claude,
                     "scores":                   scores,
                     "raw_sources":              sources,
                 }
-                _cache_save(name, domain, record)
+                _cache_save(name, domain, c_itype, record)
                 results.append(record)
                 raw_sources.extend(sources)
 
