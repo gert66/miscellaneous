@@ -1104,32 +1104,50 @@ _TITLE_SEARCH_ROUTE_MAP: dict[str, str] = {
 }
 
 
+def _quote_or_titles(text: str) -> str:
+    """Ensure every OR-separated title token is wrapped in double quotes."""
+    if not text:
+        return text
+    tokens = [t.strip() for t in text.split(" OR ")]
+    quoted = []
+    for t in tokens:
+        if not t:
+            continue
+        t = t.strip('"').strip("'").strip()
+        if t:
+            quoted.append(f'"{t}"')
+    return " OR ".join(quoted)
+
+
 def _normalize_title_searches(raw: str, preferred_route: str, backup_route: str) -> str:
     """
-    If Claude returned a comma-separated list instead of OR syntax, rebuild it
-    from the preferred and backup routes.
+    Ensure title searches use quoted OR syntax for LinkedIn Sales Navigator.
+    If Claude returned a comma-separated list or unquoted OR list, rebuild from routes.
     """
-    if raw and " OR " in raw:
-        return raw  # already in correct format
+    # Rebuild from routes when no OR syntax present
+    if not (raw and " OR " in raw):
+        parts = []
+        for route in (preferred_route, backup_route):
+            key = str(route or "").lower()
+            for route_key, titles in _TITLE_SEARCH_ROUTE_MAP.items():
+                if route_key in key:
+                    parts.append(titles)
+                    break
 
-    # Rebuild from routes
-    parts = []
-    for route in (preferred_route, backup_route):
-        key = str(route or "").lower()
-        for route_key, titles in _TITLE_SEARCH_ROUTE_MAP.items():
-            if route_key in key:
-                parts.append(titles)
-                break
+        if parts:
+            return " OR ".join(parts)
 
-    if parts:
-        return " OR ".join(parts)
+        # Fallback: comma-separated → quoted OR syntax
+        if raw and "," in raw:
+            pieces = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
+            return " OR ".join(f'"{p}"' for p in pieces[:6])
 
-    # Fallback: if comma-separated, convert to OR syntax (keep as-is but add OR)
-    if raw and "," in raw:
-        pieces = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
-        return " OR ".join(f'"{p}"' for p in pieces[:6])
+        if raw:
+            return _quote_or_titles(raw)
+        return ""
 
-    return raw or ""
+    # Has OR syntax — ensure every token is quoted
+    return _quote_or_titles(raw)
 
 
 def _cap_opportunity_score(opp: float, rec: str, input_type: str, eq: str, trigger_type: str) -> float:
@@ -1266,6 +1284,59 @@ def _apply_enriched_fallback(
     return adj
 
 
+# Matches hard quarter strings like Q3 2026, Q3-Q4 2026, Q3 2026 or Q4 2026
+_HARD_QUARTER_RE = re.compile(
+    r"\bQ[1-4]\s*(?:[-/]\s*Q[1-4]\s+|\s+or\s+Q[1-4]\s+|\s+)20\d{2}\b",
+    re.IGNORECASE,
+)
+
+
+def _soften_hard_buying_window(adj: dict) -> dict:
+    """
+    Replace a hard quarter string with hedged language unless confidence is High.
+    Claude often speculates a quarter without source evidence; this normalises those.
+    """
+    window = str(adj.get("likely_buying_window", "") or "")
+    if not window or not _HARD_QUARTER_RE.search(window):
+        return adj
+    # Keep hard quarter only when Claude explicitly rated confidence as High
+    confidence = str(adj.get("buying_window_confidence", "") or "").lower()
+    if confidence == "high":
+        return adj
+    adj = dict(adj)
+    trigger_type = str(adj.get("trigger_type", "") or "")
+    if trigger_type == "Annual planning / budget window":
+        adj["likely_buying_window"] = "Possible annual planning window, confidence low"
+    else:
+        adj["likely_buying_window"] = "Possible Q3/Q4 planning conversation, timing not confirmed"
+    adj["buying_window_confidence"] = "Low"
+    return adj
+
+
+_LOW_PRIORITY_OPENER = (
+    "Manual research first. Only contact if a current HR, hiring, onboarding, "
+    "integration, or international communication signal appears."
+)
+
+
+def _apply_low_priority_override(adj: dict, rec: str, company_name: str) -> dict:
+    """Suppress the sales opener and ensure cautious why_now for Low priority companies."""
+    if rec != "Low priority":
+        return adj
+    adj = dict(adj)
+    adj["suggested_opener"] = _LOW_PRIORITY_OPENER
+    existing_why = adj.get("why_now", "") or ""
+    # Overwrite if why_now is blank or looks like a positive pitch
+    if not existing_why or "low commercial fit" not in existing_why.lower():
+        adj["why_now"] = (
+            f"{company_name} is low priority: no strong commercial fit or timing trigger "
+            "was found in available sources. "
+            "A stronger signal — such as international hiring, L&D activity, or market "
+            "expansion — would be needed before calling."
+        )
+    return adj
+
+
 def _apply_simple_fallback(adj: dict) -> dict:
     """For simple company lists with no timing trigger, ensure why_now is never blank."""
     if adj.get("why_now"):
@@ -1294,6 +1365,8 @@ def _compute_scores(
     from commercial fit context when Claude returned no trigger.
     """
     adj = _adjust_past_buying_window(dict(claude_result))
+    # Soften any hard-quarter buying window that lacks High confidence
+    adj = _soften_hard_buying_window(adj)
 
     # Sanitize banned generic phrases — runs on cached AND fresh results
     adj = _sanitize_claude_result(adj)
@@ -1343,6 +1416,8 @@ def _compute_scores(
     # For simple lists: ensure why_now is never blank when no trigger found
     if input_type == "simple_company_list":
         adj = _apply_simple_fallback(adj)
+    # Suppress sales opener and enforce cautious copy for Low priority companies
+    adj = _apply_low_priority_override(adj, rec, company_name)
     # Re-normalise route score after possible fallback route assignment
     route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
