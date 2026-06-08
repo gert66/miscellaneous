@@ -15,7 +15,7 @@ import json
 import pathlib
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -303,6 +303,7 @@ def reset():
         _or_excel_bytes=None,
         _or_stop=False,
         _or_force_refresh=False,
+        _or_scan_start_time=None,
     )
 
 
@@ -1337,6 +1338,121 @@ def _apply_low_priority_override(adj: dict, rec: str, company_name: str) -> dict
     return adj
 
 
+# =============================================================================
+# TRIGGER RECENCY
+# =============================================================================
+
+_MONTH_MAP = {
+    "january":1, "february":2, "march":3, "april":4, "may":5, "june":6,
+    "july":7, "august":8, "september":9, "october":10, "november":11, "december":12,
+    "jan":1, "feb":2, "mar":3, "apr":4, "jun":6, "jul":7, "aug":8,
+    "sep":9, "oct":10, "nov":11, "dec":12,
+}
+
+_DATE_FORMATS_HIGH = ("%Y-%m-%d", "%d %B %Y", "%B %d, %Y", "%d/%m/%Y", "%m/%d/%Y")
+_DATE_FORMATS_MED  = ("%B %Y", "%b %Y")
+
+
+def _parse_trigger_date(raw: str):
+    """Return (datetime | None, confidence: str)."""
+    if not raw or not raw.strip():
+        return None, "Unknown"
+    d = raw.strip()
+
+    for fmt in _DATE_FORMATS_HIGH:
+        try:
+            return datetime.strptime(d, fmt), "High"
+        except ValueError:
+            pass
+
+    for fmt in _DATE_FORMATS_MED:
+        try:
+            return datetime.strptime(d, fmt), "Medium"
+        except ValueError:
+            pass
+
+    # Q1-Q4 YYYY
+    m = re.match(r"Q([1-4])\s*(20\d{2})", d, re.IGNORECASE)
+    if m:
+        month = (int(m.group(1)) - 1) * 3 + 1
+        return datetime(int(m.group(2)), month, 1), "Medium"
+
+    # Loose "Month YYYY" or "YYYY Month"
+    parts = d.lower().split()
+    if len(parts) == 2:
+        for a, b in ((0, 1), (1, 0)):
+            if parts[a] in _MONTH_MAP:
+                try:
+                    return datetime(int(parts[b]), _MONTH_MAP[parts[a]], 1), "Medium"
+                except (ValueError, KeyError):
+                    pass
+
+    # Year only
+    m = re.match(r"^(20\d{2})$", d.strip())
+    if m:
+        return datetime(int(m.group(1)), 1, 1), "Low"
+
+    return None, "Unknown"
+
+
+def _compute_trigger_recency(trigger_date: str, trigger_type: str) -> dict:
+    today = datetime.now()
+    parsed, date_confidence = _parse_trigger_date(trigger_date)
+
+    if parsed is None:
+        return {
+            "trigger_age_days":  "",
+            "recency_bucket":    "Unknown date",
+            "is_current_trigger": False,
+            "date_confidence":   "Unknown",
+            "recency_note":      "No reliable trigger date found, treat conservatively.",
+        }
+
+    age_days = max(0, (today - parsed).days)
+    if age_days <= 90:
+        bucket = "Fresh"
+    elif age_days <= 180:
+        bucket = "Recent-ish"
+    elif age_days <= 365:
+        bucket = "Old context"
+    else:
+        bucket = "Stale"
+
+    is_annual_only = (trigger_type == "Annual planning / budget window")
+    is_current     = (bucket == "Fresh") and not is_annual_only
+
+    if is_annual_only:
+        note = "Annual report timing only, not a direct buying trigger."
+    elif bucket == "Fresh":
+        note = "Recent trigger, can support active outreach."
+    elif bucket == "Recent-ish":
+        note = "Older signal, use as context only. Verify if still active."
+    elif bucket == "Old context":
+        note = "Older signal, use as context only."
+    else:
+        note = "Stale signal. Recheck current status before outreach."
+
+    return {
+        "trigger_age_days":  age_days,
+        "recency_bucket":    bucket,
+        "is_current_trigger": is_current,
+        "date_confidence":   date_confidence,
+        "recency_note":      note,
+    }
+
+
+def _apply_recency_guardrail(rec: str, recency: dict) -> str:
+    """Downgrade urgent recommendations when the trigger signal is old or unknown."""
+    bucket = recency.get("recency_bucket", "Unknown date")
+    if bucket == "Fresh":
+        return rec  # fresh signal — no downgrade needed
+    if rec == "Call now":
+        return "Call this month" if bucket == "Recent-ish" else "Call before budget cycle"
+    if rec == "Call this month" and bucket in ("Old context", "Stale", "Unknown date"):
+        return "Call before budget cycle"
+    return rec
+
+
 def _apply_simple_fallback(adj: dict) -> dict:
     """For simple company lists with no timing trigger, ensure why_now is never blank."""
     if adj.get("why_now"):
@@ -1408,6 +1524,10 @@ def _compute_scores(
 
     rec = _call_recommendation(fit, trigger, window, opp, manual, input_type, eq)
 
+    # Compute trigger recency and apply guardrail before capping score
+    recency = _compute_trigger_recency(adj.get("trigger_date", ""), adj.get("trigger_type", ""))
+    rec = _apply_recency_guardrail(rec, recency)
+
     # Cap opportunity_score for simple inputs that receive conservative recommendations
     opp = _cap_opportunity_score(opp, rec, input_type, eq, adj.get("trigger_type", ""))
 
@@ -1418,6 +1538,9 @@ def _compute_scores(
         adj = _apply_simple_fallback(adj)
     # Suppress sales opener and enforce cautious copy for Low priority companies
     adj = _apply_low_priority_override(adj, rec, company_name)
+    # Store recency fields in adj so they flow into Excel output
+    adj = dict(adj)
+    adj.update(recency)
     # Re-normalise route score after possible fallback route assignment
     route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
@@ -1523,7 +1646,8 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
             "commercial_fit_score", "commercial_tier",
             "trigger_score", "buying_window_score",
             "contact_route_score", "opportunity_score",
-            "call_recommendation", "why_now", "likely_buying_window",
+            "call_recommendation", "is_current_trigger", "recency_bucket",
+            "why_now", "likely_buying_window",
             "preferred_buyer_route", "backup_buyer_route",
             "suggested_title_searches", "suggested_opener",
             "confidence_level", "evidence_quality", "manual_review_needed",
@@ -1545,6 +1669,8 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
                 "contact_route_score":      s.get("contact_route_score", 0),
                 "opportunity_score":        s.get("opportunity_score", 0),
                 "call_recommendation":      s.get("call_recommendation", ""),
+                "is_current_trigger":       c.get("is_current_trigger", False),
+                "recency_bucket":           c.get("recency_bucket", ""),
                 "why_now":                  c.get("why_now", ""),
                 "likely_buying_window":     c.get("likely_buying_window", ""),
                 "preferred_buyer_route":    c.get("preferred_buyer_route", ""),
@@ -1564,13 +1690,18 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
         for r in results:
             c = r.get("claude", {})
             trig_rows.append({
-                "company_name":   r.get("company_name", ""),
-                "trigger_found":  c.get("trigger_found", False),
-                "trigger_type":   c.get("trigger_type", ""),
-                "trigger_date":   c.get("trigger_date", ""),
-                "trigger_score":  c.get("trigger_score", 0),
+                "company_name":    r.get("company_name", ""),
+                "trigger_found":   c.get("trigger_found", False),
+                "trigger_type":    c.get("trigger_type", ""),
+                "trigger_date":    c.get("trigger_date", ""),
+                "trigger_age_days": c.get("trigger_age_days", ""),
+                "recency_bucket":  c.get("recency_bucket", ""),
+                "is_current_trigger": c.get("is_current_trigger", False),
+                "date_confidence": c.get("date_confidence", ""),
+                "recency_note":    c.get("recency_note", ""),
+                "trigger_score":   c.get("trigger_score", 0),
                 "trigger_evidence": c.get("trigger_evidence", ""),
-                "source_urls":    c.get("evidence_sources", ""),
+                "source_urls":     c.get("evidence_sources", ""),
             })
         pd.DataFrame(trig_rows).to_excel(
             writer, index=False, sheet_name="Trigger Evidence"
@@ -1621,6 +1752,9 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
                 "call_recommendation":  s.get("call_recommendation", ""),
                 "why_now":              c.get("why_now", ""),
                 "trigger_type":         c.get("trigger_type", ""),
+                "recency_bucket":       c.get("recency_bucket", ""),
+                "is_current_trigger":   c.get("is_current_trigger", False),
+                "recency_note":         c.get("recency_note", ""),
                 "buying_window":        c.get("likely_buying_window", ""),
                 "preferred_buyer_route": c.get("preferred_buyer_route", ""),
                 "backup_buyer_route":   c.get("backup_buyer_route", ""),
@@ -1744,20 +1878,25 @@ elif ss("_or_df_raw") is not None and not ss("_or_processing", False) and not ss
     )
 
 # =============================================================================
-# MISSING KEYS WARNING
+# API KEY STATUS
 # =============================================================================
 
-if not _keys_ok and not ss("_or_done", False):
-    missing = []
-    if not _anthropic_key or not _ANTHROPIC_AVAILABLE:
-        missing.append("ANTHROPIC_API_KEY")
-    if not _serper_key:
-        missing.append("SERPER_API_KEY")
-    if missing:
-        st.warning(
-            f"⚠ Missing secrets: {', '.join(missing)}. "
-            "Add them to .streamlit/secrets.toml to run the scan."
-        )
+if not ss("_or_done", False):
+    if _keys_ok:
+        st.success("🔑 API keys detected: Serper and Claude ready")
+    else:
+        if not _serper_key:
+            st.error(
+                "Missing SERPER_API_KEY. "
+                "Opportunity Radar cannot search for company triggers without it. "
+                "Add it to .streamlit/secrets.toml."
+            )
+        if not _anthropic_key or not _ANTHROPIC_AVAILABLE:
+            st.error(
+                "Missing ANTHROPIC_API_KEY. "
+                "Opportunity Radar cannot interpret evidence without it. "
+                "Add it to .streamlit/secrets.toml."
+            )
 
 # =============================================================================
 # STEP 2 — START / PROCESSING LOOP
@@ -1807,14 +1946,15 @@ if not _done and not _processing:
             ss("_or_input_type", "simple_company_list"),
         )
         ss_set(
-            _or_processing    = True,
-            _or_done          = False,
-            _or_process_index = 0,
-            _or_company_list  = company_list,
-            _or_results       = [],
-            _or_raw_sources   = [],
-            _or_excel_bytes   = None,
-            _or_stop          = False,
+            _or_processing     = True,
+            _or_done           = False,
+            _or_process_index  = 0,
+            _or_company_list   = company_list,
+            _or_results        = [],
+            _or_raw_sources    = [],
+            _or_excel_bytes    = None,
+            _or_stop           = False,
+            _or_scan_start_time = time.time(),
         )
         st.rerun()
 
@@ -1835,10 +1975,33 @@ if _processing and not _done:
 
     # ── Progress display ──────────────────────────────────────────────────────
     if n_total:
-        st.progress(idx / n_total, text=f"Scanning {idx} of {n_total} companies…")
+        frac = idx / n_total if n_total else 0
+        st.progress(frac)
+        st.markdown("**Scanning opportunities…**")
+
         if idx < n_total:
-            current_name = company_list[idx].get("company_name") or company_list[idx].get("domain", "")
-            st.caption(f"Current company: **{current_name}**")
+            current_name = (
+                company_list[idx].get("company_name")
+                or company_list[idx].get("domain", "")
+            )
+            st.caption(f"Company {idx + 1} of {n_total}: {current_name}")
+
+        scan_start = ss("_or_scan_start_time")
+        if scan_start:
+            elapsed_sec = time.time() - scan_start
+            elapsed_str = time.strftime("%M:%S", time.gmtime(int(elapsed_sec)))
+            st.caption(f"Elapsed: {elapsed_str}")
+            completed = idx  # companies fully processed so far
+            if completed >= 2 and n_total > idx:
+                avg_sec        = elapsed_sec / completed
+                remaining_sec  = (n_total - idx) * avg_sec
+                remaining_str  = time.strftime("%M:%S", time.gmtime(int(remaining_sec)))
+                ready_time     = datetime.now() + timedelta(seconds=remaining_sec)
+                ready_str      = ready_time.strftime("%H:%M")
+                st.caption(f"Estimated remaining: {remaining_str}")
+                st.caption(f"Estimated ready around: {ready_str}")
+            elif idx < n_total:
+                st.caption("Estimating time remaining…")
 
     # ── Process one company ───────────────────────────────────────────────────
     if idx < n_total:
@@ -1963,9 +2126,16 @@ if _done:
     processed   = len(results)
     n           = ss("_or_n_companies", 0)
 
+    scan_start = ss("_or_scan_start_time")
+    avg_note = ""
+    if scan_start and processed > 0:
+        total_sec = time.time() - scan_start
+        avg_sec   = total_sec / processed
+        avg_note  = f" · avg {avg_sec:.0f} s/company"
+
     st.success(
         f"✅ Ready · **{processed:,}** "
-        f"{'company' if processed == 1 else 'companies'} scanned"
+        f"{'company' if processed == 1 else 'companies'} scanned{avg_note}"
     )
 
     # Build Excel once, cache bytes in session state
