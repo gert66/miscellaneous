@@ -1,8 +1,9 @@
 """
 mYngle · Opportunity Radar
 ==========================
-Researches buying-window signals and contact routes for enriched company lists.
-Uses Serper Google Search + Claude Haiku for signal extraction.
+Researches buying-window signals and contact routes for company lists.
+Accepts Lead Prioritizer exports (with Opportunity Input sheet) or simple
+company lists.  Uses Serper Google Search + Claude Haiku for signal extraction.
 
 Entry point:  streamlit run opportunity_radar.py
 """
@@ -281,6 +282,7 @@ def reset():
         _or_tier_col=None,
         _or_icp_col=None,
         _or_n_companies=0,
+        _or_input_type=None,   # "enriched_export" | "simple_company_list"
         _or_processing=False,
         _or_done=False,
         _or_process_index=0,
@@ -317,8 +319,17 @@ _TIER_CANDIDATES = [
 ]
 _ICP_CANDIDATES = [
     "icp_evidence", "icp evidence", "why_relevant", "why_is_this_company_relevant",
-    "buying_signals", "purchasing_signals", "icp_signals",
+    "buying_signals", "icp_buying_signals", "purchasing_signals", "icp_signals",
 ]
+
+# Columns whose presence signals an enriched export
+_ENRICHED_SIGNAL_COLS = {
+    "final_commercial_fit_score", "commercial_fit_score", "commercial_tier",
+    "icp_evidence", "icp_buying_signals", "icp_lead_score", "icp_why_relevant",
+    "icp_likely_training_interest", "icp_potential_buyer_function",
+    "sig_intl_footprint_score", "sig_rapid_growth_score", "enrichment_status",
+    "top_positive_signals", "top_score_drivers",
+}
 
 
 def _detect_col(df: pd.DataFrame, candidates: list) -> str | None:
@@ -341,6 +352,72 @@ def _count_companies(df: pd.DataFrame, name_col: str | None) -> int:
             .nunique()
         )
     return len(df)
+
+
+# =============================================================================
+# FILE LOADING WITH SHEET PRIORITY
+# =============================================================================
+
+def _load_df_from_upload(uploaded_file) -> tuple:
+    """
+    Load the best DataFrame from an uploaded file.
+
+    Sheet priority for Excel files:
+      1. 'Opportunity Input' — preferred (Lead Prioritizer export)
+      2. First sheet (usually 'Lead Scores')
+      3. 'Enriched' — fallback if first sheet has no usable columns
+      ('Company Profiles' is never read — it is formatted for humans)
+
+    Returns (df, sheet_used) where sheet_used is a string label.
+    CSV files always return (df, "csv").
+    """
+    fname = uploaded_file.name
+    if fname.lower().endswith(".csv"):
+        return pd.read_csv(uploaded_file), "csv"
+
+    xf = pd.ExcelFile(uploaded_file)
+    sheet_names = xf.sheet_names
+
+    # Priority 1 — dedicated Opportunity Input sheet
+    if "Opportunity Input" in sheet_names:
+        return xf.parse("Opportunity Input"), "Opportunity Input"
+
+    # Priority 2 — first sheet (skip Company Profiles if it is somehow first)
+    first = next(
+        (s for s in sheet_names if s != "Company Profiles"),
+        sheet_names[0] if sheet_names else None,
+    )
+    if first:
+        df_first = xf.parse(first)
+        # Check if it has at least a name or domain column
+        lower_cols = {c.lower() for c in df_first.columns}
+        has_identity = any(
+            c in lower_cols
+            for c in ("company_name", "company name", "company", "name",
+                      "domain", "company domain", "company website", "website")
+        )
+        if has_identity:
+            return df_first, first
+
+    # Priority 3 — 'Enriched' hidden sheet
+    if "Enriched" in sheet_names:
+        return xf.parse("Enriched"), "Enriched"
+
+    # Last resort — first sheet regardless
+    return xf.parse(sheet_names[0]), sheet_names[0]
+
+
+def _detect_input_type(df: pd.DataFrame) -> str:
+    """
+    Classify the uploaded file as 'enriched_export' or 'simple_company_list'.
+
+    An enriched export contains at least one of the enrichment signal columns.
+    """
+    col_set = {c.lower() for c in df.columns}
+    for sig_col in _ENRICHED_SIGNAL_COLS:
+        if sig_col.lower() in col_set:
+            return "enriched_export"
+    return "simple_company_list"
 
 
 # =============================================================================
@@ -574,44 +651,81 @@ def _contact_route_score(preferred_route: str) -> int:
     return 0  # Unknown or Procurement
 
 
-def _opportunity_score(fit: int, trigger: int, window: int, route: int) -> float:
-    return round(
-        (fit / 3 * 10 * 0.35)
-        + (trigger / 3 * 10 * 0.30)
-        + (window / 3 * 10 * 0.25)
-        + (route / 3 * 10 * 0.10),
-        1,
-    )
+def _opportunity_score(
+    fit: int, trigger: int, window: int, route: int, input_type: str
+) -> float:
+    if input_type == "enriched_export":
+        # 35% fit · 30% trigger · 25% window · 10% route
+        return round(
+            (fit / 3 * 10 * 0.35)
+            + (trigger / 3 * 10 * 0.30)
+            + (window / 3 * 10 * 0.25)
+            + (route / 3 * 10 * 0.10),
+            1,
+        )
+    else:
+        # timing-only mode: 45% trigger · 35% window · 20% route
+        return round(
+            (trigger / 3 * 10 * 0.45)
+            + (window / 3 * 10 * 0.35)
+            + (route / 3 * 10 * 0.20),
+            1,
+        )
 
 
 def _call_recommendation(
-    fit: int, trigger: int, window: int, opp: float, manual: bool
+    fit: int,
+    trigger: int,
+    window: int,
+    opp: float,
+    manual: bool,
+    input_type: str,
 ) -> str:
-    if fit == 0:
-        return "Low priority"
-    if trigger >= 3 and fit >= 2:
-        return "Call now"
-    if fit >= 2 and (trigger >= 2 or window >= 2):
-        return "Call this month"
-    if window >= 2 and fit >= 2:
-        return "Call before budget cycle"
-    if trigger >= 2 and fit >= 1:
-        return "Call this month"
-    if manual:
-        return "Manual research needed"
-    if trigger == 0 and window == 0:
+    if input_type == "enriched_export":
+        # ICP fit is known — use full decision matrix
+        if fit == 0:
+            return "Low priority"
+        if trigger >= 3 and fit >= 2:
+            return "Call now"
+        if fit >= 2 and (trigger >= 2 or window >= 2):
+            return "Call this month"
+        if window >= 2 and fit >= 2:
+            return "Call before budget cycle"
+        if trigger >= 2 and fit >= 1:
+            return "Call this month"
+        if manual:
+            return "Manual research needed"
+        if trigger == 0 and window == 0:
+            return "Monitor"
         return "Monitor"
-    return "Monitor"
+    else:
+        # ICP fit unknown — never recommend "Call now" without very strong timing signal
+        if trigger >= 3 and window >= 2:
+            return "Call this month"   # best we can say without ICP context
+        if trigger >= 2 or window >= 2:
+            return "Call this month"
+        if window >= 1 and trigger >= 1:
+            return "Call before budget cycle"
+        if manual:
+            return "Manual research needed"
+        if trigger == 0 and window == 0:
+            return "Monitor"
+        return "Monitor"
 
 
-def _compute_scores(claude_result: dict, fit_score_raw, tier_raw) -> dict:
-    fit     = _fit_bucket(fit_score_raw, tier_raw)
+def _compute_scores(
+    claude_result: dict,
+    fit_score_raw,
+    tier_raw,
+    input_type: str = "enriched_export",
+) -> dict:
+    fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
     trigger = int(claude_result.get("trigger_score", 0) or 0)
     window  = int(claude_result.get("buying_window_score", 0) or 0)
     route   = _contact_route_score(claude_result.get("preferred_buyer_route", ""))
-    opp     = _opportunity_score(fit, trigger, window, route)
+    opp     = _opportunity_score(fit, trigger, window, route, input_type)
     manual  = bool(claude_result.get("manual_review_needed", False))
-    rec     = _call_recommendation(fit, trigger, window, opp, manual)
+    rec     = _call_recommendation(fit, trigger, window, opp, manual, input_type)
 
     return {
         "trigger_score":        trigger,
@@ -634,6 +748,7 @@ def _build_company_list(
     score_col: str | None,
     tier_col: str | None,
     icp_col: str | None,
+    input_type: str = "enriched_export",
 ) -> list:
     """Deduplicate by company name and return list of dicts."""
     def _val(row, col):
@@ -649,13 +764,18 @@ def _build_company_list(
         if not name or name.lower() in seen:
             continue
         seen.add(name.lower())
+        fit_score = _val(row, score_col)
+        tier      = _val(row, tier_col)
+        fit_avail = bool(fit_score or tier) and input_type == "enriched_export"
         companies.append({
-            "company_name": _val(row, name_col),
-            "domain":       _val(row, domain_col),
-            "country":      _val(row, country_col),
-            "fit_score":    _val(row, score_col),
-            "tier":         _val(row, tier_col),
-            "icp_evidence": _val(row, icp_col),
+            "company_name":           _val(row, name_col),
+            "domain":                 _val(row, domain_col),
+            "country":                _val(row, country_col),
+            "fit_score":              fit_score,
+            "tier":                   tier,
+            "icp_evidence":           _val(row, icp_col),
+            "input_type":             input_type,
+            "commercial_fit_available": fit_avail,
         })
     return companies
 
@@ -671,6 +791,7 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
         # ── Sheet 1: Opportunity Radar (main summary) ─────────────────────────
         radar_cols = [
             "company_name", "domain", "country",
+            "input_type", "commercial_fit_available",
             "commercial_fit_score", "commercial_tier",
             "trigger_score", "buying_window_score",
             "contact_route_score", "opportunity_score",
@@ -684,25 +805,27 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
             c = r.get("claude", {})
             s = r.get("scores", {})
             radar_rows.append({
-                "company_name":          r.get("company_name", ""),
-                "domain":                r.get("domain", ""),
-                "country":               r.get("country", ""),
-                "commercial_fit_score":  r.get("fit_score", ""),
-                "commercial_tier":       r.get("tier", ""),
-                "trigger_score":         s.get("trigger_score", 0),
-                "buying_window_score":   s.get("buying_window_score", 0),
-                "contact_route_score":   s.get("contact_route_score", 0),
-                "opportunity_score":     s.get("opportunity_score", 0),
-                "call_recommendation":   s.get("call_recommendation", ""),
-                "why_now":               c.get("why_now", ""),
-                "likely_buying_window":  c.get("likely_buying_window", ""),
-                "preferred_buyer_route": c.get("preferred_buyer_route", ""),
-                "backup_buyer_route":    c.get("backup_buyer_route", ""),
+                "company_name":             r.get("company_name", ""),
+                "domain":                   r.get("domain", ""),
+                "country":                  r.get("country", ""),
+                "input_type":               r.get("input_type", ""),
+                "commercial_fit_available": r.get("commercial_fit_available", False),
+                "commercial_fit_score":     r.get("fit_score", ""),
+                "commercial_tier":          r.get("tier", ""),
+                "trigger_score":            s.get("trigger_score", 0),
+                "buying_window_score":      s.get("buying_window_score", 0),
+                "contact_route_score":      s.get("contact_route_score", 0),
+                "opportunity_score":        s.get("opportunity_score", 0),
+                "call_recommendation":      s.get("call_recommendation", ""),
+                "why_now":                  c.get("why_now", ""),
+                "likely_buying_window":     c.get("likely_buying_window", ""),
+                "preferred_buyer_route":    c.get("preferred_buyer_route", ""),
+                "backup_buyer_route":       c.get("backup_buyer_route", ""),
                 "suggested_title_searches": c.get("suggested_title_searches", ""),
-                "suggested_opener":      c.get("suggested_opener", ""),
-                "confidence_level":      c.get("confidence_level", ""),
-                "evidence_quality":      c.get("evidence_quality", ""),
-                "manual_review_needed":  c.get("manual_review_needed", False),
+                "suggested_opener":         c.get("suggested_opener", ""),
+                "confidence_level":         c.get("confidence_level", ""),
+                "evidence_quality":         c.get("evidence_quality", ""),
+                "manual_review_needed":     c.get("manual_review_needed", False),
             })
         pd.DataFrame(radar_rows, columns=radar_cols).to_excel(
             writer, index=False, sheet_name="Opportunity Radar"
@@ -809,6 +932,10 @@ _keys_ok = bool(_anthropic_key and _serper_key and _ANTHROPIC_AVAILABLE)
 
 st.divider()
 st.subheader("Step 1 · Upload your file")
+st.caption(
+    "Upload a Lead Prioritizer export, an Opportunity Input sheet, "
+    "or a simple company list with company name and website."
+)
 
 uploaded = st.file_uploader(
     "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
@@ -819,41 +946,39 @@ uploaded = st.file_uploader(
 new_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
 if new_key != ss("_or_file_key", "__none__"):
     ss_set(
-        _or_file_key     = new_key,
-        _or_df_raw       = None,
-        _or_file_name    = None,
-        _or_file_error   = None,
-        _or_name_col     = None,
-        _or_domain_col   = None,
-        _or_country_col  = None,
-        _or_score_col    = None,
-        _or_tier_col     = None,
-        _or_icp_col      = None,
-        _or_n_companies  = 0,
-        _or_processing   = False,
-        _or_done         = False,
+        _or_file_key      = new_key,
+        _or_df_raw        = None,
+        _or_file_name     = None,
+        _or_file_error    = None,
+        _or_name_col      = None,
+        _or_domain_col    = None,
+        _or_country_col   = None,
+        _or_score_col     = None,
+        _or_tier_col      = None,
+        _or_icp_col       = None,
+        _or_n_companies   = 0,
+        _or_input_type    = None,
+        _or_processing    = False,
+        _or_done          = False,
         _or_process_index = 0,
-        _or_company_list = None,
-        _or_results      = None,
-        _or_raw_sources  = None,
-        _or_excel_bytes  = None,
-        _or_stop         = False,
+        _or_company_list  = None,
+        _or_results       = None,
+        _or_raw_sources   = None,
+        _or_excel_bytes   = None,
+        _or_stop          = False,
     )
     if uploaded is not None:
         try:
-            fname     = uploaded.name
-            df_loaded = (
-                pd.read_csv(uploaded)
-                if fname.lower().endswith(".csv")
-                else pd.read_excel(uploaded)
-            )
-            name_col    = _detect_col(df_loaded, _NAME_CANDIDATES)
-            domain_col  = _detect_col(df_loaded, _DOMAIN_CANDIDATES)
-            country_col = _detect_col(df_loaded, _COUNTRY_CANDIDATES)
-            score_col   = _detect_col(df_loaded, _SCORE_CANDIDATES)
-            tier_col    = _detect_col(df_loaded, _TIER_CANDIDATES)
-            icp_col     = _detect_col(df_loaded, _ICP_CANDIDATES)
-            n           = _count_companies(df_loaded, name_col)
+            fname             = uploaded.name
+            df_loaded, sheet  = _load_df_from_upload(uploaded)
+            input_type        = _detect_input_type(df_loaded)
+            name_col          = _detect_col(df_loaded, _NAME_CANDIDATES)
+            domain_col        = _detect_col(df_loaded, _DOMAIN_CANDIDATES)
+            country_col       = _detect_col(df_loaded, _COUNTRY_CANDIDATES)
+            score_col         = _detect_col(df_loaded, _SCORE_CANDIDATES)
+            tier_col          = _detect_col(df_loaded, _TIER_CANDIDATES)
+            icp_col           = _detect_col(df_loaded, _ICP_CANDIDATES)
+            n                 = _count_companies(df_loaded, name_col)
             ss_set(
                 _or_df_raw      = df_loaded,
                 _or_file_name   = fname,
@@ -864,6 +989,7 @@ if new_key != ss("_or_file_key", "__none__"):
                 _or_tier_col    = tier_col,
                 _or_icp_col     = icp_col,
                 _or_n_companies = n,
+                _or_input_type  = input_type,
             )
         except Exception as exc:
             ss_set(_or_file_error=str(exc))
@@ -871,10 +997,16 @@ if new_key != ss("_or_file_key", "__none__"):
 if ss("_or_file_error"):
     st.error(f"Could not read the file: {ss('_or_file_error')}")
 elif ss("_or_df_raw") is not None and not ss("_or_processing", False) and not ss("_or_done", False):
-    n = ss("_or_n_companies", 0)
+    n          = ss("_or_n_companies", 0)
+    itype      = ss("_or_input_type", "")
+    itype_label = (
+        "enriched export detected" if itype == "enriched_export"
+        else "simple company list detected"
+    )
     st.success(
         f"✓ **{ss('_or_file_name')}** loaded · "
-        f"{n:,} {'company' if n == 1 else 'companies'} ready"
+        f"{n:,} {'company' if n == 1 else 'companies'} ready · "
+        f"{itype_label}"
     )
 
 # =============================================================================
@@ -920,6 +1052,7 @@ if not _done and not _processing:
             ss("_or_score_col"),
             ss("_or_tier_col"),
             ss("_or_icp_col"),
+            ss("_or_input_type", "simple_company_list"),
         )
         ss_set(
             _or_processing    = True,
@@ -964,10 +1097,15 @@ if _processing and not _done:
         fit_score = company.get("fit_score", "")
         tier      = company.get("tier", "")
         icp_ev    = company.get("icp_evidence", "")
+        c_itype   = company.get("input_type", "simple_company_list")
+        c_fit_avail = company.get("commercial_fit_available", False)
 
         # Check cache first
         cached = _cache_load(name, domain)
         if cached is not None:
+            # Freshen input_type/fit_available in case they changed since caching
+            cached["input_type"]             = c_itype
+            cached["commercial_fit_available"] = c_fit_avail
             results.append(cached)
         else:
             # Run Serper searches
@@ -981,17 +1119,19 @@ if _processing and not _done:
                 grouped_results, client,
             )
 
-            # Compute scores
-            scores = _compute_scores(claude_result, fit_score, tier)
+            # Compute scores — formula depends on input type
+            scores = _compute_scores(claude_result, fit_score, tier, c_itype)
 
             record = {
-                "company_name": name,
-                "domain":       domain,
-                "country":      country,
-                "fit_score":    fit_score,
-                "tier":         tier,
-                "claude":       claude_result,
-                "scores":       scores,
+                "company_name":             name,
+                "domain":                   domain,
+                "country":                  country,
+                "fit_score":                fit_score,
+                "tier":                     tier,
+                "input_type":               c_itype,
+                "commercial_fit_available": c_fit_avail,
+                "claude":                   claude_result,
+                "scores":                   scores,
             }
             _cache_save(name, domain, record)
             results.append(record)
