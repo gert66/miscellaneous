@@ -191,6 +191,7 @@ ALLOWED_RECOMMENDATIONS = [
     "Monitor",
     "Manual research needed",
     "Low priority",
+    "Internal / exclude",
 ]
 
 # JSON schema Claude must return
@@ -304,8 +305,9 @@ _NAME_CANDIDATES = [
 ]
 _DOMAIN_CANDIDATES = [
     "canonical_company_url", "canonical_company_domain",
-    "company_domain", "domain", "company website", "website",
-    "url", "company url", "homepage",
+    "company_domain", "company_url", "domain",
+    "company website", "company domain",
+    "website", "url", "company url", "homepage",
 ]
 _COUNTRY_CANDIDATES = [
     "country", "company_country", "company country",
@@ -338,6 +340,29 @@ def _detect_col(df: pd.DataFrame, candidates: list) -> str | None:
         if cand.lower() in lower_map:
             return lower_map[cand.lower()]
     return None
+
+
+def _normalize_domain(raw: str) -> str:
+    """Strip protocol, www, trailing path from a URL to get a bare domain."""
+    if not raw:
+        return raw
+    raw = raw.strip()
+    raw = re.sub(r"^https?://", "", raw, flags=re.IGNORECASE)
+    raw = raw.split("/")[0].split("?")[0]
+    if raw.lower().startswith("www."):
+        raw = raw[4:]
+    return raw.strip()
+
+
+_INTERNAL_NAMES   = {"myngle"}
+_INTERNAL_DOMAINS = {"myngle.com"}
+
+
+def _is_internal(name: str, domain: str) -> bool:
+    return (
+        name.lower().strip() in _INTERNAL_NAMES
+        or any(d in domain.lower() for d in _INTERNAL_DOMAINS)
+    )
 
 
 def _count_companies(df: pd.DataFrame, name_col: str | None) -> int:
@@ -530,6 +555,8 @@ _PROMPT_TEMPLATE = """\
 You are a B2B sales intelligence analyst. Analyze the following web search results \
 for {name} and extract structured buying-window signals.
 
+TODAY'S DATE: {today}
+
 COMPANY PROFILE:
 - Name: {name}
 - Domain: {domain}
@@ -549,6 +576,11 @@ INSTRUCTIONS:
 - trigger_type must be one of: {trigger_types}
 - suggested_opener: a specific 1-2 sentence cold-call opener referencing an actual signal found
 - why_now: 1-2 sentences on why this company is worth calling right now
+- IMPORTANT: likely_buying_window must be a FUTURE date relative to today ({today}).
+  If the best evidence points to a window that has already passed, project forward to the
+  next likely planning cycle (e.g. next fiscal Q1, next budget season) and set
+  buying_window_confidence to "Low". Do not leave buying_window empty if you can estimate
+  a future window from fiscal year or annual report patterns.
 - If evidence is absent for a field, use false / empty string / 0 / "Unknown" as appropriate
 - Return ONLY the JSON object below — no markdown, no explanation
 
@@ -578,7 +610,9 @@ def _call_claude(
     client,
 ) -> dict:
     search_text = _format_results_for_prompt(grouped_results)
+    today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = _PROMPT_TEMPLATE.format(
+        today=today_str,
         name=name,
         domain=domain or "(unknown)",
         country=country or "(unknown)",
@@ -713,12 +747,78 @@ def _call_recommendation(
         return "Monitor"
 
 
+_QUARTER_RE = re.compile(
+    r"Q([1-4])[- /](\d{4})|(\d{4})[- /]Q([1-4])", re.IGNORECASE
+)
+_YEAR_ONLY_RE = re.compile(r"\b(20\d{2})\b")
+
+_QUARTER_STARTS = {1: (1, 1), 2: (4, 1), 3: (7, 1), 4: (10, 1)}
+
+
+def _window_to_date(window_str: str):
+    """Return the start date implied by a buying-window string, or None."""
+    if not window_str:
+        return None
+    m = _QUARTER_RE.search(window_str)
+    if m:
+        q = int(m.group(1) or m.group(4))
+        y = int(m.group(2) or m.group(3))
+        month, day = _QUARTER_STARTS[q]
+        try:
+            return datetime(y, month, day)
+        except ValueError:
+            return None
+    m = _YEAR_ONLY_RE.search(window_str)
+    if m:
+        try:
+            return datetime(int(m.group(1)), 1, 1)
+        except ValueError:
+            return None
+    return None
+
+
+def _adjust_past_buying_window(claude_result: dict) -> dict:
+    """
+    If likely_buying_window refers to a date that has already passed, lower the
+    buying_window_score to 0 and confidence to 'Low' so the scoring formulas
+    do not recommend immediate action based on stale timing.
+    Annual report evidence is preserved — only the recommended window is adjusted.
+    """
+    window = claude_result.get("likely_buying_window", "")
+    if not window:
+        return claude_result
+    window_date = _window_to_date(window)
+    if window_date is None:
+        return claude_result
+    today = datetime.now()
+    if window_date >= today:
+        return claude_result  # window is in the future — nothing to do
+
+    result = dict(claude_result)
+    result["buying_window_score"] = 0
+    result["buying_window_confidence"] = "Low"
+    old_reason = result.get("buying_window_reason", "")
+    result["buying_window_reason"] = (
+        f"[Window expired — {window} is in the past. "
+        f"Next likely planning cycle estimated.] {old_reason}"
+    ).strip()
+    # Project forward by one year as a placeholder
+    try:
+        future_year = window_date.year + 1
+        future_q = (window_date.month - 1) // 3 + 1
+        result["likely_buying_window"] = f"Q{future_q} {future_year} (projected)"
+    except Exception:
+        result["likely_buying_window"] = "Next planning cycle (estimated)"
+    return result
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
     tier_raw,
     input_type: str = "enriched_export",
 ) -> dict:
+    claude_result = _adjust_past_buying_window(claude_result)
     fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
     trigger = int(claude_result.get("trigger_score", 0) or 0)
     window  = int(claude_result.get("buying_window_score", 0) or 0)
@@ -751,31 +851,64 @@ def _build_company_list(
     input_type: str = "enriched_export",
 ) -> list:
     """Deduplicate by company name and return list of dicts."""
+    # If name_col wasn't detected, fall back to the first string-like column
+    if name_col is None:
+        for col in df.columns:
+            if df[col].dtype == object:
+                name_col = col
+                break
+
     def _val(row, col):
         if col and col in row.index:
             v = row[col]
             return "" if pd.isna(v) else str(v).strip()
         return ""
 
-    seen = set()
+    seen: set = set()
     companies = []
-    for _, row in df.iterrows():
-        name = _val(row, name_col) or _val(row, domain_col)
-        if not name or name.lower() in seen:
+    for i, row in df.iterrows():
+        name   = _val(row, name_col)
+        domain = _normalize_domain(_val(row, domain_col))
+
+        # Fallback: use domain as display key when name is absent
+        key = name or domain
+        if not key:
+            continue  # skip rows with no identity at all
+
+        # Deduplicate by normalised name (prefer name over domain)
+        dedup_key = name.lower() if name else domain.lower()
+        if dedup_key in seen:
             continue
-        seen.add(name.lower())
+        seen.add(dedup_key)
+
+        # Exclude internal / self entries
+        if _is_internal(name, domain):
+            companies.append({
+                "company_name":             name,
+                "domain":                   domain,
+                "country":                  _val(row, country_col),
+                "fit_score":                "",
+                "tier":                     "",
+                "icp_evidence":             "",
+                "input_type":               input_type,
+                "commercial_fit_available": False,
+                "internal":                 True,
+            })
+            continue
+
         fit_score = _val(row, score_col)
         tier      = _val(row, tier_col)
         fit_avail = bool(fit_score or tier) and input_type == "enriched_export"
         companies.append({
-            "company_name":           _val(row, name_col),
-            "domain":                 _val(row, domain_col),
-            "country":                _val(row, country_col),
-            "fit_score":              fit_score,
-            "tier":                   tier,
-            "icp_evidence":           _val(row, icp_col),
-            "input_type":             input_type,
+            "company_name":             name,
+            "domain":                   domain,
+            "country":                  _val(row, country_col),
+            "fit_score":                fit_score,
+            "tier":                     tier,
+            "icp_evidence":             _val(row, icp_col),
+            "input_type":               input_type,
             "commercial_fit_available": fit_avail,
+            "internal":                 False,
         })
     return companies
 
@@ -1090,52 +1223,81 @@ if _processing and not _done:
 
     # ── Process one company ───────────────────────────────────────────────────
     if idx < n_total:
-        company   = company_list[idx]
-        name      = company.get("company_name", "")
-        domain    = company.get("domain", "")
-        country   = company.get("country", "")
-        fit_score = company.get("fit_score", "")
-        tier      = company.get("tier", "")
-        icp_ev    = company.get("icp_evidence", "")
-        c_itype   = company.get("input_type", "simple_company_list")
+        company     = company_list[idx]
+        name        = company.get("company_name", "")
+        domain      = company.get("domain", "")
+        country     = company.get("country", "")
+        fit_score   = company.get("fit_score", "")
+        tier        = company.get("tier", "")
+        icp_ev      = company.get("icp_evidence", "")
+        c_itype     = company.get("input_type", "simple_company_list")
         c_fit_avail = company.get("commercial_fit_available", False)
+        is_internal = company.get("internal", False)
 
-        # Check cache first
-        cached = _cache_load(name, domain)
-        if cached is not None:
-            # Freshen input_type/fit_available in case they changed since caching
-            cached["input_type"]             = c_itype
-            cached["commercial_fit_available"] = c_fit_avail
-            results.append(cached)
-        else:
-            # Run Serper searches
-            grouped_results = _run_searches(name or domain, domain, _serper_key)
-            sources         = _collect_raw_sources(name, grouped_results)
-
-            # Call Claude
-            client = _anthropic_mod.Anthropic(api_key=_anthropic_key)
-            claude_result = _call_claude(
-                name, domain, country, fit_score, tier, icp_ev,
-                grouped_results, client,
-            )
-
-            # Compute scores — formula depends on input type
-            scores = _compute_scores(claude_result, fit_score, tier, c_itype)
-
+        if is_internal:
+            # Mark without any research
             record = {
                 "company_name":             name,
                 "domain":                   domain,
                 "country":                  country,
-                "fit_score":                fit_score,
-                "tier":                     tier,
+                "fit_score":                "",
+                "tier":                     "",
                 "input_type":               c_itype,
-                "commercial_fit_available": c_fit_avail,
-                "claude":                   claude_result,
-                "scores":                   scores,
+                "commercial_fit_available": False,
+                "claude": {
+                    **_EMPTY_CLAUDE_RESULT,
+                    "why_now": "Internal / exclude",
+                    "trigger_evidence": "Internal company — excluded from radar.",
+                },
+                "scores": {
+                    "trigger_score":       0,
+                    "buying_window_score": 0,
+                    "contact_route_score": 0,
+                    "opportunity_score":   0,
+                    "call_recommendation": "Internal / exclude",
+                },
             }
-            _cache_save(name, domain, record)
             results.append(record)
-            raw_sources.extend(sources)
+        else:
+            # Check cache first
+            cached = _cache_load(name, domain)
+            if cached is not None:
+                # Freshen input_type/fit_available in case they changed since caching
+                cached["input_type"]              = c_itype
+                cached["commercial_fit_available"] = c_fit_avail
+                results.append(cached)
+                # Restore raw sources stored in cache (if any)
+                raw_sources.extend(cached.get("raw_sources", []))
+            else:
+                # Run Serper searches
+                grouped_results = _run_searches(name or domain, domain, _serper_key)
+                sources         = _collect_raw_sources(name, grouped_results)
+
+                # Call Claude
+                client = _anthropic_mod.Anthropic(api_key=_anthropic_key)
+                claude_result = _call_claude(
+                    name, domain, country, fit_score, tier, icp_ev,
+                    grouped_results, client,
+                )
+
+                # Compute scores — formula depends on input type
+                scores = _compute_scores(claude_result, fit_score, tier, c_itype)
+
+                record = {
+                    "company_name":             name,
+                    "domain":                   domain,
+                    "country":                  country,
+                    "fit_score":                fit_score,
+                    "tier":                     tier,
+                    "input_type":               c_itype,
+                    "commercial_fit_available": c_fit_avail,
+                    "claude":                   claude_result,
+                    "scores":                   scores,
+                    "raw_sources":              sources,
+                }
+                _cache_save(name, domain, record)
+                results.append(record)
+                raw_sources.extend(sources)
 
         ss_set(
             _or_results       = results,
