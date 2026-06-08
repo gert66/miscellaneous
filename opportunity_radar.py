@@ -1214,14 +1214,15 @@ def _apply_enriched_fallback(
 
     fit = _fit_bucket(fit_score_raw, tier_raw)
 
-    # Low-fit / Pass companies: ensure why_now explains the low priority
+    # Low-fit / Pass companies: ensure why_now explains the low priority cautiously
     if fit == 0:
-        if not adj.get("why_now"):
-            adj = dict(adj)
-            adj["why_now"] = (
-                f"{company_name} has a low commercial fit and no current trigger was found. "
-                "No immediate language or communication training need is evident."
-            )
+        adj = dict(adj)
+        adj["why_now"] = (
+            f"{company_name} has a low commercial fit and no current trigger was found. "
+            "No immediate language or communication training need is evident. "
+            "A stronger signal — such as international hiring, L&D activity, or market expansion "
+            "— would be needed before calling."
+        )
         return adj
 
     # Infer buyer route from ICP evidence when Claude returned Unknown or blank
@@ -1265,6 +1266,19 @@ def _apply_enriched_fallback(
     return adj
 
 
+def _apply_simple_fallback(adj: dict) -> dict:
+    """For simple company lists with no timing trigger, ensure why_now is never blank."""
+    if adj.get("why_now"):
+        return adj
+    adj = dict(adj)
+    adj["why_now"] = (
+        "No clear current timing trigger was found from the available sources. "
+        "Monitor for international hiring, L&D hiring, onboarding, "
+        "sales/customer success expansion, or annual planning signals."
+    )
+    return adj
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
@@ -1294,6 +1308,13 @@ def _compute_scores(
         adj.get("backup_buyer_route", ""),
     )
 
+    # Annual report alone is weak evidence — cap trigger_score at 1
+    if adj.get("trigger_type") == "Annual planning / budget window":
+        raw_trigger = int(adj.get("trigger_score", 0) or 0)
+        if raw_trigger > 1:
+            adj = dict(adj)
+            adj["trigger_score"] = 1
+
     # For simple lists, never use commercial fit in scoring
     fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
     trigger = int(adj.get("trigger_score", 0) or 0)
@@ -1319,6 +1340,9 @@ def _compute_scores(
 
     # For enriched exports: fill blank guidance from commercial fit context
     adj = _apply_enriched_fallback(adj, fit_score_raw, tier_raw, icp_evidence, company_name, input_type)
+    # For simple lists: ensure why_now is never blank when no trigger found
+    if input_type == "simple_company_list":
+        adj = _apply_simple_fallback(adj)
     # Re-normalise route score after possible fallback route assignment
     route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
@@ -1669,17 +1693,23 @@ _processing = ss("_or_processing", False)
 _done       = ss("_or_done", False)
 
 if not _done and not _processing:
-    force_refresh = st.checkbox(
-        "Force fresh scan — ignore cached results",
+    use_cache = st.checkbox(
+        "Use cached results when available",
         value=ss("_or_force_refresh", False),
         key="or_force_refresh_cb",
         help=(
-            f"When checked, cached analysis is skipped and every company is "
-            f"re-fetched and re-analysed from scratch. "
+            f"When checked, previously cached analysis may be reused. "
+            f"When unchecked (default), every company is re-fetched and re-analysed from scratch. "
             f"Cache version: {CACHE_VERSION}"
         ),
     )
-    ss_set(_or_force_refresh=force_refresh)
+    ss_set(_or_force_refresh=use_cache)
+    mode_text = (
+        "Scan mode: cached results may be reused"
+        if ss("_or_force_refresh", False)
+        else "Scan mode: fresh search and fresh analysis"
+    )
+    st.caption(mode_text)
 
     start_btn = st.button(
         "▶ Start radar scan",
@@ -1773,9 +1803,9 @@ if _processing and not _done:
             }
             results.append(record)
         else:
-            # Check cache — skip if force refresh is requested
-            force_refresh = ss("_or_force_refresh", False)
-            cached = None if force_refresh else _cache_load(name, domain, c_itype)
+            # Check cache — only use if "Use cached results" is checked
+            use_cache = ss("_or_force_refresh", False)
+            cached = _cache_load(name, domain, c_itype) if use_cache else None
             if cached is not None:
                 # Enforce correct fit data for this input type
                 cached["input_type"]              = c_itype
