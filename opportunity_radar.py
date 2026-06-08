@@ -135,6 +135,10 @@ CLAUDE_MODEL    = "claude-haiku-4-5-20251001"
 SERPER_URL      = "https://google.serper.dev/search"
 RADAR_CACHE_DIR = pathlib.Path("radar_cache")
 
+# Bump this string whenever the prompt or interpretation logic changes.
+# It is included in cache keys so old Claude outputs are never reused after a prompt update.
+CACHE_VERSION = "v3_myngle_20260608"
+
 # 5 query groups — one Serper call each
 QUERY_GROUPS = [
     (
@@ -298,6 +302,7 @@ def reset():
         _or_raw_sources=None,
         _or_excel_bytes=None,
         _or_stop=False,
+        _or_force_refresh=False,
     )
 
 
@@ -456,8 +461,8 @@ def _detect_input_type(df: pd.DataFrame) -> str:
 # =============================================================================
 
 def _cache_key(name: str, domain: str, input_type: str = "") -> str:
-    # input_type is part of the key so enriched/simple runs never share a cache file
-    raw = f"{name.lower().strip()}|{domain.lower().strip()}|{input_type}"
+    # CACHE_VERSION + input_type in key → old prompts never bleed into new runs
+    raw = f"{CACHE_VERSION}|{name.lower().strip()}|{domain.lower().strip()}|{input_type}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -962,6 +967,71 @@ _BANNED_PHRASES = [
     "broad l&d", "generic l&d", "learning tools", "training platform",
 ]
 
+# Phrase-replacement map: banned generic phrase (lowercase) → mYngle-specific replacement
+_PHRASE_REPLACEMENTS: list[tuple[str, str]] = [
+    # Most specific multi-word first to prevent partial replacements
+    ("l&d technology solutions",            "language and communication training"),
+    ("learning and development technology", "language training"),
+    ("talent development tools",            "language training"),
+    ("talent development solutions",        "language training"),
+    ("talent development platform",         "language training platform"),
+    ("learning platforms",                  "language training"),
+    ("learning platform",                   "language training"),
+    ("upskilling solutions",                "language and communication training"),
+    ("upskilling solution",                 "language and communication training"),
+    ("digital learning tools",              "language training"),
+    ("digital learning tool",               "language training"),
+    ("digital learning",                    "language training"),
+    ("workforce solutions",                 "language training"),
+    ("workforce solution",                  "language training"),
+    ("workforce training platform",         "language training"),
+    ("talent tools",                        "language training"),
+    ("e-learning tools",                    "language training"),
+    ("e-learning tool",                     "language training"),
+    ("learning management system",          "language training programme"),
+    ("broad l&d",                           "language and communication training"),
+    ("generic l&d",                         "language training"),
+    ("l&d technology",                      "language and communication training"),
+    ("training platform",                   "language training programme"),
+    ("skill development platform",          "language training"),
+    ("hr platform",                         "people development platform"),
+    ("talent management",                   "people development"),
+    ("evaluating new learning",             "reviewing language and communication training"),
+    ("evaluating learning",                 "reviewing language training"),
+    ("new learning tools",                  "language training"),
+]
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace banned generic phrases with mYngle-specific wording. Case-preserving."""
+    if not text:
+        return text
+    result = text
+    lower = result.lower()
+    # Work on lowercase index to find replacement positions; rebuild preserving original case
+    for banned, replacement in _PHRASE_REPLACEMENTS:
+        start = 0
+        while True:
+            idx = lower.find(banned, start)
+            if idx == -1:
+                break
+            result = result[:idx] + replacement + result[idx + len(banned):]
+            lower  = result.lower()
+            start  = idx + len(replacement)
+    return result
+
+
+def _sanitize_claude_result(cr: dict) -> dict:
+    """Apply text sanitizer to all caller-facing text fields in a Claude result dict."""
+    fields = ("why_now", "suggested_opener", "trigger_evidence",
+              "buying_window_reason", "manual_review_reason")
+    sanitized = dict(cr)
+    for f in fields:
+        if f in sanitized and isinstance(sanitized[f], str):
+            sanitized[f] = _sanitize_text(sanitized[f])
+    return sanitized
+
+
 # Fuzzy mapping: substrings in Claude's free-text → canonical trigger type
 _TRIGGER_MAP: list[tuple[str, str]] = [
     # Most specific first
@@ -1081,6 +1151,9 @@ def _compute_scores(
     adjusted_claude_result has any expired buying window projected forward.
     """
     adj = _adjust_past_buying_window(dict(claude_result))
+
+    # Sanitize banned generic phrases — runs on cached AND fresh results
+    adj = _sanitize_claude_result(adj)
 
     # Normalize trigger_type to fixed taxonomy
     adj["trigger_type"] = _normalize_trigger_type(adj.get("trigger_type", ""))
@@ -1462,6 +1535,18 @@ _processing = ss("_or_processing", False)
 _done       = ss("_or_done", False)
 
 if not _done and not _processing:
+    force_refresh = st.checkbox(
+        "Force fresh scan — ignore cached results",
+        value=ss("_or_force_refresh", False),
+        key="or_force_refresh_cb",
+        help=(
+            f"When checked, cached analysis is skipped and every company is "
+            f"re-fetched and re-analysed from scratch. "
+            f"Cache version: {CACHE_VERSION}"
+        ),
+    )
+    ss_set(_or_force_refresh=force_refresh)
+
     start_btn = st.button(
         "▶ Start radar scan",
         type="primary",
@@ -1554,8 +1639,9 @@ if _processing and not _done:
             }
             results.append(record)
         else:
-            # Check cache first — key is scoped to input_type so enriched/simple never collide
-            cached = _cache_load(name, domain, c_itype)
+            # Check cache — skip if force refresh is requested
+            force_refresh = ss("_or_force_refresh", False)
+            cached = None if force_refresh else _cache_load(name, domain, c_itype)
             if cached is not None:
                 # Enforce correct fit data for this input type
                 cached["input_type"]              = c_itype
