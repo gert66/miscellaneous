@@ -5160,120 +5160,59 @@ except Exception:
 # Column/row controls live in the sidebar "Advanced data options" expander.
 _adv_main: bool = False
 
-if _show_adv:
- with st.sidebar:
-    # Correct any stale session state that still holds the disabled provider
-    if st.session_state.get("_step2_provider") == STEP2_PROVIDER_CLAUDE:
-        st.session_state["_step2_provider"] = STEP2_PROVIDER_SERPER
-        st.warning(
-            "⚠ Step 2 provider was 'Claude Web Search' (disabled). "
-            "Reset to Serper Google Search."
-        )
+# ── Hardcoded defaults for all removed sidebar controls ───────────────────────
+_elm_mode  = False
+debug_mode = False
+delay_sec  = 1.0
+ss_set(
+    _enable_lusha_api          = bool(lusha_api_key),
+    _run_step1_enrichment      = not ss("_has_lusha_input", False),
+    _run_step2_enrichment      = True,
+    _extract_model_signals     = True,
+    _include_signal_evidence   = True,
+    _step2_dry_run             = False,
+    _zero_cost_preview         = False,
+    _show_step2_debug          = False,
+    _save_step2_debug          = False,
+    _use_playwright            = _PLAYWRIGHT_AVAILABLE,
+    _local_save_enabled        = False,
+    _local_save_path           = _DEFAULT_DOWNLOAD_DIR,
+    _step2_provider            = STEP2_PROVIDER_SERPER,
+    _elm_mode                  = False,
+    _per_company_autosave_enabled = False,
+)
 
-    # ── 1. Enrichment mode ────────────────────────────────────────────────────
-    enrichment_mode = st.radio(
-        "Enrichment mode",
-        options=["Full Claude enrichment", "Extreme Light Mode (no API)"],
-        index=0,                        # default: Full Claude enrichment
-        key="enrichment_mode_radio",
-        help=(
-            "**Full Claude**: Jina AI + Claude API — requires ANTHROPIC_API_KEY.\n\n"
-            "**Extreme Light Mode**: fetches company pages with requests/BeautifulSoup, "
-            "extracts keyword signals and normalised scores — no API key, zero tokens."
-        ),
-    )
-    _elm_mode = enrichment_mode == "Extreme Light Mode (no API)"
-    st.divider()
-
+# ── Simplified sidebar ─────────────────────────────────────────────────────────
+with st.sidebar:
     st.header("Settings")
 
-    # ── 2. API key statuses ───────────────────────────────────────────────────
+    # API key statuses
     if api_key:
         st.success("✓ Anthropic API key loaded")
     else:
         st.error("⚠ Anthropic API key missing")
-    _current_provider = st.session_state.get("_step2_provider", STEP2_PROVIDER_SERPER)
     if serper_key:
         st.success("✓ Serper API key loaded")
-    elif _current_provider == STEP2_PROVIDER_SERPER:
-        st.error("⚠ Serper API key missing — required for Serper Google Search")
     else:
-        st.caption("ⓘ Serper API key not set (only needed for Serper Google Search)")
+        st.error("⚠ Serper API key missing — required for Step 2 search")
     if lusha_api_key:
         st.success("✓ Lusha API key loaded")
     else:
-        st.caption("ⓘ Lusha API key not set (needed when Lusha enrichment is enabled)")
+        st.caption("ⓘ Lusha API key not set")
 
     st.divider()
 
-    # ── 3. Lusha API enrichment ───────────────────────────────────────────────
-    enable_lusha_api = st.checkbox(
-        "Enable Lusha API enrichment",
-        value=True,                     # default: enabled
-        key="enable_lusha_api_checkbox",
-        help=(
-            "Calls the real Lusha Company API to enrich each row with verified "
-            "firmographic data. Requires LUSHA_API_KEY in .streamlit/secrets.toml.\n\n"
-            "Results appear as new columns prefixed lusha_api_. "
-            "Existing Step 1 / Step 2 columns are not affected."
-        ),
-    )
-    if enable_lusha_api and not lusha_api_key:
-        st.warning(
-            "⚠️ LUSHA_API_KEY is missing from .streamlit/secrets.toml. "
-            "Add it or disable Lusha API enrichment."
-        )
-    st.session_state["_enable_lusha_api"] = enable_lusha_api
-
-    st.divider()
-
-    # ── 3b. Step selection ────────────────────────────────────────────────────
-    _has_lusha_input = ss("_has_lusha_input", False)
-    if _has_lusha_input:
-        st.info(
-            "ℹ️ Existing Lucia/Lusha fields detected in the uploaded file. "
-            "Step 1 firmographic enrichment is disabled by default — "
-            "existing values will be preserved."
-        )
-
-    run_step1_enrichment = st.checkbox(
-        "Run Step 1 firmographic enrichment",
-        value=not _has_lusha_input,
-        key="run_step1_enrichment_checkbox",
-        help=(
-            "Runs Jina AI + Claude extraction to fill firmographic fields. "
-            "Disable when the uploaded file already contains Lusha/Lucia enrichment. "
-            "When disabled, existing Lusha/Lucia values are preserved unchanged."
-        ),
-    )
-    if run_step1_enrichment and _has_lusha_input:
-        st.warning(
-            "⚠️ Step 1 is enabled but Lusha/Lucia fields already exist in the file. "
-            "Existing non-empty values will be preserved."
-        )
-    st.session_state["_run_step1_enrichment"] = run_step1_enrichment
-
-    run_step2_enrichment = st.checkbox(
-        "Run Step 2 ICP/web enrichment",
-        value=True,
-        key="run_step2_enrichment_checkbox",
-        help="Runs web search + Claude analysis to fill ICP buying signal fields.",
-    )
-    st.session_state["_run_step2_enrichment"] = run_step2_enrichment
-
-    st.divider()
-
-    # ── 4. Model selection ────────────────────────────────────────────────────
+    # Model selectors
     model_step1_label = st.selectbox(
         "Model — Step 1 (firmographics)",
         options=list(AVAILABLE_MODELS.keys()),
-        index=0,                        # default: Haiku 4.5
+        index=0,
         help="Used for extracting structured company data from scraped pages. Haiku is sufficient here.",
     )
     model_step2_label = st.selectbox(
         "Model — Step 2 (ICP web search)",
         options=list(AVAILABLE_MODELS.keys()),
-        index=0,                        # default: Haiku 4.5
+        index=0,
         help="Used for the agentic web search. Sonnet gives better signal detection but costs ~5x more.",
     )
     selected_model_step1 = AVAILABLE_MODELS[model_step1_label]
@@ -5283,253 +5222,7 @@ if _show_adv:
 
     st.divider()
 
-    # ── 5. Step 2 web search provider ─────────────────────────────────────────
-    # Anthropic web_search (Claude Web Search) is permanently disabled.
-    # Serper Google Search is the only permitted provider.
-    step2_provider = STEP2_PROVIDER_SERPER
-    st.session_state["_step2_provider"] = step2_provider
-    st.caption(f"Step 2 search provider: **{STEP2_PROVIDER_SERPER}**")
-    if not serper_key:
-        st.error(
-            "⚠️ SERPER_API_KEY missing — add it to `.streamlit/secrets.toml`."
-        )
-
-    st.divider()
-
-    # ── 6. Per-company local autosave ─────────────────────────────────────────
-    st.subheader("💾 Per-company local autosave")
-    pca_enabled = st.checkbox(
-        "Enable per-company local autosave",
-        value=ss("_per_company_autosave_enabled", True),  # default: enabled
-        key="pca_enabled_checkbox",
-        help=(
-            "Writes one JSON file per company immediately after processing, "
-            "plus cumulative CSV and Excel files in a timestamped run folder. "
-            "Nothing is lost if the app crashes or the browser refreshes."
-        ),
-    )
-    if pca_enabled:
-        _pca_default = (
-            ss("_per_company_autosave_base_folder", "") or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
-        )
-        pca_folder = st.text_input(
-            "Autosave base folder",
-            value=_pca_default,
-            placeholder=_PER_COMPANY_AUTOSAVE_DEFAULT_DIR,
-            key="pca_folder_input",
-        )
-        _pca_folder_eff = (pca_folder or "").strip() or _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
-        ss_set(
-            _per_company_autosave_enabled=True,
-            _per_company_autosave_base_folder=_pca_folder_eff,
-        )
-        st.caption(
-            "Only works when the app runs locally. "
-            "On Streamlit Cloud this saves to the cloud container, not your PC."
-        )
-        _pca_run_dir = ss("_per_company_autosave_run_dir", "")
-        if _pca_run_dir and ss("processing", False):
-            st.caption(f"📂 Run folder: `{_pca_run_dir}`")
-        _pca_last = ss("_per_company_autosave_last_saved", "")
-        if _pca_last:
-            st.caption(f"✔ Last saved: {_pca_last}")
-        _pca_err = ss("_per_company_autosave_last_error", "")
-        if _pca_err:
-            st.warning(f"⚠ Autosave error: {_pca_err}")
-    else:
-        ss_set(
-            _per_company_autosave_enabled=False,
-            _per_company_autosave_base_folder=ss(
-                "_per_company_autosave_base_folder", _PER_COMPANY_AUTOSAVE_DEFAULT_DIR
-            ),
-        )
-
-    st.divider()
-
-    # ── 7. Model signal extraction ────────────────────────────────────────────
-    st.markdown("**Model signal extraction**")
-
-    extract_model_signals = st.checkbox(
-        "Extract model signals (Step 3)",
-        value=True,
-        key="extract_model_signals_checkbox",
-        help=(
-            "After Step 1 + Step 2, runs a structured signal-extraction pass that "
-            "produces discrete ordinal scores (0–3) and binary columns ready for "
-            "logistic-regression training.  Adds ~1 extra Claude call per company."
-        ),
-    )
-    st.session_state["_extract_model_signals"] = extract_model_signals
-
-    include_signal_evidence = st.checkbox(
-        "Include QA evidence columns",
-        value=True,
-        key="include_signal_evidence_checkbox",
-        help=(
-            "Include the *_evidence columns alongside each score/binary field. "
-            "Useful for manual QA. Disable to reduce Excel column count."
-        ),
-    )
-    st.session_state["_include_signal_evidence"] = include_signal_evidence
-
-    st.divider()
-
-    # ── 8. Advanced options ───────────────────────────────────────────────────
-    st.markdown("**Advanced options**")
-
-    step2_dry_run = st.checkbox(
-        "Step 2 dry run: generate prompts only",
-        value=False,
-        help=(
-            "Generate and display Step 2 prompts/search queries without calling "
-            "Anthropic or Serper. Useful for inspecting what would be sent before "
-            "spending tokens or API credits."
-        ),
-    )
-    st.session_state["_step2_dry_run"] = step2_dry_run
-    if step2_dry_run:
-        st.info("Dry run active — Step 2 will not call any API.")
-
-    _zero_cost_default = step2_dry_run
-    zero_cost_preview = st.checkbox(
-        "Zero-cost preview: skip Step 1 API calls",
-        value=_zero_cost_default,
-        help=(
-            "When enabled alongside dry run, skips ALL external API calls — "
-            "Jina, Anthropic, Serper, and browser scraping. "
-            "Uses only uploaded row data and existing cache to build Step 2 prompt previews. "
-            "Cost stays $0.00."
-        ),
-    )
-    st.session_state["_zero_cost_preview"] = zero_cost_preview
-    if zero_cost_preview and step2_dry_run:
-        st.info("Zero-cost preview active — no Step 1 or Step 2 API calls will be made.")
-
-    st.divider()
-
-    debug_mode = st.checkbox(
-        "Enable debug mode",
-        value=False,
-        help="Shows per-row JSON responses, cache tools, and additional downloads.",
-    )
-
-    st.markdown("**Step 2 debug logging**")
-    show_step2_debug = st.checkbox(
-        "Show Step 2 debug logs",
-        value=False,
-        help=(
-            "Shows a live debug/log window in the app during Step 2 processing. "
-            "Reveals the exact prompt sent to Claude and status messages per company."
-        ),
-    )
-    save_step2_debug = st.checkbox(
-        "Save Step 2 debug logs to files",
-        value=False,
-        help=(
-            f"Saves one .txt file per company to the `{DEBUG_LOG_DIR}/` folder. "
-            "Includes model, prompt, provider, and status notes."
-        ),
-    )
-    st.session_state["_show_step2_debug"] = show_step2_debug
-    st.session_state["_save_step2_debug"] = save_step2_debug
-    if save_step2_debug:
-        st.caption(
-            f"Prompt files → `{DEBUG_LOG_DIR}/`  \n"
-            f"Search I/O files → `{SEARCH_OUTPUT_DIR}/`"
-        )
-
-    st.divider()
-
-    if _PLAYWRIGHT_AVAILABLE:
-        use_playwright = st.checkbox(
-            "Use browser scraping for blocked sites",
-            value=True,
-            help=(
-                "Uses headless Chrome with human behaviour to scrape sites that block Jina. "
-                "Slower but more thorough."
-            ),
-        )
-    else:
-        st.caption(
-            "⚠ Browser scraping unavailable — run "
-            "`pip install playwright && playwright install chromium` to enable."
-        )
-        use_playwright = False
-    st.session_state["_use_playwright"] = use_playwright
-
-    st.divider()
-
-    _cache_n = get_cache_count()
-    st.caption(f"Enrichment cache: **{_cache_n}** file(s)")
-    if st.button("Clear enrichment cache", use_container_width=True, key="clear_cache_always"):
-        if CACHE_DIR.exists():
-            for f in CACHE_DIR.glob("*.json"):
-                f.unlink(missing_ok=True)
-        st.rerun()
-
-    # ── Crash-recovery autosave status ────────────────────────────────────────
-    _last_name = ss("autosave_last_name", "")
-    if ss("processing", False) and _last_name:
-        st.divider()
-        st.caption(f"💾 Auto-save active — last saved: **{_last_name}**")
-        _auto_dl_msg = ss("_auto_dl_last_msg", "")
-        if _auto_dl_msg:
-            st.caption(f"📥 {_auto_dl_msg}")
-    elif os.path.exists(AUTOSAVE_PATH):
-        _saved_df = autosave_load()
-        if _saved_df is not None:
-            st.divider()
-            st.info(
-                f"⚠️ Interrupted session found — "
-                f"**{len(_saved_df)}** companies already processed."
-            )
-            _rb, _fb = st.columns(2)
-            if _rb.button("▶ Resume", use_container_width=True, key="resume_btn"):
-                ss_set(_resume_mode=True)
-                st.rerun()
-            if _fb.button("✕ Start fresh", use_container_width=True, key="fresh_btn"):
-                autosave_clear()
-                ss_set(_resume_mode=False)
-                st.rerun()
-
-    # ── Local auto-save (snapshot every N rows) ───────────────────────────────
-    st.divider()
-    st.subheader("📁 Local auto-save")
-    local_save_enabled = st.checkbox(
-        "Enable local auto-save",
-        value=ss("local_save_enabled", True),   # default: enabled
-        key="local_save_enabled",
-        help=(
-            "Overwrites latest_results.xlsx/csv after every company. "
-            f"Writes checkpoint_NNN.xlsx every {CHECKPOINT_EVERY} companies. "
-            "Only works when the app runs locally."
-        ),
-    )
-    if local_save_enabled:
-        _default_dir = ss("_local_save_path", "") or _DEFAULT_DOWNLOAD_DIR
-        local_save_path = st.text_input(
-            "Download directory",
-            value=_default_dir,
-            placeholder=_DEFAULT_DOWNLOAD_DIR,
-            key="local_save_path_input",
-        )
-        _eff_path = (local_save_path or "").strip() or _DEFAULT_DOWNLOAD_DIR
-        ss_set(_local_save_path=_eff_path, _local_save_enabled=True)
-        st.caption(f"📁 Saving to: **{_eff_path}**")
-        _last_local = ss("_last_local_save", "")
-        if _last_local:
-            st.caption(f"Last save: {_last_local}")
-        else:
-            st.caption(
-                f"Saves **latest_results.xlsx** after every company + "
-                f"**checkpoint_NNN.xlsx** every {CHECKPOINT_EVERY} rows."
-            )
-    else:
-        ss_set(_local_save_path="", _local_save_enabled=False)
-        st.caption("When disabled, only the in-browser download button is available.")
-
-    # ── Simple Excel autosave ─────────────────────────────────────────────────
-    st.divider()
+    # Excel autosave
     st.subheader("📄 Excel autosave")
     _xl_enabled = st.checkbox(
         "Enable Excel autosave",
@@ -5565,82 +5258,6 @@ if _show_adv:
                 st.caption(f"Last save: {_xl_last}")
     else:
         ss_set(_xl_autosave_every=_XL_AUTOSAVE_EVERY, _xl_autosave_filename=_XL_AUTOSAVE_DEFAULT)
-
-    if debug_mode:
-        st.divider()
-        st.subheader("Debug settings")
-        delay_sec = st.slider(
-            "Delay between API calls (sec)",
-            min_value=0.0, max_value=3.0, value=1.0, step=0.1,
-        )
-        st.divider()
-        st.metric("Cached entries", get_cache_count())
-        st.caption(f"Cache: `{CACHE_DIR.resolve()}`")
-        if st.button("Clear cache", use_container_width=True):
-            if CACHE_DIR.exists():
-                for f in CACHE_DIR.glob("*.json"):
-                    f.unlink()
-            st.success("Cache cleared.")
-            st.rerun()
-
-        st.divider()
-        st.subheader("Web-search audit")
-        _AUDIT_STRINGS = [
-            "web_search_20250305",
-            "Claude Web Search",
-            "WEB_SEARCH_TOOL",
-            "PROVIDER: Claude Web Search",
-            "STEP 2 CLAUDE WEB SEARCH",
-        ]
-        if st.button("Scan source for blocked patterns", use_container_width=True):
-            _audit_src = pathlib.Path(__file__).resolve()
-            try:
-                _audit_lines = _audit_src.read_text(encoding="utf-8").splitlines()
-            except Exception as _ae:
-                st.error(f"Could not read source: {_ae}")
-                _audit_lines = []
-            for _pat in _AUDIT_STRINGS:
-                _hits = [
-                    (i + 1, ln.strip())
-                    for i, ln in enumerate(_audit_lines)
-                    if _pat in ln
-                ]
-                if _hits:
-                    with st.expander(f"⚠️ `{_pat}` — {len(_hits)} hit(s)", expanded=False):
-                        for _lineno, _text in _hits:
-                            st.code(f"L{_lineno}: {_text}", language="python")
-                else:
-                    st.success(f"✅ `{_pat}` — 0 hits")
-    else:
-        delay_sec = 1.0
-
-else:
-    # ── Simplified mode: no sidebar shown — use sensible defaults ─────────────
-    _elm_mode  = False
-    debug_mode = False
-    delay_sec  = 1.0
-    ss_set(
-        _enable_lusha_api          = True,
-        _run_step1_enrichment      = not ss("_has_lusha_input", False),
-        _run_step2_enrichment      = True,
-        _extract_model_signals     = True,
-        _include_signal_evidence   = True,
-        _step2_dry_run             = False,
-        _zero_cost_preview         = False,
-        _show_step2_debug          = False,
-        _save_step2_debug          = False,
-        _use_playwright            = _PLAYWRIGHT_AVAILABLE,
-        _local_save_enabled        = False,
-        _local_save_path           = _DEFAULT_DOWNLOAD_DIR,
-        _model_step1               = MODEL_STEP1,
-        _model_step2               = MODEL_STEP2,
-        _step2_provider            = STEP2_PROVIDER_SERPER,
-        _elm_mode                  = False,
-        _per_company_autosave_enabled = False,
-        _xl_autosave_enabled       = True,
-        _xl_autosave_every         = _XL_AUTOSAVE_EVERY,
-        _xl_autosave_filename      = _XL_AUTOSAVE_DEFAULT,
-    )
 
 # =============================================================================
 # INPUT MODE
