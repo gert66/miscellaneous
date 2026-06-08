@@ -861,6 +861,9 @@ def _call_recommendation(
         # ICP fit is known — use full decision matrix
         if fit == 0:
             return "Low priority"
+        # Cool fit (1) with no trigger → just monitor; don't create false urgency
+        if fit == 1 and trigger == 0 and window == 0:
+            return "Monitor"
         # Call now only when fit is strong, trigger is strong, AND evidence is credible
         if trigger >= 3 and fit >= 2 and eq_strong:
             return "Call now"
@@ -870,10 +873,13 @@ def _call_recommendation(
             return "Call this month"
         if fit >= 2 and trigger >= 1:
             return "Call before budget cycle" if window >= 1 else "Monitor"
-        if manual:
+        # Hot/Warm fit but no trigger and manual flag → human should research next
+        if fit >= 2 and manual:
             return "Manual research needed"
         if trigger == 0 and window == 0:
             return "Monitor"
+        if manual:
+            return "Manual research needed"
         return "Monitor"
     else:
         # ICP fit unknown — conservative; weak evidence always routes to manual review
@@ -1140,15 +1146,138 @@ def _cap_opportunity_score(opp: float, rec: str, input_type: str, eq: str, trigg
     return round(opp, 1)
 
 
+def _infer_buyer_route_from_context(icp_evidence: str) -> str:
+    """Infer a non-Unknown buyer route from ICP evidence text."""
+    ev = (icp_evidence or "").lower()
+    if any(k in ev for k in ("international", "multilingual", "global", "cross-border", "foreign hq")):
+        return "International HR"
+    if any(k in ev for k in ("l&d", "learning and development", "talent development", "training", "academy")):
+        return "L&D / Talent Development"
+    if any(k in ev for k in ("sales", "account manag", "revenue", "commercial team")):
+        return "Sales Enablement"
+    if any(k in ev for k in ("customer success", "client-facing", "client facing")):
+        return "Customer Success"
+    if any(k in ev for k in ("onboard", "people operations", "hr operations")):
+        return "People Operations"
+    return "HR / People"
+
+
+def _fallback_opener(name: str, route: str) -> str:
+    """Generate a cautious, mYngle-specific cold-call opener when Claude left it blank."""
+    r = route.lower()
+    if "international" in r:
+        return (
+            f"Given {name}'s international teams and cross-border operations, "
+            "I wanted to ask whether Business English or cross-border communication training "
+            "is currently part of your L&D planning."
+        )
+    if "l&d" in r or "talent development" in r:
+        return (
+            f"I noticed {name} has an active L&D function. "
+            "I wanted to check whether language training or business communication support "
+            "is currently part of your training agenda."
+        )
+    if "sales enablement" in r:
+        return (
+            f"Given {name}'s international sales and account teams, "
+            "I wanted to ask whether Business English or client communication training "
+            "is currently being reviewed."
+        )
+    if "customer success" in r:
+        return (
+            f"Given {name}'s customer-facing teams, "
+            "I wanted to ask whether business communication or language training "
+            "is currently on your L&D agenda."
+        )
+    return (
+        f"Given {name}'s international presence, "
+        "I wanted to ask whether Business English or cross-border communication training "
+        "is currently part of your L&D planning."
+    )
+
+
+def _apply_enriched_fallback(
+    adj: dict,
+    fit_score_raw,
+    tier_raw,
+    icp_evidence: str,
+    company_name: str,
+    input_type: str,
+) -> dict:
+    """
+    For enriched exports where Claude returned blank guidance, fill in fallback
+    why_now, buyer route, opener, and buying_window from commercial fit context.
+    Never called for simple company lists.
+    """
+    if input_type != "enriched_export":
+        return adj
+
+    fit = _fit_bucket(fit_score_raw, tier_raw)
+
+    # Low-fit / Pass companies: ensure why_now explains the low priority
+    if fit == 0:
+        if not adj.get("why_now"):
+            adj = dict(adj)
+            adj["why_now"] = (
+                f"{company_name} has a low commercial fit and no current trigger was found. "
+                "No immediate language or communication training need is evident."
+            )
+        return adj
+
+    # Infer buyer route from ICP evidence when Claude returned Unknown or blank
+    if not adj.get("preferred_buyer_route") or adj.get("preferred_buyer_route") == "Unknown":
+        adj = dict(adj)
+        inferred = _infer_buyer_route_from_context(icp_evidence)
+        adj["preferred_buyer_route"] = inferred
+        adj["suggested_title_searches"] = _normalize_title_searches("", inferred, "")
+
+    # Fill blank buying window
+    if not adj.get("likely_buying_window"):
+        adj = dict(adj)
+        adj["likely_buying_window"] = "No clear buying window found"
+        adj["buying_window_confidence"] = adj.get("buying_window_confidence") or "Unknown"
+
+    # Fill blank why_now for commercially relevant companies
+    if not adj.get("why_now"):
+        adj = dict(adj)
+        tier_str = str(tier_raw or "").strip()
+        score_str = str(fit_score_raw or "").strip()
+        if fit >= 3:
+            fit_desc = "a very strong mYngle-fit company (tier: Hot)"
+        elif fit >= 2:
+            fit_desc = "a good mYngle-fit company (tier: Warm)"
+        else:
+            fit_desc = "a potential mYngle-fit company (tier: Cool)"
+        adj["why_now"] = (
+            f"{company_name} is {fit_desc}. "
+            "No concrete recent timing trigger was found in available sources. "
+            "Best next step: manually research current hiring, L&D planning, "
+            "international team growth, or customer-facing expansion before calling."
+        )
+
+    # Fill blank opener
+    if not adj.get("suggested_opener"):
+        adj = dict(adj)
+        adj["suggested_opener"] = _fallback_opener(
+            company_name, adj.get("preferred_buyer_route", "")
+        )
+
+    return adj
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
     tier_raw,
     input_type: str = "enriched_export",
+    icp_evidence: str = "",
+    company_name: str = "",
 ) -> tuple:
     """
     Returns (adjusted_claude_result, scores_dict).
-    adjusted_claude_result has any expired buying window projected forward.
+    adjusted_claude_result has any expired buying window projected forward,
+    banned phrases sanitized, and (for enriched exports) fallback guidance filled
+    from commercial fit context when Claude returned no trigger.
     """
     adj = _adjust_past_buying_window(dict(claude_result))
 
@@ -1187,6 +1316,11 @@ def _compute_scores(
 
     # Cap opportunity_score for simple inputs that receive conservative recommendations
     opp = _cap_opportunity_score(opp, rec, input_type, eq, adj.get("trigger_type", ""))
+
+    # For enriched exports: fill blank guidance from commercial fit context
+    adj = _apply_enriched_fallback(adj, fit_score_raw, tier_raw, icp_evidence, company_name, input_type)
+    # Re-normalise route score after possible fallback route assignment
+    route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
     scores = {
         "trigger_score":        trigger,
@@ -1656,6 +1790,8 @@ if _processing and not _done:
                     cached.get("fit_score", ""),
                     cached.get("tier", ""),
                     c_itype,
+                    icp_evidence=icp_ev,
+                    company_name=name,
                 )
                 cached["claude"] = adj_claude
                 cached["scores"] = fresh_scores
@@ -1675,7 +1811,10 @@ if _processing and not _done:
                 )
 
                 # Adjust window + compute scores; formula depends on input type
-                adj_claude, scores = _compute_scores(raw_claude, fit_score, tier, c_itype)
+                adj_claude, scores = _compute_scores(
+                    raw_claude, fit_score, tier, c_itype,
+                    icp_evidence=icp_ev, company_name=name,
+                )
 
                 # For simple lists: never carry commercial fit values
                 out_fit_score = fit_score if c_itype == "enriched_export" else ""
