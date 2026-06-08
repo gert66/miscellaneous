@@ -4397,6 +4397,97 @@ def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
             xrow += 1
 
 
+def _xl_write_opportunity_input(
+    ws,
+    df: pd.DataFrame,
+    name_guess: str | None,
+    domain_guess: str | None,
+) -> None:
+    """Write the flat machine-readable Opportunity Input sheet.
+
+    One row per company, simple column headers, no merged cells, no formatting
+    beyond a frozen header row.  Designed as clean pandas-ready input for the
+    Opportunity Radar app.
+    """
+    # Priority-ordered candidate lists for each output column.
+    # First matching df column wins; missing columns get an empty series.
+    COLUMN_MAP: list[tuple[str, list]] = [
+        # ── Identity ─────────────────────────────────────────────────────────
+        ("company_name",    [name_guess, "canonical_company_name", "Company Name"]),
+        ("domain",          [domain_guess, "canonical_company_domain",
+                             "canonical_company_url", "Company Domain", "Company Website"]),
+        ("country",         ["lusha_api_country", "Company Country", "company_hq_country"]),
+        ("city",            ["lusha_api_city", "Company City"]),
+        ("industry",        ["lusha_api_industry", "Company Main Industry"]),
+        ("employee_range",  ["lusha_api_employee_range", "Company Number of Employees"]),
+        # ── Commercial scoring ────────────────────────────────────────────────
+        ("commercial_fit_score", ["final_commercial_fit_score"]),
+        ("commercial_tier",      ["commercial_tier"]),
+        ("model_probability",    ["model_probability", "lean_model_prob"]),
+        ("lean_model_prob",      ["lean_model_prob"]),
+        ("scoring_notes",        ["scoring_notes"]),
+        ("needs_manual_review",  ["needs_manual_review"]),
+        ("match_notes",          ["match_notes"]),
+        # ── ICP context ───────────────────────────────────────────────────────
+        ("icp_lead_score",               ["icp_lead_score"]),
+        ("icp_buying_signals",           ["icp_buying_signals"]),
+        ("icp_evidence",                 ["icp_evidence"]),
+        ("icp_why_relevant",             ["icp_why_relevant"]),
+        ("icp_likely_training_interest", ["icp_likely_training_interest"]),
+        ("icp_potential_buyer_function", ["icp_potential_buyer_function"]),
+        # ── Signal summaries ──────────────────────────────────────────────────
+        ("top_positive_signals", ["top_score_drivers"]),   # best available equivalent
+        ("gaps_missing_signals", []),                      # no current equivalent — left blank
+        # ── Raw signal scores (sig_* and ti_*) ───────────────────────────────
+        ("sig_intl_footprint_score",            ["sig_intl_footprint_score"]),
+        ("sig_foreign_hq_score",                ["sig_foreign_hq_score"]),
+        ("sig_explicit_lnd_score",              ["sig_explicit_lnd_score"]),
+        ("sig_multicultural_score",             ["sig_multicultural_score"]),
+        ("sig_employer_branding_score",         ["sig_employer_branding_score"]),
+        ("sig_rapid_growth_score",              ["sig_rapid_growth_score"]),
+        ("sig_merger_acq_score",                ["sig_merger_acq_score"]),
+        ("sig_lnd_onboarding_score",            ["sig_lnd_onboarding_score"]),
+        ("ti_language_english_score",           ["ti_language_english_score"]),
+        ("ti_onboarding_score",                 ["ti_onboarding_score"]),
+        ("ti_leadership_score",                 ["ti_leadership_score"]),
+        ("ti_broader_professional_score",       ["ti_broader_professional_score"]),
+        ("ti_team_collab_score",                ["ti_team_collab_score"]),
+        ("ti_intercultural_score",              ["ti_intercultural_score"]),
+        ("ti_negotiation_sales_score",          ["ti_negotiation_sales_score"]),
+        # ── Priority evidence fields ──────────────────────────────────────────
+        ("sig_intl_footprint_evidence",    ["sig_intl_footprint_evidence"]),
+        ("sig_foreign_hq_evidence",        ["sig_foreign_hq_evidence"]),
+        ("sig_explicit_lnd_evidence",      ["sig_explicit_lnd_evidence"]),
+        ("sig_multicultural_evidence",     ["sig_multicultural_evidence"]),
+        ("sig_employer_branding_evidence", ["sig_employer_branding_evidence"]),
+        ("sig_rapid_growth_evidence",      ["sig_rapid_growth_evidence"]),
+        ("sig_merger_acq_evidence",        ["sig_merger_acq_evidence"]),
+        ("sig_lnd_onboarding_evidence",    ["sig_lnd_onboarding_evidence"]),
+        ("ti_language_english_evidence",   ["ti_language_english_evidence"]),
+        ("ti_onboarding_evidence",         ["ti_onboarding_evidence"]),
+        ("ti_leadership_evidence",         ["ti_leadership_evidence"]),
+        ("ti_intercultural_evidence",      ["ti_intercultural_evidence"]),
+        ("ti_negotiation_sales_evidence",  ["ti_negotiation_sales_evidence"]),
+    ]
+
+    # Build output DataFrame: one column per entry in COLUMN_MAP
+    out: dict = {}
+    empty = pd.Series([""] * len(df), dtype=str)
+    for output_col, candidates in COLUMN_MAP:
+        series = empty
+        for cand in candidates:
+            if cand and cand in df.columns:
+                series = df[cand].fillna("").astype(str)
+                break
+        out[output_col] = series
+
+    out_df = pd.DataFrame(out).reset_index(drop=True)
+    _xl_write_df(ws, out_df)
+
+    # Freeze the header row so it stays visible when scrolling
+    ws.freeze_panes = "A2"
+
+
 def build_rich_excel_bytes(
     df: pd.DataFrame,
     name_col: str | None = None,
@@ -4406,7 +4497,7 @@ def build_rich_excel_bytes(
     """
     Build a fully formatted multi-sheet Excel workbook.
 
-    Visible sheets  : Lead Scores | Company Profiles
+    Visible sheets  : Lead Scores | Company Profiles | Opportunity Input
     Hidden sheets   : Input | Advanced Evidence | Scoring Settings |
                       Enriched | model_features | qa_evidence
 
@@ -4530,8 +4621,12 @@ def build_rich_excel_bytes(
     )
     _xl_write_summary(ws_lead_scores, df, _name_guess, _domain_guess, profile_rows)
 
-    # Visible order: Lead Scores → Company Profiles; hidden sheets appended after
-    wb._sheets = [ws_lead_scores, ws_profiles, ws_input]
+    # ── Opportunity Input (visible) — flat machine-readable sheet ────────────
+    ws_opp_input = wb.create_sheet("Opportunity Input")
+    _xl_write_opportunity_input(ws_opp_input, df, _name_guess, _domain_guess)
+
+    # Visible order: Lead Scores → Company Profiles → Opportunity Input
+    wb._sheets = [ws_lead_scores, ws_profiles, ws_opp_input, ws_input]
 
     # ── Advanced Evidence (hidden) — long-format, one row per company per signal ─
     try:
