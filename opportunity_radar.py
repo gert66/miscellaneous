@@ -304,6 +304,11 @@ def reset():
         _or_stop=False,
         _or_force_refresh=False,
         _or_scan_start_time=None,
+        _or_autosave=True,
+        _or_checkpoint_n=10,
+        _or_last_checkpoint_path=None,
+        _or_last_checkpoint_count=None,
+        _or_final_autosave_path=None,
     )
 
 
@@ -1442,15 +1447,74 @@ def _compute_trigger_recency(trigger_date: str, trigger_type: str) -> dict:
 
 
 def _apply_recency_guardrail(rec: str, recency: dict) -> str:
-    """Downgrade urgent recommendations when the trigger signal is old or unknown."""
+    """Downgrade urgent recommendations when the trigger signal is old or unknown.
+    Each step operates on the already-downgraded rec so multi-hop chains resolve."""
     bucket = recency.get("recency_bucket", "Unknown date")
     if bucket == "Fresh":
-        return rec  # fresh signal — no downgrade needed
+        return rec
     if rec == "Call now":
-        return "Call this month" if bucket == "Recent-ish" else "Call before budget cycle"
+        rec = "Call this month" if bucket == "Recent-ish" else "Call before budget cycle"
     if rec == "Call this month" and bucket in ("Old context", "Stale", "Unknown date"):
-        return "Call before budget cycle"
+        rec = "Call before budget cycle"
+    if rec == "Call before budget cycle" and bucket == "Stale":
+        rec = "Manual research needed"
     return rec
+
+
+_STALE_URGENCY_WORDS = (
+    " recent ", " recently ", " active ", " actively ", " current ", " currently ",
+    " ongoing ", " live ", " now ", " right now", " this year's ",
+)
+
+
+def _apply_stale_recency_wording(adj: dict, rec: str, company_name: str) -> dict:
+    """
+    Override why_now and suggested_opener when trigger evidence is stale or unknown,
+    so caller-facing text does not imply fresh activity.
+    Skipped for Low priority and Internal companies (already handled).
+    """
+    if rec in ("Low priority", "Internal / exclude"):
+        return adj
+
+    bucket = adj.get("recency_bucket", "")
+    if not bucket or bucket == "Fresh":
+        return adj
+
+    adj = dict(adj)
+
+    if bucket == "Stale":
+        adj["why_now"] = (
+            f"{company_name} has historical signals that may be relevant, "
+            "but the available trigger evidence is stale (older than 12 months). "
+            "Manual research is needed to confirm whether there is current activity, "
+            "budget ownership, or a live language-training need."
+        )
+        adj["suggested_opener"] = (
+            f"We have some older background context on {company_name}, "
+            "but our information may be outdated. "
+            "Has language or business communication training come up recently in your planning?"
+        )
+
+    elif bucket == "Old context":
+        why = adj.get("why_now", "")
+        why_lower = why.lower()
+        if any(w in why_lower for w in _STALE_URGENCY_WORDS):
+            adj["why_now"] = (
+                why.rstrip(".") + ". "
+                "Note: the trigger signal is several months old — "
+                "use as context only and verify current status before outreach."
+            )
+
+    elif bucket == "Unknown date":
+        why = adj.get("why_now", "")
+        if why and "date could not be confirmed" not in why.lower():
+            adj["why_now"] = (
+                why.rstrip(".") + ". "
+                "Note: the trigger date could not be confirmed — "
+                "treat timing conservatively and verify before outreach."
+            )
+
+    return adj
 
 
 def _apply_simple_fallback(adj: dict) -> dict:
@@ -1541,6 +1605,8 @@ def _compute_scores(
     # Store recency fields in adj so they flow into Excel output
     adj = dict(adj)
     adj.update(recency)
+    # Override stale/old caller-facing wording so text matches recency bucket
+    adj = _apply_stale_recency_wording(adj, rec, company_name)
     # Re-normalise route score after possible fallback route assignment
     route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
@@ -1781,7 +1847,38 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
 
 
 # =============================================================================
-# API KEY LOADING
+# AUTOSAVE HELPERS
+# =============================================================================
+
+def _output_folder() -> pathlib.Path:
+    """Return the autosave folder: ~/Downloads if it exists, else ./output/."""
+    downloads = pathlib.Path.home() / "Downloads"
+    if downloads.exists():
+        return downloads
+    fallback = pathlib.Path(__file__).parent / "output"
+    fallback.mkdir(exist_ok=True)
+    return fallback
+
+
+def _unique_path(folder: pathlib.Path, name: str) -> pathlib.Path:
+    """Return a path in folder that does not already exist."""
+    p = folder / name
+    if not p.exists():
+        return p
+    stem, suffix = p.stem, p.suffix
+    for i in range(1, 1000):
+        p2 = folder / f"{stem}_{i}{suffix}"
+        if not p2.exists():
+            return p2
+    return folder / f"{stem}_dup{suffix}"
+
+
+def _autosave_excel(excel_bytes: bytes, filename: str) -> pathlib.Path:
+    """Write excel_bytes to the output folder and return the path written."""
+    folder = _output_folder()
+    p = _unique_path(folder, filename)
+    p.write_bytes(excel_bytes)
+    return p
 # =============================================================================
 
 _anthropic_key = ""
@@ -1925,6 +2022,26 @@ if not _done and not _processing:
     )
     st.caption(mode_text)
 
+    _col_a, _col_b = st.columns([3, 2])
+    with _col_a:
+        autosave_cb = st.checkbox(
+            "Autosave results to Downloads",
+            value=ss("_or_autosave", True),
+            key="or_autosave_cb",
+        )
+        ss_set(_or_autosave=autosave_cb)
+    with _col_b:
+        chk_n_val = st.number_input(
+            "Checkpoint every N companies",
+            min_value=1, max_value=50,
+            value=int(ss("_or_checkpoint_n", 10)),
+            step=1, key="or_checkpoint_n_input",
+        )
+        ss_set(_or_checkpoint_n=int(chk_n_val))
+
+    if autosave_cb:
+        st.caption(f"Autosave destination: {_output_folder()}")
+
     start_btn = st.button(
         "▶ Start radar scan",
         type="primary",
@@ -2002,6 +2119,14 @@ if _processing and not _done:
                 st.caption(f"Estimated ready around: {ready_str}")
             elif idx < n_total:
                 st.caption("Estimating time remaining…")
+
+        # Show latest checkpoint status
+        chk_path = ss("_or_last_checkpoint_path")
+        chk_count = ss("_or_last_checkpoint_count")
+        if chk_path and chk_count:
+            st.caption(
+                f"Latest checkpoint saved after {chk_count} companies: {chk_path}"
+            )
 
     # ── Process one company ───────────────────────────────────────────────────
     if idx < n_total:
@@ -2104,11 +2229,31 @@ if _processing and not _done:
                 results.append(record)
                 raw_sources.extend(sources)
 
+        new_idx = idx + 1
         ss_set(
             _or_results       = results,
             _or_raw_sources   = raw_sources,
-            _or_process_index = idx + 1,
+            _or_process_index = new_idx,
         )
+
+        # ── Checkpoint autosave ───────────────────────────────────────────────
+        if ss("_or_autosave", True):
+            chk_n = ss("_or_checkpoint_n", 10)
+            if new_idx > 0 and new_idx % chk_n == 0:
+                try:
+                    chk_bytes = _build_excel_bytes(results, raw_sources)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    chk_name = (
+                        f"opportunity_radar_checkpoint_{ts}_after_{new_idx:03d}.xlsx"
+                    )
+                    chk_path = _autosave_excel(chk_bytes, chk_name)
+                    ss_set(
+                        _or_last_checkpoint_path=str(chk_path),
+                        _or_last_checkpoint_count=new_idx,
+                    )
+                except Exception:
+                    pass  # never block the scan on a save failure
+
         st.rerun()
 
     else:
@@ -2141,6 +2286,19 @@ if _done:
     # Build Excel once, cache bytes in session state
     if ss("_or_excel_bytes") is None:
         ss_set(_or_excel_bytes=_build_excel_bytes(results, raw_sources))
+
+    # Final autosave — runs once per completed scan
+    if ss("_or_autosave", True) and ss("_or_final_autosave_path") is None:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            final_name = f"opportunity_radar_autosave_{ts}.xlsx"
+            final_path = _autosave_excel(ss("_or_excel_bytes"), final_name)
+            ss_set(_or_final_autosave_path=str(final_path))
+        except Exception:
+            pass  # autosave failure never blocks download
+
+    if ss("_or_final_autosave_path"):
+        st.caption(f"Final autosave saved: {ss('_or_final_autosave_path')}")
 
     st.download_button(
         label="⬇ Download opportunity radar",
