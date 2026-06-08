@@ -599,15 +599,31 @@ ANALYSIS INSTRUCTIONS:
    - Annual report published (signals planning cycle timing)
    trigger_score: 0=no relevant signal, 1=weak/indirect, 2=clear signal, 3=strong + recent
 
+   trigger_type MUST be exactly one of: {trigger_types}
+   Choose the single strongest primary trigger. Do not combine or invent labels.
+   If multiple triggers are present, pick the most commercially relevant one for mYngle
+   and add context to trigger_evidence.
+   Examples of correct mapping:
+   - "International expansion + multinational workforce" → "Multilingual workforce growth"
+   - "L&D / Onboarding Infrastructure + Annual Planning Cycle" → "HR / L&D hiring"
+   - "Annual planning signal" → "Annual planning / budget window"
+   - No relevant trigger found → "No clear trigger"
+
 2. BUYING WINDOW
-   - If annual report found, estimate next budget planning window
-   - If fiscal year is non-calendar, adjust accordingly
    - IMPORTANT: likely_buying_window must be FUTURE relative to today ({today})
    - If best evidence points to a past window, project forward one year and set
      buying_window_confidence to "Low"
-   - Use plain language: e.g. "Q3/Q4 2026, assuming calendar-year budgeting"
-     or "Possible H2 2026 planning window, confidence low"
-   - Do NOT invent a specific window without any supporting evidence
+   - Do NOT invent a specific quarter unless the fiscal year pattern and a planning
+     logic chain clearly support it. Use hedged language:
+       * "Possible Q3/Q4 planning conversation, assuming calendar-year budgeting"
+       * "Possible annual planning window, confidence low"
+       * "Possible fiscal-year planning conversation, timing not confirmed"
+       * "Current trigger found, timing appears commercially relevant"
+       * "No clear buying window found"
+   - Only say "Q3 2026" if you can explain WHY Q3 — e.g. fiscal year ends Dec, so
+     budget planning typically happens Aug/Sep. Otherwise use hedged wording.
+   - If annual report found, it confirms a planning cycle exists but does NOT by itself
+     confirm a specific quarter unless the fiscal year end is stated.
    buying_window_score: 0=no basis, 1=possible, 2=likely, 3=imminent
 
 3. BUYER ROUTE — choose based on the dominant trigger signal:
@@ -623,31 +639,51 @@ ANALYSIS INSTRUCTIONS:
    preferred_buyer_route must be one of: {routes}
 
 4. SUGGESTED TITLE SEARCHES (for LinkedIn Sales Navigator)
-   Match to preferred and backup buyer routes. Use OR syntax:
-   - L&D route: '"Learning Development" OR "Talent Development" OR "L&D"'
-   - HR/People route: '"HR Director" OR "People Director" OR "Head of People"'
-   - International HR route: '"International HR" OR "Global HR" OR "People Operations"'
-   - Sales Enablement route: '"Sales Enablement" OR "Revenue Enablement"'
-   - Customer Success route: '"Customer Success Director" OR "VP Customer Success"'
-   - People Operations route: '"Onboarding" OR "People Operations" OR "HR Operations"'
+   Match to preferred and backup buyer routes. Output as a single string using OR syntax.
+   Use ONLY the OR-syntax format. Do NOT use comma-separated lists.
+   - L&D route: "Learning Development" OR "Talent Development" OR "L&D"
+   - HR/People route: "HR Director" OR "People Director" OR "Head of People"
+   - International HR route: "International HR" OR "Global HR" OR "People Operations"
+   - Sales Enablement route: "Sales Enablement" OR "Revenue Enablement"
+   - Customer Success route: "Customer Success Director" OR "VP Customer Success"
+   - People Operations route: "Onboarding" OR "People Operations" OR "HR Operations"
+   Combine preferred and backup routes: e.g.
+   "Learning Development" OR "L&D" OR "HR Director" OR "Head of People"
 
 5. WHY NOW — must connect evidence to mYngle's value proposition
    Focus on: language training, Business English, business communication, client-facing
    communication, international team communication, onboarding of international employees,
-   multilingual workforce support, intercultural communication, foreign HQ communication.
-   DO NOT write: "learning platform", "digital learning", "talent tools", "workforce solution".
-   Example: "Capgemini is expanding internationally and hiring at scale — this often creates
-   language and communication training needs across new hires and client-facing teams."
+   multilingual workforce support, intercultural communication, foreign HQ communication,
+   cross-border communication, business communication training.
+
+   BANNED PHRASES — never write any of the following:
+   "learning platform", "talent development tools", "upskilling solutions",
+   "digital learning", "workforce solution", "talent tools", "e-learning",
+   "learning tools", "broad L&D", "generic L&D", "training platform",
+   "talent management", "HR platform", "learning management", "LMS",
+   "skill development platform", "workforce training platform".
+
+   Use instead: "language training", "Business English", "business communication training",
+   "client-facing communication", "international team communication",
+   "multilingual workforce support", "onboarding communication support",
+   "cross-border communication", "intercultural communication".
+
+   Example: "Capgemini has large international teams and active internal training
+   infrastructure. Companies at that scale often review Business English and
+   client-facing communication support during annual planning cycles."
 
 6. CALLER OPENER — short, natural, specific
    - Mention one concrete signal from the search results
-   - Connect it to language or communication training
+   - Connect it to language training or business communication
    - End with a soft discovery question
-   - Do NOT say "learning platform" or "digital learning"
+   - BANNED: "learning platform", "digital learning tools", "talent development tools",
+     "upskilling", "workforce solutions", "HR software"
+   - The question should feel like a natural cold-call opening, not a product pitch
    - Examples by trigger:
      * International hiring: "I noticed you're expanding internationally and hiring across
        new markets. Companies often use that moment to review language and communication
-       support for new teams. Is this already part of your L&D planning?"
+       support for new teams. Is business communication training already part of your
+       L&D planning?"
      * Customer-facing growth: "I noticed growth in your international customer-facing
        teams. That often creates pressure around Business English and client communication.
        Is this something your team is already looking at?"
@@ -655,8 +691,12 @@ ANALYSIS INSTRUCTIONS:
        often bring communication and language alignment challenges across teams and countries.
        Is language training part of the integration plan?"
      * Annual planning: "I noticed your annual planning cycle may be coming up. Many
-       companies review language and communication training before finalizing their L&D
-       budget. Is this already on your agenda?"
+       companies review language and business communication training before finalising their
+       L&D budget. Is this already on your agenda?"
+     * Large international workforce: "I noticed {name} has extensive international
+       operations. Companies at that scale often have ongoing needs around Business English
+       and cross-border communication support. Is language training already part of your
+       current L&D planning?"
 
 7. CONFIDENCE AND EVIDENCE QUALITY
    - evidence_quality: Strong=multiple recent specific sources, Medium=1-2 relevant sources,
@@ -913,6 +953,123 @@ def _adjust_past_buying_window(claude_result: dict) -> dict:
     return result
 
 
+# Banned phrases that must never appear in caller-facing text fields
+_BANNED_PHRASES = [
+    "learning platform", "talent development tools", "upskilling solution",
+    "digital learning tool", "workforce solution", "talent tools", "e-learning tool",
+    "learning management", "talent management", "hr platform", "lms",
+    "skill development platform", "workforce training platform",
+    "broad l&d", "generic l&d", "learning tools", "training platform",
+]
+
+# Fuzzy mapping: substrings in Claude's free-text → canonical trigger type
+_TRIGGER_MAP: list[tuple[str, str]] = [
+    # Most specific first
+    ("multilingual",              "Multilingual workforce growth"),
+    ("foreign hq",                "Foreign HQ / group communication"),
+    ("cross-border",              "Foreign HQ / group communication"),
+    ("group communication",       "Foreign HQ / group communication"),
+    ("m&a",                       "M&A / integration"),
+    ("merger",                    "M&A / integration"),
+    ("acquisition",               "M&A / integration"),
+    ("integrat",                  "M&A / integration"),
+    ("funding",                   "Funding / growth investment"),
+    ("investment",                "Funding / growth investment"),
+    ("private equity",            "Funding / growth investment"),
+    ("client-facing",             "Client-facing team expansion"),
+    ("customer success",          "Client-facing team expansion"),
+    ("account manag",             "Client-facing team expansion"),
+    ("sales",                     "Sales / customer success growth"),
+    ("revenue",                   "Sales / customer success growth"),
+    ("international hiring",      "International hiring"),
+    ("international expansion",   "New market or office expansion"),
+    ("new market",                "New market or office expansion"),
+    ("new office",                "New market or office expansion"),
+    ("global expansion",          "New market or office expansion"),
+    ("onboard",                   "Onboarding pressure"),
+    ("rapid growth",              "Onboarding pressure"),
+    ("fast hiring",               "Onboarding pressure"),
+    ("employer brand",            "Employer branding / retention"),
+    ("retention",                 "Employer branding / retention"),
+    ("l&d hiring",                "HR / L&D hiring"),
+    ("hr hiring",                 "HR / L&D hiring"),
+    ("learning and development",  "HR / L&D hiring"),
+    ("annual plan",               "Annual planning / budget window"),
+    ("budget",                    "Annual planning / budget window"),
+    ("fiscal year",               "Annual planning / budget window"),
+    ("annual report",             "Annual planning / budget window"),
+    ("hiring",                    "International hiring"),
+]
+
+_ALLOWED_TRIGGER_SET = set(ALLOWED_TRIGGER_TYPES)
+
+
+def _normalize_trigger_type(raw: str) -> str:
+    """Map Claude's free-text trigger_type to the fixed taxonomy."""
+    if raw in _ALLOWED_TRIGGER_SET:
+        return raw
+    raw_lower = raw.lower()
+    for fragment, canonical in _TRIGGER_MAP:
+        if fragment in raw_lower:
+            return canonical
+    if not raw or raw.lower() in ("none", "no trigger", "no clear trigger"):
+        return "No clear trigger"
+    return "Other"
+
+
+_TITLE_SEARCH_ROUTE_MAP: dict[str, str] = {
+    "l&d / talent development":  '"Learning Development" OR "Talent Development" OR "L&D"',
+    "hr / people":               '"HR Director" OR "People Director" OR "Head of People"',
+    "international hr":          '"International HR" OR "Global HR" OR "People Operations"',
+    "sales enablement":          '"Sales Enablement" OR "Revenue Enablement"',
+    "customer success":          '"Customer Success Director" OR "VP Customer Success"',
+    "people operations":         '"Onboarding" OR "People Operations" OR "HR Operations"',
+    "operations":                '"Operations Director" OR "Head of Operations"',
+}
+
+
+def _normalize_title_searches(raw: str, preferred_route: str, backup_route: str) -> str:
+    """
+    If Claude returned a comma-separated list instead of OR syntax, rebuild it
+    from the preferred and backup routes.
+    """
+    if raw and " OR " in raw:
+        return raw  # already in correct format
+
+    # Rebuild from routes
+    parts = []
+    for route in (preferred_route, backup_route):
+        key = str(route or "").lower()
+        for route_key, titles in _TITLE_SEARCH_ROUTE_MAP.items():
+            if route_key in key:
+                parts.append(titles)
+                break
+
+    if parts:
+        return " OR ".join(parts)
+
+    # Fallback: if comma-separated, convert to OR syntax (keep as-is but add OR)
+    if raw and "," in raw:
+        pieces = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
+        return " OR ".join(f'"{p}"' for p in pieces[:6])
+
+    return raw or ""
+
+
+def _cap_opportunity_score(opp: float, rec: str, input_type: str, eq: str, trigger_type: str) -> float:
+    """Apply post-processing caps to opportunity_score for simple company list."""
+    if input_type != "simple_company_list":
+        return opp
+    eq_lower = eq.lower()
+    if rec == "Manual research needed":
+        opp = min(opp, 6.0)
+    if eq_lower in ("medium", "weak", "insufficient") and trigger_type in ("No clear trigger", "Annual planning / budget window", "Other"):
+        opp = min(opp, 5.5)
+    if trigger_type == "No clear trigger":
+        opp = min(opp, 4.5)
+    return round(opp, 1)
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
@@ -924,6 +1081,16 @@ def _compute_scores(
     adjusted_claude_result has any expired buying window projected forward.
     """
     adj = _adjust_past_buying_window(dict(claude_result))
+
+    # Normalize trigger_type to fixed taxonomy
+    adj["trigger_type"] = _normalize_trigger_type(adj.get("trigger_type", ""))
+
+    # Normalize title searches to OR syntax
+    adj["suggested_title_searches"] = _normalize_title_searches(
+        adj.get("suggested_title_searches", ""),
+        adj.get("preferred_buyer_route", ""),
+        adj.get("backup_buyer_route", ""),
+    )
 
     # For simple lists, never use commercial fit in scoring
     fit     = _fit_bucket(fit_score_raw, tier_raw) if input_type == "enriched_export" else 1
@@ -941,11 +1108,12 @@ def _compute_scores(
             manual = True
         cl = str(adj.get("confidence_level", "")).lower()
         if cl == "high":
-            # Simple inputs can't be High confidence without enriched ICP context
-            adj = dict(adj)
             adj["confidence_level"] = "Medium"
 
     rec = _call_recommendation(fit, trigger, window, opp, manual, input_type, eq)
+
+    # Cap opportunity_score for simple inputs that receive conservative recommendations
+    opp = _cap_opportunity_score(opp, rec, input_type, eq, adj.get("trigger_type", ""))
 
     scores = {
         "trigger_score":        trigger,
