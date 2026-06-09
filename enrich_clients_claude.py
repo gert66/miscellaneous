@@ -4413,8 +4413,7 @@ def _xl_write_opportunity_input(
     """
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
-    from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, FormulaRule
-    from openpyxl.styles.differential import DifferentialStyle
+    from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, DataBarRule
 
     # Priority-ordered candidate lists for each output column.
     # First matching df column wins; missing columns get an empty series.
@@ -4584,13 +4583,30 @@ def _xl_write_opportunity_input(
         cell.font = hdr_font
         cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
 
+    # Row background colors keyed by commercial_tier (handles emoji and plain variants)
+    _ROW_TIER_FILLS = {
+        "🥇 Hot":  PatternFill(start_color="D6E4F7", end_color="D6E4F7", fill_type="solid"),
+        "🥈 Warm": PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid"),
+        "🥉 Cool": PatternFill(start_color="FCE5CD", end_color="FCE5CD", fill_type="solid"),
+        "❄️ Pass": PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid"),
+        "Hot":     PatternFill(start_color="D6E4F7", end_color="D6E4F7", fill_type="solid"),
+        "Warm":    PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid"),
+        "Cool":    PatternFill(start_color="FCE5CD", end_color="FCE5CD", fill_type="solid"),
+        "Pass":    PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid"),
+        "Low":     PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"),
+    }
+
     # ── Write data rows ───────────────────────────────────────────────────────
     n_rows = len(out_df)
     records = out_df.to_dict("records")
     for ri, record in enumerate(records, 2):
+        tier_val = str(record.get("commercial_tier", "") or "").strip()
+        row_fill = _ROW_TIER_FILLS.get(tier_val)
         for ci, col in enumerate(out_df.columns, 1):
             val = record[col]
             cell = ws.cell(row=ri, column=ci, value=val)
+            if row_fill:
+                cell.fill = row_fill
             if numeric_flags.get(col) and val is not None:
                 cell.number_format = _num_format(col)
             if col in _WRAP_COLS:
@@ -4626,21 +4642,21 @@ def _xl_write_opportunity_input(
 
     data_range_end = n_rows + 1  # last data row (1-indexed, row 1 = header)
 
-    # commercial_fit_score: red→orange→green color scale
+    # commercial_fit_score: blue data bar 0–10, matching Lead Scores sheet
     fit_col = col_letters.get("commercial_fit_score")
     if fit_col:
         fit_range = f"{fit_col}2:{fit_col}{data_range_end}"
-        ws.conditional_formatting.add(
-            fit_range,
-            ColorScaleRule(
-                start_type="num", start_value=0,
-                start_color="FFCCCC",   # light red
-                mid_type="num",   mid_value=5,
-                mid_color="FFEB9C",     # yellow
-                end_type="num",   end_value=10,
-                end_color="C6EFCE",     # green
-            ),
-        )
+        try:
+            ws.conditional_formatting.add(
+                fit_range,
+                DataBarRule(
+                    start_type="num", start_value=0,
+                    end_type="num",   end_value=10,
+                    color="0070C0",
+                ),
+            )
+        except Exception:
+            pass
 
     # model_probability / lean_model_prob: color scale
     for prob_col_name in ("model_probability", "lean_model_prob"):
@@ -4653,28 +4669,6 @@ def _xl_write_opportunity_input(
                     start_type="min", start_color="FFCCCC",
                     mid_type="percentile", mid_value=50, mid_color="FFEB9C",
                     end_type="max", end_color="C6EFCE",
-                ),
-            )
-
-    # commercial_tier: fill by tier value
-    tier_col = col_letters.get("commercial_tier")
-    if tier_col:
-        tier_range = f"{tier_col}2:{tier_col}{data_range_end}"
-        _TIER_COLORS = {
-            "Hot":  ("C6EFCE", "276221"),   # green fill, dark green font
-            "Warm": ("FFEB9C", "9C6500"),   # yellow fill, dark orange font
-            "Cool": ("FFD966", "7D4711"),   # light orange fill, brown font
-            "Pass": ("FFCCCC", "9C0006"),   # red fill, dark red font
-            "Low":  ("F2F2F2", "595959"),   # gray fill, gray font
-        }
-        for tier_val, (bg, fg) in _TIER_COLORS.items():
-            ws.conditional_formatting.add(
-                tier_range,
-                CellIsRule(
-                    operator="equal",
-                    formula=[f'"{tier_val}"'],
-                    fill=PatternFill(bgColor=bg, fill_type="solid"),
-                    font=Font(color=fg, bold=True),
                 ),
             )
 
