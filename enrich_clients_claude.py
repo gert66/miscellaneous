@@ -4405,10 +4405,17 @@ def _xl_write_opportunity_input(
 ) -> None:
     """Write the flat machine-readable Opportunity Input sheet.
 
-    One row per company, simple column headers, no merged cells, no formatting
-    beyond a frozen header row.  Designed as clean pandas-ready input for the
-    Opportunity Radar app.
+    One row per company, simple column headers, no merged cells.
+    Numeric score/probability columns are written as real Excel numbers
+    (not strings) so Excel does not show green warning triangles.
+    Conditional formatting, frozen header, autofilter, and bold header
+    are applied to make the sheet easy to use while remaining machine-readable.
     """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, FormulaRule
+    from openpyxl.styles.differential import DifferentialStyle
+
     # Priority-ordered candidate lists for each output column.
     # First matching df column wins; missing columns get an empty series.
     COLUMN_MAP: list[tuple[str, list]] = [
@@ -4470,22 +4477,227 @@ def _xl_write_opportunity_input(
         ("ti_negotiation_sales_evidence",  ["ti_negotiation_sales_evidence"]),
     ]
 
+    # Columns that should be written as real numeric values (float/int).
+    # Anything whose name ends in _score or _prob, plus the named pairs below.
+    _NUMERIC_COLS = {
+        "commercial_fit_score", "model_probability", "lean_model_prob",
+        "icp_lead_score",
+    }
+    # Text columns that must never be coerced to numbers even if they look numeric.
+    _TEXT_COLS = {
+        "company_name", "domain", "country", "city", "industry",
+        "employee_range", "commercial_tier", "scoring_notes", "match_notes",
+        "icp_buying_signals", "icp_evidence", "icp_why_relevant",
+        "icp_likely_training_interest", "icp_potential_buyer_function",
+        "top_positive_signals", "gaps_missing_signals",
+        "needs_manual_review",
+    }
+
+    def _is_numeric_col(col_name: str) -> bool:
+        if col_name in _TEXT_COLS:
+            return False
+        if col_name in _NUMERIC_COLS:
+            return True
+        nl = col_name.lower()
+        # sig_*_score, ti_*_score, any *_score, *_prob
+        if nl.endswith("_score") or nl.endswith("_prob") or nl.endswith("_probability"):
+            return True
+        return False
+
+    def _coerce_numeric(series: pd.Series) -> pd.Series:
+        """Convert a series to float; non-parseable values and blanks become None."""
+        result = []
+        for v in series:
+            if v is None or v == "" or str(v).strip() in ("", "nan", "None", "NaN"):
+                result.append(None)
+                continue
+            try:
+                result.append(float(str(v).strip()))
+            except (ValueError, TypeError):
+                result.append(None)
+        return pd.Series(result, dtype=object)
+
+    # Excel number formats per column
+    _NUM_FORMATS: dict[str, str] = {
+        "commercial_fit_score": "0.00",
+        "model_probability":    "0.000",
+        "lean_model_prob":      "0.000",
+        "icp_lead_score":       "0.00",
+    }
+    _SCORE_FORMAT = "0.00"
+    _PROB_FORMAT  = "0.000"
+
+    def _num_format(col_name: str) -> str:
+        if col_name in _NUM_FORMATS:
+            return _NUM_FORMATS[col_name]
+        nl = col_name.lower()
+        if nl.endswith("_prob") or nl.endswith("_probability"):
+            return _PROB_FORMAT
+        return _SCORE_FORMAT
+
+    # Long text columns that should wrap
+    _WRAP_COLS = {
+        "scoring_notes", "match_notes", "icp_buying_signals", "icp_evidence",
+        "icp_why_relevant", "icp_likely_training_interest",
+        "top_positive_signals", "gaps_missing_signals",
+        "sig_intl_footprint_evidence", "sig_foreign_hq_evidence",
+        "sig_explicit_lnd_evidence", "sig_multicultural_evidence",
+        "sig_employer_branding_evidence", "sig_rapid_growth_evidence",
+        "sig_merger_acq_evidence", "sig_lnd_onboarding_evidence",
+        "ti_language_english_evidence", "ti_onboarding_evidence",
+        "ti_leadership_evidence", "ti_intercultural_evidence",
+        "ti_negotiation_sales_evidence",
+    }
+
     # Build output DataFrame: one column per entry in COLUMN_MAP
     out: dict = {}
-    empty = pd.Series([""] * len(df), dtype=str)
+    numeric_flags: dict[str, bool] = {}
+    empty_str  = pd.Series([""] * len(df), dtype=str)
+    empty_none = pd.Series([None] * len(df), dtype=object)
+
     for output_col, candidates in COLUMN_MAP:
-        series = empty
+        is_num = _is_numeric_col(output_col)
+        numeric_flags[output_col] = is_num
+        series = empty_none if is_num else empty_str
         for cand in candidates:
             if cand and cand in df.columns:
-                series = df[cand].fillna("").astype(str)
+                raw = df[cand]
+                if is_num:
+                    series = _coerce_numeric(raw)
+                else:
+                    series = raw.fillna("").astype(str)
                 break
         out[output_col] = series
 
     out_df = pd.DataFrame(out).reset_index(drop=True)
-    _xl_write_df(ws, out_df)
 
-    # Freeze the header row so it stays visible when scrolling
+    # ── Write header row ──────────────────────────────────────────────────────
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    col_letters: dict[str, str] = {}
+
+    for ci, col in enumerate(out_df.columns, 1):
+        letter = get_column_letter(ci)
+        col_letters[col] = letter
+        cell = ws.cell(row=1, column=ci, value=col)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    # ── Write data rows ───────────────────────────────────────────────────────
+    n_rows = len(out_df)
+    records = out_df.to_dict("records")
+    for ri, record in enumerate(records, 2):
+        for ci, col in enumerate(out_df.columns, 1):
+            val = record[col]
+            cell = ws.cell(row=ri, column=ci, value=val)
+            if numeric_flags.get(col) and val is not None:
+                cell.number_format = _num_format(col)
+            if col in _WRAP_COLS:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    _WIDE_COLS = _WRAP_COLS | {
+        "scoring_notes", "icp_evidence", "icp_why_relevant", "top_positive_signals",
+    }
+    for ci, col in enumerate(out_df.columns, 1):
+        letter = col_letters[col]
+        if col in _WIDE_COLS:
+            ws.column_dimensions[letter].width = 45
+        elif numeric_flags.get(col):
+            ws.column_dimensions[letter].width = 12
+        elif col in ("company_name", "domain"):
+            ws.column_dimensions[letter].width = 28
+        elif col in ("commercial_tier", "needs_manual_review"):
+            ws.column_dimensions[letter].width = 16
+        else:
+            # Auto-fit based on header name length
+            ws.column_dimensions[letter].width = min(max(len(col) + 2, 12), 30)
+
+    # ── Freeze header + autofilter ────────────────────────────────────────────
     ws.freeze_panes = "A2"
+    if n_rows > 0:
+        last_col_letter = get_column_letter(len(out_df.columns))
+        ws.auto_filter.ref = f"A1:{last_col_letter}1"
+
+    # ── Conditional formatting ────────────────────────────────────────────────
+    if n_rows == 0:
+        return
+
+    data_range_end = n_rows + 1  # last data row (1-indexed, row 1 = header)
+
+    # commercial_fit_score: red→orange→green color scale
+    fit_col = col_letters.get("commercial_fit_score")
+    if fit_col:
+        fit_range = f"{fit_col}2:{fit_col}{data_range_end}"
+        ws.conditional_formatting.add(
+            fit_range,
+            ColorScaleRule(
+                start_type="num", start_value=0,
+                start_color="FFCCCC",   # light red
+                mid_type="num",   mid_value=5,
+                mid_color="FFEB9C",     # yellow
+                end_type="num",   end_value=10,
+                end_color="C6EFCE",     # green
+            ),
+        )
+
+    # model_probability / lean_model_prob: color scale
+    for prob_col_name in ("model_probability", "lean_model_prob"):
+        pcol = col_letters.get(prob_col_name)
+        if pcol:
+            pr = f"{pcol}2:{pcol}{data_range_end}"
+            ws.conditional_formatting.add(
+                pr,
+                ColorScaleRule(
+                    start_type="min", start_color="FFCCCC",
+                    mid_type="percentile", mid_value=50, mid_color="FFEB9C",
+                    end_type="max", end_color="C6EFCE",
+                ),
+            )
+
+    # commercial_tier: fill by tier value
+    tier_col = col_letters.get("commercial_tier")
+    if tier_col:
+        tier_range = f"{tier_col}2:{tier_col}{data_range_end}"
+        _TIER_COLORS = {
+            "Hot":  ("C6EFCE", "276221"),   # green fill, dark green font
+            "Warm": ("FFEB9C", "9C6500"),   # yellow fill, dark orange font
+            "Cool": ("FFD966", "7D4711"),   # light orange fill, brown font
+            "Pass": ("FFCCCC", "9C0006"),   # red fill, dark red font
+            "Low":  ("F2F2F2", "595959"),   # gray fill, gray font
+        }
+        for tier_val, (bg, fg) in _TIER_COLORS.items():
+            ws.conditional_formatting.add(
+                tier_range,
+                CellIsRule(
+                    operator="equal",
+                    formula=[f'"{tier_val}"'],
+                    fill=PatternFill(bgColor=bg, fill_type="solid"),
+                    font=Font(color=fg, bold=True),
+                ),
+            )
+
+    # needs_manual_review: TRUE → light orange
+    nmr_col = col_letters.get("needs_manual_review")
+    if nmr_col:
+        nmr_range = f"{nmr_col}2:{nmr_col}{data_range_end}"
+        ws.conditional_formatting.add(
+            nmr_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"True"'],
+                fill=PatternFill(bgColor="FFE0B2", fill_type="solid"),
+            ),
+        )
+        ws.conditional_formatting.add(
+            nmr_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"False"'],
+                fill=PatternFill(bgColor="E8F5E9", fill_type="solid"),
+            ),
+        )
 
 
 def build_rich_excel_bytes(
