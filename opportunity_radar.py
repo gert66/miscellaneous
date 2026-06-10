@@ -321,6 +321,7 @@ _NAME_CANDIDATES = [
     "company", "name", "organisation", "organization",
 ]
 _DOMAIN_CANDIDATES = [
+    "validated_domain",          # preferred: set by Lead Prioritizer domain validation
     "canonical_company_url", "canonical_company_domain",
     "company_domain", "company_url", "domain",
     "company website", "company domain",
@@ -1650,9 +1651,15 @@ def _build_company_list(
 
     seen: set = set()
     companies = []
+    # Find optional traceability columns added by Lead Prioritizer domain validation
+    _validated_domain_col = _detect_col(df, ["validated_domain"])
+    _input_domain_col     = _detect_col(df, ["input_domain"])
+
     for i, row in df.iterrows():
         name   = _val(row, name_col)
-        domain = _normalize_domain(_val(row, domain_col))
+        # Prefer validated_domain when present and non-empty; fall back to domain_col
+        _vd = _normalize_domain(_val(row, _validated_domain_col)) if _validated_domain_col else ""
+        domain = _vd or _normalize_domain(_val(row, domain_col))
 
         # Fallback: use domain as display key when name is absent
         key = name or domain

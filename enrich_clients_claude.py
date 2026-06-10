@@ -501,9 +501,21 @@ MODEL_SIGNAL_FIELDS = (
     + MODEL_SIGNAL_QA_FIELDS
 )
 
+DOMAIN_VALIDATION_FIELDS = [
+    "input_domain",
+    "validated_domain",
+    "domain_used_for_enrichment",
+    "domain_match_confidence",
+    "possible_domain_mismatch",
+    "suggested_domain",
+    "domain_check_reason",
+    "domain_source",
+    "needs_domain_review",
+]
+
 ALL_ENRICHMENT_FIELDS = (
     LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS
-    + META_FIELDS + MODEL_SIGNAL_FIELDS
+    + META_FIELDS + DOMAIN_VALIDATION_FIELDS + MODEL_SIGNAL_FIELDS
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1123,6 +1135,71 @@ def _strip_legal(name: str) -> str:
 def _legal_suffix(name: str) -> str:
     hits = _LEGAL_RE.findall(name)
     return re.sub(r"[^a-z0-9]", "", hits[-1].lower()) if hits else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Domain validation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GENERIC_DOMAINS: frozenset = frozenset({
+    "linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com",
+    "youtube.com", "wikipedia.org", "bloomberg.com", "crunchbase.com",
+    "glassdoor.com", "indeed.com", "xing.com", "angel.co", "pitchbook.com",
+    "google.com", "bing.com", "yahoo.com", "reuters.com", "ft.com",
+    "github.com", "amazon.com", "zoominfo.com", "dnb.com",
+    "opencorporates.com", "companieshouse.gov.uk", "app.lusha.com",
+})
+
+_DV_NOISE_TOKENS: frozenset = frozenset({
+    "the", "and", "for", "group", "holding", "holdings", "global",
+    "international", "services", "solutions", "consulting", "management",
+    "technology", "technologies", "systems", "software", "digital",
+    "company", "corp", "enterprise", "enterprises", "partners",
+    "nederland", "netherlands", "deutschland", "germany", "france",
+    "belgium", "europe", "european", "asia",
+})
+
+_DV_TLDS: frozenset = frozenset({
+    "com","net","org","io","co","nl","de","fr","be","uk","us","eu",
+    "info","biz","ch","at","se","no","dk","fi","pl","es","it","pt",
+    "ru","cn","jp","au","ca","br","in","sg","ae","nz","mx","za",
+    "ie","lu","hu","cz","ro","gr","hr","sk","si","ee","lv","lt",
+})
+
+
+def _dv_domain_tokens(domain: str) -> set:
+    """Extract meaningful stem tokens from a domain (strips TLDs and www)."""
+    d = clean_domain(domain)
+    if not d:
+        return set()
+    parts = d.split(".")
+    while len(parts) > 1 and parts[-1].lower() in _DV_TLDS:
+        parts = parts[:-1]
+    base = ".".join(parts)
+    return {t for t in re.split(r"[-.]", base.lower()) if t and len(t) >= 2}
+
+
+def _dv_company_tokens(name: str) -> set:
+    """Extract meaningful tokens from a company name (strips legal forms and noise)."""
+    clean = _strip_legal(name)
+    clean = re.sub(r"[^\w\s\-]", " ", clean)
+    tokens = {t.lower() for t in re.split(r"[\s\-_]+", clean) if len(t) >= 3}
+    return tokens - _DV_NOISE_TOKENS
+
+
+def _dv_token_overlap(company_name: str, domain: str) -> float:
+    """Overlap ratio [0..1] between company name tokens and domain stem tokens.
+    Includes substring containment so 'capgemini nederland' matches 'capgemini.com'."""
+    ctok = _dv_company_tokens(company_name)
+    dtok = _dv_domain_tokens(domain)
+    if not ctok or not dtok:
+        return 0.0
+    overlap: set = ctok & dtok
+    for c in ctok:
+        for d in dtok:
+            if c in d or d in c:
+                overlap.add(c)
+    return len(overlap) / min(len(ctok), len(dtok))
 
 
 def is_lucia_contact_export(df: pd.DataFrame) -> bool:
@@ -3328,6 +3405,204 @@ def run_lusha_api_enrichment(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Company-domain validation  (runs before enrichment, uses local + Serper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dv_search_for_domain(company_name: str, serper_key: str) -> str:
+    """Run two Serper queries and return the most likely official domain.
+
+    Parses result URLs directly — no Claude call.  Returns "" when nothing
+    convincing is found.
+    """
+    queries = [
+        f'"{company_name}" official website',
+        f'"{company_name}" company',
+    ]
+    domain_hits: dict[str, int] = {}
+    for q in queries:
+        hits, _, _, err = _call_serper(q, serper_key, timeout=10)
+        if err or not hits:
+            continue
+        for h in hits[:5]:
+            link = h.get("link", "") or ""
+            d = clean_domain(link)
+            if not d or d in _GENERIC_DOMAINS:
+                continue
+            if _dv_token_overlap(company_name, d) >= 0.15:
+                domain_hits[d] = domain_hits.get(d, 0) + 1
+    if not domain_hits:
+        return ""
+    return max(domain_hits, key=lambda d: (domain_hits[d], _dv_token_overlap(company_name, d)))
+
+
+def validate_company_domain(
+    company_name: str,
+    raw_url: str,
+    serper_key: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Pre-enrichment check: does the input company name match the input domain?
+
+    Fast local token check runs first; Serper is called only for uncertain or
+    suspicious cases when a key is provided and dry_run is False.
+
+    Returns a dict with all DOMAIN_VALIDATION_FIELDS keys.
+    """
+    result: dict = {
+        "input_domain":               "",
+        "validated_domain":           "",
+        "domain_used_for_enrichment": "unknown",
+        "domain_match_confidence":    "Unknown",
+        "possible_domain_mismatch":   "False",
+        "suggested_domain":           "",
+        "domain_check_reason":        "",
+        "domain_source":              "",
+        "needs_domain_review":        "False",
+    }
+
+    input_domain = clean_domain(raw_url) if raw_url else ""
+    result["input_domain"] = input_domain
+    company_name = (company_name or "").strip()
+
+    if not company_name:
+        result.update({
+            "domain_check_reason":        "No company name provided.",
+            "domain_source":              "no_input",
+            "domain_used_for_enrichment": "unknown",
+            "needs_domain_review":        "True",
+        })
+        return result
+
+    # ── No domain ─────────────────────────────────────────────────────────────
+    if not input_domain:
+        result.update({
+            "domain_used_for_enrichment": "company_name_only",
+            "domain_check_reason":        "No domain provided in input.",
+            "domain_source":              "missing_domain",
+            "needs_domain_review":        "True",
+        })
+        if serper_key and not dry_run:
+            suggested = _dv_search_for_domain(company_name, serper_key)
+            if suggested:
+                result.update({
+                    "suggested_domain":           suggested,
+                    "validated_domain":           suggested,
+                    "domain_used_for_enrichment": "suggested_domain",
+                    "domain_match_confidence":    "Medium",
+                    "domain_check_reason":        (
+                        f"No domain in input; Serper search suggests {suggested}."
+                    ),
+                    "domain_source": "serper_search",
+                })
+        return result
+
+    # ── Generic / directory domain ────────────────────────────────────────────
+    if input_domain in _GENERIC_DOMAINS:
+        result.update({
+            "possible_domain_mismatch":   "True",
+            "domain_match_confidence":    "Low",
+            "domain_check_reason":        (
+                f"{input_domain} is a generic directory/social/media site, "
+                "not a company website."
+            ),
+            "domain_source":              "local_generic_check",
+            "needs_domain_review":        "True",
+        })
+        if serper_key and not dry_run:
+            suggested = _dv_search_for_domain(company_name, serper_key)
+            if suggested:
+                result.update({
+                    "suggested_domain":           suggested,
+                    "validated_domain":           suggested,
+                    "domain_used_for_enrichment": "suggested_domain",
+                    "domain_match_confidence":    "Medium",
+                    "domain_source":              "serper_search",
+                    "domain_check_reason":        (
+                        f"{input_domain} is a generic site. "
+                        f"Serper search suggests {suggested} as official domain."
+                    ),
+                })
+        return result
+
+    # ── Fast local token check ────────────────────────────────────────────────
+    overlap = _dv_token_overlap(company_name, input_domain)
+
+    if overlap >= 0.5:
+        result.update({
+            "validated_domain":           input_domain,
+            "domain_used_for_enrichment": "original_domain",
+            "domain_match_confidence":    "High",
+            "possible_domain_mismatch":   "False",
+            "domain_check_reason":        (
+                "Company name tokens strongly match domain tokens."
+            ),
+            "domain_source":              "local_token_match",
+            "needs_domain_review":        "False",
+        })
+        return result
+
+    if overlap >= 0.15:
+        # Partial match — acceptable: may be group/parent domain or abbreviation
+        result.update({
+            "validated_domain":           input_domain,
+            "domain_used_for_enrichment": "original_domain",
+            "domain_match_confidence":    "Medium",
+            "possible_domain_mismatch":   "False",
+            "domain_check_reason":        (
+                "Partial name-domain overlap — likely a group/parent domain "
+                "or brand abbreviation. Treated as acceptable."
+            ),
+            "domain_source":              "local_token_match",
+            "needs_domain_review":        "False",
+        })
+        return result
+
+    # ── Low / no token overlap — suspicious ───────────────────────────────────
+    result.update({
+        "validated_domain":           input_domain,
+        "domain_used_for_enrichment": "original_domain",
+        "domain_match_confidence":    "Low",
+        "possible_domain_mismatch":   "True",
+        "domain_check_reason":        (
+            f"Company name '{company_name}' shares no clear tokens with "
+            f"domain '{input_domain}'. Possible mismatch."
+        ),
+        "domain_source":              "local_token_check",
+        "needs_domain_review":        "True",
+    })
+
+    if serper_key and not dry_run:
+        suggested = _dv_search_for_domain(company_name, serper_key)
+        if suggested and suggested != input_domain:
+            ov2 = _dv_token_overlap(company_name, suggested)
+            result["suggested_domain"] = suggested
+            result["domain_source"] = "serper_search"
+            if ov2 >= 0.3:
+                # Strong match → use suggested for enrichment
+                result.update({
+                    "validated_domain":           suggested,
+                    "domain_used_for_enrichment": "suggested_domain",
+                    "domain_match_confidence":    "High",
+                    "domain_check_reason":        (
+                        f"Input domain '{input_domain}' did not match. "
+                        f"Serper search strongly suggests '{suggested}'."
+                    ),
+                })
+            else:
+                # Weak match → flag but don't replace
+                result.update({
+                    "domain_match_confidence": "Medium",
+                    "domain_check_reason":     (
+                        f"Input domain '{input_domain}' did not match. "
+                        f"Serper search found '{suggested}' as a possible "
+                        "alternative — verify before use."
+                    ),
+                })
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-row enrichment  ← orchestrates both steps
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3359,7 +3634,18 @@ def enrich_one_row(
     url          = raw_url.strip() if raw_url else ""
     company_name = company_name.strip() if company_name else ""
 
+    # ── Domain validation (fast local check + optional Serper) ────────────────
+    _dv = validate_company_domain(
+        company_name, url,
+        serper_key=serper_key,
+        dry_run=dry_run,
+    )
+    # Use the suggested domain for enrichment only when confidence is High
+    if _dv.get("domain_used_for_enrichment") == "suggested_domain" and _dv.get("suggested_domain"):
+        url = normalize_url(_dv["suggested_domain"])
+
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
+    row.update(_dv)
 
     # Populate row with any pre-existing Lusha/Lucia data from the input file
     # so downstream steps (Step 2, Step 3) can use it as context.
@@ -4238,11 +4524,13 @@ def _xl_write_summary(ws, df: pd.DataFrame,
     headers = [
         "Company Name",
         "Company Domain / URL",
+        "Domain Check",
+        "Mismatch?",
         "Final Commercial Fit Score",
         "Commercial Tier",
         "Open Profile",
     ]
-    widths = [30, 35, 24, 16, 18]
+    widths = [30, 35, 14, 10, 24, 16, 18]
 
     hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
     hdr_font = Font(bold=True, color="FFFFFF", size=11)
@@ -4267,11 +4555,13 @@ def _xl_write_summary(ws, df: pd.DataFrame,
         rd   = row.to_dict()
         xrow = df_idx + 2   # Excel row (1-indexed header + offset)
 
-        company = _xl_get(rd, "canonical_company_name",
-                          name_col or "", "lusha_company_name", "lusha_api_company_name")
-        domain  = _xl_get(rd, "canonical_company_domain",
-                          domain_col or "", "lusha_domain", "lusha_api_domain")
-        tier    = _xl_get(rd, "commercial_tier")
+        company    = _xl_get(rd, "canonical_company_name",
+                             name_col or "", "lusha_company_name", "lusha_api_company_name")
+        domain     = _xl_get(rd, "canonical_company_domain",
+                             domain_col or "", "lusha_domain", "lusha_api_domain")
+        dom_conf   = str(rd.get("domain_match_confidence", "") or "").strip()
+        mismatch   = str(rd.get("possible_domain_mismatch", "") or "").strip()
+        tier       = _xl_get(rd, "commercial_tier")
         try:
             score = float(rd.get("final_commercial_fit_score", "") or "")
         except (ValueError, TypeError):
@@ -4283,23 +4573,33 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             fill_type="solid",
         ) if tier else None
 
-        for ci, val in enumerate([company, domain, score, tier], 1):
+        for ci, val in enumerate([company, domain, dom_conf, mismatch, score, tier], 1):
             c = ws.cell(row=xrow, column=ci, value=val)
             if row_fill:
                 c.fill = row_fill
             c.alignment = Alignment(horizontal="left", vertical="center")
 
-        # Open Profile hyperlink — jump a few rows below the profile header
+        # Highlight domain confidence issues (cols 3 and 4)
+        if dom_conf in ("Low", "Unknown"):
+            ws.cell(row=xrow, column=3).fill = PatternFill(
+                start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+            )
+        if mismatch == "True":
+            ws.cell(row=xrow, column=4).fill = PatternFill(
+                start_color="FFD700", end_color="FFD700", fill_type="solid"
+            )
+
+        # Open Profile hyperlink — column 7 now (shifted by 2 new cols)
         prof_start = profile_start_rows.get(df_idx, 1)
         link_target_row = prof_start + 4   # lands near "Why Relevant"
-        lc = ws.cell(row=xrow, column=5, value="Open Profile")
+        lc = ws.cell(row=xrow, column=7, value="Open Profile")
         lc.hyperlink = f"#'Company Profiles'!A{link_target_row}"
         lc.font = link_font
         lc.alignment = Alignment(horizontal="center", vertical="center")
 
         ws.row_dimensions[xrow].height = 20
 
-    # Blue data bar on score column (C)
+    # Blue data bar on score column (E — was C, shifted by 2)
     n = len(df)
     if n > 0:
         try:
@@ -4308,7 +4608,7 @@ def _xl_write_summary(ws, df: pd.DataFrame,
                 end_type="num", end_value=10,
                 color="0070C0",
             )
-            ws.conditional_formatting.add(f"C2:C{n + 1}", rule)
+            ws.conditional_formatting.add(f"E2:E{n + 1}", rule)
         except Exception:
             pass
 
@@ -4422,6 +4722,16 @@ def _xl_write_opportunity_input(
         ("company_name",    [name_guess, "canonical_company_name", "Company Name"]),
         ("domain",          [domain_guess, "canonical_company_domain",
                              "canonical_company_url", "Company Domain", "Company Website"]),
+        # ── Domain validation ─────────────────────────────────────────────────
+        ("input_domain",              ["input_domain"]),
+        ("validated_domain",          ["validated_domain"]),
+        ("domain_used_for_enrichment",["domain_used_for_enrichment"]),
+        ("domain_match_confidence",   ["domain_match_confidence"]),
+        ("possible_domain_mismatch",  ["possible_domain_mismatch"]),
+        ("suggested_domain",          ["suggested_domain"]),
+        ("domain_check_reason",       ["domain_check_reason"]),
+        ("domain_source",             ["domain_source"]),
+        ("needs_domain_review",       ["needs_domain_review"]),
         ("country",         ["lusha_api_country", "Company Country", "company_hq_country"]),
         ("city",            ["lusha_api_city", "Company City"]),
         ("industry",        ["lusha_api_industry", "Company Main Industry"]),
@@ -4490,6 +4800,11 @@ def _xl_write_opportunity_input(
         "icp_likely_training_interest", "icp_potential_buyer_function",
         "top_positive_signals", "gaps_missing_signals",
         "needs_manual_review",
+        # domain validation
+        "input_domain", "validated_domain", "domain_used_for_enrichment",
+        "domain_match_confidence", "possible_domain_mismatch",
+        "suggested_domain", "domain_check_reason", "domain_source",
+        "needs_domain_review",
     }
 
     def _is_numeric_col(col_name: str) -> bool:
@@ -4539,6 +4854,7 @@ def _xl_write_opportunity_input(
         "scoring_notes", "match_notes", "icp_buying_signals", "icp_evidence",
         "icp_why_relevant", "icp_likely_training_interest",
         "top_positive_signals", "gaps_missing_signals",
+        "domain_check_reason",
         "sig_intl_footprint_evidence", "sig_foreign_hq_evidence",
         "sig_explicit_lnd_evidence", "sig_multicultural_evidence",
         "sig_employer_branding_evidence", "sig_rapid_growth_evidence",
@@ -4624,8 +4940,12 @@ def _xl_write_opportunity_input(
             ws.column_dimensions[letter].width = 12
         elif col in ("company_name", "domain"):
             ws.column_dimensions[letter].width = 28
-        elif col in ("commercial_tier", "needs_manual_review"):
-            ws.column_dimensions[letter].width = 16
+        elif col in ("commercial_tier", "needs_manual_review", "needs_domain_review",
+                     "domain_match_confidence", "possible_domain_mismatch",
+                     "domain_used_for_enrichment", "domain_source"):
+            ws.column_dimensions[letter].width = 18
+        elif col in ("input_domain", "validated_domain", "suggested_domain"):
+            ws.column_dimensions[letter].width = 26
         else:
             # Auto-fit based on header name length
             ws.column_dimensions[letter].width = min(max(len(col) + 2, 12), 30)
@@ -4692,6 +5012,56 @@ def _xl_write_opportunity_input(
                 fill=PatternFill(bgColor="E8F5E9", fill_type="solid"),
             ),
         )
+
+    # possible_domain_mismatch: True → amber warning
+    pdm_col = col_letters.get("possible_domain_mismatch")
+    if pdm_col:
+        pdm_range = f"{pdm_col}2:{pdm_col}{data_range_end}"
+        ws.conditional_formatting.add(
+            pdm_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"True"'],
+                fill=PatternFill(bgColor="FFD700", fill_type="solid"),
+                font=Font(color="5C3A00", bold=True),
+            ),
+        )
+
+    # needs_domain_review: True → amber; False → light green
+    ndr_col = col_letters.get("needs_domain_review")
+    if ndr_col:
+        ndr_range = f"{ndr_col}2:{ndr_col}{data_range_end}"
+        ws.conditional_formatting.add(
+            ndr_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"True"'],
+                fill=PatternFill(bgColor="FFD700", fill_type="solid"),
+                font=Font(color="5C3A00", bold=True),
+            ),
+        )
+        ws.conditional_formatting.add(
+            ndr_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"False"'],
+                fill=PatternFill(bgColor="E8F5E9", fill_type="solid"),
+            ),
+        )
+
+    # domain_match_confidence: Low/Unknown → light yellow caution
+    dmc_col = col_letters.get("domain_match_confidence")
+    if dmc_col:
+        dmc_range = f"{dmc_col}2:{dmc_col}{data_range_end}"
+        for val in ("Low", "Unknown"):
+            ws.conditional_formatting.add(
+                dmc_range,
+                CellIsRule(
+                    operator="equal",
+                    formula=[f'"{val}"'],
+                    fill=PatternFill(bgColor="FFF2CC", fill_type="solid"),
+                ),
+            )
 
 
 def build_rich_excel_bytes(
