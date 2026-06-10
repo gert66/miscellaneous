@@ -132,9 +132,22 @@ st.markdown(
 
 SHEET_CALLER_PREP = "Caller Prep Input"
 
-# Lusha person search endpoint (same API version as company enrichment)
-_LUSHA_PERSON_BASE = "https://api.lusha.com/person"
+# Lusha person/contact endpoint candidates — tried in order during preflight.
+# The /company endpoint (used by Layer 1) is confirmed working.
+# Person endpoints vary by plan; we probe all known variants and stop at first 200.
+_LUSHA_PERSON_CANDIDATES = [
+    "https://api.lusha.com/contacts",          # most common v2 people endpoint
+    "https://api.lusha.com/people",            # alternative name
+    "https://api.lusha.com/person",            # v1 style (404 observed)
+    "https://api.lusha.com/api/contacts",      # some account types
+]
+_LUSHA_COMPANY_BASE = "https://api.lusha.com/company"  # confirmed working
 _LUSHA_TIMEOUT = 20
+
+# HTTP status codes that mean "endpoint does not exist / not on your plan"
+_LUSHA_UNSUPPORTED_CODES = {404, 405, 501}
+# HTTP status codes that mean "API key problem"
+_LUSHA_AUTH_CODES = {401, 403}
 
 # Relevance tiers for buyer contact scoring
 _HIGH_RELEVANCE_TITLES = [
@@ -233,6 +246,7 @@ STATUS_NO_CONTACTS = "no_contacts_found"
 STATUS_COMPANY_ONLY = "company_data_only"
 STATUS_NOT_RUN = "contact_lookup_not_run"
 STATUS_ERROR = "contact_lookup_error"
+STATUS_NOT_SUPPORTED = "contact_lookup_not_supported"
 STATUS_SKIPPED_NOT_SELECTED = "skipped_not_selected"
 STATUS_SKIPPED_HAS_CONTACTS = "skipped_already_has_contacts"
 
@@ -628,87 +642,103 @@ def _contact_fit_notes(title: str, preferred_route: str = "") -> str:
 
 
 # =============================================================================
-# LUSHA PERSON API
+# LUSHA PERSON API — PREFLIGHT + SEARCH
 # =============================================================================
 
+# Cached at session level so we only probe once per session
+_LUSHA_ACTIVE_ENDPOINT: str | None = None   # set after successful preflight
 
-def _lusha_person_search(
-    domain: str,
-    company_name: str,
-    preferred_route: str,
-    api_key: str,
-) -> tuple[list[dict], str, str | None]:
+
+def _lusha_headers(api_key: str) -> dict:
+    return {"api_key": api_key, "Content-Type": "application/json"}
+
+
+def _classify_http_error(status_code: int) -> str:
+    """Return 'not_supported' | 'auth_error' | 'other'."""
+    if status_code in _LUSHA_UNSUPPORTED_CODES:
+        return "not_supported"
+    if status_code in _LUSHA_AUTH_CODES:
+        return "auth_error"
+    return "other"
+
+
+def _preflight_lusha_contact(api_key: str, test_domain: str) -> tuple[str, str, str]:
     """
-    Query Lusha person search for up to ~10 people at a company, then
-    rank and return the top 3 most relevant buyer contacts.
+    Probe all known Lusha person endpoint candidates with a single company.
 
-    Returns (contacts_list, search_used_str, error_str_or_None).
+    Returns (outcome, active_endpoint_or_empty, message).
+    outcome: "ok" | "not_supported" | "auth_error" | "network_error"
 
-    contacts_list: list of dicts with keys matching CONTACT_FIELDS_BASE.
-    search_used_str: human-readable description of the query used.
-
-    Lusha API v2 person search (GET):
-      GET https://api.lusha.com/person
-      Headers: api_key: <key>
-      Query params:
-        company  — company domain (preferred) or name
-        limit    — max results (we request 10)
-
-    The response is a JSON object. People are typically under:
-      data.result  — list of person objects, or
-      data         — direct list, or
-      results      — list
-    Each person object may contain:
-      firstName, lastName, fullName, title, email, phone,
-      linkedInUrl, department, seniority
+    Side-effect: stores the working endpoint in the session state key
+    "_bcf_lusha_active_endpoint" so subsequent calls skip the probe.
     """
-    headers = {
-        "api_key": api_key,
-        "Content-Type": "application/json",
-    }
+    global _LUSHA_ACTIVE_ENDPOINT
 
-    # Build query: prefer domain, fall back to company name
-    clean = domain.strip() if domain else ""
-    if not clean and company_name:
-        clean = company_name.strip()
+    # Already resolved in this process (avoids re-probe on rerun within same session)
+    cached = st.session_state.get("_bcf_lusha_active_endpoint")
+    if cached:
+        return "ok", cached, f"Using cached endpoint: {cached}"
 
-    params: dict = {"limit": 10}
-    if _normalize_domain(clean):
-        params["company"] = _normalize_domain(clean)
-        search_label = f"domain={_normalize_domain(clean)}"
-    elif company_name:
-        params["companyName"] = company_name.strip()
-        search_label = f"companyName={company_name.strip()}"
-    else:
-        return [], "no domain or company name", "Missing domain and company name"
+    headers = _lusha_headers(api_key)
+    norm = _normalize_domain(test_domain) or test_domain
 
-    try:
-        resp = requests.get(
-            _LUSHA_PERSON_BASE,
-            headers=headers,
-            params=params,
-            timeout=_LUSHA_TIMEOUT,
+    # Param variants — different endpoints use different param names
+    param_variants = [
+        {"companyDomain": norm, "limit": 1},
+        {"company": norm, "limit": 1},
+        {"domain": norm, "limit": 1},
+    ]
+
+    last_status = None
+    last_msg = ""
+
+    for endpoint in _LUSHA_PERSON_CANDIDATES:
+        for params in param_variants:
+            try:
+                resp = requests.get(
+                    endpoint, headers=headers, params=params, timeout=_LUSHA_TIMEOUT
+                )
+                if resp.status_code == 200:
+                    st.session_state["_bcf_lusha_active_endpoint"] = endpoint
+                    _LUSHA_ACTIVE_ENDPOINT = endpoint
+                    return "ok", endpoint, f"Endpoint confirmed: {endpoint}"
+                last_status = resp.status_code
+                last_msg = f"HTTP {resp.status_code} from {endpoint}"
+                classification = _classify_http_error(resp.status_code)
+                if classification == "auth_error":
+                    return "auth_error", "", (
+                        f"Lusha API key rejected (HTTP {resp.status_code}). "
+                        "Check that LUSHA_API_KEY is correct."
+                    )
+                # 404/405 — try next endpoint
+            except requests.exceptions.Timeout:
+                last_msg = f"Timeout on {endpoint}"
+            except Exception as exc:
+                last_msg = f"Network error on {endpoint}: {exc}"
+
+    # All candidates failed
+    if last_status in _LUSHA_UNSUPPORTED_CODES:
+        return "not_supported", "", (
+            "Lusha contact endpoint not available for this API setup "
+            f"(last response: HTTP {last_status}). "
+            "Company-level Lusha enrichment may still work, but contact "
+            "enrichment requires a valid people/contact endpoint — "
+            "check your Lusha plan or contact Lusha support."
         )
-        resp.raise_for_status()
-        raw = resp.json()
-    except requests.exceptions.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else "?"
-        return [], search_label, f"HTTP {status_code}: {exc}"
-    except requests.exceptions.Timeout:
-        return [], search_label, "Request timed out"
-    except Exception as exc:
-        return [], search_label, str(exc)
+    return "network_error", "", f"Could not reach Lusha contact API: {last_msg}"
 
-    # Parse response — try multiple known nesting patterns
+
+def _parse_lusha_people_response(raw, preferred_route: str) -> list[dict]:
+    """Extract and rank up to 3 buyer contacts from a raw Lusha API response."""
     people_raw: list = []
     if isinstance(raw, list):
         people_raw = raw
     elif isinstance(raw, dict):
-        for path in ("data.result", "data", "results", "people", "contacts"):
+        for path in ("data.result", "data.contacts", "data.people", "data",
+                     "results", "people", "contacts", "contact"):
             if "." in path:
-                parts = path.split(".")
                 node = raw
-                for p in parts:
+                for p in path.split("."):
                     node = node.get(p, {}) if isinstance(node, dict) else {}
                 if isinstance(node, list):
                     people_raw = node
@@ -718,13 +748,9 @@ def _lusha_person_search(
                 if isinstance(val, list):
                     people_raw = val
                     break
-                elif isinstance(val, dict):
-                    # single person wrapped in dict
+                elif isinstance(val, dict) and val:
                     people_raw = [val]
                     break
-
-    if not people_raw:
-        return [], search_label, None  # no error, just no results
 
     contacts = []
     for person in people_raw:
@@ -738,36 +764,33 @@ def _lusha_person_search(
                     return str(v).strip()
             return ""
 
-        # Resolve full name
         first = _sv("firstName", "first_name", "givenName")
         last = _sv("lastName", "last_name", "familyName")
         full_name = _sv("fullName", "full_name", "name")
         if not full_name and (first or last):
             full_name = f"{first} {last}".strip()
 
-        # Email — may be nested under emails[]
         email = _sv("email")
         if not email:
             emails = person.get("emails") or []
             if isinstance(emails, list) and emails:
-                email = str(emails[0].get("email", "") or emails[0]).strip()
+                first_e = emails[0]
+                email = str(first_e.get("email", "") if isinstance(first_e, dict) else first_e).strip()
 
-        # Phone — may be nested under phones[]
         phone = _sv("phone", "phoneNumber", "phone_number")
         if not phone:
             phones = person.get("phones") or []
             if isinstance(phones, list) and phones:
-                phone = str(phones[0].get("phoneNumber", "") or phones[0]).strip()
+                first_p = phones[0]
+                phone = str(first_p.get("phoneNumber", "") if isinstance(first_p, dict) else first_p).strip()
 
-        # LinkedIn
         linkedin = _sv("linkedInUrl", "linkedin_url", "linkedinUrl", "linkedin")
-
         title = _sv("title", "jobTitle", "job_title", "position")
         dept = _sv("department", "dept")
         seniority = _sv("seniority", "seniorityLevel", "level")
 
         if not full_name and not title:
-            continue  # skip empty records
+            continue
 
         contacts.append({
             "name": full_name,
@@ -781,8 +804,64 @@ def _lusha_person_search(
             "fit_notes": _contact_fit_notes(title, preferred_route),
         })
 
-    ranked = _rank_contacts(contacts, preferred_route)
-    return ranked, search_label, None
+    return _rank_contacts(contacts, preferred_route)
+
+
+def _lusha_person_search(
+    domain: str,
+    company_name: str,
+    preferred_route: str,
+    api_key: str,
+) -> tuple[list[dict], str, str | None, str]:
+    """
+    Query the active Lusha person endpoint for a single company.
+
+    Returns (contacts, search_label, error_or_None, outcome).
+    outcome: "ok" | "not_supported" | "auth_error" | "no_results" | "error"
+
+    Caller must ensure preflight passed before calling this.
+    Active endpoint is read from session state.
+    """
+    endpoint = st.session_state.get("_bcf_lusha_active_endpoint", "")
+    if not endpoint:
+        return [], "no active endpoint", "Preflight not run — no active endpoint.", "error"
+
+    headers = _lusha_headers(api_key)
+    norm = _normalize_domain(domain) if domain else ""
+
+    if norm:
+        params = {"companyDomain": norm, "limit": 10}
+        search_label = f"companyDomain={norm}"
+    elif company_name:
+        params = {"companyName": company_name.strip(), "limit": 10}
+        search_label = f"companyName={company_name.strip()}"
+    else:
+        return [], "no domain or name", "Missing domain and company name.", "error"
+
+    try:
+        resp = requests.get(endpoint, headers=headers, params=params, timeout=_LUSHA_TIMEOUT)
+        if resp.status_code in _LUSHA_UNSUPPORTED_CODES:
+            return [], search_label, (
+                f"Contact endpoint not supported (HTTP {resp.status_code})"
+            ), "not_supported"
+        if resp.status_code in _LUSHA_AUTH_CODES:
+            return [], search_label, (
+                f"API key rejected (HTTP {resp.status_code})"
+            ), "auth_error"
+        resp.raise_for_status()
+        raw = resp.json()
+    except requests.exceptions.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else "?"
+        return [], search_label, f"HTTP {code}: {exc}", "error"
+    except requests.exceptions.Timeout:
+        return [], search_label, "Request timed out", "error"
+    except Exception as exc:
+        return [], search_label, str(exc), "error"
+
+    contacts = _parse_lusha_people_response(raw, preferred_route)
+    if not contacts:
+        return [], search_label, None, "no_results"
+    return contacts, search_label, None, "ok"
 
 
 # =============================================================================
@@ -833,7 +912,7 @@ def _enrich_row(
             route_val = str(v).strip()
             break
 
-    contacts, search_used, error = _lusha_person_search(
+    contacts, search_used, error, outcome = _lusha_person_search(
         domain_val, name_col_val, route_val, api_key
     )
 
@@ -841,6 +920,13 @@ def _enrich_row(
     result["contact_lookup_timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     result["contact_credits_estimated"] = 1
     result["contact_credits_used"] = ""
+
+    if outcome == "not_supported":
+        result["contact_data_status"] = STATUS_NOT_SUPPORTED
+        result["contact_lookup_error"] = (
+            error or "Lusha contact endpoint not available for this API setup"
+        )
+        return result
 
     if error:
         result["contact_data_status"] = STATUS_ERROR
@@ -938,15 +1024,19 @@ def _build_excel(
     summary_rows = [
         ["Metric", "Value"],
         ["Total companies in Caller Prep Input", summary.get("total_companies", "")],
-        ["Selected for contact lookup", summary.get("selected_count", "")],
+        ["Estimated lookups selected", summary.get("credits_estimated", "")],
+        ["Actual lookups attempted", summary.get("attempted_lookups", "")],
+        ["Selected for this run", summary.get("selected_count", "")],
         ["Skipped (not selected)", summary.get("skipped_not_selected", "")],
         ["Skipped (already had contacts)", summary.get("skipped_had_contacts", "")],
         ["Contacts found", summary.get("contacts_found", "")],
-        ["No contacts found", summary.get("no_contacts_found", "")],
+        ["No contacts found (searched, none returned)", summary.get("no_contacts_found", "")],
+        ["Contact endpoint not supported", summary.get("endpoint_not_supported", "")],
         ["Lookup errors", summary.get("lookup_errors", "")],
-        ["Estimated credits used", summary.get("credits_estimated", "")],
-        ["Credits used (if reported by API)", summary.get("credits_used", "")],
+        ["Credits used (actual billed lookups)", summary.get("credits_used", "")],
         [],
+        ["Preflight outcome", summary.get("preflight_outcome", "")],
+        ["Preflight message", summary.get("preflight_message", "")],
         ["Run timestamp", summary.get("run_timestamp", "")],
         ["Input file", summary.get("input_file", "")],
     ]
@@ -1158,7 +1248,7 @@ def main():
         len(already_selected),
         help="These are selected but will be skipped unless 'Refresh' is on.",
     )
-    m4.metric("Estimated Lusha lookups", net_lookups)
+    m4.metric("Estimated lookups selected", net_lookups)
 
     if net_lookups == 0 and len(selected_indices) > 0:
         st.info(
@@ -1184,7 +1274,8 @@ def main():
     st.markdown("### Step 4 — Run contact enrichment")
 
     confirmed = st.checkbox(
-        f"I confirm I want to enrich the selected {net_lookups} companies with Lusha.",
+        f"I confirm I want to enrich the selected {net_lookups} companies with Lusha "
+        f"(estimated {net_lookups} lookup credit{'' if net_lookups == 1 else 's'}).",
         value=False,
         key="bcf_confirm",
     )
@@ -1218,6 +1309,93 @@ def main():
         selected_set = set(selected_indices)
         raw_evidence: list[dict] = []
 
+        # ── Preflight: test one company before running the full batch ─────────
+        preflight_placeholder = st.empty()
+        preflight_placeholder.info("🔍 Running preflight check on Lusha contact endpoint…")
+
+        # Find the first selected row with a domain to use as the test case
+        test_domain = ""
+        test_company = ""
+        for idx in selected_indices:
+            row_test = enriched_df.iloc[idx]
+            for c in _DOMAIN_CANDIDATES:
+                v = row_test.get(c, "")
+                if v and str(v).strip() not in ("", "nan"):
+                    test_domain = str(v).strip()
+                    break
+            for c in _NAME_CANDIDATES:
+                v = row_test.get(c, "")
+                if v and str(v).strip() not in ("", "nan"):
+                    test_company = str(v).strip()
+                    break
+            if test_domain or test_company:
+                break
+
+        pf_outcome, pf_endpoint, pf_msg = _preflight_lusha_contact(
+            lusha_api_key, test_domain or test_company
+        )
+        preflight_placeholder.empty()
+
+        if pf_outcome != "ok":
+            # Endpoint unavailable — mark all selected rows, build output, stop
+            not_supported_msg = (
+                "Lusha contact endpoint not available for this API setup"
+                if pf_outcome == "not_supported"
+                else pf_msg
+            )
+            for iloc_i in range(len(enriched_df)):
+                if iloc_i in selected_set:
+                    enriched_df.at[enriched_df.index[iloc_i], "contact_data_status"] = (
+                        STATUS_NOT_SUPPORTED if pf_outcome == "not_supported" else STATUS_ERROR
+                    )
+                    enriched_df.at[enriched_df.index[iloc_i], "contact_lookup_error"] = not_supported_msg
+                    enriched_df.at[enriched_df.index[iloc_i], "contact_lookup_timestamp"] = (
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                elif str(enriched_df.iloc[iloc_i].get("contact_data_status", "")).strip() == "":
+                    enriched_df.at[enriched_df.index[iloc_i], "contact_data_status"] = STATUS_SKIPPED_NOT_SELECTED
+
+            ui_label = (
+                "⚠️ Contact lookup endpoint unavailable or unsupported. "
+                "No contacts were retrieved. Company-level Lusha enrichment may "
+                "still work, but contact enrichment requires a valid people/contact "
+                "endpoint — check your Lusha plan or contact Lusha support."
+                if pf_outcome == "not_supported"
+                else f"⚠️ Lusha API error during preflight: {pf_msg}"
+            )
+
+            run_summary = {
+                **summary_data,
+                "selected_count": len(selected_indices),
+                "attempted_lookups": 0,
+                "skipped_not_selected": len(enriched_df) - len(selected_indices),
+                "skipped_had_contacts": 0,
+                "contacts_found": 0,
+                "no_contacts_found": 0,
+                "lookup_errors": 0,
+                "endpoint_not_supported": len(selected_indices) if pf_outcome == "not_supported" else 0,
+                "credits_estimated": net_lookups,
+                "credits_used": 0,
+                "preflight_outcome": pf_outcome,
+                "preflight_message": pf_msg,
+                "run_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "input_file": ss("_bcf_file_name", ""),
+            }
+            excel_bytes = _build_excel(
+                enriched_df, ss("_bcf_df_original"), run_summary, [], all_sheets
+            )
+            ss_set(
+                _bcf_processing=False,
+                _bcf_done=True,
+                _bcf_results_df=enriched_df,
+                _bcf_summary=run_summary,
+                _bcf_raw_evidence=[],
+                _bcf_excel_bytes=excel_bytes,
+                _bcf_preflight_error=ui_label,
+            )
+            st.rerun()
+
+        # ── Preflight passed — run full batch ─────────────────────────────────
         progress_bar = st.progress(0.0, text="Starting contact lookup…")
         status_text = st.empty()
 
@@ -1225,9 +1403,11 @@ def main():
             "contacts_found": 0,
             "no_contacts_found": 0,
             "lookup_errors": 0,
+            "not_supported": 0,
             "skipped_had_contacts": 0,
             "skipped_not_selected": 0,
             "credits_used": 0,
+            "attempted": 0,
         }
 
         total_rows = len(enriched_df)
@@ -1259,11 +1439,17 @@ def main():
             if status == STATUS_CONTACTS_FOUND:
                 counts["contacts_found"] += 1
                 counts["credits_used"] += 1
+                counts["attempted"] += 1
             elif status == STATUS_NO_CONTACTS:
                 counts["no_contacts_found"] += 1
                 counts["credits_used"] += 1
+                counts["attempted"] += 1
+            elif status == STATUS_NOT_SUPPORTED:
+                counts["not_supported"] += 1
+                counts["attempted"] += 1
             elif status == STATUS_ERROR:
                 counts["lookup_errors"] += 1
+                counts["attempted"] += 1
             elif status == STATUS_SKIPPED_HAS_CONTACTS:
                 counts["skipped_had_contacts"] += 1
             elif status == STATUS_SKIPPED_NOT_SELECTED:
@@ -1334,13 +1520,17 @@ def main():
         run_summary = {
             **summary_data,
             "selected_count": len(selected_indices),
+            "attempted_lookups": counts["attempted"],
             "skipped_not_selected": counts["skipped_not_selected"],
             "skipped_had_contacts": counts["skipped_had_contacts"],
             "contacts_found": counts["contacts_found"],
             "no_contacts_found": counts["no_contacts_found"],
             "lookup_errors": counts["lookup_errors"],
+            "endpoint_not_supported": counts["not_supported"],
             "credits_estimated": net_lookups,
             "credits_used": counts["credits_used"],
+            "preflight_outcome": "ok",
+            "preflight_message": pf_msg,
             "run_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             "input_file": ss("_bcf_file_name", ""),
         }
@@ -1360,19 +1550,38 @@ def main():
             _bcf_summary=run_summary,
             _bcf_raw_evidence=raw_evidence,
             _bcf_excel_bytes=excel_bytes,
+            _bcf_preflight_error=None,
         )
         st.rerun()
 
     # ── Results ───────────────────────────────────────────────────────────────
     if ss("_bcf_done"):
         run_summary = ss("_bcf_summary") or {}
-        st.markdown("### ✅ Contact enrichment complete")
+        preflight_error = ss("_bcf_preflight_error")
 
-        r_a, r_b, r_c, r_d = st.columns(4)
+        if preflight_error:
+            st.error(preflight_error)
+            st.markdown(
+                "**What to do:**  \n"
+                "- Check your Lusha plan — contact/person lookup may require a separate add-on.  \n"
+                "- Verify your `LUSHA_API_KEY` in Streamlit secrets has people-search permissions.  \n"
+                "- The output file below is still valid and Lovable-compatible — "
+                "contact fields are blank but all other Opportunity Radar data is preserved."
+            )
+            st.markdown("### ⬇ Download output (no contacts — endpoint unavailable)")
+        else:
+            st.markdown("### ✅ Contact enrichment complete")
+
+        r_a, r_b, r_c, r_d, r_e = st.columns(5)
         r_a.metric("Contacts found", run_summary.get("contacts_found", 0))
         r_b.metric("No contacts found", run_summary.get("no_contacts_found", 0))
-        r_c.metric("Errors", run_summary.get("lookup_errors", 0))
-        r_d.metric("Credits used", run_summary.get("credits_used", 0))
+        r_c.metric("Endpoint not supported", run_summary.get("endpoint_not_supported", 0))
+        r_d.metric("Errors", run_summary.get("lookup_errors", 0))
+        r_e.metric(
+            "Credits used (actual)",
+            run_summary.get("credits_used", 0),
+            help="Counts only successful or billed lookups (contacts_found + no_contacts_found).",
+        )
 
         st.markdown("---")
         ts = run_summary.get("run_timestamp", "")
