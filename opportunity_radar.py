@@ -17,6 +17,9 @@ import re
 import time
 from datetime import datetime, timedelta
 
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import requests
 import streamlit as st
@@ -349,6 +352,61 @@ _ENRICHED_SIGNAL_COLS = {
     "icp_likely_training_interest", "icp_potential_buyer_function",
     "sig_intl_footprint_score", "sig_rapid_growth_score", "enrichment_status",
     "top_positive_signals", "top_score_drivers",
+}
+
+
+# Layer 1 fields carried through from Lead Prioritizer enriched export
+_L1_IDENTITY_FIELDS = [
+    "lead_id", "company_key", "input_company_name", "normalized_company_name",
+    "city", "industry", "employee_range",
+]
+_L1_DOMAIN_FIELDS = [
+    "input_domain", "validated_domain", "domain_used_for_enrichment",
+    "domain_match_confidence", "possible_domain_mismatch", "suggested_domain",
+    "domain_check_reason", "domain_source", "needs_domain_review",
+]
+_L1_COMMERCIAL_FIELDS = [
+    "model_probability", "lean_model_prob", "icp_lead_score",
+    "icp_buying_signals", "icp_evidence", "icp_why_relevant",
+    "icp_likely_training_interest", "icp_potential_buyer_function",
+    "top_positive_signals", "gaps_missing_signals",
+    "scoring_notes", "needs_manual_review", "match_notes",
+]
+_L1_SIGNAL_SCORE_FIELDS = [
+    "sig_intl_footprint_score", "sig_foreign_hq_score", "sig_explicit_lnd_score",
+    "sig_multicultural_score", "sig_employer_branding_score", "sig_rapid_growth_score",
+    "sig_merger_acq_score", "sig_lnd_onboarding_score",
+    "ti_language_english_score", "ti_onboarding_score", "ti_leadership_score",
+    "ti_broader_professional_score", "ti_team_collab_score", "ti_intercultural_score",
+    "ti_negotiation_sales_score",
+]
+_L1_EVIDENCE_FIELDS = [
+    "sig_intl_footprint_evidence", "sig_foreign_hq_evidence", "sig_explicit_lnd_evidence",
+    "sig_multicultural_evidence", "sig_employer_branding_evidence", "sig_rapid_growth_evidence",
+    "sig_merger_acq_evidence", "sig_lnd_onboarding_evidence",
+    "ti_language_english_evidence", "ti_onboarding_evidence", "ti_leadership_evidence",
+    "ti_intercultural_evidence", "ti_negotiation_sales_evidence",
+]
+
+# Row colors for Caller Prep Input (same palette as Lead Prioritizer)
+_CPI_TIER_FILLS: dict = {
+    "🥇 Hot":  "D6E4F7",
+    "🥈 Warm": "D9EAD3",
+    "🥉 Cool": "FCE5CD",
+    "❄️ Pass": "F4CCCC",
+    "Hot":     "D6E4F7",
+    "Warm":    "D9EAD3",
+    "Cool":    "FCE5CD",
+    "Pass":    "F4CCCC",
+    "Low":     "F2F2F2",
+}
+_CPI_REC_FILLS: dict = {
+    "Call now":                 "D6E4F7",
+    "Call this month":          "D9EAD3",
+    "Call before budget cycle": "FCE5CD",
+    "Manual research needed":   "FFF2CC",
+    "Low priority":             "F2F2F2",
+    "Internal / exclude":       "F4CCCC",
 }
 
 
@@ -1531,6 +1589,70 @@ def _apply_simple_fallback(adj: dict) -> dict:
     return adj
 
 
+def _compute_caller_caution(adj: dict, rec: str) -> dict:
+    """Derive caution_note, reason_not_to_call_now, missing_evidence from final rec + recency.
+
+    These fields protect cold callers from overclaiming or calling at the wrong time.
+    """
+    bucket       = adj.get("recency_bucket", "")
+    trigger_type = adj.get("trigger_type", "")
+
+    caution_parts: list = []
+    reason_parts:  list = []
+    missing_parts: list = []
+
+    if rec == "Low priority":
+        caution_parts.append(
+            "Low priority: do not actively contact unless a stronger current signal appears."
+        )
+        reason_parts.append(
+            "No strong commercial fit or timing trigger found in available sources."
+        )
+        missing_parts.append(
+            "Stronger signal needed: international hiring, L&D activity, "
+            "onboarding pressure, M&A, or explicit training initiative."
+        )
+
+    if rec == "Call before budget cycle":
+        caution_parts.append(
+            "Soft timing angle only — no evidence of active buying intent. "
+            "Use as context, not a primary hook."
+        )
+
+    if bucket in ("Stale", "Old context", "Unknown date"):
+        _label = {
+            "Stale":        "stale (older than 12 months)",
+            "Old context":  "several months old",
+            "Unknown date": "undated",
+        }.get(bucket, bucket.lower())
+        caution_parts.append(
+            f"Trigger signal is {_label} — not confirmed as current. "
+            "Do not imply the company is actively buying."
+        )
+        if not reason_parts:
+            reason_parts.append(
+                "Current evidence is stale or unconfirmed. "
+                "Verify with current sources before outreach."
+            )
+
+    if trigger_type in ("No clear trigger", "No clear trigger found", "") and not reason_parts:
+        reason_parts.append(
+            "No current timing trigger was found in available sources."
+        )
+
+    if trigger_type in ("No clear trigger", "No clear trigger found", "") and not missing_parts:
+        missing_parts.append(
+            "Stronger signal needed: HR/L&D hiring, international expansion, "
+            "onboarding pressure, M&A activity, or explicit training initiative."
+        )
+
+    return {
+        "caution_note":           " | ".join(caution_parts),
+        "reason_not_to_call_now": " | ".join(reason_parts),
+        "missing_evidence":       " | ".join(missing_parts),
+    }
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
@@ -1608,6 +1730,8 @@ def _compute_scores(
     adj.update(recency)
     # Override stale/old caller-facing wording so text matches recency bucket
     adj = _apply_stale_recency_wording(adj, rec, company_name)
+    # Add caution fields so cold callers don't overclaim
+    adj.update(_compute_caller_caution(adj, rec))
     # Re-normalise route score after possible fallback route assignment
     route = _contact_route_score(adj.get("preferred_buyer_route", ""))
 
@@ -1672,6 +1796,14 @@ def _build_company_list(
             continue
         seen.add(dedup_key)
 
+        # Carry the full input row as a dict for Caller Prep Input passthrough
+        def _sv(v):
+            try:
+                return "" if pd.isna(v) else v
+            except Exception:
+                return v
+        enriched_row = {col: _sv(row[col]) for col in df.columns if col in row.index}
+
         # Exclude internal / self entries
         if _is_internal(name, domain):
             companies.append({
@@ -1684,6 +1816,7 @@ def _build_company_list(
                 "input_type":               input_type,
                 "commercial_fit_available": False,
                 "internal":                 True,
+                "enriched_row":             enriched_row,
             })
             continue
 
@@ -1700,8 +1833,221 @@ def _build_company_list(
             "input_type":               input_type,
             "commercial_fit_available": fit_avail,
             "internal":                 False,
+            "enriched_row":             enriched_row,
         })
     return companies
+
+
+# =============================================================================
+# CALLER PREP INPUT SHEET
+# =============================================================================
+
+# Column spec: (col_name, src, src_key, is_numeric, num_fmt, width, wrap)
+# src: "result" | "enriched" | "claude" | "scores" | "placeholder"
+_CPI_COLUMN_SPEC = [
+    # Group 1 — Company identity
+    ("lead_id",                   "enriched",     "lead_id",                   False, None,    16, False),
+    ("company_key",               "enriched",     "company_key",               False, None,    16, False),
+    ("company_name",              "result",       "company_name",              False, None,    30, False),
+    ("input_company_name",        "enriched",     "input_company_name",        False, None,    30, False),
+    ("normalized_company_name",   "enriched",     "normalized_company_name",   False, None,    26, False),
+    ("domain",                    "result",       "domain",                    False, None,    26, False),
+    ("input_domain",              "enriched",     "input_domain",              False, None,    26, False),
+    ("validated_domain",          "enriched",     "validated_domain",          False, None,    26, False),
+    ("domain_used_for_enrichment","enriched",     "domain_used_for_enrichment",False, None,    20, False),
+    ("country",                   "result",       "country",                   False, None,    14, False),
+    ("city",                      "enriched",     "city",                      False, None,    14, False),
+    ("industry",                  "enriched",     "industry",                  False, None,    22, False),
+    ("employee_range",            "enriched",     "employee_range",            False, None,    14, False),
+    # Group 2 — Data quality
+    ("domain_match_confidence",   "enriched",     "domain_match_confidence",   False, None,    16, False),
+    ("possible_domain_mismatch",  "enriched",     "possible_domain_mismatch",  False, None,    14, False),
+    ("suggested_domain",          "enriched",     "suggested_domain",          False, None,    26, False),
+    ("domain_check_reason",       "enriched",     "domain_check_reason",       False, None,    40, True),
+    ("domain_source",             "enriched",     "domain_source",             False, None,    16, False),
+    ("needs_domain_review",       "enriched",     "needs_domain_review",       False, None,    14, False),
+    ("needs_manual_review",       "enriched",     "needs_manual_review",       False, None,    14, False),
+    ("match_notes",               "enriched",     "match_notes",               False, None,    40, True),
+    ("scoring_notes",             "enriched",     "scoring_notes",             False, None,    40, True),
+    # Group 3 — Commercial fit / ICP
+    ("commercial_fit_score",      "result",       "fit_score",                 True,  "0.00",  12, False),
+    ("commercial_tier",           "result",       "tier",                      False, None,    14, False),
+    ("model_probability",         "enriched",     "model_probability",         True,  "0.000", 12, False),
+    ("lean_model_prob",           "enriched",     "lean_model_prob",           True,  "0.000", 12, False),
+    ("icp_lead_score",            "enriched",     "icp_lead_score",            True,  "0.00",  12, False),
+    ("icp_buying_signals",        "enriched",     "icp_buying_signals",        False, None,    40, True),
+    ("icp_evidence",              "enriched",     "icp_evidence",              False, None,    50, True),
+    ("icp_why_relevant",          "enriched",     "icp_why_relevant",          False, None,    50, True),
+    ("icp_likely_training_interest","enriched",   "icp_likely_training_interest",False,None,   40, True),
+    ("icp_potential_buyer_function","enriched",   "icp_potential_buyer_function",False,None,   30, False),
+    ("top_positive_signals",      "enriched",     "top_positive_signals",      False, None,    40, True),
+    ("gaps_missing_signals",      "enriched",     "gaps_missing_signals",      False, None,    40, True),
+    # Group 4 — Opportunity Radar / timing
+    ("call_recommendation",       "scores",       "call_recommendation",       False, None,    22, False),
+    ("opportunity_score",         "scores",       "opportunity_score",         True,  "0.00",  12, False),
+    ("trigger_type",              "claude",       "trigger_type",              False, None,    28, False),
+    ("trigger_score",             "scores",       "trigger_score",             True,  "0",     10, False),
+    ("trigger_date",              "claude",       "trigger_date",              False, None,    14, False),
+    ("trigger_age_days",          "claude",       "trigger_age_days",          True,  "0",     12, False),
+    ("recency_bucket",            "claude",       "recency_bucket",            False, None,    16, False),
+    ("is_current_trigger",        "claude",       "is_current_trigger",        False, None,    14, False),
+    ("date_confidence",           "claude",       "date_confidence",           False, None,    14, False),
+    ("recency_note",              "claude",       "recency_note",              False, None,    40, True),
+    ("likely_buying_window",      "claude",       "likely_buying_window",      False, None,    36, False),
+    ("buying_window_score",       "scores",       "buying_window_score",       True,  "0",     12, False),
+    ("evidence_quality",          "claude",       "evidence_quality",          False, None,    14, False),
+    ("confidence_level",          "claude",       "confidence_level",          False, None,    14, False),
+    ("why_now",                   "claude",       "why_now",                   False, None,    55, True),
+    ("evidence_summary",          "claude",       "trigger_evidence",          False, None,    55, True),
+    # Group 5 — Buyer route / call prep
+    ("preferred_buyer_route",     "claude",       "preferred_buyer_route",     False, None,    28, False),
+    ("backup_buyer_route",        "claude",       "backup_buyer_route",        False, None,    28, False),
+    ("suggested_title_searches",  "claude",       "suggested_title_searches",  False, None,    45, True),
+    ("suggested_opener",          "claude",       "suggested_opener",          False, None,    55, True),
+    ("caution_note",              "claude",       "caution_note",              False, None,    55, True),
+    ("reason_not_to_call_now",    "claude",       "reason_not_to_call_now",    False, None,    55, True),
+    ("missing_evidence",          "claude",       "missing_evidence",          False, None,    55, True),
+    # Group 6 — Source summary
+    ("top_source_urls",           "computed",     "top_source_urls",           False, None,    45, True),
+    ("raw_source_summary",        "computed",     "raw_source_summary",        False, None,    30, False),
+    ("source_count",              "computed",     "source_count",              True,  "0",     12, False),
+    ("latest_source_date",        "computed",     "latest_source_date",        False, None,    16, False),
+    # Group 7 — Layer 3 workflow placeholders (all blank)
+    ("selected_for_calling",      "placeholder",  None,                        False, None,    16, False),
+    ("assigned_to",               "placeholder",  None,                        False, None,    16, False),
+    ("call_batch",                "placeholder",  None,                        False, None,    14, False),
+    ("contact_1_name",            "placeholder",  None,                        False, None,    20, False),
+    ("contact_1_title",           "placeholder",  None,                        False, None,    22, False),
+    ("contact_1_linkedin_url",    "placeholder",  None,                        False, None,    30, False),
+    ("contact_1_email",           "placeholder",  None,                        False, None,    24, False),
+    ("contact_1_fit",             "placeholder",  None,                        False, None,    14, False),
+    ("contact_1_notes",           "placeholder",  None,                        False, None,    30, True),
+    ("contact_2_name",            "placeholder",  None,                        False, None,    20, False),
+    ("contact_2_title",           "placeholder",  None,                        False, None,    22, False),
+    ("contact_2_linkedin_url",    "placeholder",  None,                        False, None,    30, False),
+    ("contact_2_email",           "placeholder",  None,                        False, None,    24, False),
+    ("contact_2_fit",             "placeholder",  None,                        False, None,    14, False),
+    ("contact_2_notes",           "placeholder",  None,                        False, None,    30, True),
+    ("contact_3_name",            "placeholder",  None,                        False, None,    20, False),
+    ("contact_3_title",           "placeholder",  None,                        False, None,    22, False),
+    ("contact_3_linkedin_url",    "placeholder",  None,                        False, None,    30, False),
+    ("contact_3_email",           "placeholder",  None,                        False, None,    24, False),
+    ("contact_3_fit",             "placeholder",  None,                        False, None,    14, False),
+    ("contact_3_notes",           "placeholder",  None,                        False, None,    30, True),
+    ("final_opener",              "placeholder",  None,                        False, None,    40, True),
+    ("discovery_question_1",      "placeholder",  None,                        False, None,    40, True),
+    ("discovery_question_2",      "placeholder",  None,                        False, None,    40, True),
+    ("evidence_to_mention",       "placeholder",  None,                        False, None,    40, True),
+    ("what_not_to_overclaim",     "placeholder",  None,                        False, None,    40, True),
+    ("call_notes",                "placeholder",  None,                        False, None,    40, True),
+    ("call_outcome",              "placeholder",  None,                        False, None,    20, False),
+    ("next_step",                 "placeholder",  None,                        False, None,    30, False),
+    ("sales_feedback",            "placeholder",  None,                        False, None,    40, True),
+]
+
+
+def _cpi_get(r: dict, src: str, key: str | None, is_numeric: bool):
+    """Extract a value from the correct sub-dict in a result record."""
+    if src == "placeholder" or key is None:
+        return None
+    if src == "result":
+        raw = r.get(key, "")
+    elif src == "enriched":
+        raw = r.get("enriched_row", {}).get(key, "")
+    elif src == "claude":
+        raw = r.get("claude", {}).get(key, "")
+    elif src == "scores":
+        raw = r.get("scores", {}).get(key, "")
+    else:
+        raw = ""
+
+    # Normalize blank-ish values
+    if raw is None or (isinstance(raw, float) and raw != raw):  # NaN check
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ("", "nan", "none"):
+        return None
+
+    if is_numeric:
+        try:
+            return float(str(raw).strip())
+        except (ValueError, TypeError):
+            return None
+    return raw if not isinstance(raw, bool) else str(raw)
+
+
+def _write_caller_prep_sheet(ws, results: list) -> None:
+    """Write the Caller Prep Input sheet — one row per company, fully formatted."""
+    hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+
+    n_cols = len(_CPI_COLUMN_SPEC)
+
+    # Header row
+    for ci, (col_name, *_rest) in enumerate(_CPI_COLUMN_SPEC, 1):
+        cell = ws.cell(row=1, column=ci, value=col_name)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    # Column widths
+    for ci, (_, _src, _key, _num, _fmt, width, _wrap) in enumerate(_CPI_COLUMN_SPEC, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = width
+
+    # Data rows
+    for ri, r in enumerate(results, 2):
+        # Determine row background from tier > recommendation
+        tier = str(r.get("tier", "") or "").strip()
+        rec  = str(r.get("scores", {}).get("call_recommendation", "") or "").strip()
+        row_color = _CPI_TIER_FILLS.get(tier) or _CPI_REC_FILLS.get(rec)
+        row_fill  = (
+            PatternFill(start_color=row_color, end_color=row_color, fill_type="solid")
+            if row_color else None
+        )
+
+        # Compute source summary fields once per row
+        raw_srcs = r.get("raw_sources", [])
+        urls = list(dict.fromkeys(
+            s.get("url", "") for s in raw_srcs if s.get("url")
+        ))[:5]
+        src_dates = [s.get("date", "") for s in raw_srcs if s.get("date")]
+        src_dates_clean = sorted([d for d in src_dates if d], reverse=True)
+        computed = {
+            "top_source_urls":   " | ".join(urls),
+            "raw_source_summary": (
+                f"{len(raw_srcs)} sources"
+                + (f" across {len({s.get('query_group','') for s in raw_srcs} - {''})} query groups"
+                   if raw_srcs else "")
+            ),
+            "source_count":     float(len(raw_srcs)),
+            "latest_source_date": src_dates_clean[0] if src_dates_clean else "",
+        }
+
+        for ci, (col_name, src, key, is_numeric, num_fmt, _width, wrap) in \
+                enumerate(_CPI_COLUMN_SPEC, 1):
+            if src == "computed":
+                raw = computed.get(key)
+                if raw is not None and is_numeric:
+                    try:
+                        val = float(raw)
+                    except Exception:
+                        val = raw
+                else:
+                    val = raw
+            else:
+                val = _cpi_get(r, src, key, is_numeric)
+
+            cell = ws.cell(row=ri, column=ci, value=val)
+            if row_fill:
+                cell.fill = row_fill
+            if is_numeric and val is not None and num_fmt:
+                cell.number_format = num_fmt
+            if wrap:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # Freeze top row + autofilter
+    ws.freeze_panes = "A2"
+    if results:
+        ws.auto_filter.ref = f"A1:{get_column_letter(n_cols)}1"
 
 
 # =============================================================================
@@ -1850,7 +2196,15 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
             writer, index=False, sheet_name="Raw Sources"
         )
 
-    return buf.getvalue()
+    # ── Sheet 7: Caller Prep Input (openpyxl for numeric formatting) ──────────
+    buf.seek(0)
+    wb = openpyxl.load_workbook(buf)
+    ws_cp = wb.create_sheet("Caller Prep Input")
+    _write_caller_prep_sheet(ws_cp, results)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 # =============================================================================
@@ -2148,6 +2502,8 @@ if _processing and not _done:
         c_fit_avail = company.get("commercial_fit_available", False)
         is_internal = company.get("internal", False)
 
+        enriched_row = company.get("enriched_row", {})
+
         if is_internal:
             # Mark without any research
             record = {
@@ -2170,6 +2526,7 @@ if _processing and not _done:
                     "opportunity_score":   0,
                     "call_recommendation": "Internal / exclude",
                 },
+                "enriched_row": enriched_row,
             }
             results.append(record)
         else:
@@ -2184,6 +2541,8 @@ if _processing and not _done:
                     # Strip any enriched fit values that crept into the cache
                     cached["fit_score"] = ""
                     cached["tier"]      = ""
+                # Reattach enriched_row (not stored in cache)
+                cached["enriched_row"] = enriched_row
                 # Re-apply window adjustment and recompute scores (in case window aged)
                 adj_claude, fresh_scores = _compute_scores(
                     cached.get("claude", {}),
@@ -2231,6 +2590,7 @@ if _processing and not _done:
                     "claude":                   adj_claude,
                     "scores":                   scores,
                     "raw_sources":              sources,
+                    "enriched_row":             enriched_row,
                 }
                 _cache_save(name, domain, c_itype, record)
                 results.append(record)
