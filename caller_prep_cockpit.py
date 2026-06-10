@@ -444,6 +444,243 @@ def render_company_list(df: pd.DataFrame, filters: dict) -> str | None:
     return str(match.iloc[0].get(key_col, selected_name))
 
 
+# ── Signal label → plain-language sentences ───────────────────────────────────
+_SIG_PLAIN = {
+    "sig_intl_footprint":    "This company appears to have an international footprint, which may create a need for cross-border communication and language training.",
+    "sig_foreign_hq":        "The company is headquartered abroad, so Dutch or local teams likely communicate regularly in English with the parent organisation.",
+    "sig_intl_hiring":       "Recent international hiring activity suggests the team is growing across borders and may need onboarding support in Business English.",
+    "sig_expat_workforce":   "The presence of international staff points to a mixed-language work environment where structured language training adds real value.",
+    "sig_english_required":  "Job postings or company content indicate English is a working language, creating a clear opening for mYngle's Business English programmes.",
+    "sig_ld_investment":     "The company appears to invest in learning and development, making L&D and HR stakeholders likely receptive to a training conversation.",
+    "sig_training_history":  "There are signs of previous training activity, suggesting this company is already a buyer of employee development programmes.",
+    "sig_client_facing":     "Client-facing teams in this company communicate internationally, creating a direct need for professional communication skills.",
+    "sig_scale_growth":      "The company is growing or scaling, a phase when investing in team communication skills typically becomes a priority.",
+    "sig_language_barrier":  "Indicators suggest language or communication gaps exist within the team, which is precisely the problem mYngle solves.",
+}
+
+_REC_LABEL = {
+    "Call now":               ("🔵 Call now",               "#1565C0"),
+    "Call this month":        ("🟢 Call this month",         "#2E7D32"),
+    "Call before budget cycle": ("🟡 Call before budget cycle", "#F57F17"),
+    "Manual research needed": ("🟠 Manual research first",   "#E65100"),
+    "Monitor":                ("⚪ Monitor — not yet",        "#607D8B"),
+    "Low priority":           ("⚫ Low priority",             "#555555"),
+    "Internal / exclude":     ("🔴 Do not call",              "#B71C1C"),
+}
+
+
+def _plain_why(row: pd.Series) -> str:
+    """Return the best available human-readable rationale for this company."""
+    # Prefer the richer narrative fields already produced by Layer 1/2
+    for field in ("icp_why_relevant", "top_positive_signals", "icp_buying_signals"):
+        v = _safe(row.get(field))
+        if v:
+            return v
+
+    # Fall back: scan column names for known signal patterns
+    for sig_key, sentence in _SIG_PLAIN.items():
+        col_score = next(
+            (c for c in row.index if sig_key in c and "score" in c), None
+        )
+        if col_score:
+            try:
+                if float(row[col_score]) > 0:
+                    return sentence
+            except (TypeError, ValueError):
+                pass
+
+    return ""
+
+
+def _plain_why_now(row: pd.Series) -> str:
+    for field in ("why_now", "evidence_summary", "recency_note"):
+        v = _safe(row.get(field))
+        if v:
+            return v
+    trigger = _safe(row.get("trigger_type"))
+    bucket  = _safe(row.get("recency_bucket"))
+    if trigger and trigger not in ("No clear trigger", "No clear trigger found"):
+        parts = [f"Trigger: {trigger}."]
+        if bucket:
+            parts.append(f"Signal recency: {bucket}.")
+        return " ".join(parts)
+    return ""
+
+
+# ── Caller Card Preview ───────────────────────────────────────────────────────
+def render_caller_card(row: pd.Series, ckey: str) -> None:
+    """Clean, human-readable call-prep card shown above the detail tabs."""
+
+    name       = _safe(row.get("company_name"), "Unknown company")
+    domain     = _safe(row.get("domain"))
+    country    = _safe(row.get("country"))
+    employees  = _safe(row.get("employee_range"))
+    tier       = _safe(row.get("commercial_tier"))
+    score_raw  = _num(row.get("commercial_fit_score"))
+    rec        = _safe(row.get("call_recommendation"))
+    route      = _safe(row.get("preferred_buyer_route"))
+    titles_raw = _safe(row.get("suggested_title_searches"))
+    opener     = _safe(get_edit(ckey, "final_opener", _safe(row.get("suggested_opener"))))
+    caution    = _safe(row.get("caution_note"))
+    reason     = _safe(row.get("reason_not_to_call_now"))
+    opp_score  = _num(row.get("opportunity_score"))
+
+    rec_label, rec_color = _REC_LABEL.get(rec, (f"• {rec}" if rec else "—", "#555555"))
+
+    st.markdown("---")
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown(
+        f"<div style='background:#f0f4fa;border-left:5px solid #0B4A92;"
+        f"padding:14px 18px;border-radius:6px;margin-bottom:8px'>"
+        f"<span style='font-size:1.3em;font-weight:700'>{name}</span>"
+        + (f"<span style='color:#555;font-size:0.9em;margin-left:12px'>{domain}</span>" if domain else "")
+        + (f"<span style='color:#888;font-size:0.85em;margin-left:12px'>· {country}</span>" if country else "")
+        + (f"<span style='color:#888;font-size:0.85em;margin-left:12px'>· {employees} employees</span>" if employees else "")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Call decision + company meta ─────────────────────────────────────────
+    col_dec, col_meta = st.columns([2, 3])
+
+    with col_dec:
+        st.markdown(
+            f"<div style='background:#ffffff;border:1px solid #dce3ef;"
+            f"border-radius:6px;padding:14px 16px;height:100%'>"
+            f"<div style='font-size:0.75em;color:#666;margin-bottom:4px'>CALL DECISION</div>"
+            f"<div style='font-size:1.25em;font-weight:700;color:{rec_color}'>{rec_label}</div>"
+            + (f"<div style='font-size:0.8em;color:#555;margin-top:6px'>Opportunity score: <b>{opp_score:.1f}</b></div>" if opp_score is not None else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col_meta:
+        score_str = f"{score_raw:.1f} / 10" if score_raw is not None else "—"
+        tier_color = TIER_COLORS.get(tier, "#EEEEEE")
+        st.markdown(
+            f"<div style='background:#ffffff;border:1px solid #dce3ef;"
+            f"border-radius:6px;padding:14px 16px;height:100%'>"
+            f"<table style='width:100%;border-collapse:collapse;font-size:0.88em'>"
+            f"<tr><td style='color:#666;padding:2px 8px 2px 0'>Commercial fit</td>"
+            f"<td style='font-weight:600'>{score_str}</td>"
+            f"<td style='color:#666;padding:2px 8px 2px 16px'>Tier</td>"
+            f"<td><span style='background:{tier_color};padding:1px 8px;border-radius:3px'>{tier or '—'}</span></td></tr>"
+            f"<tr><td style='color:#666;padding:2px 8px 2px 0'>Buyer route</td>"
+            f"<td colspan='3' style='font-weight:600'>{route or '—'}</td></tr>"
+            f"</table></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Why this company / Why now / Who to contact / Opener / Caution ───────
+    sec_a, sec_b = st.columns(2)
+
+    with sec_a:
+        # Why this company
+        why = _plain_why(row)
+        st.markdown(
+            "<div style='background:#fff;border:1px solid #dce3ef;border-radius:6px;"
+            "padding:12px 14px;margin-bottom:10px'>"
+            "<div style='font-size:0.75em;color:#0B4A92;font-weight:600;margin-bottom:4px'>"
+            "WHY THIS COMPANY</div>"
+            + (f"<div style='font-size:0.88em;color:#222'>{why}</div>" if why
+               else "<div style='color:#aaa;font-size:0.85em'>No rationale available.</div>")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Who to contact
+        _standard_fns = [
+            "HR", "People & Culture", "Learning & Development",
+            "Talent", "International HR", "Training",
+        ]
+        suggestions = []
+        if route:
+            suggestions.insert(0, f"{name} {route}")
+        for fn in _standard_fns:
+            c = f"{name} {fn}"
+            if c not in suggestions:
+                suggestions.append(c)
+        titles_list = [t.strip() for t in re.split(r"[,;\n]+", titles_raw) if t.strip()] if titles_raw else []
+
+        st.markdown(
+            "<div style='background:#fff;border:1px solid #dce3ef;border-radius:6px;"
+            "padding:12px 14px;margin-bottom:10px'>"
+            "<div style='font-size:0.75em;color:#0B4A92;font-weight:600;margin-bottom:6px'>"
+            "WHO TO CONTACT</div>"
+            + (f"<div style='font-size:0.85em;color:#333;margin-bottom:4px'>"
+               f"Suggested buyer route: <b>{route}</b></div>" if route else "")
+            + (("<div style='font-size:0.8em;color:#555;margin-bottom:4px'>Suggested titles: "
+                + ", ".join(titles_list) + "</div>") if titles_list else "")
+            + "<div style='font-size:0.8em;color:#555;margin-top:6px'>Sales Navigator searches:</div>"
+            + "".join(
+                f"<div style='font-family:monospace;font-size:0.78em;background:#f5f7fa;"
+                f"border-radius:3px;padding:1px 6px;margin:2px 0'>{s}</div>"
+                for s in suggestions[:4]
+              )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    with sec_b:
+        # Why now
+        why_now_text = _plain_why_now(row)
+        st.markdown(
+            "<div style='background:#fff;border:1px solid #dce3ef;border-radius:6px;"
+            "padding:12px 14px;margin-bottom:10px'>"
+            "<div style='font-size:0.75em;color:#0B4A92;font-weight:600;margin-bottom:4px'>"
+            "WHY NOW</div>"
+            + (f"<div style='font-size:0.88em;color:#222'>{why_now_text}</div>" if why_now_text
+               else "<div style='color:#aaa;font-size:0.85em'>No current buying trigger found.</div>")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Suggested opener
+        st.markdown(
+            "<div style='background:#fff;border:1px solid #dce3ef;border-radius:6px;"
+            "padding:12px 14px;margin-bottom:10px'>"
+            "<div style='font-size:0.75em;color:#0B4A92;font-weight:600;margin-bottom:4px'>"
+            "SUGGESTED OPENER</div>"
+            + (f"<div style='font-size:0.88em;color:#222;font-style:italic'>\"{opener}\"</div>"
+               if opener
+               else "<div style='color:#aaa;font-size:0.85em'>No opener available. Edit in Call prep tab.</div>")
+            + "<div style='font-size:0.75em;color:#999;margin-top:4px'>Edit in the Call prep &amp; outcome tab below.</div>"
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Caution
+        has_caution = bool(caution or reason)
+        caution_bg  = "#fff8f0" if has_caution else "#f6fdf6"
+        caution_border = "#E65100" if has_caution else "#2E7D32"
+        caution_text = ""
+        if caution:
+            caution_text += f"<div style='margin-bottom:4px'>⚠️ {caution}</div>"
+        if reason:
+            caution_text += f"<div style='color:#B71C1C'>🚫 {reason}</div>"
+        if not has_caution:
+            caution_text = "<div style='color:#2E7D32'>✅ No specific caution flagged.</div>"
+
+        st.markdown(
+            f"<div style='background:{caution_bg};border:1px solid {caution_border};"
+            f"border-radius:6px;padding:12px 14px;margin-bottom:10px'>"
+            f"<div style='font-size:0.75em;color:#0B4A92;font-weight:600;margin-bottom:4px'>"
+            f"CAUTION</div>"
+            f"<div style='font-size:0.88em'>{caution_text}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        "<div style='font-size:0.75em;color:#aaa;margin-top:2px'>"
+        "↓ Full details, contact capture, and call outcome in the tabs below.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
+
 # ── Company prep view ─────────────────────────────────────────────────────────
 def render_company_prep(row: pd.Series, ckey: str):
     name = _safe(row.get("company_name"), "Unknown company")
@@ -801,6 +1038,7 @@ def main():
         match = df[df[key_col] == selected_key]
         if not match.empty:
             row = match.iloc[0]
+            render_caller_card(row, selected_key)
             render_company_prep(row, selected_key)
             st.markdown("---")
 
