@@ -138,15 +138,44 @@ def _company_key_col(df: pd.DataFrame) -> str:
     return df.columns[0]
 
 
+_SEARCH_COLS = (
+    "company_name", "domain", "preferred_buyer_route",
+    "trigger_type", "call_recommendation",
+)
+
+
 def _filter_df(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     out = df.copy()
+
+    # Standard column → value(s) filters
     for col, vals in filters.items():
+        if col.startswith("_"):
+            continue  # handled separately
         if col not in out.columns:
             continue
         if isinstance(vals, list) and vals:
             out = out[out[col].isin(vals)]
         elif isinstance(vals, str) and vals.strip():
             out = out[out[col].str.lower().str.contains(vals.strip().lower(), na=False)]
+
+    # Caution filter
+    caution_sel = filters.get("_caution", [])
+    if caution_sel and "caution_note" in out.columns:
+        has_caution = out["caution_note"].str.strip() != ""
+        if "⚠️ Has caution" in caution_sel and "✅ No caution" not in caution_sel:
+            out = out[has_caution]
+        elif "✅ No caution" in caution_sel and "⚠️ Has caution" not in caution_sel:
+            out = out[~has_caution]
+
+    # Free-text search across multiple columns
+    search = filters.get("_search", "").strip()
+    if search:
+        mask = pd.Series([False] * len(out), index=out.index)
+        for col in _SEARCH_COLS:
+            if col in out.columns:
+                mask |= out[col].str.lower().str.contains(search.lower(), na=False)
+        out = out[mask]
+
     return out
 
 
@@ -206,8 +235,8 @@ def _kpi_card(label: str, value, color: str = "#0B4A92"):
     )
 
 
-# ── Sidebar: upload + filters ─────────────────────────────────────────────────
-def render_sidebar(df: pd.DataFrame | None) -> dict:
+# ── Sidebar: upload only ──────────────────────────────────────────────────────
+def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 📞 Caller Prep Cockpit")
         st.markdown("**mYngle · Layer 3**")
@@ -231,54 +260,98 @@ def render_sidebar(df: pd.DataFrame | None) -> dict:
                 ss_set("cpc_raw", raw)
                 st.success(f"{len(loaded)} companies loaded.")
 
-        filters = {}
-        if df is None:
-            return filters
+        df = ss("cpc_df")
+        if df is not None:
+            st.markdown("---")
+            st.caption(f"**{len(df)} companies** in this export.")
+            active = ss("cpc_filter_epoch", 0)
+            if active:
+                st.caption("⚙️ Filters active")
 
-        st.markdown("---")
+
+# ── Inline filter bar ─────────────────────────────────────────────────────────
+def render_filters(df: pd.DataFrame) -> dict:
+    """Render compact filter controls; return active filters dict."""
+    epoch = ss("cpc_filter_epoch", 0)
+
+    def _opts(col):
+        if col not in df.columns:
+            return []
+        vals = sorted(df[col].dropna().unique().tolist())
+        return [v for v in vals if v not in ("", "nan")]
+
+    with st.container():
         st.markdown("#### Filters")
+        row1 = st.columns([2, 2, 2, 2, 1])
+        row2 = st.columns([2, 2, 2, 4])
 
-        def _opts(col):
-            if col not in df.columns:
-                return []
-            vals = sorted(df[col].dropna().unique().tolist())
-            return [v for v in vals if v not in ("", "nan")]
+        with row1[0]:
+            rec_sel = st.multiselect(
+                "Call recommendation", _opts("call_recommendation"),
+                key=f"f_rec_{epoch}",
+            )
+        with row1[1]:
+            tier_sel = st.multiselect(
+                "Commercial tier", _opts("commercial_tier"),
+                key=f"f_tier_{epoch}",
+            )
+        with row1[2]:
+            bucket_sel = st.multiselect(
+                "Recency bucket", _opts("recency_bucket"),
+                key=f"f_bucket_{epoch}",
+            )
+        with row1[3]:
+            route_sel = st.multiselect(
+                "Preferred buyer route", _opts("preferred_buyer_route"),
+                key=f"f_route_{epoch}",
+            )
+        with row1[4]:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("Reset", key=f"f_reset_{epoch}", use_container_width=True):
+                ss_set("cpc_filter_epoch", epoch + 1)
+                st.rerun()
 
-        rec_opts = _opts("call_recommendation")
-        rec_sel = st.multiselect("Call recommendation", rec_opts, key="f_rec")
-        if rec_sel:
-            filters["call_recommendation"] = rec_sel
+        with row2[0]:
+            conf_sel = st.multiselect(
+                "Domain confidence", _opts("domain_match_confidence"),
+                key=f"f_conf_{epoch}",
+            )
+        with row2[1]:
+            caution_sel = st.multiselect(
+                "Has caution",
+                ["⚠️ Has caution", "✅ No caution"],
+                key=f"f_caution_{epoch}",
+            )
+        with row2[2]:
+            review_sel = st.multiselect(
+                "Needs domain review", _opts("needs_domain_review"),
+                key=f"f_review_{epoch}",
+            )
+        with row2[3]:
+            search = st.text_input(
+                "Search company, domain, trigger, recommendation, buyer route",
+                key=f"f_search_{epoch}",
+                placeholder="Type to search…",
+            )
 
-        tier_opts = _opts("commercial_tier")
-        tier_sel = st.multiselect("Commercial tier", tier_opts, key="f_tier")
-        if tier_sel:
-            filters["commercial_tier"] = tier_sel
-
-        rec_bucket_opts = _opts("recency_bucket")
-        bucket_sel = st.multiselect("Recency bucket", rec_bucket_opts, key="f_bucket")
-        if bucket_sel:
-            filters["recency_bucket"] = bucket_sel
-
-        route_opts = _opts("preferred_buyer_route")
-        route_sel = st.multiselect("Preferred buyer route", route_opts, key="f_route")
-        if route_sel:
-            filters["preferred_buyer_route"] = route_sel
-
-        conf_opts = _opts("domain_match_confidence")
-        conf_sel = st.multiselect("Domain confidence", conf_opts, key="f_conf")
-        if conf_sel:
-            filters["domain_match_confidence"] = conf_sel
-
-        review_opts = _opts("needs_domain_review")
-        review_sel = st.multiselect("Needs domain review", review_opts, key="f_review")
-        if review_sel:
-            filters["needs_domain_review"] = review_sel
-
-        search = st.text_input("Search company / domain", key="f_search")
-        if search.strip():
-            filters["_search"] = search.strip()
-
-        return filters
+    filters: dict = {}
+    if rec_sel:
+        filters["call_recommendation"] = rec_sel
+    if tier_sel:
+        filters["commercial_tier"] = tier_sel
+    if bucket_sel:
+        filters["recency_bucket"] = bucket_sel
+    if route_sel:
+        filters["preferred_buyer_route"] = route_sel
+    if conf_sel:
+        filters["domain_match_confidence"] = conf_sel
+    if review_sel:
+        filters["needs_domain_review"] = review_sel
+    if caution_sel:
+        filters["_caution"] = caution_sel
+    if search.strip():
+        filters["_search"] = search.strip()
+    return filters
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -326,53 +399,45 @@ LIST_COLS = [
 
 
 def render_company_list(df: pd.DataFrame, filters: dict) -> str | None:
-    """Render filtered list; return selected company_key or None."""
-    section_header("Company list")
-
-    # Apply search separately (across name + domain)
-    search = filters.pop("_search", "")
+    """Render filtered list inside expander; return selected company_key or None."""
     filtered = _filter_df(df, filters)
-    if search:
-        mask = pd.Series([False] * len(filtered), index=filtered.index)
-        for col in ("company_name", "domain"):
-            if col in filtered.columns:
-                mask |= filtered[col].str.lower().str.contains(search.lower(), na=False)
-        filtered = filtered[mask]
+    n_filtered, n_total = len(filtered), len(df)
 
-    st.caption(f"{len(filtered)} of {len(df)} companies shown")
+    expander_label = (
+        f"Company list — {n_filtered} of {n_total} companies"
+        + (" (filters active)" if n_filtered < n_total else "")
+    )
+
+    with st.expander(expander_label, expanded=True):
+        if filtered.empty:
+            st.warning("No companies match the current filters. Try resetting the filters.")
+        else:
+            show_cols = [c for c in LIST_COLS if c in filtered.columns]
+            if "caution_note" in filtered.columns:
+                filtered = filtered.copy()
+                filtered["⚠"] = filtered["caution_note"].apply(
+                    lambda x: "⚠️" if str(x).strip() not in ("", "nan") else ""
+                )
+                show_cols.append("⚠")
+
+            st.dataframe(
+                filtered[show_cols].reset_index(drop=True),
+                use_container_width=True,
+                height=min(40 * n_filtered + 40, 360),
+            )
 
     if filtered.empty:
-        st.info("No companies match the current filters.")
         return None
-
-    # Build display table
-    show_cols = [c for c in LIST_COLS if c in filtered.columns]
-    # Add caution indicator
-    if "caution_note" in filtered.columns:
-        filtered = filtered.copy()
-        filtered["⚠ caution"] = filtered["caution_note"].apply(
-            lambda x: "⚠️" if str(x).strip() not in ("", "nan") else ""
-        )
-        show_cols.append("⚠ caution")
-
-    st.dataframe(
-        filtered[show_cols].reset_index(drop=True),
-        use_container_width=True,
-        height=280,
-    )
 
     key_col = _company_key_col(df)
     name_col = "company_name" if "company_name" in filtered.columns else key_col
     options = filtered[name_col].tolist()
-    if not options:
-        return None
 
     selected_name = st.selectbox(
         "Select company for call prep",
         options,
         key="cpc_selected_name",
     )
-    # Map back to key
     match = filtered[filtered[name_col] == selected_name]
     if match.empty:
         return None
@@ -513,28 +578,44 @@ def render_company_prep(row: pd.Series, ckey: str):
             "Do not rely on automatic extraction."
         )
 
-        titles_raw = _safe(row.get("suggested_title_searches"))
-        company    = _safe(row.get("company_name"))
-        domain     = _safe(row.get("domain"))
+        company  = _safe(row.get("company_name"))
+        domain   = _safe(row.get("domain"))
+        route    = _safe(row.get("preferred_buyer_route"))
 
+        # Build ordered search suggestion list
+        _standard_functions = [
+            "HR", "People & Culture", "Learning & Development",
+            "Talent", "International HR", "Training",
+        ]
+        search_suggestions: list[str] = []
+        if route:
+            search_suggestions.append(f"{company} {route}")
+        for fn in _standard_functions:
+            candidate = f"{company} {fn}"
+            if candidate not in search_suggestions:
+                search_suggestions.append(candidate)
+
+        st.markdown("**Manual search suggestions** — copy each into LinkedIn / Sales Navigator:")
+        for s in search_suggestions:
+            st.code(s, language=None)
+
+        titles_raw = _safe(row.get("suggested_title_searches"))
         if titles_raw:
-            st.markdown("**Suggested title searches:**")
+            st.markdown("**AI-suggested title searches from Opportunity Radar:**")
             for t in re.split(r"[,;\n]+", titles_raw):
                 t = t.strip()
                 if t:
-                    st.code(t, language=None)
+                    st.code(f"{company} {t}", language=None)
 
-        st.markdown("**Combined search text (copy & paste into Sales Navigator):**")
-        combined = f"{company} {titles_raw}".strip() if titles_raw else company
-        st.code(combined, language=None)
-
+        st.markdown("---")
         st.markdown(
-            "**[Open LinkedIn Sales Navigator search](https://www.linkedin.com/sales/search/people)**  "
+            "**[Open LinkedIn Sales Navigator people search]"
+            "(https://www.linkedin.com/sales/search/people)**  "
             "*(log in first)*"
         )
         if domain:
             st.markdown(
-                f"**[Search LinkedIn for company: {company}]"
+                f"**[Find {company} on LinkedIn]"
                 f"(https://www.linkedin.com/search/results/companies/?keywords={domain})**"
             )
 
@@ -691,9 +772,8 @@ def render_export(df: pd.DataFrame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    # Pass current df to sidebar so filters render on subsequent runs.
-    # Re-read AFTER sidebar so an upload processed this run is visible to main.
-    filters = render_sidebar(ss("cpc_df"))
+    # Sidebar handles upload only; re-read df after so first-upload rerun works.
+    render_sidebar()
     df: pd.DataFrame | None = ss("cpc_df")
 
     if df is None:
@@ -709,6 +789,9 @@ def main():
 
     render_dashboard(df)
     st.markdown("---")
+
+    filters = render_filters(df)
+    st.markdown("")
 
     selected_key = render_company_list(df, filters)
     st.markdown("---")
