@@ -42,9 +42,15 @@ _COMPANY_NAME_COLS = (
     "organization", "organisation", "business_name",
 )
 _DOMAIN_COLS = (
-    "domain", "website", "url", "company_url",
-    "homepage", "web_site", "site",
+    "website_url", "website url", "website", "domain",
+    "url", "company_url", "company url", "company_website", "company website",
+    "homepage", "web_site", "web site", "site",
 )
+
+
+def _normalize_col_key(col: str) -> str:
+    """Lowercase and collapse spaces/underscores/hyphens to a single space."""
+    return re.sub(r"[\s_\-]+", " ", col.strip().lower())
 
 # Legal suffixes to strip before token comparison
 _LEGAL_TOKENS = re.compile(
@@ -139,12 +145,15 @@ def is_generic(domain: str) -> bool:
 
 # ── Column detection ──────────────────────────────────────────────────────────
 def detect_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
-    cols_lower = {c.lower().strip(): c for c in df.columns}
+    # Map normalised key → original column name (both sides normalised)
+    cols_norm = {_normalize_col_key(c): c for c in df.columns}
     name_col = next(
-        (cols_lower[k] for k in _COMPANY_NAME_COLS if k in cols_lower), None
+        (cols_norm[_normalize_col_key(k)] for k in _COMPANY_NAME_COLS
+         if _normalize_col_key(k) in cols_norm), None
     )
     domain_col = next(
-        (cols_lower[k] for k in _DOMAIN_COLS if k in cols_lower), None
+        (cols_norm[_normalize_col_key(k)] for k in _DOMAIN_COLS
+         if _normalize_col_key(k) in cols_norm), None
     )
     return name_col, domain_col
 
@@ -541,21 +550,96 @@ def _write_sheet(ws, df: pd.DataFrame, name_col: str | None = None) -> None:
     ws.row_dimensions[1].height = 18
 
 
+def _build_best_guess_df(
+    enriched_df: pd.DataFrame, name_col: str
+) -> pd.DataFrame:
+    """Return a two-column dataframe (company_name, website_url) with best-guess domains."""
+    rows = []
+    for _, r in enriched_df.iterrows():
+        action   = str(r.get("domain_action", "") or "")
+        norm     = str(r.get("normalized_input_domain", "") or "").strip()
+        recom    = str(r.get("recommended_domain", "") or "").strip()
+        cname    = str(r.get(name_col, "") or "").strip()
+
+        if action in ("OK", "LIKELY_OK"):
+            url = norm
+        elif action in ("SUGGEST_REPLACE", "MISSING_DOMAIN_FIXED"):
+            url = recom
+        elif action == "REVIEW":
+            url = norm or recom
+        else:  # NO_CONFIDENT_MATCH, MISSING_DOMAIN, unknown
+            url = norm  # blank if norm is ""
+
+        rows.append({"company_name": cname, "website_url": url})
+    return pd.DataFrame(rows)
+
+
+def _write_best_guess_sheet(ws, bg_df: pd.DataFrame, enriched_df: pd.DataFrame) -> None:
+    """Write Best Guess Input sheet with simple highlighting."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    hdr_fill, hdr_font = _header_fill()
+
+    # Header
+    for ci, col in enumerate(bg_df.columns, 1):
+        cell = ws.cell(row=1, column=ci, value=col)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws.column_dimensions[get_column_letter(ci)].width = 36
+
+    # Fills
+    changed_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    blank_fill   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    ok_fill      = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+
+    # We need the original normalised domain per row for comparison
+    orig_norms = enriched_df.get("normalized_input_domain", pd.Series("", index=enriched_df.index))
+
+    for ri, ((_, bg_row), orig_norm) in enumerate(
+        zip(bg_df.iterrows(), orig_norms), 2
+    ):
+        cname = bg_row["company_name"]
+        url   = bg_row["website_url"]
+        orig  = str(orig_norm or "").strip()
+
+        ws.cell(row=ri, column=1, value=cname)
+
+        url_cell = ws.cell(row=ri, column=2, value=url)
+        if not url:
+            url_cell.fill = blank_fill
+        elif url != orig:
+            url_cell.fill = changed_fill
+            url_cell.font = Font(bold=True, color="C00000")
+        else:
+            url_cell.fill = ok_fill
+
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 18
+
+
 def build_excel(
     enriched_df: pd.DataFrame,
     original_df: pd.DataFrame,
     evidence_rows: list[dict],
+    name_col: str = "company_name",
 ) -> bytes:
     import openpyxl
 
     wb = openpyxl.Workbook()
 
-    # Sheet 1: Cleaned Input
-    ws1 = wb.active
-    ws1.title = "Cleaned Input"
+    # Sheet 1: Best Guess Input
+    ws0 = wb.active
+    ws0.title = "Best Guess Input"
+    bg_df = _build_best_guess_df(enriched_df, name_col)
+    _write_best_guess_sheet(ws0, bg_df, enriched_df)
+
+    # Sheet 2: Cleaned Input
+    ws1 = wb.create_sheet("Cleaned Input")
     _write_sheet(ws1, enriched_df)
 
-    # Sheet 2: Review Needed
+    # Sheet 3: Review Needed
     ws2 = wb.create_sheet("Review Needed")
     review_df = enriched_df[
         enriched_df.get("manual_review_needed", pd.Series(False, index=enriched_df.index))
@@ -721,6 +805,7 @@ def main():
         st.session_state["icl_enriched"]  = enriched_df
         st.session_state["icl_evidence"]  = evidence_rows
         st.session_state["icl_original"]  = df
+        st.session_state["icl_name_col"]  = name_col
 
     # ── Results ───────────────────────────────────────────────────────────────
     enriched_df = st.session_state.get("icl_enriched")
@@ -751,7 +836,10 @@ def main():
     # ── Download ──────────────────────────────────────────────────────────────
     evidence_rows = st.session_state.get("icl_evidence", [])
     original_df   = st.session_state.get("icl_original", df)
-    excel_bytes   = build_excel(enriched_df, original_df, evidence_rows)
+    excel_bytes   = build_excel(
+        enriched_df, original_df, evidence_rows,
+        name_col=st.session_state.get("icl_name_col", "company_name"),
+    )
 
     st.download_button(
         "⬇ Download cleaned Excel",
