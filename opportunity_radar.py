@@ -312,6 +312,7 @@ def reset():
         _or_last_checkpoint_path=None,
         _or_last_checkpoint_count=None,
         _or_final_autosave_path=None,
+        _or_input_bytes=None,
     )
 
 
@@ -1749,6 +1750,14 @@ def _compute_scores(
 # COMPANY LIST BUILDER
 # =============================================================================
 
+def _make_company_key(name: str, domain: str) -> str:
+    """Return a normalized slug 'name__domain' suitable for dedup and traceability."""
+    n = re.sub(r"[^\w\s]", "", name.lower())
+    n = re.sub(r"\s+", "_", n.strip())
+    d = re.sub(r"[.\-]", "_", domain.lower().strip())
+    return f"{n}__{d}" if d else n
+
+
 def _build_company_list(
     df: pd.DataFrame,
     name_col: str | None,
@@ -1803,6 +1812,13 @@ def _build_company_list(
             except Exception:
                 return v
         enriched_row = {col: _sv(row[col]) for col in df.columns if col in row.index}
+
+        # Stable fallback IDs — preserve existing values when present
+        seq = len(companies) + 1
+        if not str(enriched_row.get("lead_id", "") or "").strip():
+            enriched_row["lead_id"] = f"OR_{seq:06d}"
+        if not str(enriched_row.get("company_key", "") or "").strip():
+            enriched_row["company_key"] = _make_company_key(name, domain)
 
         # Exclude internal / self entries
         if _is_internal(name, domain):
@@ -2022,6 +2038,8 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
             "latest_source_date": src_dates_clean[0] if src_dates_clean else "",
         }
 
+        domain = str(r.get("domain", "") or "")
+
         for ci, (col_name, src, key, is_numeric, num_fmt, _width, wrap) in \
                 enumerate(_CPI_COLUMN_SPEC, 1):
             if src == "computed":
@@ -2036,6 +2054,17 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
             else:
                 val = _cpi_get(r, src, key, is_numeric)
 
+            # Domain traceability fallbacks for older exports without Layer 0 fields
+            if not val or val == "":
+                if col_name == "input_domain":
+                    val = domain
+                elif col_name == "validated_domain":
+                    val = domain
+                elif col_name == "domain_used_for_enrichment":
+                    val = "domain"
+                elif col_name == "domain_match_confidence":
+                    val = "Unknown"
+
             cell = ws.cell(row=ri, column=ci, value=val)
             if row_fill:
                 cell.fill = row_fill
@@ -2044,8 +2073,12 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
             if wrap:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
+        # Compact row height — prevent openpyxl from auto-expanding to text size
+        ws.row_dimensions[ri].height = 20
+
     # Freeze top row + autofilter
     ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 22
     if results:
         ws.auto_filter.ref = f"A1:{get_column_letter(n_cols)}1"
 
@@ -2054,7 +2087,34 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
 # EXCEL BUILDER
 # =============================================================================
 
-def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
+def _copy_sheet(src_ws, dst_wb, dest_name: str) -> None:
+    """Copy a worksheet cell-by-cell into dst_wb with basic style preservation."""
+    from copy import copy as _copy
+    dst_ws = dst_wb.create_sheet(dest_name)
+    for row in src_ws.iter_rows():
+        for cell in row:
+            dst = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                try:
+                    dst.font        = _copy(cell.font)
+                    dst.fill        = _copy(cell.fill)
+                    dst.border      = _copy(cell.border)
+                    dst.alignment   = _copy(cell.alignment)
+                    dst.number_format = cell.number_format
+                except Exception:
+                    pass
+    for col_letter, col_dim in src_ws.column_dimensions.items():
+        dst_ws.column_dimensions[col_letter].width = col_dim.width
+    for row_num, row_dim in src_ws.row_dimensions.items():
+        dst_ws.row_dimensions[row_num].height = row_dim.height
+    if src_ws.freeze_panes:
+        dst_ws.freeze_panes = src_ws.freeze_panes
+    if src_ws.auto_filter.ref:
+        dst_ws.auto_filter.ref = src_ws.auto_filter.ref
+
+
+def _build_excel_bytes(results: list, raw_sources: list,
+                       input_bytes: bytes | None = None) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
 
@@ -2196,11 +2256,29 @@ def _build_excel_bytes(results: list, raw_sources: list) -> bytes:
             writer, index=False, sheet_name="Raw Sources"
         )
 
-    # ── Sheet 7: Caller Prep Input (openpyxl for numeric formatting) ──────────
+    # ── Sheet 7: Caller Prep Input + optional original sheets ─────────────────
     buf.seek(0)
     wb = openpyxl.load_workbook(buf)
+
     ws_cp = wb.create_sheet("Caller Prep Input")
     _write_caller_prep_sheet(ws_cp, results)
+
+    # Copy original Lead Scores / Company Profiles / Opportunity Input if present
+    if input_bytes:
+        try:
+            src_wb = openpyxl.load_workbook(io.BytesIO(input_bytes))
+            for src_name, dst_name in [
+                ("Lead Scores",      "Original Lead Scores"),
+                ("Company Profiles", "Original Company Profiles"),
+                ("Opportunity Input","Original Opportunity Input"),
+            ]:
+                if src_name in src_wb.sheetnames:
+                    try:
+                        _copy_sheet(src_wb[src_name], wb, dst_name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     out = io.BytesIO()
     wb.save(out)
@@ -2296,6 +2374,13 @@ if new_key != ss("_or_file_key", "__none__"):
     if uploaded is not None:
         try:
             fname             = uploaded.name
+            # Capture raw bytes before _load_df_from_upload consumes the file
+            try:
+                uploaded.seek(0)
+                _raw_bytes = uploaded.read()
+                uploaded.seek(0)
+            except Exception:
+                _raw_bytes = None
             df_loaded, sheet  = _load_df_from_upload(uploaded)
             input_type        = _detect_input_type(df_loaded)
             name_col          = _detect_col(df_loaded, _NAME_CANDIDATES)
@@ -2316,6 +2401,7 @@ if new_key != ss("_or_file_key", "__none__"):
                 _or_icp_col     = icp_col,
                 _or_n_companies = n,
                 _or_input_type  = input_type,
+                _or_input_bytes = _raw_bytes,
             )
         except Exception as exc:
             ss_set(_or_file_error=str(exc))
@@ -2608,7 +2694,8 @@ if _processing and not _done:
             chk_n = ss("_or_checkpoint_n", 10)
             if new_idx > 0 and new_idx % chk_n == 0:
                 try:
-                    chk_bytes = _build_excel_bytes(results, raw_sources)
+                    chk_bytes = _build_excel_bytes(results, raw_sources,
+                                                   input_bytes=ss("_or_input_bytes"))
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     chk_name = (
                         f"opportunity_radar_checkpoint_{ts}_after_{new_idx:03d}.xlsx"
@@ -2652,7 +2739,8 @@ if _done:
 
     # Build Excel once, cache bytes in session state
     if ss("_or_excel_bytes") is None:
-        ss_set(_or_excel_bytes=_build_excel_bytes(results, raw_sources))
+        ss_set(_or_excel_bytes=_build_excel_bytes(results, raw_sources,
+                                                   input_bytes=ss("_or_input_bytes")))
 
     # Final autosave — runs once per completed scan
     if ss("_or_autosave", True) and ss("_or_final_autosave_path") is None:
