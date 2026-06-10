@@ -26,9 +26,9 @@ Reference validation (Capgemini, all 7 signals supplied)
 ---------------------------------------------------------
   lr_z_score          ≈ 0.9870
   lean_model_prob     ≈ 0.7285
-  icp_similarity_score ≈ 9.39
+  icp_similarity_score ≈ 9.69
   company_size_score  = 10.0
-  final_commercial_fit_score ≈ 9.54
+  final_commercial_fit_score ≈ 9.77
   commercial_tier     = 🥇 Hot
 """
 
@@ -88,10 +88,21 @@ _SIZE_MIDPOINT_BANDS: list[tuple[float, float]] = [
 ]
 SIZE_SCORE_MISSING: float = 5.5   # default when range is unknown
 
-#: Sigmoid stretch parameters.
-SIGMOID_K:     float = 5.0
-SIGMOID_S_MIN: float = 0.328827
-SIGMOID_S_MAX: float = 0.789236
+#: Sigmoid steepness.  Controls how strongly probabilities are spread around
+#: the midpoint.  Higher k → sharper separation; does NOT change prob ranking.
+SIGMOID_K: float = 10.0
+
+#: Reference probability boundaries for the normalisation range.
+#: These are the practical min/max LR probabilities from model calibration.
+#: Changing SIGMOID_K does NOT require changing these — S_MIN/S_MAX are
+#: recomputed automatically below.
+_SIGMOID_P_LO: float = 0.35734
+_SIGMOID_P_HI: float = 0.76427
+
+#: Sigmoid values at the reference probabilities.  Auto-derived from SIGMOID_K
+#: so they are always consistent — never hardcode these independently.
+SIGMOID_S_MIN: float = 1.0 / (1.0 + math.exp(-SIGMOID_K * (_SIGMOID_P_LO - 0.5)))
+SIGMOID_S_MAX: float = 1.0 / (1.0 + math.exp(-SIGMOID_K * (_SIGMOID_P_HI - 0.5)))
 
 #: Blend weights.
 MODEL_WEIGHT: float = 0.75
@@ -550,14 +561,14 @@ if __name__ == "__main__":
     _chk("model_probability ≠ 0.9992  (old wrong value)",
          abs(r1["model_probability"] - 0.9992) > 0.01,
          str(round(r1["model_probability"], 4)))
-    _chk("icp_similarity_score ≈ 9.39",
-         abs(r1["icp_similarity_score"] - 9.39) < 0.05,
+    _chk("icp_similarity_score ≈ 9.69  (k=10)",
+         abs(r1["icp_similarity_score"] - 9.69) < 0.05,
          str(r1["icp_similarity_score"]))
     _chk("company_size_score = 10",
          r1["company_size_score"] == 10.0,
          str(r1["company_size_score"]))
-    _chk("final_commercial_fit_score ≈ 9.54",
-         abs(r1["final_commercial_fit_score"] - 9.54) < 0.05,
+    _chk("final_commercial_fit_score ≈ 9.77  (k=10)",
+         abs(r1["final_commercial_fit_score"] - 9.77) < 0.05,
          str(r1["final_commercial_fit_score"]))
     _chk("final_commercial_fit_score ≠ 9.99  (old wrong value)",
          abs(r1["final_commercial_fit_score"] - 9.99) > 0.1,

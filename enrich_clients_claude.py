@@ -4160,6 +4160,7 @@ def _xl_write_scoring_settings(ws) -> None:
         from commercial_fit_scoring import (
             INTERCEPT as _INT, LEAN_COEFFICIENTS as _LC,
             SIZE_BAND_LOOKUP as _SB, TIER_THRESHOLDS as _TT,
+            SIGMOID_K as _SIGMOID_K,
         )
     except ImportError:
         ws.cell(row=1, column=1, value="Scoring module not available")
@@ -4176,6 +4177,9 @@ def _xl_write_scoring_settings(ws) -> None:
 
     ws.cell(row=r, column=1, value="Intercept").font = bold
     ws.cell(row=r, column=2, value=_INT).font = norm
+    r += 1
+    ws.cell(row=r, column=1, value="Sigmoid steepness k").font = bold
+    ws.cell(row=r, column=2, value=_SIGMOID_K).font = norm
     r += 2
 
     ws.cell(row=r, column=1, value="Lean Model Coefficients").font = bold
