@@ -691,8 +691,10 @@ def render_export(df: pd.DataFrame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    # Pass current df to sidebar so filters render on subsequent runs.
+    # Re-read AFTER sidebar so an upload processed this run is visible to main.
+    filters = render_sidebar(ss("cpc_df"))
     df: pd.DataFrame | None = ss("cpc_df")
-    filters = render_sidebar(df)
 
     if df is None:
         st.markdown("# 📞 mYngle Caller Prep Cockpit")
