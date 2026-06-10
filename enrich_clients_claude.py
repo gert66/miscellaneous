@@ -5327,18 +5327,24 @@ def _xl_autosave_path(filename: str) -> Path:
     return _xl_autosave_output_dir() / filename
 
 
-def _xl_autosave_write(df: pd.DataFrame, filename: str) -> tuple[bool, str]:
+def _xl_autosave_write(
+    df: pd.DataFrame,
+    filename: str,
+    name_col: str | None = None,
+    domain_col: str | None = None,
+) -> tuple[bool, str]:
     """
-    Atomically write df to Excel.
+    Atomically write df to Excel using the full rich workbook format
+    (Lead Scores, Company Profiles, Opportunity Input + hidden sheets).
     Returns (ok, message):
       ok=True  → message is the full path + HH:MM:SS timestamp
-      ok=False → message is the human-readable error (PermissionError gets
-                 a friendly hint about closing the file in Excel)
+      ok=False → message is the human-readable error
     """
     try:
         dst = _xl_autosave_path(filename)
         tmp = dst.with_suffix(".tmp.xlsx")
-        df_to_excel_bytes_write(df, str(tmp))
+        xl_bytes = build_rich_excel_bytes(df, name_col=name_col, domain_col=domain_col)
+        tmp.write_bytes(xl_bytes)
         tmp.replace(dst)
         from datetime import datetime as _dt
         return True, f"{dst}  ({_dt.now().strftime('%H:%M:%S')})"
@@ -5432,13 +5438,15 @@ def save_partial_outputs_to_run_folder(
     run_dir: str,
     elm_mode: bool = False,
     row_count: int = 0,
+    name_col: str | None = None,
+    domain_col: str | None = None,
 ) -> tuple:
     """
     Write cumulative files to run_dir:
-      latest_results.csv    — always overwritten
-      latest_results.xlsx   — always overwritten
-      processing_log.csv    — always overwritten
-      checkpoint_NNN.xlsx   — when row_count is a multiple of CHECKPOINT_EVERY
+      latest_results.csv                        — always overwritten (flat)
+      latest_results.xlsx                       — always overwritten (full workbook)
+      processing_log.csv                        — always overwritten
+      enriched_results_partial_NNN_companies.xlsx — every CHECKPOINT_EVERY rows
     Returns (success: bool, message: str).
     """
     try:
@@ -5448,10 +5456,13 @@ def save_partial_outputs_to_run_folder(
 
         partial_df.to_csv(rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
         log_df.to_csv(rdir / "processing_log.csv",     index=False, encoding="utf-8-sig")
-        df_to_excel_bytes_write(partial_df, str(rdir / "latest_results.xlsx"))
+
+        xl_bytes = build_rich_excel_bytes(partial_df, name_col=name_col, domain_col=domain_col)
+        (rdir / "latest_results.xlsx").write_bytes(xl_bytes)
 
         if row_count > 0 and row_count % CHECKPOINT_EVERY == 0:
-            df_to_excel_bytes_write(partial_df, str(rdir / f"checkpoint_{row_count:04d}.xlsx"))
+            ckpt_name = f"enriched_results_partial_{row_count:03d}_companies.xlsx"
+            (rdir / ckpt_name).write_bytes(xl_bytes)
 
         return True, f"{len(results)} rows written to {run_dir}"
     except Exception as exc:
@@ -6830,11 +6841,14 @@ if ss("processing", False):
                 run_dir=_pca_run_dir_run,
                 elm_mode=_elm_mode_run,
                 row_count=_new_idx,
+                name_col=name_col,
+                domain_col=domain_col,
             )
             if _pca_ok2:
                 _save_label = f"{_new_idx} rows → latest_results.xlsx"
                 if _new_idx > 0 and _new_idx % CHECKPOINT_EVERY == 0:
-                    _save_label += f" + checkpoint_{_new_idx:04d}.xlsx"
+                    _ckpt_label = f"enriched_results_partial_{_new_idx:03d}_companies.xlsx"
+                    _save_label += f" + {_ckpt_label}"
                 ss_set(_last_local_save=_save_label)
             else:
                 ss_set(
@@ -6847,11 +6861,15 @@ if ss("processing", False):
             _new_idx, int(ss("_xl_autosave_every", _XL_AUTOSAVE_EVERY))
         ):
             _xl_snap = build_partial_df(results, df_work, _active_fields)
+            _xl_partial_fname = (
+                f"enriched_results_partial_{_new_idx:03d}_companies.xlsx"
+            )
             _xl_ok, _xl_msg = _xl_autosave_write(
-                _xl_snap, ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
+                _xl_snap, _xl_partial_fname,
+                name_col=name_col, domain_col=domain_col,
             )
             ss_set(_xl_autosave_last_msg=(
-                f"Autosaved {_new_idx} rows to: {_xl_msg}"
+                f"Autosaved {_new_idx} rows → {_xl_partial_fname}: {_xl_msg}"
                 if _xl_ok else f"⚠ {_xl_msg}"
             ))
 
@@ -7484,11 +7502,12 @@ if ss("enrichment_done", False):
 
     # ── Simple Excel autosave — final write (runs exactly once per run) ─────────
     if not ss("_xl_autosave_final_done", False) and ss("_xl_autosave_enabled", True) and processed > 0:
+        _xl_fin_fname_cfg = ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
         _xl_fin_ok, _xl_fin_msg = _xl_autosave_write(
-            df_enriched, ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
+            df_enriched, _xl_fin_fname_cfg,
+            name_col=name_col, domain_col=domain_col,
         )
         if _xl_fin_ok:
-            _xl_fin_fname = ss("_xl_autosave_filename", _XL_AUTOSAVE_DEFAULT)
             ss_set(
                 _xl_autosave_last_msg=f"Autosaved {processed} rows to: {_xl_fin_msg}",
                 _xl_autosave_final_done=True,
