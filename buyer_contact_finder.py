@@ -1071,6 +1071,10 @@ def main():
         st.metric("Total companies", summary_data["total_companies"])
         st.metric("Already have contacts", summary_data["already_have_contacts"])
         st.metric("Missing contacts", summary_data["missing_contacts"])
+        st.caption(
+            "ℹ️ Not every company missing contacts will be enriched. "
+            "Only the companies you select below will use Lusha credits in this run."
+        )
     with col_b:
         st.metric("Call now", summary_data["call_now"])
         st.metric("Call this month", summary_data["call_this_month"])
@@ -1136,11 +1140,33 @@ def main():
     if refresh_existing:
         net_lookups = len(selected_indices)
 
-    # Preview selected
+    # Preview selected + run breakdown
     name_col = _detect_col(df, _NAME_CANDIDATES)
     rec_col = _detect_col(df, _REC_CANDIDATES)
     tier_col = _detect_col(df, _TIER_CANDIDATES)
     route_col = _detect_col(df, _ROUTE_CANDIDATES)
+
+    already_selected = [i for i in selected_indices if _has_existing_contacts(df.iloc[i])]
+    not_selected_count = len(df) - len(selected_indices)
+
+    st.markdown("---")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Selected for this run", len(selected_indices))
+    m2.metric("Not selected", not_selected_count)
+    m3.metric(
+        "Already have contacts",
+        len(already_selected),
+        help="These are selected but will be skipped unless 'Refresh' is on.",
+    )
+    m4.metric("Estimated Lusha lookups", net_lookups)
+
+    if net_lookups == 0 and len(selected_indices) > 0:
+        st.info(
+            "All selected companies already have contacts. "
+            "Enable 'Refresh / overwrite existing contacts' to re-run them."
+        )
+    elif net_lookups == 0:
+        st.info("No companies selected — adjust the selection method above.")
 
     preview_cols = [c for c in [name_col, rec_col, tier_col, route_col] if c]
     if selected_indices and preview_cols:
@@ -1148,29 +1174,17 @@ def main():
         st.markdown(f"**Preview — first 20 of {len(selected_indices)} selected companies:**")
         st.dataframe(preview_df, use_container_width=True, height=300)
 
-    # Credit estimate
-    st.markdown("---")
-    credits_col, _ = st.columns([2, 1])
-    with credits_col:
-        st.info(
-            f"**Estimated Lusha lookups:** {net_lookups}  \n"
-            f"_(1 lookup per company; up to 3 contacts per lookup)_"
-        )
-
     if not lusha_api_key:
         st.warning(
             "⚠ Lusha API key not found in Streamlit secrets. "
             "Add `LUSHA_API_KEY = \"your-key\"` to `.streamlit/secrets.toml`."
         )
 
-    if net_lookups == 0:
-        st.info("No new lookups needed — all selected companies already have contacts.")
-
     # ── Confirmation + Run ────────────────────────────────────────────────────
     st.markdown("### Step 4 — Run contact enrichment")
 
     confirmed = st.checkbox(
-        f"✅ I confirm I want to run **{net_lookups}** Lusha lookup(s)",
+        f"I confirm I want to enrich the selected {net_lookups} companies with Lusha.",
         value=False,
         key="bcf_confirm",
     )
