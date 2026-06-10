@@ -1654,6 +1654,193 @@ def _compute_caller_caution(adj: dict, rec: str) -> dict:
     }
 
 
+def _compute_caller_prep_fields(r: dict) -> dict:
+    """Derive final_opener, discovery_question_1/2, evidence_to_mention,
+    what_not_to_overclaim from already-computed result fields.
+
+    Returns a dict with the 5 keys.  For internal/excluded companies every
+    value is left blank so no outreach copy is generated.
+    """
+    scores  = r.get("scores",  {})
+    claude  = r.get("claude",  {})
+    enriched = r.get("enriched_row", {})
+
+    rec         = str(scores.get("call_recommendation", "") or "").strip()
+    is_internal = rec in ("Internal / exclude",)
+
+    if is_internal:
+        return {
+            "final_opener":        "",
+            "discovery_question_1": "",
+            "discovery_question_2": "",
+            "evidence_to_mention": "",
+            "what_not_to_overclaim": "Internal / exclude — do not generate outreach content.",
+        }
+
+    def _sv(*keys_dicts):
+        """Return first non-blank value searching key/dict pairs."""
+        for key, d in keys_dicts:
+            v = str(d.get(key, "") or "").strip()
+            if v and v.lower() not in ("nan", "none", "n/a"):
+                return v
+        return ""
+
+    company         = str(r.get("company_name", "") or "").strip()
+    suggested_opener = _sv(("suggested_opener", claude))
+    icp_why         = _sv(("icp_why_relevant",       enriched),
+                           ("icp_why_relevant",       claude))
+    why_now         = _sv(("why_now",                 claude))
+    buyer_route     = _sv(("preferred_buyer_route",   claude))
+    training_interest = _sv(("icp_likely_training_interest", enriched),
+                             ("icp_likely_training_interest", claude))
+    trigger_type    = _sv(("trigger_type",            claude))
+    is_current      = claude.get("is_current_trigger", False)
+    recency_bucket  = _sv(("recency_bucket",          claude))
+    evidence_quality = _sv(("evidence_quality",       claude))
+    confidence_level = _sv(("confidence_level",       claude))
+    caution_note    = _sv(("caution_note",             claude))
+    missing_ev      = _sv(("missing_evidence",         claude))
+    icp_evidence    = _sv(("icp_evidence",             enriched),
+                           ("icp_evidence",             claude))
+    icp_signals     = _sv(("icp_buying_signals",       enriched),
+                           ("icp_buying_signals",       claude))
+    ev_summary      = _sv(("trigger_evidence",         claude),
+                           ("evidence_summary",         claude))
+    latest_src_date = _sv(("latest_source_date",       scores))
+
+    # ── 1. final_opener ───────────────────────────────────────────────────────
+    if suggested_opener:
+        final_opener = suggested_opener
+    else:
+        # Build a conservative fallback from available context
+        parts = []
+        if buyer_route:
+            parts.append(f"I'm reaching out to {buyer_route}s at {company or 'your organisation'}.")
+        elif company:
+            parts.append(f"I'm reaching out regarding {company}.")
+        if is_current and why_now:
+            parts.append(why_now[:120].rstrip(".") + ".")
+        elif icp_why:
+            parts.append(icp_why[:120].rstrip(".") + ".")
+        parts.append(
+            "We work with international companies on Business English and "
+            "cross-border communication training. I'd love to explore whether "
+            "that's relevant for your team."
+        )
+        final_opener = " ".join(parts)
+
+    # ── 2. discovery_question_1 ───────────────────────────────────────────────
+    li = (training_interest or icp_why or "").lower()
+    if "onboard" in li:
+        dq1 = (
+            "Is onboarding of new international employees currently creating "
+            "new language or communication training needs?"
+        )
+    elif "l&d" in li or "learning" in li or "development" in li:
+        dq1 = (
+            "Is language training or business communication currently part "
+            "of your L&D planning for this year?"
+        )
+    elif "client" in li or "client-facing" in li:
+        dq1 = (
+            "Are client-facing teams currently receiving support for "
+            "business communication or professional English?"
+        )
+    elif buyer_route and "hr" in buyer_route.lower():
+        dq1 = (
+            "Are international teams currently facing communication or "
+            "language challenges that HR is looking to address?"
+        )
+    else:
+        dq1 = (
+            "Is language training or business communication currently part "
+            "of your team development plans?"
+        )
+
+    # ── 3. discovery_question_2 ───────────────────────────────────────────────
+    if buyer_route and ("l&d" in buyer_route.lower() or "learning" in buyer_route.lower()):
+        dq2 = (
+            "Which teams would benefit most from stronger Business English "
+            "or cross-border communication support?"
+        )
+    elif buyer_route and "hr" in buyer_route.lower():
+        dq2 = (
+            "Are these training needs handled centrally by HR and L&D, "
+            "or by individual business units?"
+        )
+    else:
+        dq2 = (
+            "Do you currently work with external providers for language or "
+            "communication training, or is that handled in-house?"
+        )
+
+    # ── 4. evidence_to_mention ────────────────────────────────────────────────
+    ev_parts: list[str] = []
+    for snippet in (icp_evidence, icp_signals, ev_summary):
+        if snippet:
+            ev_parts.append(snippet[:180].rstrip("."))
+            break  # one clear snippet is enough
+    date_note = f" (last signal: {latest_src_date})" if latest_src_date else ""
+    if ev_parts:
+        evidence_to_mention = ev_parts[0].strip() + date_note + "."
+    else:
+        evidence_to_mention = (
+            "Public sources suggest this company has international operations "
+            "or internal employee development activity."
+            + date_note
+        )
+
+    # ── 5. what_not_to_overclaim ──────────────────────────────────────────────
+    wno_parts: list[str] = []
+
+    if not is_current:
+        wno_parts.append(
+            "Do not imply the company is actively buying or has confirmed training needs."
+        )
+
+    if recency_bucket in ("Stale", "Old context", "Unknown date"):
+        wno_parts.append("Signal recency is uncertain — do not reference specific recent events.")
+
+    if confidence_level.lower() in ("low", "unknown", ""):
+        wno_parts.append(
+            "Evidence confidence is low. Treat this as a fit-based lead, "
+            "not a trigger-confirmed lead."
+        )
+    elif evidence_quality.lower() in ("weak", "insufficient"):
+        wno_parts.append(
+            "Evidence is thin. Do not cite specific sources or claim confirmed activity."
+        )
+
+    if rec in ("Monitor", "Low priority"):
+        wno_parts.append(
+            "This company is not yet ready to contact. Do not initiate outreach."
+        )
+    elif rec == "Call before budget cycle":
+        wno_parts.append(
+            "No clear buying window confirmed. Do not mention a specific budget cycle."
+        )
+
+    if trigger_type in ("No clear trigger", "No clear trigger found", ""):
+        if not any("trigger" in p.lower() for p in wno_parts):
+            wno_parts.append("No current timing trigger was confirmed.")
+
+    if caution_note and caution_note not in " | ".join(wno_parts):
+        wno_parts.append(caution_note)
+
+    what_not_to_overclaim = " | ".join(wno_parts) if wno_parts else (
+        "Standard caution: position mYngle as a relevant partner, "
+        "not a response to a confirmed active need."
+    )
+
+    return {
+        "final_opener":          final_opener,
+        "discovery_question_1":  dq1,
+        "discovery_question_2":  dq2,
+        "evidence_to_mention":   evidence_to_mention,
+        "what_not_to_overclaim": what_not_to_overclaim,
+    }
+
+
 def _compute_scores(
     claude_result: dict,
     fit_score_raw,
@@ -2040,6 +2227,9 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
 
         domain = str(r.get("domain", "") or "")
 
+        # Compute the 5 caller-prep fields once per row
+        caller_prep = _compute_caller_prep_fields(r)
+
         for ci, (col_name, src, key, is_numeric, num_fmt, _width, wrap) in \
                 enumerate(_CPI_COLUMN_SPEC, 1):
             if src == "computed":
@@ -2051,6 +2241,9 @@ def _write_caller_prep_sheet(ws, results: list) -> None:
                         val = raw
                 else:
                     val = raw
+            elif col_name in caller_prep:
+                # Caller-prep fields: use generated value instead of blank placeholder
+                val = caller_prep[col_name]
             else:
                 val = _cpi_get(r, src, key, is_numeric)
 
