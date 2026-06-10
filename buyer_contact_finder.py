@@ -247,8 +247,58 @@ STATUS_COMPANY_ONLY = "company_data_only"
 STATUS_NOT_RUN = "contact_lookup_not_run"
 STATUS_ERROR = "contact_lookup_error"
 STATUS_NOT_SUPPORTED = "contact_lookup_not_supported"
+STATUS_DEMO = "demo_contacts"
 STATUS_SKIPPED_NOT_SELECTED = "skipped_not_selected"
 STATUS_SKIPPED_HAS_CONTACTS = "skipped_already_has_contacts"
+
+# Demo placeholder contact templates keyed by buyer route fragment
+_DEMO_CONTACTS_BY_ROUTE: dict[str, list[dict]] = {
+    "international hr": [
+        {"title": "Head of International HR",    "department": "HR"},
+        {"title": "HR Director",                 "department": "HR"},
+        {"title": "People Operations Manager",   "department": "People Operations"},
+    ],
+    "l&d": [
+        {"title": "Head of Learning & Development", "department": "L&D"},
+        {"title": "Talent Development Manager",      "department": "L&D"},
+        {"title": "Training Manager",                "department": "Training"},
+    ],
+    "talent": [
+        {"title": "Head of Learning & Development", "department": "L&D"},
+        {"title": "Talent Development Manager",      "department": "L&D"},
+        {"title": "Training Manager",                "department": "Training"},
+    ],
+    "sales enablement": [
+        {"title": "Sales Enablement Lead",          "department": "Sales Enablement"},
+        {"title": "Commercial Enablement Manager",  "department": "Commercial"},
+        {"title": "Revenue Enablement Manager",     "department": "Revenue Operations"},
+    ],
+    "customer success": [
+        {"title": "Head of Customer Success",       "department": "Customer Success"},
+        {"title": "Customer Success Enablement Manager", "department": "Customer Success"},
+        {"title": "VP Customer Success",            "department": "Customer Success"},
+    ],
+    "hr / people": [
+        {"title": "HR Director",       "department": "HR"},
+        {"title": "Head of People",    "department": "People"},
+        {"title": "People Manager",    "department": "People"},
+    ],
+    "people operations": [
+        {"title": "Head of People Operations", "department": "People Operations"},
+        {"title": "HR Operations Manager",     "department": "HR Operations"},
+        {"title": "HR Business Partner",       "department": "HR"},
+    ],
+}
+
+_DEMO_CONTACTS_DEFAULT = [
+    {"title": "HR Director",       "department": "HR"},
+    {"title": "People Manager",    "department": "People"},
+    {"title": "Training Manager",  "department": "Training"},
+]
+
+_DEMO_FIT_NOTE = "Demo contact generated for interface preview only"
+_DEMO_SOURCE = "Demo placeholder"
+_DEMO_SEARCH_LABEL = "Demo placeholder mode — no API call made"
 
 # Contact output field names
 CONTACT_FIELDS_BASE = [
@@ -865,6 +915,66 @@ def _lusha_person_search(
 
 
 # =============================================================================
+# DEMO PLACEHOLDER GENERATOR
+# =============================================================================
+
+
+def _demo_contacts_for_route(preferred_route: str) -> list[dict]:
+    """Return the 3 demo contact templates for the given buyer route."""
+    route = (preferred_route or "").lower()
+    for key, templates in _DEMO_CONTACTS_BY_ROUTE.items():
+        if key in route:
+            return templates
+    return _DEMO_CONTACTS_DEFAULT
+
+
+def _generate_demo_row(row: pd.Series, selected: bool, refresh_existing: bool = False) -> dict:
+    """
+    Return contact field updates populated with clearly artificial placeholder data.
+    No API calls, no credits consumed.
+    """
+    result: dict = {}
+
+    if not selected:
+        existing_status = str(row.get("contact_data_status", "")).strip()
+        if not existing_status or existing_status in (STATUS_NOT_RUN, ""):
+            result["contact_data_status"] = STATUS_SKIPPED_NOT_SELECTED
+        return result
+
+    if _has_existing_contacts(row) and not refresh_existing:
+        result["contact_data_status"] = STATUS_SKIPPED_HAS_CONTACTS
+        return result
+
+    route_val = ""
+    for c in _ROUTE_CANDIDATES:
+        v = row.get(c, "")
+        if v and str(v).strip() not in ("", "nan", "Unknown"):
+            route_val = str(v).strip()
+            break
+
+    templates = _demo_contacts_for_route(route_val)
+
+    for i, tpl in enumerate(templates[:3], start=1):
+        result[f"contact_{i}_name"] = f"Demo Contact {i}"
+        result[f"contact_{i}_title"] = tpl["title"]
+        result[f"contact_{i}_email"] = f"demo.contact{i}@example.com"
+        result[f"contact_{i}_phone"] = ""
+        result[f"contact_{i}_linkedin_url"] = ""
+        result[f"contact_{i}_department"] = tpl.get("department", "")
+        result[f"contact_{i}_seniority"] = ""
+        result[f"contact_{i}_source"] = _DEMO_SOURCE
+        result[f"contact_{i}_fit_notes"] = _DEMO_FIT_NOTE
+
+    result["contact_data_status"] = STATUS_DEMO
+    result["contact_search_used"] = _DEMO_SEARCH_LABEL
+    result["contact_lookup_timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    result["contact_credits_estimated"] = 0
+    result["contact_credits_used"] = 0
+    result["contact_lookup_error"] = ""
+    return result
+
+
+# =============================================================================
 # ENRICHMENT RUNNER
 # =============================================================================
 
@@ -1032,6 +1142,7 @@ def _build_excel(
         ["Contacts found", summary.get("contacts_found", "")],
         ["No contacts found (searched, none returned)", summary.get("no_contacts_found", "")],
         ["Contact endpoint not supported", summary.get("endpoint_not_supported", "")],
+        ["Demo placeholder contacts generated", summary.get("demo_contacts_generated", "")],
         ["Lookup errors", summary.get("lookup_errors", "")],
         ["Credits used (actual billed lookups)", summary.get("credits_used", "")],
         [],
@@ -1273,28 +1384,55 @@ def main():
     # ── Confirmation + Run ────────────────────────────────────────────────────
     st.markdown("### Step 4 — Run contact enrichment")
 
+    demo_mode = st.checkbox(
+        "🧪 Generate demo placeholder contacts instead of real Lusha lookup",
+        value=False,
+        key="bcf_demo_mode",
+        help=(
+            "For interface preview only. Populates artificial contacts based on "
+            "preferred_buyer_route. No API calls, no credits used. "
+            "MUST NOT be used for real outreach."
+        ),
+    )
+
+    if demo_mode:
+        st.warning(
+            "⚠️ **Demo mode active.** Placeholder contacts will be generated — "
+            "no real people, no real emails. "
+            "These contacts are artificial and must not be used for real outreach."
+        )
+        confirm_label = (
+            f"I understand these are demo placeholders and will enrich "
+            f"{len(selected_indices)} selected companies with artificial contacts."
+        )
+        run_disabled_extra = len(selected_indices) == 0
+    else:
+        confirm_label = (
+            f"I confirm I want to enrich the selected {net_lookups} companies with Lusha "
+            f"(estimated {net_lookups} lookup credit{'' if net_lookups == 1 else 's'})."
+        )
+        run_disabled_extra = not lusha_api_key or net_lookups == 0
+
     confirmed = st.checkbox(
-        f"I confirm I want to enrich the selected {net_lookups} companies with Lusha "
-        f"(estimated {net_lookups} lookup credit{'' if net_lookups == 1 else 's'}).",
+        confirm_label,
         value=False,
         key="bcf_confirm",
     )
 
     run_disabled = (
         not confirmed
-        or not lusha_api_key
-        or net_lookups == 0
+        or run_disabled_extra
         or ss("_bcf_processing")
         or ss("_bcf_done")
     )
 
     if st.button(
-        "▶ Run Contact Enrichment",
+        "▶ Run Demo Enrichment" if demo_mode else "▶ Run Contact Enrichment",
         disabled=run_disabled,
         type="primary",
         key="bcf_run",
     ):
-        ss_set(_bcf_processing=True, _bcf_done=False)
+        ss_set(_bcf_processing=True, _bcf_done=False, _bcf_demo_mode=demo_mode)
         st.rerun()
 
     # ── Processing ────────────────────────────────────────────────────────────
@@ -1308,6 +1446,58 @@ def main():
 
         selected_set = set(selected_indices)
         raw_evidence: list[dict] = []
+
+        # ── Demo mode fast-path — no API calls ───────────────────────────────
+        if ss("_bcf_demo_mode"):
+            demo_counts = {
+                "demo_generated": 0, "skipped_had_contacts": 0,
+                "skipped_not_selected": 0,
+            }
+            for iloc_i in range(len(enriched_df)):
+                row = enriched_df.iloc[iloc_i]
+                is_selected = iloc_i in selected_set
+                updates = _generate_demo_row(row, is_selected, refresh_existing)
+                for field, value in updates.items():
+                    enriched_df.at[enriched_df.index[iloc_i], field] = value
+                status = updates.get("contact_data_status", "")
+                if status == STATUS_DEMO:
+                    demo_counts["demo_generated"] += 1
+                elif status == STATUS_SKIPPED_HAS_CONTACTS:
+                    demo_counts["skipped_had_contacts"] += 1
+                elif status == STATUS_SKIPPED_NOT_SELECTED:
+                    demo_counts["skipped_not_selected"] += 1
+
+            run_summary = {
+                **summary_data,
+                "selected_count": len(selected_indices),
+                "attempted_lookups": demo_counts["demo_generated"],
+                "skipped_not_selected": demo_counts["skipped_not_selected"],
+                "skipped_had_contacts": demo_counts["skipped_had_contacts"],
+                "contacts_found": 0,
+                "no_contacts_found": 0,
+                "lookup_errors": 0,
+                "endpoint_not_supported": 0,
+                "demo_contacts_generated": demo_counts["demo_generated"],
+                "credits_estimated": 0,
+                "credits_used": 0,
+                "preflight_outcome": "demo_mode",
+                "preflight_message": "Demo placeholder mode — no Lusha API calls made",
+                "run_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "input_file": ss("_bcf_file_name", ""),
+            }
+            excel_bytes = _build_excel(
+                enriched_df, ss("_bcf_df_original"), run_summary, [], all_sheets
+            )
+            ss_set(
+                _bcf_processing=False,
+                _bcf_done=True,
+                _bcf_results_df=enriched_df,
+                _bcf_summary=run_summary,
+                _bcf_raw_evidence=[],
+                _bcf_excel_bytes=excel_bytes,
+                _bcf_preflight_error=None,
+            )
+            st.rerun()
 
         # ── Preflight: test one company before running the full batch ─────────
         preflight_placeholder = st.empty()
@@ -1559,7 +1749,18 @@ def main():
         run_summary = ss("_bcf_summary") or {}
         preflight_error = ss("_bcf_preflight_error")
 
-        if preflight_error:
+        is_demo_run = run_summary.get("preflight_outcome") == "demo_mode"
+
+        if is_demo_run:
+            st.warning(
+                "⚠️ **Demo run completed.** "
+                f"{run_summary.get('demo_contacts_generated', 0)} companies were populated "
+                "with artificial placeholder contacts.  \n"
+                "**These contacts are not real and must not be used for real outreach.**  \n"
+                "Use this output to preview the Caller Prep interface layout only."
+            )
+            st.markdown("### ✅ Demo enrichment complete")
+        elif preflight_error:
             st.error(preflight_error)
             st.markdown(
                 "**What to do:**  \n"
