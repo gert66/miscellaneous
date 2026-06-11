@@ -1463,14 +1463,38 @@ def _apply_haiku_decision(
 # AUTOSAVE / RESUME
 # =============================================================================
 
+_MODE_SAFE: dict[str, str] = {
+    _HAIKU_MODE_PYTHON:    "pythononly",
+    _HAIKU_MODE_UNCERTAIN: "haikuuncertain",
+    _HAIKU_MODE_ALL:       "haikuall",
+}
+
+
+def _make_run_label(
+    mode: str, batch_n: int, max_queries: int, debug: bool,
+    ts: str | None = None,
+) -> str:
+    """Return a human-readable run label: YYYYMMDD_HHMM_mode_Nrows_Qq_debug."""
+    if ts is None:
+        ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M")
+    mode_safe = _MODE_SAFE.get(mode, "pythononly")
+    debug_str = "debug" if debug else "nodebug"
+    return f"{ts}_{mode_safe}_{batch_n}rows_{max_queries}q_{debug_str}"
+
+
+def _make_filename(run_label: str, run_id: str) -> str:
+    """Return a readable Excel output filename."""
+    return f"register_cleaned_{run_label}_{run_id[:8]}.xlsx"
+
 
 def _file_hash(data: bytes) -> str:
     """Return a short, stable identifier for a file's byte content."""
     return hashlib.sha1(data).hexdigest()[:16]
 
 
-def _cp_dir(run_id: str) -> Path:
-    return _AUTOSAVE_DIR / run_id
+def _cp_dir(run_id: str, run_label: str = "") -> Path:
+    folder = f"{run_label}_{run_id}" if run_label else run_id
+    return _AUTOSAVE_DIR / folder
 
 
 def _save_checkpoint(
@@ -1482,13 +1506,16 @@ def _save_checkpoint(
     input_df: pd.DataFrame,
     cols: dict,
     settings: dict,
+    run_label: str = "",
 ) -> None:
-    """Persist current progress to autosave/{run_id}/."""
-    d = _cp_dir(run_id)
+    """Persist current progress to autosave/{run_label}_{run_id}/ (or autosave/{run_id}/ if no label)."""
+    d = _cp_dir(run_id, run_label)
     d.mkdir(parents=True, exist_ok=True)
 
     meta = {
         "run_id":     run_id,
+        "run_label":  run_label,
+        "folder_name": d.name,
         "row_idx":    row_idx,
         "total_rows": total_rows,
         "timestamp":  pd.Timestamp.now().isoformat(timespec="seconds"),
@@ -1512,42 +1539,45 @@ def _save_checkpoint(
         input_df.to_csv(input_path, index=False)
 
 
-def _load_checkpoint(run_id: str) -> dict | None:
-    """Load checkpoint from disk. Returns None if missing or unreadable."""
-    d = _cp_dir(run_id)
-    meta_path = d / "meta.json"
-    if not meta_path.exists():
-        return None
+def _load_checkpoint_from_dir(d: Path) -> dict | None:
+    """Load checkpoint data from a specific directory."""
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         results: list[dict] = []
         results_path = d / "results.csv"
         if results_path.exists():
             results = pd.read_csv(results_path, dtype=str).fillna("").to_dict("records")
-
         evidence: list[dict] = []
         ev_path = d / "evidence.json"
         if ev_path.exists():
             evidence = json.loads(ev_path.read_text(encoding="utf-8"))
-
         input_df: pd.DataFrame | None = None
         input_path = d / "input.csv"
         if input_path.exists():
             input_df = pd.read_csv(input_path, dtype=str).fillna("")
-
-        return {
-            "meta":     meta,
-            "results":  results,
-            "evidence": evidence,
-            "input_df": input_df,
-        }
+        return {"meta": meta, "results": results, "evidence": evidence, "input_df": input_df}
     except Exception:
         return None
 
 
+def _load_checkpoint(run_id: str) -> dict | None:
+    """
+    Load checkpoint by run_id.  Tries legacy hash-only folder first, then scans all
+    checkpoint directories for a meta.json whose run_id matches.
+    """
+    legacy = _AUTOSAVE_DIR / run_id
+    if legacy.is_dir() and (legacy / "meta.json").exists():
+        return _load_checkpoint_from_dir(legacy)
+    for cp_meta in _list_checkpoints():
+        if cp_meta.get("run_id") == run_id:
+            folder = _AUTOSAVE_DIR / cp_meta["_folder"]
+            if folder.is_dir():
+                return _load_checkpoint_from_dir(folder)
+    return None
+
+
 def _list_checkpoints() -> list[dict]:
-    """Return all checkpoint meta dicts sorted newest-first."""
+    """Return all checkpoint meta dicts sorted newest-first.  Adds '_folder' key."""
     if not _AUTOSAVE_DIR.exists():
         return []
     out = []
@@ -1558,14 +1588,20 @@ def _list_checkpoints() -> list[dict]:
         if not mp.exists():
             continue
         try:
-            out.append(json.loads(mp.read_text(encoding="utf-8")))
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            meta["_folder"] = d.name
+            out.append(meta)
         except Exception:
             continue
     return sorted(out, key=lambda m: m.get("timestamp", ""), reverse=True)
 
 
 def _delete_checkpoint(run_id: str) -> None:
-    shutil.rmtree(_cp_dir(run_id), ignore_errors=True)
+    for cp_meta in _list_checkpoints():
+        if cp_meta.get("run_id") == run_id:
+            shutil.rmtree(_AUTOSAVE_DIR / cp_meta["_folder"], ignore_errors=True)
+            return
+    shutil.rmtree(_AUTOSAVE_DIR / run_id, ignore_errors=True)
 
 
 def _checkpoint_excel_bytes(run_id: str, cols: dict) -> bytes | None:
@@ -1583,11 +1619,11 @@ def _checkpoint_excel_bytes(run_id: str, cols: dict) -> bytes | None:
         partial_in = input_df.iloc[:n_done].copy().reset_index(drop=True)
         result_df  = result_df.reset_index(drop=True)
 
-        # Re-align index so concat works
         enriched   = pd.concat([partial_in, result_df], axis=1)
         enriched   = enriched.loc[:, ~enriched.columns.duplicated()]
 
-        return build_excel(enriched, input_df, evidence, cols)
+        return build_excel(enriched, input_df, evidence, cols,
+                           debug_rows=None, debug_mode=False, run_meta=None)
     except Exception:
         return None
 
@@ -1651,20 +1687,24 @@ def process_dataframe(
     prior_results: list[dict] | None = None,
     prior_evidence: list[dict] | None = None,
     settings: dict | None = None,
+    run_label: str = "",
     # Claude Haiku review layer
     haiku_mode: str = _HAIKU_MODE_PYTHON,
     haiku_api_key: str | None = None,
     haiku_model: str = _DEFAULT_HAIKU_MODEL,
     haiku_max_rows: int = 0,   # 0 = no limit
-) -> tuple[pd.DataFrame, list[dict]]:
+    # Debug
+    debug_mode: bool = False,
+) -> tuple[pd.DataFrame, list[dict], list[dict]]:
     """
     Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
     Saves a checkpoint to disk every _AUTOSAVE_EVERY rows and on completion.
 
-    Returns (enriched_df_for_all_rows, all_evidence_rows).
+    Returns (enriched_df_for_all_rows, all_evidence_rows, all_debug_rows).
     """
     new_results:  list[dict] = []
     new_evidence: list[dict] = []
+    new_debug:    list[dict] = []
     n = len(df)
 
     company_col  = cols.get("company") or ""
@@ -1750,6 +1790,36 @@ def process_dataframe(
                 "discovery_method":  res.get("website_discovery_method", ""),
             })
 
+        # Candidate Discovery Debug rows — one row per Serper result
+        if debug_mode and raw_ev:
+            query_counters: dict[str, int] = {}
+            for e in raw_ev:
+                q = e.get("query", "")
+                query_counters[q] = query_counters.get(q, 0) + 1
+                new_debug.append({
+                    "company_name":        name,
+                    "row_number":          global_i + 1,
+                    "search_query":        q,
+                    "result_rank":         query_counters[q],
+                    "title":               e.get("title", ""),
+                    "snippet":             e.get("snippet", ""),
+                    "url":                 e.get("url", ""),
+                    "extracted_domain":    e.get("domain", ""),
+                    "score":               e.get("score", ""),
+                    "used":                e.get("used", ""),
+                    "skip_reason":         e.get("skip_reason", ""),
+                    "rejection_category":  e.get("rejection_category", ""),
+                    "brand_overlap":       e.get("brand_overlap", ""),
+                    "full_overlap":        e.get("full_overlap", ""),
+                    "location_match":      e.get("location_match", ""),
+                    "email_match":         e.get("email_match", ""),
+                    "official_signal":     e.get("official_signal", ""),
+                    "final_python_domain": res.get("validated_domain", ""),
+                    "haiku_mode":          haiku_mode,
+                    "haiku_decision":      res.get("haiku_decision", ""),
+                    "final_selected_domain": res.get("final_selected_domain", ""),
+                })
+
         rows_done = global_i + 1
         # Checkpoint every N rows and on the final row
         if run_id and (rows_done % _AUTOSAVE_EVERY == 0 or rows_done == n):
@@ -1757,7 +1827,7 @@ def process_dataframe(
             all_e = list(prior_evidence or []) + new_evidence
             _save_checkpoint(
                 run_id, all_r, all_e, rows_done, n,
-                df, cols, settings or {},
+                df, cols, settings or {}, run_label=run_label,
             )
 
         if progress_cb:
@@ -1766,11 +1836,12 @@ def process_dataframe(
     # Merge prior completed rows with newly processed rows
     all_results  = list(prior_results or []) + new_results
     all_evidence = list(prior_evidence or []) + new_evidence
+    all_debug    = new_debug   # debug rows only cover the newly processed rows
 
     result_df = pd.DataFrame(all_results, index=df.index)
     enriched  = pd.concat([df.copy(), result_df], axis=1)
     enriched  = enriched.loc[:, ~enriched.columns.duplicated()]
-    return enriched, all_evidence
+    return enriched, all_evidence, all_debug
 
 
 # =============================================================================
@@ -1949,11 +2020,37 @@ def _write_best_guess_sheet(ws, bg_df: pd.DataFrame, enriched_df: pd.DataFrame) 
     ws.row_dimensions[1].height = 18
 
 
+def _write_run_summary_sheet(ws, run_meta: dict) -> None:
+    """Write a two-column (Field / Value) run summary sheet."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    hdr_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    key_font  = Font(bold=True, size=10)
+    for ci, header in enumerate(["Field", "Value"], 1):
+        cell = ws.cell(row=1, column=ci, value=header)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="left")
+    ws.column_dimensions["A"].width = 36
+    ws.column_dimensions["B"].width = 52
+    for ri, (field, value) in enumerate(run_meta.items(), 2):
+        a = ws.cell(row=ri, column=1, value=str(field))
+        a.font = key_font
+        a.alignment = Alignment(vertical="top")
+        b = ws.cell(row=ri, column=2, value=str(value) if value is not None else "")
+        b.alignment = Alignment(vertical="top", wrap_text=False)
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 18
+
+
 def build_excel(
     enriched_df: pd.DataFrame,
     original_df: pd.DataFrame,
     evidence_rows: list[dict],
     cols: dict,
+    debug_rows: list[dict] | None = None,
+    debug_mode: bool = False,
+    run_meta: dict | None = None,
 ) -> bytes:
     import openpyxl
 
@@ -2010,6 +2107,35 @@ def build_excel(
         _write_sheet(ws5, enriched_df[avail_haiku_cols].copy())
     else:
         ws5.cell(row=1, column=1, value="Haiku review was not used in this run.")
+
+    # Sheet 7: Candidate Discovery Debug (only when debug_mode is active)
+    if debug_mode:
+        ws6 = wb.create_sheet("Candidate Discovery Debug")
+        _debug_cols = [
+            "company_name", "row_number", "search_query", "result_rank",
+            "title", "snippet", "url", "extracted_domain",
+            "score", "used", "skip_reason", "rejection_category",
+            "brand_overlap", "full_overlap", "location_match", "email_match",
+            "official_signal", "final_python_domain",
+            "haiku_mode", "haiku_decision", "final_selected_domain",
+        ]
+        if debug_rows:
+            debug_df = pd.DataFrame(debug_rows)
+            for c in _debug_cols:
+                if c not in debug_df.columns:
+                    debug_df[c] = ""
+            _write_sheet(ws6, debug_df[_debug_cols])
+        else:
+            ws6.cell(row=1, column=1,
+                     value="Debug mode was enabled but no Serper results were collected "
+                           "(no Serper key, or no rows required search).")
+
+    # Sheet 8 (or 7): Run Summary — always last
+    ws_summary = wb.create_sheet("Run Summary")
+    if run_meta:
+        _write_run_summary_sheet(ws_summary, run_meta)
+    else:
+        ws_summary.cell(row=1, column=1, value="Run metadata not available.")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -2135,6 +2261,91 @@ def _summary_metrics(df: pd.DataFrame, cols: dict) -> None:
 # =============================================================================
 
 
+def _build_run_meta(
+    enriched_df: pd.DataFrame,
+    input_filename: str,
+    run_id: str,
+    run_label: str,
+    total_rows_input: int,
+    batch_n: int,
+    max_queries: int,
+    haiku_mode: str,
+    haiku_model: str,
+    haiku_max_rows: int,
+    debug_mode: bool,
+    serper_key_present: bool,
+    anthropic_key_present: bool,
+) -> dict:
+    """Build the ordered dict that populates the Run Summary Excel sheet."""
+    actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
+    has_final = int(
+        enriched_df.get("final_selected_domain", enriched_df.get("validated_domain",
+            pd.Series(dtype=str))).astype(str).str.strip().replace("", pd.NA).notna().sum()
+    )
+    coverage = round(has_final / batch_n * 100) if batch_n else 0
+    decisions = enriched_df.get("haiku_decision", pd.Series(dtype=str)).astype(str)
+    n_haiku   = int(
+        enriched_df.get("haiku_used", pd.Series(dtype=str)).astype(str)
+        .str.lower().isin(["true", "1"]).sum()
+    )
+    review = int(
+        enriched_df.get("manual_review_needed", pd.Series(dtype=str))
+        .astype(str).str.lower().isin(["true", "1", "yes"]).sum()
+    )
+    no_match = int(actions.isin(["MISSING_DOMAIN", "NO_CONFIDENT_MATCH"]).sum())
+    return {
+        "timestamp":                 pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "input_filename":            input_filename,
+        "input_file_hash":           run_id,
+        "run_label":                 run_label,
+        "total_rows_in_input":       total_rows_input,
+        "processed_rows":            batch_n,
+        "max_serper_queries":        max_queries,
+        "haiku_mode":                haiku_mode,
+        "haiku_model":               haiku_model,
+        "haiku_max_rows":            haiku_max_rows if haiku_max_rows > 0 else "all",
+        "candidate_debug_mode":      "on" if debug_mode else "off",
+        "serper_key_present":        "yes" if serper_key_present else "no",
+        "anthropic_key_present":     "yes" if anthropic_key_present else "no",
+        "rows_with_final_domain":    has_final,
+        "final_website_coverage_%":  f"{coverage}%",
+        "rows_reviewed_by_haiku":    n_haiku,
+        "haiku_accepted_python":     int(decisions.eq("accept").sum()),
+        "haiku_replaced_python":     int(decisions.eq("replace").sum()),
+        "haiku_rejected":            int(decisions.eq("reject").sum()),
+        "haiku_uncertain":           int(decisions.eq("uncertain").sum()),
+        "no_confident_match_count":  no_match,
+        "manual_review_count":       review,
+    }
+
+
+def _show_run_info_block(
+    run_label: str,
+    run_id: str,
+    batch_n,
+    max_queries: int,
+    haiku_mode: str,
+    debug_mode: bool,
+    filename: str,
+) -> None:
+    """Show a compact post-run settings summary in the main area."""
+    mode_safe = _MODE_SAFE.get(haiku_mode, "pythononly")
+    debug_str = "on" if debug_mode else "off"
+    st.markdown(
+        f"<div style='background:#f0f4f8;border-radius:6px;padding:10px 16px;"
+        f"font-size:0.82em;margin:8px 0;line-height:1.7'>"
+        f"<b>Run summary</b> · "
+        f"Mode: <code>{mode_safe}</code> · "
+        f"Rows: <code>{batch_n}</code> · "
+        f"Queries: <code>{max_queries}</code> · "
+        f"Debug: <code>{debug_str}</code><br>"
+        f"File: <code>{filename}</code> · "
+        f"Autosave: <code>{_AUTOSAVE_DIR}/{run_label}_{run_id[:8] if run_label else run_id}</code>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _load_secrets_key() -> str | None:
     try:
         return st.secrets.get("SERPER_API_KEY") or st.secrets.get("serper_api_key")
@@ -2180,12 +2391,19 @@ def _show_results(enriched_df: pd.DataFrame, stored_cols: dict) -> None:
             st.dataframe(enriched_df[review_mask][show_cols], use_container_width=True)
 
 
-def _download_section(enriched_df, original_df, evidence_rows, stored_cols,
-                      filename="register_cleaned_output.xlsx") -> None:
+def _download_section(
+    enriched_df, original_df, evidence_rows, stored_cols,
+    filename="register_cleaned_output.xlsx",
+    debug_rows: list[dict] | None = None,
+    debug_mode: bool = False,
+    run_meta: dict | None = None,
+) -> None:
     """Render the output-sheet legend + download button."""
-    excel_bytes = build_excel(enriched_df, original_df, evidence_rows, stored_cols)
-    st.markdown(
-        "**Output sheets:**  \n"
+    excel_bytes = build_excel(
+        enriched_df, original_df, evidence_rows, stored_cols,
+        debug_rows=debug_rows, debug_mode=debug_mode, run_meta=run_meta,
+    )
+    sheet_list = (
         "1. **Best Guess Input** — company, website, email, city, province, phone "
         "+ discovery method (ready for Lead Prioritizer)  \n"
         "2. **Cleaned Register Input** — all original columns + validation + diagnostic columns  \n"
@@ -2194,6 +2412,13 @@ def _download_section(enriched_df, original_df, evidence_rows, stored_cols,
         "5. **Raw Search Evidence** — Serper queries, results, name variants, rejection reasons  \n"
         "6. **Python vs Haiku Comparison** — side-by-side comparison (populated when Haiku mode is active)"
     )
+    if debug_mode:
+        sheet_list += (
+            "  \n7. **Candidate Discovery Debug** — every Serper result per company with full scoring detail"
+        )
+    sheet_list += "  \n8. **Run Summary** — run settings and outcome metrics" if debug_mode \
+        else "  \n7. **Run Summary** — run settings and outcome metrics"
+    st.markdown("**Output sheets:**  \n" + sheet_list)
     st.download_button(
         "⬇ Download cleaned register Excel",
         data=excel_bytes,
@@ -2302,6 +2527,22 @@ def main():
         haiku_max_rows = 0
 
     st.sidebar.markdown("---")
+    debug_mode = st.sidebar.checkbox(
+        "Candidate Discovery Debug Mode",
+        value=False,
+        key="reg_debug_mode",
+        help=(
+            "When enabled, exports an extra Excel sheet with every Serper result for "
+            "every company: title, snippet, url, score, rejection reason, brand overlap, etc. "
+            "Useful for diagnosing why certain companies fail. Increases file size."
+        ),
+    )
+    if debug_mode:
+        st.sidebar.caption(
+            "🔍 Debug sheet will include all raw Serper candidates + rejection reasons."
+        )
+
+    st.sidebar.markdown("---")
     st.sidebar.caption(
         f"Autosave every **{_AUTOSAVE_EVERY} rows** → `{_AUTOSAVE_DIR}/`  \n"
         "If the app crashes or your browser refreshes, reopen the app and use "
@@ -2320,10 +2561,11 @@ def main():
                 ts         = str(cp_meta.get("timestamp", "?"))[:19]
                 complete   = cp_meta.get("complete", False)
                 pct        = f"{row_idx / total * 100:.0f}%" if isinstance(total, int) and total else "?"
+                run_label_cp = cp_meta.get("run_label", "") or cp_meta.get("_folder", run_id_cp[:8])
                 label_str  = (
                     f"{'✅ Complete' if complete else '⏸ Partial'} · "
                     f"**{row_idx}/{total}** rows ({pct}) · saved {ts}  \n"
-                    f"Run ID `{run_id_cp}`"
+                    f"`{run_label_cp}`"
                 )
 
                 c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
@@ -2430,7 +2672,14 @@ def main():
                 cols[role] = col_name
 
         run_df  = df.head(total_rows).copy()
-        settings_dict = {"max_queries": int(max_queries), "batch_n": total_rows}
+        # Recompute a run label for this resume session (new timestamp + current settings)
+        _resume_label = _make_run_label(haiku_mode, total_rows, int(max_queries), debug_mode)
+        _resume_filename = _make_filename(_resume_label, run_id)
+        settings_dict = {
+            "max_queries": int(max_queries), "batch_n": total_rows,
+            "haiku_mode": haiku_mode, "debug_mode": debug_mode,
+            "run_label": _resume_label,
+        }
 
         if col_a.button(
             f"▶ Continue from row {resume_from + 1}", type="primary", use_container_width=True
@@ -2442,7 +2691,7 @@ def main():
                 progress_bar.progress(i / total)
                 status_text.caption(f"Processing {i} / {total}…")
 
-            enriched_df, evidence_rows = process_dataframe(
+            enriched_df, evidence_rows, debug_rows = process_dataframe(
                 run_df, cols, serper_key, int(max_queries),
                 progress_cb=progress_cb,
                 run_id=run_id,
@@ -2450,26 +2699,47 @@ def main():
                 prior_results=prior_results,
                 prior_evidence=prior_evidence,
                 settings=settings_dict,
+                run_label=_resume_label,
                 haiku_mode=haiku_mode,
                 haiku_api_key=anthropic_key,
                 haiku_model=haiku_model,
                 haiku_max_rows=int(haiku_max_rows),
+                debug_mode=debug_mode,
             )
 
             progress_bar.progress(1.0)
             status_text.caption(f"Done — {total_rows} companies processed.")
 
-            st.session_state["reg_enriched"] = enriched_df
-            st.session_state["reg_evidence"] = evidence_rows
-            st.session_state["reg_original"] = run_df
-            st.session_state["reg_cols"]     = cols
-            st.session_state["reg_run_id"]   = run_id
+            # Build run_meta for summary sheet
+            _run_meta_resume = _build_run_meta(
+                enriched_df=enriched_df,
+                input_filename="(resumed run)",
+                run_id=run_id, run_label=_resume_label,
+                total_rows_input=total_rows, batch_n=total_rows,
+                max_queries=int(max_queries), haiku_mode=haiku_mode,
+                haiku_model=haiku_model, haiku_max_rows=int(haiku_max_rows),
+                debug_mode=debug_mode,
+                serper_key_present=bool(serper_key),
+                anthropic_key_present=bool(anthropic_key),
+            )
+
+            st.session_state["reg_enriched"]   = enriched_df
+            st.session_state["reg_evidence"]   = evidence_rows
+            st.session_state["reg_debug"]      = debug_rows
+            st.session_state["reg_original"]   = run_df
+            st.session_state["reg_cols"]       = cols
+            st.session_state["reg_run_id"]     = run_id
+            st.session_state["reg_run_label"]  = _resume_label
+            st.session_state["reg_filename"]   = _resume_filename
+            st.session_state["reg_run_meta"]   = _run_meta_resume
+            st.session_state["reg_debug_mode"] = debug_mode
             st.session_state.pop("reg_resume_data", None)
 
             # Mark checkpoint complete
             _save_checkpoint(
                 run_id, list(prior_results or []) + evidence_rows,
                 evidence_rows, total_rows, total_rows, run_df, cols, settings_dict,
+                run_label=_resume_label,
             )
 
         # Show partial download while waiting for user to click Continue
@@ -2489,17 +2759,29 @@ def main():
         if enriched_df is not None:
             st.markdown("---")
             st.markdown("### Results")
-            stored_cols = st.session_state.get("reg_cols", cols)
+            stored_cols  = st.session_state.get("reg_cols", cols)
+            _stored_label = st.session_state.get("reg_run_label", _resume_label)
+            _stored_fn    = st.session_state.get("reg_filename", _resume_filename)
+            _stored_dm    = st.session_state.get("reg_debug_mode", debug_mode)
             _summary_metrics(enriched_df, stored_cols)
             st.markdown("")
             _show_results(enriched_df, stored_cols)
+            _show_run_info_block(
+                run_label=_stored_label, run_id=run_id,
+                batch_n=total_rows, max_queries=int(max_queries),
+                haiku_mode=haiku_mode, debug_mode=_stored_dm,
+                filename=_stored_fn,
+            )
             st.markdown("---")
             _download_section(
                 enriched_df,
                 st.session_state.get("reg_original", run_df),
                 st.session_state.get("reg_evidence", []),
                 stored_cols,
-                filename=f"register_cleaned_{run_id[:8]}.xlsx",
+                filename=_stored_fn,
+                debug_rows=st.session_state.get("reg_debug", []),
+                debug_mode=_stored_dm,
+                run_meta=st.session_state.get("reg_run_meta"),
             )
         return   # ← resume path ends here
 
@@ -2604,12 +2886,19 @@ def main():
         else:
             batch_n = max_rows
 
-    settings_dict = {"max_queries": int(max_queries), "batch_n": int(batch_n)}
-
     # ── Run ───────────────────────────────────────────────────────────────────
     if st.button("🧹 Clean and validate register data", type="primary", use_container_width=True):
         run_df = df.head(int(batch_n)).copy()
         n      = len(run_df)
+        # Compute label + filename at run start
+        _run_label    = _make_run_label(haiku_mode, n, int(max_queries), debug_mode)
+        _run_filename = _make_filename(_run_label, run_id)
+        settings_dict = {
+            "max_queries": int(max_queries), "batch_n": n,
+            "haiku_mode": haiku_mode, "debug_mode": debug_mode,
+            "run_label": _run_label,
+        }
+
         progress_bar = st.progress(0.0)
         status_text  = st.empty()
 
@@ -2617,7 +2906,7 @@ def main():
             progress_bar.progress(i / total)
             status_text.caption(f"Processing {i} / {total}…")
 
-        enriched_df, evidence_rows = process_dataframe(
+        enriched_df, evidence_rows, debug_rows = process_dataframe(
             run_df, cols, serper_key, int(max_queries),
             progress_cb=progress_cb,
             run_id=run_id,
@@ -2625,23 +2914,44 @@ def main():
             prior_results=[],
             prior_evidence=[],
             settings=settings_dict,
+            run_label=_run_label,
             haiku_mode=haiku_mode,
             haiku_api_key=anthropic_key,
             haiku_model=haiku_model,
             haiku_max_rows=int(haiku_max_rows),
+            debug_mode=debug_mode,
         )
 
         progress_bar.progress(1.0)
         status_text.caption(f"✅ Done — {n} companies processed.")
 
-        # Mark complete in checkpoint
-        _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict)
+        # Build run_meta for summary sheet
+        _run_meta = _build_run_meta(
+            enriched_df=enriched_df,
+            input_filename=uploaded.name,
+            run_id=run_id, run_label=_run_label,
+            total_rows_input=len(df), batch_n=n,
+            max_queries=int(max_queries), haiku_mode=haiku_mode,
+            haiku_model=haiku_model, haiku_max_rows=int(haiku_max_rows),
+            debug_mode=debug_mode,
+            serper_key_present=bool(serper_key),
+            anthropic_key_present=bool(anthropic_key),
+        )
 
-        st.session_state["reg_enriched"] = enriched_df
-        st.session_state["reg_evidence"] = evidence_rows
-        st.session_state["reg_original"] = run_df
-        st.session_state["reg_cols"]     = cols
-        st.session_state["reg_run_id"]   = run_id
+        # Mark complete in checkpoint
+        _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict,
+                         run_label=_run_label)
+
+        st.session_state["reg_enriched"]   = enriched_df
+        st.session_state["reg_evidence"]   = evidence_rows
+        st.session_state["reg_debug"]      = debug_rows
+        st.session_state["reg_original"]   = run_df
+        st.session_state["reg_cols"]       = cols
+        st.session_state["reg_run_id"]     = run_id
+        st.session_state["reg_run_label"]  = _run_label
+        st.session_state["reg_filename"]   = _run_filename
+        st.session_state["reg_run_meta"]   = _run_meta
+        st.session_state["reg_debug_mode"] = debug_mode
 
     # ── Results ───────────────────────────────────────────────────────────────
     enriched_df = st.session_state.get("reg_enriched")
@@ -2650,20 +2960,34 @@ def main():
 
     st.markdown("---")
     st.markdown("### Results")
-    stored_cols = st.session_state.get("reg_cols", cols)
+    stored_cols   = st.session_state.get("reg_cols", cols)
+    active_run_id = st.session_state.get("reg_run_id", run_id)
+    _out_label    = st.session_state.get("reg_run_label", "")
+    _out_filename = st.session_state.get("reg_filename",
+                        f"register_cleaned_{active_run_id[:8]}.xlsx")
+    _out_dm       = st.session_state.get("reg_debug_mode", debug_mode)
+
     _summary_metrics(enriched_df, stored_cols)
     st.markdown("")
     _show_results(enriched_df, stored_cols)
+    _show_run_info_block(
+        run_label=_out_label, run_id=active_run_id,
+        batch_n=int(st.session_state.get("reg_run_meta", {}).get("processed_rows", "?")),
+        max_queries=int(max_queries), haiku_mode=haiku_mode,
+        debug_mode=_out_dm, filename=_out_filename,
+    )
 
     # ── Download ──────────────────────────────────────────────────────────────
     st.markdown("---")
-    active_run_id = st.session_state.get("reg_run_id", run_id)
     _download_section(
         enriched_df,
         st.session_state.get("reg_original", df),
         st.session_state.get("reg_evidence", []),
         stored_cols,
-        filename=f"register_cleaned_{active_run_id[:8]}.xlsx",
+        filename=_out_filename,
+        debug_rows=st.session_state.get("reg_debug", []),
+        debug_mode=_out_dm,
+        run_meta=st.session_state.get("reg_run_meta"),
     )
 
 
