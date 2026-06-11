@@ -2732,7 +2732,7 @@ def main():
             st.session_state["reg_run_label"]  = _resume_label
             st.session_state["reg_filename"]   = _resume_filename
             st.session_state["reg_run_meta"]   = _run_meta_resume
-            st.session_state["reg_debug_mode"] = debug_mode
+            st.session_state["reg_debug_mode_value"] = debug_mode
             st.session_state.pop("reg_resume_data", None)
 
             # Mark checkpoint complete
@@ -2762,7 +2762,7 @@ def main():
             stored_cols  = st.session_state.get("reg_cols", cols)
             _stored_label = st.session_state.get("reg_run_label", _resume_label)
             _stored_fn    = st.session_state.get("reg_filename", _resume_filename)
-            _stored_dm    = st.session_state.get("reg_debug_mode", debug_mode)
+            _stored_dm    = st.session_state.get("reg_debug_mode_value", debug_mode)
             _summary_metrics(enriched_df, stored_cols)
             st.markdown("")
             _show_results(enriched_df, stored_cols)
@@ -2951,7 +2951,7 @@ def main():
         st.session_state["reg_run_label"]  = _run_label
         st.session_state["reg_filename"]   = _run_filename
         st.session_state["reg_run_meta"]   = _run_meta
-        st.session_state["reg_debug_mode"] = debug_mode
+        st.session_state["reg_debug_mode_value"] = debug_mode
 
     # ── Results ───────────────────────────────────────────────────────────────
     enriched_df = st.session_state.get("reg_enriched")
@@ -2965,7 +2965,7 @@ def main():
     _out_label    = st.session_state.get("reg_run_label", "")
     _out_filename = st.session_state.get("reg_filename",
                         f"register_cleaned_{active_run_id[:8]}.xlsx")
-    _out_dm       = st.session_state.get("reg_debug_mode", debug_mode)
+    _out_dm       = st.session_state.get("reg_debug_mode_value", debug_mode)
 
     _summary_metrics(enriched_df, stored_cols)
     st.markdown("")
