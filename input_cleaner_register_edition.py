@@ -83,6 +83,12 @@ _GENERIC_DOMAINS: frozenset = frozenset({
     "italianmade.com", "viesus.com",
     "madeintaly.com", "italyexport.com",
     "nixonpowerseo.it", "dnbItaly.com",
+    # Italian business-profile / financial-data directory sites
+    "fatturatoaziende.com", "fatturatoitalia.it",
+    "registroaziende.it", "registroaziende.com",
+    "informazione-aziende.it", "aziendit.com",
+    "dati-aziende.it", "ufficio-camerale.it",
+    "companiesitaly.com", "italianbusinessregister.it",
     # News aggregators, price comparison, marketplaces
     "corriere.it", "repubblica.it", "ilsole24ore.com", "sole24ore.com",
     "trovaprezzi.it", "idealo.it", "amazon.it",
@@ -95,6 +101,12 @@ _GENERIC_DOMAIN_BASES: tuple = (
     "europages.com", "europages.it", "paginegialle.it", "paginebianche.it",
     "cerved.com", "cervedgroup.it", "dnb.com", "zoominfo.com",
     "bloomberg.com", "crunchbase.com", "glassdoor.com", "indeed.com",
+    # Italian business-profile directory base domains (catches subdomains like m.fatturatoitalia.it)
+    "fatturatoaziende.com", "fatturatoitalia.it",
+    "registroaziende.it", "registroaziende.com",
+    "informazione-aziende.it", "aziendit.com",
+    "dati-aziende.it", "ufficio-camerale.it",
+    "companiesitaly.com", "italianbusinessregister.it",
 )
 
 # PEC (Posta Elettronica Certificata) domains — never use as company website
@@ -174,6 +186,24 @@ _FORMA_ABBREVIATA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "O IN BREVE", "IN BREVE" → use text after phrase (the short name)
+_IN_BREVE_RE = re.compile(
+    r"\bO?\s*IN\s+BREVE[,\s]+(.+)",
+    re.IGNORECASE,
+)
+
+# "DA INDICARE ANCHE COME", "INDICARE ANCHE COME", "ANCHE COME" → use text after
+_ANCHE_COME_RE = re.compile(
+    r"\b(?:DA\s+INDICARE\s+)?(?:INDICARE\s+)?ANCHE\s+COME[,\s]+(.+)",
+    re.IGNORECASE,
+)
+
+# "IN SIGLA ...", "SIGLABILE ..." → strip from this phrase onward (main name is before)
+_IN_SIGLA_RE = re.compile(
+    r"\s*[,\-–]\s*(?:IN\s+SIGLA|SIGLABILE)\b.*$",
+    re.IGNORECASE,
+)
+
 # Extra Italian register legal phrases not caught by _LEGAL_TOKENS / _ITALIAN_DESCRIPTORS
 _EXTRA_LEGAL_PHRASES_RE = re.compile(
     r"\bSOCIETA\'?\s+PER\s+AZIONI\b"
@@ -229,7 +259,20 @@ _RELIGIOUS_PATTERNS = re.compile(
 _DIRECTORY_EXTRA_PATTERNS = re.compile(
     r"oraridiapertura|aperturenegozi|tuttopmi|impresaitalia|"
     r"businessfinder|b2bnetwork|catalogoimprese|trovimprese|"
-    r"ioimpresa|businessregister|italiabusiness|infobel",
+    r"ioimpresa|businessregister|italiabusiness|infobel|"
+    r"fatturato|bilanci|dati-aziend|scheda-aziend|scheda-impres|"
+    r"visura-aziend|report-aziend|company-profile|business-profile",
+    re.IGNORECASE,
+)
+
+# Strong content signals that identify a page as a business-profile/directory entry.
+# Checked against title+snippet when domain is not in _GENERIC_DOMAINS.
+_DIRECTORY_PROFILE_TITLE_SIGNALS = re.compile(
+    r"\bfatturato\b|\bbilancio\b|\butili\b|\bricavi\b|\bpartita\s+iva\b|"
+    r"\bp\.?\s*iva\b|\bscheda\s+azienda\b|\bscheda\s+impresa\b|"
+    r"\bdati\s+aziendali\b|\breport\s+azienda\b|\bvisura\b|"
+    r"\bregistro\s+aziende\b|\bcompany\s+profile\b|\bbusiness\s+profile\b|"
+    r"\bcodice\s+ateco\b|\bforma\s+giuridica\b|\bcapitale\s+sociale\b",
     re.IGNORECASE,
 )
 
@@ -374,20 +417,40 @@ def _pre_clean_register_name(name: str) -> str:
     """
     Pre-process Italian Chamber of Commerce long-form names before variant extraction.
 
-    Handles patterns such as:
-      "POMPE GARBARINO SOCIETA' PER AZIONI O, IN FORMA ABBREVIATA, POMPE GARBARINO S.P.A."
-      → returns "POMPE GARBARINO S.P.A."   (the official short form after the phrase)
+    Resolution priority (first match wins):
+      1. "IN FORMA ABBREVIATA …" → use text after phrase
+      2. "O IN BREVE …" / "IN BREVE …" → use text after phrase
+      3. "ANCHE COME …" / "DA INDICARE ANCHE COME …" → use text after phrase
+      4. "IN SIGLA …" / "SIGLABILE …" → strip phrase and everything after (keep main name)
 
-    Also strips stray apostrophes left by SOCIETA' and normalises whitespace.
+    After resolution, strips residual legal boilerplate, apostrophes, and normalises
+    whitespace. Trailing dots are preserved (e.g. "S.P.A.").
     """
     s = name.strip()
 
-    # If "IN FORMA ABBREVIATA" is present, use only the text that follows it
+    # Priority 1: IN FORMA ABBREVIATA
     m = _FORMA_ABBREVIATA_RE.search(s)
     if m:
         short = m.group(1).strip().strip(",").strip()
         if short:
             s = short
+    else:
+        # Priority 2: O IN BREVE / IN BREVE
+        m = _IN_BREVE_RE.search(s)
+        if m:
+            short = m.group(1).strip().strip(",").strip()
+            if short:
+                s = short
+        else:
+            # Priority 3: ANCHE COME / DA INDICARE ANCHE COME
+            m = _ANCHE_COME_RE.search(s)
+            if m:
+                short = m.group(1).strip().strip(",").strip()
+                if short:
+                    s = short
+            else:
+                # Priority 4: IN SIGLA / SIGLABILE — keep only main name before phrase
+                s = _IN_SIGLA_RE.sub("", s).strip()
 
     # Strip remaining extra legal phrases not covered by _LEGAL_TOKENS
     s = _EXTRA_LEGAL_PHRASES_RE.sub(" ", s)
@@ -401,16 +464,31 @@ def _pre_clean_register_name(name: str) -> str:
     return s
 
 
+_ACRONYM_RE = re.compile(r"^[A-Z](\.[A-Z])+\.?$")
+
+
+def _is_acronym(token: str) -> bool:
+    """True if token looks like a dotted acronym: I.M.E.S.A. or I.T."""
+    return bool(_ACRONYM_RE.match(token.strip()))
+
+
+def _acronym_nodot(token: str) -> str:
+    """Return the dotless form of a dotted acronym: I.M.E.S.A. → IMESA."""
+    return re.sub(r"\.", "", token).upper()
+
+
 def extract_name_variants(name: str) -> dict:
     """
     Build multiple name variants for search query generation.
 
     Returns dict with keys:
-      full         — cleaned name (pre-processed to remove register legal boilerplate)
-      no_legal     — full with legal suffix removed
-      no_desc      — full with legal suffix + Italian descriptors removed
-      brand        — the core brand string used for domain matching and focused queries
-      original     — raw input name before any cleaning
+      full            — cleaned name (pre-processed to remove register legal boilerplate)
+      no_legal        — full with legal suffix removed
+      no_desc         — full with legal suffix + Italian descriptors removed
+      brand           — the core brand string used for domain matching and focused queries
+      brand_nodot     — for dotted acronyms (I.M.E.S.A. → IMESA), else same as brand
+      original        — raw input name before any cleaning
+      is_acronym      — True if brand is a dotted acronym
     """
     original = name.strip()
 
@@ -422,12 +500,34 @@ def extract_name_variants(name: str) -> dict:
     no_legal = strip_legal(full)
     no_desc  = strip_descriptors(full)
 
-    # Extract significant tokens from the cleaned descriptor-free name
-    raw_toks = [
-        t for t in re.split(r"[\s\-_/&,]+", no_desc)
-        if len(t) >= 2 and t.lower() not in _NOISE_TOKENS
-        and not re.match(r"^\d+$", t)
+    # Dotted-acronym protection: strip_legal can corrupt "I.M.E.S.A." → "I.M.E"
+    # because the sub-pattern s\.?a\.?s? matches .S.A. inside the acronym.
+    # If the stripped result is much shorter AND the original full contains a dotted
+    # acronym, use full tokens directly (legal suffix at end already removed by full split).
+    _full_toks_raw = [
+        t for t in re.split(r"[\s\-_/&,]+", full)
+        if len(t) >= 2 and t.lower() not in _NOISE_TOKENS and not re.match(r"^\d+$", t)
     ]
+    _has_acronym_in_full = any(_is_acronym(t) for t in _full_toks_raw)
+    _stripping_corrupted = (
+        _has_acronym_in_full
+        and len(no_desc.strip()) < len(full.strip()) * 0.6
+    )
+    if _stripping_corrupted:
+        # Use full tokens; exclude standalone legal-suffix tokens at end
+        _legal_suffix_re = re.compile(r"^[Ss]\.?[Pp]?\.?[Aa]?\.?$|^[Ss]\.[Pp]\.[Aa]\.$", re.I)
+        raw_toks = [t for t in _full_toks_raw if not _legal_suffix_re.match(t)]
+        if not raw_toks:
+            raw_toks = _full_toks_raw
+        # Also fix no_desc so subsequent brand logic has a clean base
+        no_desc = " ".join(raw_toks)
+    else:
+        # Normal path
+        raw_toks = [
+            t for t in re.split(r"[\s\-_/&,]+", no_desc)
+            if len(t) >= 2 and t.lower() not in _NOISE_TOKENS
+            and not re.match(r"^\d+$", t)
+        ]
 
     if not raw_toks:
         brand = no_desc or no_legal or full
@@ -446,12 +546,18 @@ def extract_name_variants(name: str) -> dict:
         else:
             brand = raw_toks[-1]
 
+    # Acronym handling: if brand is a single dotted-acronym token, build nodot form
+    brand_is_acronym = _is_acronym(brand)
+    brand_nodot = _acronym_nodot(brand) if brand_is_acronym else brand
+
     return {
-        "full":     full,
-        "no_legal": no_legal,
-        "no_desc":  no_desc,
-        "brand":    brand,
-        "original": original,
+        "full":         full,
+        "no_legal":     no_legal,
+        "no_desc":      no_desc,
+        "brand":        brand,
+        "brand_nodot":  brand_nodot,
+        "original":     original,
+        "is_acronym":   brand_is_acronym,
     }
 
 
@@ -491,6 +597,7 @@ def brand_overlap(brand: str, domain: str) -> float:
     """
     Direct brand-name / domain overlap.
     Returns 1.0 if brand (lowercased, stripped) appears literally in domain base.
+    For dotted acronyms (I.M.E.S.A.) also tries the nodot form (IMESA).
     """
     if not brand or not domain:
         return 0.0
@@ -513,6 +620,14 @@ def brand_overlap(brand: str, domain: str) -> float:
         hit = b_toks & base_toks
         return len(hit) / min(len(b_toks), len(base_toks))
     return 0.0
+
+
+def brand_overlap_variants(name_variants: dict, domain: str) -> float:
+    """Return the best brand_overlap across brand and brand_nodot variants."""
+    bo = brand_overlap(name_variants.get("brand", ""), domain)
+    if name_variants.get("is_acronym"):
+        bo = max(bo, brand_overlap(name_variants.get("brand_nodot", ""), domain))
+    return bo
 
 
 def is_generic(domain: str) -> bool:
@@ -573,6 +688,8 @@ def classify_domain(domain: str, title: str = "", snippet: str = "") -> str | No
 
     Checks domain string first; for religious also checks the page title
     because a domain like 'sannicola.it' is ambiguous without title context.
+    Also rejects pages that look like business-profile/financial-data pages
+    based on strong title/snippet signals (e.g. "fatturato", "visura").
     """
     dl = domain.lower()
 
@@ -588,6 +705,11 @@ def classify_domain(domain: str, title: str = "", snippet: str = "") -> str | No
 
     if _ACADEMIC_PATTERNS.search(dl):
         return "academic"
+
+    # Content-based: title or snippet strongly signals a business-profile/directory page
+    combined = (title + " " + snippet).lower()
+    if _DIRECTORY_PROFILE_TITLE_SIGNALS.search(combined):
+        return "directory"
 
     return None
 
@@ -663,6 +785,26 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+def _brand_is_ambiguous(brand: str) -> bool:
+    """
+    True if brand is likely too generic or short to confidently identify an Italian company
+    without additional location context.
+
+    Heuristics:
+    - Single word ≤ 10 chars: ambiguous (SIMONETTI, RAINBOW, MINO, FERRARI)
+    - Multi-word where NO token exceeds 7 chars: ambiguous (DELTA MOTORS, MINI BIKE)
+      Brands with at least one distinctive long token are not ambiguous (POMPE GARBARINO).
+    """
+    if not brand:
+        return True
+    toks = brand.split()
+    if len(toks) == 1 and len(brand) <= 10:
+        return True
+    if len(toks) >= 2 and max(len(t) for t in toks) <= 7:
+        return True
+    return False
+
+
 def _build_search_queries(
     name_variants: dict,
     city: str,
@@ -671,43 +813,62 @@ def _build_search_queries(
     max_queries: int = 5,
 ) -> list[str]:
     """
-    Build up to max_queries Serper search queries using 8 strategy templates.
-    Uses name variants: full clean name + short brand name.
+    Build up to max_queries Serper search queries.
+
+    For ambiguous/generic brands, location queries are prioritised early to
+    reduce false positives from foreign or unrelated companies.
+    For dotted acronyms (I.M.E.S.A.), the nodot form (IMESA) is also used.
     """
-    clean_name = name_variants.get("no_desc") or name_variants.get("no_legal") or name_variants["full"]
-    brand      = name_variants.get("brand") or clean_name
+    clean_name  = name_variants.get("no_desc") or name_variants.get("no_legal") or name_variants["full"]
+    brand       = name_variants.get("brand") or clean_name
+    brand_nodot = name_variants.get("brand_nodot") or brand
+    is_acronym  = name_variants.get("is_acronym", False)
+    ambiguous   = _brand_is_ambiguous(brand)
 
-    # Use brand only if meaningfully shorter than clean_name
+    # Use brand queries only when the brand meaningfully differs from clean_name
     use_brand_queries = (brand.lower() != clean_name.lower() and len(brand) >= 3)
+    use_nodot_queries = is_acronym and brand_nodot.lower() != brand.lower()
 
-    queries = []
+    loc = city or province  # best available location string
 
-    # Strategy 1-4: full clean name variants
-    queries.append(f'"{clean_name}" official website')
-    queries.append(f'"{clean_name}" sito ufficiale')
-    queries.append(f'"{clean_name}" company website')
-    queries.append(f'"{clean_name}" Italy')
+    queries: list[str] = []
 
-    # Strategy 5-6: location-refined
-    if city:
-        queries.append(f'"{clean_name}" "{city}" Italy')
-    elif province:
-        queries.append(f'"{clean_name}" "{province}" Italy')
+    if ambiguous and loc:
+        # For ambiguous brands: lead with location to anchor to Italy
+        queries.append(f'"{clean_name}" {loc} Italy sito ufficiale')
+        queries.append(f'"{clean_name}" Italy official website')
+        queries.append(f'"{clean_name}" sito ufficiale')
+        if city and province:
+            queries.append(f'"{clean_name}" "{city}" "{province}" Italy')
+        elif city:
+            queries.append(f'"{clean_name}" "{city}" Italy')
+        elif province:
+            queries.append(f'"{clean_name}" "{province}" Italy')
+        queries.append(f'site:.it "{clean_name}"')
+    else:
+        # Standard order for well-identified brands
+        queries.append(f'"{clean_name}" official website')
+        queries.append(f'"{clean_name}" sito ufficiale')
+        if city:
+            queries.append(f'"{clean_name}" "{city}" Italy')
+        elif province:
+            queries.append(f'"{clean_name}" "{province}" Italy')
+        queries.append(f'"{clean_name}" Italy')
+        if province and city:
+            queries.append(f'"{clean_name}" "{province}" Italy')
+        queries.append(f'site:.it "{clean_name}"')
+        if use_brand_queries:
+            queries.append(f'"{brand}" Italy official website')
+            queries.append(f'site:.it "{brand}"')
 
-    if province and city:
-        queries.append(f'"{clean_name}" "{province}" Italy')
-
-    # Strategy 7: site:.it search
-    queries.append(f'site:.it "{clean_name}"')
-
-    # Strategy 8+: brand name fallback queries
-    if use_brand_queries:
-        queries.append(f'"{brand}" Italy official website')
-        queries.append(f'site:.it "{brand}"')
+    # Acronym nodot queries — use as additional fallback
+    if use_nodot_queries:
+        queries.append(f'"{brand_nodot}" Italy sito ufficiale')
+        queries.append(f'site:.it "{brand_nodot}"')
 
     # Deduplicate while preserving order
-    seen = set()
-    unique = []
+    seen: set = set()
+    unique: list[str] = []
     for q in queries:
         if q not in seen:
             seen.add(q)
@@ -735,10 +896,10 @@ def _score_candidate(
     # 1. Position weight (rank 0 = 1.0, rank 4 = 0.2)
     position_w = 1.0 / (rank + 1)
 
-    # 2. Name overlap signals (use best across variants)
+    # 2. Name overlap signals (use best across variants, incl. acronym nodot form)
     full_overlap  = token_overlap(name_variants["full"], domain)
     desc_overlap  = token_overlap(name_variants.get("no_desc", ""), domain)
-    brand_ov      = brand_overlap(name_variants.get("brand", ""), domain)
+    brand_ov      = brand_overlap_variants(name_variants, domain)
 
     best_name_overlap = max(full_overlap, desc_overlap, brand_ov)
     score += position_w * (0.5 + best_name_overlap * 1.5)
@@ -894,7 +1055,7 @@ def search_official_domain_register(
 
             if domain not in candidates or score > candidates[domain]:
                 candidates[domain] = score
-                bov = brand_overlap(name_variants.get("brand", ""), domain)
+                bov = brand_overlap_variants(name_variants, domain)
                 dov = token_overlap(name_variants.get("no_desc", ""), domain)
                 fov = token_overlap(name_variants["full"], domain)
                 if bov >= dov and bov >= fov:
@@ -910,7 +1071,7 @@ def search_official_domain_register(
                 "query": query, "title": title[:120], "url": url,
                 "snippet": snippet[:200],
                 "domain": domain, "score": round(score, 3),
-                "brand_overlap": round(brand_overlap(name_variants.get("brand", ""), domain), 3),
+                "brand_overlap": round(brand_overlap_variants(name_variants, domain), 3),
                 "full_overlap":  round(token_overlap(name_variants["full"], domain), 3),
                 "location_match": location_in_text(title + " " + snippet, city, province),
                 "email_match": (domain == email_domain),
@@ -932,9 +1093,10 @@ def search_official_domain_register(
     best, best_score = sorted_cands[0]
     top3 = [d for d, _ in sorted_cands[:3]]
 
-    b_ov         = brand_overlap(name_variants.get("brand", ""), best)
+    b_ov         = brand_overlap_variants(name_variants, best)
     f_ov         = token_overlap(name_variants["full"], best)
     brand_lower  = (name_variants.get("brand") or "").lower()
+    brand_nodot_lower = (name_variants.get("brand_nodot") or brand_lower).lower()
     best_variant = domain_variant.get(best, "full")
 
     # Top evidence entry for supplementary signals
@@ -943,39 +1105,69 @@ def search_official_domain_register(
     )
     loc_match = top_ev.get("location_match", False)
     official  = top_ev.get("official_signal", False)
-    brand_in_title = bool(brand_lower and brand_lower in top_ev.get("title", "").lower())
-
-    # ── High-confidence rules (must satisfy at least ONE) ───────────────────
-    # A: Brand clearly in domain
-    rule_A = b_ov >= _HIGH_CONF_BRAND_THRESHOLD
-    # B: Domain matches email domain (external corroboration)
-    rule_B = bool(email_domain and best == email_domain)
-    # C: Brand name appears in the search result title
-    rule_C = brand_in_title
-    # D: Multiple independent signals agree
-    rule_D = (
-        best_score >= 1.0
-        and sum([loc_match, official, rule_B, rule_A, rule_C]) >= 2
+    combined_title_snip = (top_ev.get("title", "") + " " + top_ev.get("snippet", "")).lower()
+    brand_in_title = bool(
+        (brand_lower and brand_lower in combined_title_snip)
+        or (brand_nodot_lower and brand_nodot_lower in combined_title_snip)
     )
 
-    is_high = rule_A or rule_B or rule_C or rule_D
+    # ── High-confidence rules ────────────────────────────────────────────────
+    # A: Brand clearly in domain (exact/near-exact match or strong substring)
+    #    A_strong: brand constitutes majority of domain base (e.g. pompegarbarino.com)
+    #    A_weak:   brand is substring of longer domain (e.g. goblinsimonetti.com, deltamotorsofconcord.com)
+    #    A_weak requires corroborating location or .it TLD to qualify for High.
+    domain_base_clean = re.sub(r"[^\w]", "", re.sub(r"\.[a-z]{2,}$", "", best.lower()))
+    brand_clean_str   = re.sub(r"[^\w]", "", brand_lower)
+    brand_fills_domain = (
+        len(brand_clean_str) >= len(domain_base_clean) * 0.7
+        if domain_base_clean else False
+    )
+    rule_A_strong = b_ov >= _HIGH_CONF_BRAND_THRESHOLD and brand_fills_domain
+    rule_A_weak   = b_ov >= _HIGH_CONF_BRAND_THRESHOLD and not brand_fills_domain
+    # A_weak only counts for High when location or .it is present
+    rule_A = rule_A_strong or (rule_A_weak and (loc_match or best.endswith(".it")))
+
+    # B: Domain matches email domain (external corroboration)
+    rule_B = bool(email_domain and best == email_domain)
+
+    # C: Brand in title alone — no longer sufficient for High by itself
+    #    (title match can be fabricated in directory pages)
+    rule_C = brand_in_title  # kept for rule_D counting and extras display
+
+    # D: Multiple independent signals agree (requires score ≥ 1.0)
+    rule_D = (
+        best_score >= 1.0
+        and sum([loc_match, official, rule_B, rule_A_strong or rule_A_weak, rule_C]) >= 2
+    )
+
+    is_high = rule_A or rule_B or rule_D
+
+    # Score guardrail: score < 1.0 → High only if email match or exact brand-in-domain
+    if best_score < 1.0 and not rule_B:
+        is_high = is_high and rule_A_strong
+
+    # Low-score guardrail: if score < 0.8 and no email match, cap at Low/Medium
+    below_threshold = best_score < 0.8 and not rule_B
 
     # Assign confidence
     if rule_B and best_score >= 0.6:
         conf   = 0.88
-        reason = f"Serper confirms email domain '{best}' as top result."
+        reason = f"Email domain '{best}' confirmed by Serper."
     elif is_high and best_score >= 1.2:
         conf   = 0.85
-        reason = "Strong brand match in domain/title + search position."
+        reason = "Strong brand match in domain + search position."
     elif is_high and best_score >= 0.7:
         conf   = 0.78
-        reason = "Brand confirmed + reasonable search position."
+        reason = "Brand confirmed in domain + reasonable search position."
     elif is_high:
         conf   = 0.72
-        reason = "At least one high-confidence signal (brand in domain/title or email match)."
-    elif best_score >= 0.60:
+        reason = "Brand confirmed in domain or email match."
+    elif rule_C and best_score >= 0.8 and not below_threshold:
+        conf   = 0.62
+        reason = "Brand in search result title, score acceptable."
+    elif best_score >= 0.60 and not below_threshold:
         conf   = 0.52
-        reason = "Reasonable position + partial name match, but brand not confirmed in domain or title."
+        reason = "Reasonable position + partial name match."
     elif best_score >= 0.35:
         conf   = 0.38
         reason = "Weak brand-domain relationship. Likely needs manual review."
@@ -983,13 +1175,20 @@ def search_official_domain_register(
         conf   = 0.20
         reason = "Very weak match — high false-positive risk."
 
+    # If below_threshold, cap at Medium regardless
+    if below_threshold and conf > 0.65:
+        conf   = 0.55
+        reason += " [capped: score < 0.8]"
+
     extras = []
-    if rule_A:
-        extras.append(f"brand '{name_variants.get('brand','')}' in domain")
+    if rule_A_strong:
+        extras.append(f"brand '{name_variants.get('brand','')}' fills domain")
+    elif rule_A_weak:
+        extras.append(f"brand '{name_variants.get('brand','')}' in domain (partial)")
     if rule_B:
         extras.append(f"matches email domain ({best})")
     if rule_C:
-        extras.append("brand in search result title")
+        extras.append("brand in search result title/snippet")
     if loc_match:
         extras.append("city/province in result")
     if official:
@@ -1879,10 +2078,22 @@ def process_dataframe(
             _final_sel = res.get("final_selected_domain", "")
             _haiku_dec = res.get("haiku_decision", "")
             if raw_ev:
+                # Find best-score evidence row for the selected domain (for selected_best_candidate)
+                _best_sel_score: float = -1.0
+                _best_sel_idx: int = -1
+                _row_start = len(new_debug)
                 query_counters: dict[str, int] = {}
                 for e in raw_ev:
                     q = e.get("query", "")
                     query_counters[q] = query_counters.get(q, 0) + 1
+                    is_sel = e.get("domain", "") == _final_sel and bool(_final_sel)
+                    try:
+                        _sc = float(e.get("score", -1))
+                    except (TypeError, ValueError):
+                        _sc = -1.0
+                    if is_sel and _sc > _best_sel_score:
+                        _best_sel_score = _sc
+                        _best_sel_idx = len(new_debug)
                     new_debug.append({
                         "company_name":          name,
                         "row_number":            global_i + 1,
@@ -1905,11 +2116,12 @@ def process_dataframe(
                         "haiku_mode":            haiku_mode,
                         "haiku_decision":        _haiku_dec,
                         "final_selected_domain": _final_sel,
-                        "selected_candidate":    (
-                            e.get("domain", "") == _final_sel
-                            and bool(_final_sel)
-                        ),
+                        "selected_candidate":    is_sel,
+                        "selected_best_candidate": False,  # back-filled below
                     })
+                # Back-fill the single best evidence row for the selected domain
+                if _best_sel_idx >= 0:
+                    new_debug[_best_sel_idx]["selected_best_candidate"] = True
             else:
                 # No Serper evidence at all (no key, pre-Serper failure, or website
                 # already accepted without search). Always emit one sentinel row so
@@ -1935,8 +2147,9 @@ def process_dataframe(
                     "final_python_domain":   _final_py,
                     "haiku_mode":            haiku_mode,
                     "haiku_decision":        _haiku_dec,
-                    "final_selected_domain": _final_sel,
-                    "selected_candidate":    False,
+                    "final_selected_domain":   _final_sel,
+                    "selected_candidate":      False,
+                    "selected_best_candidate": False,
                 })
 
         rows_done = global_i + 1
@@ -2432,7 +2645,8 @@ def build_excel(
         _debug_cols = [
             "company_name", "row_number", "search_query", "result_rank",
             "title", "snippet", "url", "extracted_domain",
-            "score", "used", "selected_candidate", "skip_reason", "rejection_category",
+            "score", "used", "selected_candidate", "selected_best_candidate",
+            "skip_reason", "rejection_category",
             "brand_overlap", "full_overlap", "location_match", "email_match",
             "official_signal", "final_python_domain",
             "haiku_mode", "haiku_decision", "final_selected_domain",
