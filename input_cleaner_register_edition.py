@@ -167,6 +167,22 @@ _ITALIAN_DESCRIPTORS = re.compile(
     re.IGNORECASE,
 )
 
+# Matches "O, IN FORMA ABBREVIATA, <short name>" — Italian register long-form pattern
+# Captures everything after the phrase as the preferred short name
+_FORMA_ABBREVIATA_RE = re.compile(
+    r"\bO?,?\s*IN\s+FORMA\s+ABBREVIATA[,\s]+(.+)",
+    re.IGNORECASE,
+)
+
+# Extra Italian register legal phrases not caught by _LEGAL_TOKENS / _ITALIAN_DESCRIPTORS
+_EXTRA_LEGAL_PHRASES_RE = re.compile(
+    r"\bSOCIETA\'?\s+PER\s+AZIONI\b"
+    r"|\bPER\s+AZIONI\b"
+    r"|\bIN\s+FORMA\s+ABBREVIATA\b"
+    r"|\bO,?\s*IN\s+FORMA\s+ABBREVIATA\b",
+    re.IGNORECASE,
+)
+
 _NOISE_TOKENS: frozenset = frozenset({
     "the", "and", "for", "global", "international", "services", "solutions",
     "consulting", "management", "technology", "technologies", "systems",
@@ -354,22 +370,59 @@ def strip_descriptors(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip(" .,/-")
 
 
+def _pre_clean_register_name(name: str) -> str:
+    """
+    Pre-process Italian Chamber of Commerce long-form names before variant extraction.
+
+    Handles patterns such as:
+      "POMPE GARBARINO SOCIETA' PER AZIONI O, IN FORMA ABBREVIATA, POMPE GARBARINO S.P.A."
+      → returns "POMPE GARBARINO S.P.A."   (the official short form after the phrase)
+
+    Also strips stray apostrophes left by SOCIETA' and normalises whitespace.
+    """
+    s = name.strip()
+
+    # If "IN FORMA ABBREVIATA" is present, use only the text that follows it
+    m = _FORMA_ABBREVIATA_RE.search(s)
+    if m:
+        short = m.group(1).strip().strip(",").strip()
+        if short:
+            s = short
+
+    # Strip remaining extra legal phrases not covered by _LEGAL_TOKENS
+    s = _EXTRA_LEGAL_PHRASES_RE.sub(" ", s)
+
+    # Remove stray apostrophes (e.g. left by SOCIETA')
+    s = s.replace("'", "")
+
+    # Collapse whitespace; trim only leading/trailing spaces and commas — not dots
+    # (dots are part of legal abbreviations like S.P.A.)
+    s = re.sub(r"\s+", " ", s).strip(" ,")
+    return s
+
+
 def extract_name_variants(name: str) -> dict:
     """
     Build multiple name variants for search query generation.
 
     Returns dict with keys:
-      full         — original name
-      no_legal     — name with legal suffix removed
-      no_desc      — name with legal suffix + Italian descriptors removed
-      brand        — shortest meaningful token(s): the 'real' brand name
+      full         — cleaned name (pre-processed to remove register legal boilerplate)
+      no_legal     — full with legal suffix removed
+      no_desc      — full with legal suffix + Italian descriptors removed
+      brand        — the core brand string used for domain matching and focused queries
+      original     — raw input name before any cleaning
     """
-    full = name.strip()
-    no_legal = strip_legal(full)
-    no_desc = strip_descriptors(full)
+    original = name.strip()
 
-    # Extract brand: split no_desc into meaningful tokens, pick the longest
-    # or the last/most-distinctive ones (often the brand is the last proper noun)
+    # Pre-clean: resolve IN FORMA ABBREVIATA and strip extra legal phrases
+    full = _pre_clean_register_name(original)
+    if not full:
+        full = original  # safety fallback
+
+    no_legal = strip_legal(full)
+    no_desc  = strip_descriptors(full)
+
+    # Extract significant tokens from the cleaned descriptor-free name
     raw_toks = [
         t for t in re.split(r"[\s\-_/&,]+", no_desc)
         if len(t) >= 2 and t.lower() not in _NOISE_TOKENS
@@ -380,13 +433,15 @@ def extract_name_variants(name: str) -> dict:
         brand = no_desc or no_legal or full
     elif len(raw_toks) == 1:
         brand = raw_toks[0]
+    elif len(raw_toks) == 2:
+        # Two-token brand names should be kept together: "POMPE GARBARINO", "SAN NICOLA"
+        brand = " ".join(raw_toks)
     else:
-        # If any single token is ≥5 chars and not a noise word, treat it as brand
-        # Prefer later tokens (brand name often at end of Italian company names)
-        # but also consider longest token
+        # Three or more tokens: keep last two significant long tokens together
         long_toks = [t for t in raw_toks if len(t) >= 4]
-        if long_toks:
-            # Heuristic: the last long token is often the most unique brand name
+        if len(long_toks) >= 2:
+            brand = " ".join(long_toks[-2:])
+        elif long_toks:
             brand = long_toks[-1]
         else:
             brand = raw_toks[-1]
@@ -396,6 +451,7 @@ def extract_name_variants(name: str) -> dict:
         "no_legal": no_legal,
         "no_desc":  no_desc,
         "brand":    brand,
+        "original": original,
     }
 
 
@@ -759,14 +815,42 @@ def search_official_domain_register(
         results, err = _call_serper(query, serper_key)
         if err:
             rejection_notes.append(f"Serper error: {err}")
+            evidence.append({
+                "query": query, "title": "", "url": "", "snippet": "",
+                "domain": "", "used": False,
+                "skip_reason": f"serper_error: {err[:120]}",
+                "rejection_category": "serper_error",
+                "score": "",
+            })
             break
+        if not results:
+            evidence.append({
+                "query": query, "title": "", "url": "", "snippet": "",
+                "domain": "", "used": False,
+                "skip_reason": "no_serper_results",
+                "rejection_category": "serper_no_results",
+                "score": "",
+            })
+            continue
         for rank, item in enumerate(results):
             url     = item.get("link", "")
             title   = item.get("title", "")
             snippet = item.get("snippet", "")
             domain  = _extract_domain(url)
 
-            if not domain or is_generic(domain):
+            # Separate: URL gave no extractable domain vs domain is generic/blacklisted
+            if not domain:
+                evidence.append({
+                    "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
+                    "domain": "", "used": False,
+                    "skip_reason": "no_extractable_domain",
+                    "rejection_category": "domain_extraction_failed",
+                    "score": "",
+                })
+                continue
+
+            if is_generic(domain):
                 evidence.append({
                     "query": query, "title": title[:80], "url": url,
                     "snippet": snippet[:200],
@@ -774,8 +858,7 @@ def search_official_domain_register(
                     "skip_reason": "generic/blacklisted", "score": 0,
                 })
                 rejection_notes.append(f"{domain}: blacklisted")
-                if domain:
-                    rejection_counts["directory"] += 1
+                rejection_counts["directory"] += 1
                 continue
 
             # Category check — reject government, religious, directory, academic
@@ -1790,34 +1873,65 @@ def process_dataframe(
                 "discovery_method":  res.get("website_discovery_method", ""),
             })
 
-        # Candidate Discovery Debug rows — one row per Serper result
-        if debug_mode and raw_ev:
-            query_counters: dict[str, int] = {}
-            for e in raw_ev:
-                q = e.get("query", "")
-                query_counters[q] = query_counters.get(q, 0) + 1
+        # Candidate Discovery Debug rows — one row per Serper result (or sentinel)
+        if debug_mode:
+            _final_py  = res.get("validated_domain", "")
+            _final_sel = res.get("final_selected_domain", "")
+            _haiku_dec = res.get("haiku_decision", "")
+            if raw_ev:
+                query_counters: dict[str, int] = {}
+                for e in raw_ev:
+                    q = e.get("query", "")
+                    query_counters[q] = query_counters.get(q, 0) + 1
+                    new_debug.append({
+                        "company_name":          name,
+                        "row_number":            global_i + 1,
+                        "search_query":          q,
+                        "result_rank":           query_counters[q] if e.get("url") else "",
+                        "title":                 e.get("title", ""),
+                        "snippet":               e.get("snippet", ""),
+                        "url":                   e.get("url", ""),
+                        "extracted_domain":      e.get("domain", ""),
+                        "score":                 e.get("score", ""),
+                        "used":                  e.get("used", ""),
+                        "skip_reason":           e.get("skip_reason", ""),
+                        "rejection_category":    e.get("rejection_category", ""),
+                        "brand_overlap":         e.get("brand_overlap", ""),
+                        "full_overlap":          e.get("full_overlap", ""),
+                        "location_match":        e.get("location_match", ""),
+                        "email_match":           e.get("email_match", ""),
+                        "official_signal":       e.get("official_signal", ""),
+                        "final_python_domain":   _final_py,
+                        "haiku_mode":            haiku_mode,
+                        "haiku_decision":        _haiku_dec,
+                        "final_selected_domain": _final_sel,
+                    })
+            else:
+                # No Serper evidence at all (no key, pre-Serper failure, or website
+                # already accepted without search). Always emit one sentinel row so
+                # every input company appears in the debug sheet.
                 new_debug.append({
-                    "company_name":        name,
-                    "row_number":          global_i + 1,
-                    "search_query":        q,
-                    "result_rank":         query_counters[q],
-                    "title":               e.get("title", ""),
-                    "snippet":             e.get("snippet", ""),
-                    "url":                 e.get("url", ""),
-                    "extracted_domain":    e.get("domain", ""),
-                    "score":               e.get("score", ""),
-                    "used":                e.get("used", ""),
-                    "skip_reason":         e.get("skip_reason", ""),
-                    "rejection_category":  e.get("rejection_category", ""),
-                    "brand_overlap":       e.get("brand_overlap", ""),
-                    "full_overlap":        e.get("full_overlap", ""),
-                    "location_match":      e.get("location_match", ""),
-                    "email_match":         e.get("email_match", ""),
-                    "official_signal":     e.get("official_signal", ""),
-                    "final_python_domain": res.get("validated_domain", ""),
-                    "haiku_mode":          haiku_mode,
-                    "haiku_decision":      res.get("haiku_decision", ""),
-                    "final_selected_domain": res.get("final_selected_domain", ""),
+                    "company_name":          name,
+                    "row_number":            global_i + 1,
+                    "search_query":          res.get("search_query_used", ""),
+                    "result_rank":           "",
+                    "title":                 "",
+                    "snippet":               "",
+                    "url":                   "",
+                    "extracted_domain":      "",
+                    "score":                 "",
+                    "used":                  False,
+                    "skip_reason":           "no_candidates_generated",
+                    "rejection_category":    "candidate_generation_failed",
+                    "brand_overlap":         "",
+                    "full_overlap":          "",
+                    "location_match":        "",
+                    "email_match":           "",
+                    "official_signal":       "",
+                    "final_python_domain":   _final_py,
+                    "haiku_mode":            haiku_mode,
+                    "haiku_decision":        _haiku_dec,
+                    "final_selected_domain": _final_sel,
                 })
 
         rows_done = global_i + 1
