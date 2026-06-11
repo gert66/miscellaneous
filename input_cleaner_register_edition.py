@@ -178,6 +178,46 @@ _OFFICIAL_SIGNALS = frozenset({
     "sito web ufficiale", "official website", "official site",
 })
 
+# Government domain patterns — always reject as company website
+_GOVT_PATTERNS = re.compile(
+    r"\.gov\.it$|\.gov\b|agenziaentrate|"
+    r"(?:^|\.)comune\.|(?:^|\.)regione\.|(?:^|\.)provincia\.|"
+    r"prefettura|questura|tribunale|ministero|"
+    r"inps\.it$|inail\.it$|agenziademanio|"
+    r"camera\.it$|senato\.it$|governo\.it$|quirinale\.it$|mef\.gov",
+    re.IGNORECASE,
+)
+
+# Religious institution patterns — reject as company website
+_RELIGIOUS_PATTERNS = re.compile(
+    r"basilica|diocesi|parrocchia|chiesa(?:cattolica)?|santuario|"
+    r"abbazia|convento|vescovado|cattedrale|arcidiocesi|"
+    r"seminario|oratorio|vaticano|pontific|caritas|"
+    r"cappella|pieve|fraternita|confraternita",
+    re.IGNORECASE,
+)
+
+# Directory / hours / aggregator patterns not already in _GENERIC_DOMAINS
+_DIRECTORY_EXTRA_PATTERNS = re.compile(
+    r"oraridiapertura|aperturenegozi|tuttopmi|impresaitalia|"
+    r"businessfinder|b2bnetwork|catalogoimprese|trovimprese|"
+    r"ioimpresa|businessregister|italiabusiness|infobel",
+    re.IGNORECASE,
+)
+
+# Academic / university patterns
+_ACADEMIC_PATTERNS = re.compile(
+    r"\.edu$|\.ac\.[a-z]{2,}$|universit[aà]|polimi|polito|"
+    r"unimi|unibo|unitn|luiss|bocconi|sapienza|unipd|unifi|politecnico",
+    re.IGNORECASE,
+)
+
+# Brand similarity gate thresholds
+_MIN_BRAND_SIM_TO_SCORE    = 0.15  # below this → score × 0.10 (near-rejection)
+_WEAK_BRAND_SIM_MULTIPLIER = 0.35  # between _MIN and 0.25 → score × this
+_WEAK_BRAND_SIM_THRESHOLD  = 0.25
+_HIGH_CONF_BRAND_THRESHOLD = 0.60  # brand must reach this for High-confidence rule A
+
 # Row colours (openpyxl ARGB hex)
 _ACTION_COLORS = {
     "OK":                   "C6EFCE",
@@ -418,6 +458,34 @@ def has_official_signal(text: str) -> bool:
     return any(sig in tl for sig in _OFFICIAL_SIGNALS)
 
 
+def classify_domain(domain: str, title: str = "", snippet: str = "") -> str | None:
+    """
+    Return a rejection-category string if the domain belongs to a known
+    non-commercial category, or None if the domain looks acceptable.
+
+    Categories: "government" | "religious" | "directory" | "academic" | None
+
+    Checks domain string first; for religious also checks the page title
+    because a domain like 'sannicola.it' is ambiguous without title context.
+    """
+    dl = domain.lower()
+
+    if _GOVT_PATTERNS.search(dl):
+        return "government"
+
+    # Religious: domain match OR title match (e.g. "Basilica di San Nicola" in title)
+    if _RELIGIOUS_PATTERNS.search(dl) or _RELIGIOUS_PATTERNS.search(title.lower()):
+        return "religious"
+
+    if _DIRECTORY_EXTRA_PATTERNS.search(dl):
+        return "directory"
+
+    if _ACADEMIC_PATTERNS.search(dl):
+        return "academic"
+
+    return None
+
+
 def _conf_label(conf: float) -> str:
     if conf >= 0.70:
         return "High"
@@ -573,6 +641,14 @@ def _score_candidate(
     if brand_ov >= 0.8:
         score += 0.4
 
+    # Brand similarity gate — penalise domains that have very little to do with
+    # the company name. This prevents high-ranking directory pages or unrelated
+    # sites from winning purely on search position.
+    if best_name_overlap < _MIN_BRAND_SIM_TO_SCORE:
+        score *= 0.10   # near-rejection: keeps domain in evidence but won't win
+    elif best_name_overlap < _WEAK_BRAND_SIM_THRESHOLD:
+        score *= _WEAK_BRAND_SIM_MULTIPLIER
+
     # 4. Title / snippet contains official-page keywords
     combined_text = (title + " " + snippet).lower()
     if has_official_signal(combined_text):
@@ -606,22 +682,28 @@ def search_official_domain_register(
     email_domain: str,
     serper_key: str,
     max_queries: int = 5,
-) -> tuple[str, float, str, list, str, str, list]:
+) -> tuple[str, float, str, list, str, str, list, dict]:
     """
     Run up to max_queries Serper queries with multi-variant brand scoring.
 
     Returns:
       (suggested_domain, confidence, reason, evidence_rows,
-       query_used, name_variant_used, top_3_domains)
+       query_used, name_variant_used, top_3_domains, rejection_counts)
+
+    rejection_counts: dict with keys directory/government/religious/academic/low_similarity
     """
     name_variants = extract_name_variants(company_name)
     queries = _build_search_queries(name_variants, city, province, postcode, max_queries)
 
-    candidates: dict[str, float] = {}   # domain → cumulative score
-    domain_variant: dict[str, str] = {} # domain → which variant matched best
+    candidates: dict[str, float] = {}    # domain → best score seen
+    domain_variant: dict[str, str] = {}  # domain → which name variant matched best
     evidence: list[dict] = []
     query_used = queries[0] if queries else ""
     rejection_notes: list[str] = []
+    rejection_counts: dict[str, int] = {
+        "directory": 0, "government": 0, "religious": 0,
+        "academic": 0, "low_similarity": 0,
+    }
 
     for query in queries:
         results, err = _call_serper(query, serper_key)
@@ -636,11 +718,26 @@ def search_official_domain_register(
 
             if not domain or is_generic(domain):
                 evidence.append({
-                    "query": query, "title": title, "url": url,
-                    "domain": domain, "used": False, "skip_reason": "generic/blacklisted",
-                    "score": 0,
+                    "query": query, "title": title[:80], "url": url,
+                    "domain": domain, "used": False,
+                    "skip_reason": "generic/blacklisted", "score": 0,
                 })
                 rejection_notes.append(f"{domain}: blacklisted")
+                if domain:
+                    rejection_counts["directory"] += 1
+                continue
+
+            # Category check — reject government, religious, directory, academic
+            cat = classify_domain(domain, title, snippet)
+            if cat:
+                evidence.append({
+                    "query": query, "title": title[:80], "url": url,
+                    "domain": domain, "used": False,
+                    "skip_reason": f"category:{cat}", "score": 0,
+                    "rejection_category": cat,
+                })
+                rejection_counts[cat] = rejection_counts.get(cat, 0) + 1
+                rejection_notes.append(f"{domain}: rejected ({cat})")
                 continue
 
             score = _score_candidate(
@@ -648,20 +745,19 @@ def search_official_domain_register(
                 name_variants, email_domain, city, province,
             )
 
-            # Very low score — skip but note it
-            if score < 0.1:
+            # Very low score after brand gate — note it but don't include in candidates
+            if score < 0.08:
                 evidence.append({
-                    "query": query, "title": title[:120], "url": url,
+                    "query": query, "title": title[:80], "url": url,
                     "domain": domain, "used": False,
-                    "skip_reason": f"score_too_low({score:.3f})",
-                    "score": score,
+                    "skip_reason": f"low_similarity_score({score:.3f})", "score": score,
                 })
-                rejection_notes.append(f"{domain}: score too low ({score:.3f})")
+                rejection_counts["low_similarity"] += 1
+                rejection_notes.append(f"{domain}: low similarity ({score:.3f})")
                 continue
 
             if domain not in candidates or score > candidates[domain]:
                 candidates[domain] = score
-                # Track which variant drove the best match
                 bov = brand_overlap(name_variants.get("brand", ""), domain)
                 dov = token_overlap(name_variants.get("no_desc", ""), domain)
                 fov = token_overlap(name_variants["full"], domain)
@@ -687,56 +783,78 @@ def search_official_domain_register(
         time.sleep(0.25)
 
     if not candidates:
-        top3 = []
         return (
             "", 0.0,
-            "No candidate domain found in search results. " + "; ".join(rejection_notes[:3]),
-            evidence, query_used, "", top3,
+            "No candidate domain found. " + "; ".join(rejection_notes[:4]),
+            evidence, query_used, "", [],
+            rejection_counts,
         )
 
-    # Sort by score
+    # Sort by score — compare all candidates, pick best
     sorted_cands = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
     best, best_score = sorted_cands[0]
     top3 = [d for d, _ in sorted_cands[:3]]
 
-    b_ov   = brand_overlap(name_variants.get("brand", ""), best)
-    f_ov   = token_overlap(name_variants["full"], best)
+    b_ov         = brand_overlap(name_variants.get("brand", ""), best)
+    f_ov         = token_overlap(name_variants["full"], best)
+    brand_lower  = (name_variants.get("brand") or "").lower()
     best_variant = domain_variant.get(best, "full")
 
-    # Find top evidence entry for explanation
+    # Top evidence entry for supplementary signals
     top_ev = next(
         (e for e in evidence if e.get("domain") == best and e.get("used")), {}
     )
-
-    # Confidence logic
-    email_confirmed = (email_domain and best == email_domain)
     loc_match = top_ev.get("location_match", False)
     official  = top_ev.get("official_signal", False)
+    brand_in_title = bool(brand_lower and brand_lower in top_ev.get("title", "").lower())
 
-    if email_confirmed and best_score >= 0.6:
-        conf = 0.88
+    # ── High-confidence rules (must satisfy at least ONE) ───────────────────
+    # A: Brand clearly in domain
+    rule_A = b_ov >= _HIGH_CONF_BRAND_THRESHOLD
+    # B: Domain matches email domain (external corroboration)
+    rule_B = bool(email_domain and best == email_domain)
+    # C: Brand name appears in the search result title
+    rule_C = brand_in_title
+    # D: Multiple independent signals agree
+    rule_D = (
+        best_score >= 1.0
+        and sum([loc_match, official, rule_B, rule_A, rule_C]) >= 2
+    )
+
+    is_high = rule_A or rule_B or rule_C or rule_D
+
+    # Assign confidence
+    if rule_B and best_score >= 0.6:
+        conf   = 0.88
         reason = f"Serper confirms email domain '{best}' as top result."
-    elif best_score >= 1.2 and (b_ov >= 0.7 or f_ov >= 0.5):
-        conf = 0.85
-        reason = "Strong brand/name match + search position + supporting signals."
-    elif best_score >= 0.8 and (b_ov >= 0.4 or f_ov >= 0.35):
-        conf = 0.72
-        reason = "Good name match with search confirmation."
-    elif best_score >= 0.5 or b_ov >= 0.4:
-        conf = 0.55
-        reason = "Reasonable match; partial name-domain overlap."
-    elif best_score >= 0.3:
-        conf = 0.38
-        reason = "Weak but plausible match. Manual review recommended."
+    elif is_high and best_score >= 1.2:
+        conf   = 0.85
+        reason = "Strong brand match in domain/title + search position."
+    elif is_high and best_score >= 0.7:
+        conf   = 0.78
+        reason = "Brand confirmed + reasonable search position."
+    elif is_high:
+        conf   = 0.72
+        reason = "At least one high-confidence signal (brand in domain/title or email match)."
+    elif best_score >= 0.60:
+        conf   = 0.52
+        reason = "Reasonable position + partial name match, but brand not confirmed in domain or title."
+    elif best_score >= 0.35:
+        conf   = 0.38
+        reason = "Weak brand-domain relationship. Likely needs manual review."
     else:
-        conf = 0.20
-        reason = "Very weak domain match. High uncertainty."
+        conf   = 0.20
+        reason = "Very weak match — high false-positive risk."
 
     extras = []
-    if loc_match:
-        extras.append(f"city/province found in result")
-    if email_confirmed:
+    if rule_A:
+        extras.append(f"brand '{name_variants.get('brand','')}' in domain")
+    if rule_B:
         extras.append(f"matches email domain ({best})")
+    if rule_C:
+        extras.append("brand in search result title")
+    if loc_match:
+        extras.append("city/province in result")
     if official:
         extras.append("official-page keyword in title/snippet")
     if best.endswith(".it"):
@@ -744,7 +862,7 @@ def search_official_domain_register(
     if extras:
         reason += " — " + "; ".join(extras) + "."
 
-    return best, conf, reason, evidence, query_used, best_variant, top3
+    return best, conf, reason, evidence, query_used, best_variant, top3, rejection_counts
 
 
 # =============================================================================
@@ -814,6 +932,12 @@ def validate_register_row(
         "top_3_candidate_domains":      "",
         "rejection_reason_if_missing":  "",
         "website_discovery_method":     "",
+        # v3 rejection counts (accumulated across Serper calls for this row)
+        "rejected_directory":           0,
+        "rejected_government":          0,
+        "rejected_religious":           0,
+        "rejected_academic":            0,
+        "rejected_low_similarity":      0,
     }
 
     if not name:
@@ -829,7 +953,7 @@ def validate_register_row(
 
     # Helper: run Serper and fill result fields
     def _run_serper(existing_email_domain=""):
-        sug, conf, reason, ev, query, variant, top3 = search_official_domain_register(
+        sug, conf, reason, ev, query, variant, top3, rej = search_official_domain_register(
             name, city, province, postcode,
             existing_email_domain or email_domain,
             serper_key, max_queries,
@@ -840,9 +964,11 @@ def validate_register_row(
         result["candidate_domains_considered"] = ", ".join(dict.fromkeys(filter(None, all_doms)))
         result["top_3_candidate_domains"] = ", ".join(top3)
         if sug:
-            result["best_candidate_score"] = str(round(
-                next((s for d, s in {d: 0.0 for d in all_doms}.items() if d == sug), conf), 3
-            ))
+            result["best_candidate_score"] = str(round(conf, 3))
+        # Accumulate rejection counts across multiple Serper calls for this row
+        for cat, cnt in rej.items():
+            key = f"rejected_{cat}"
+            result[key] = result.get(key, 0) + cnt
         return sug, conf, reason, ev
 
     # ── Case 1: website present, non-generic ─────────────────────────────────
@@ -1099,6 +1225,12 @@ _OUTPUT_COLS = [
     "top_3_candidate_domains",
     "rejection_reason_if_missing",
     "website_discovery_method",
+    # v3 rejection counts
+    "rejected_directory",
+    "rejected_government",
+    "rejected_religious",
+    "rejected_academic",
+    "rejected_low_similarity",
 ]
 
 
@@ -1468,6 +1600,24 @@ def _summary_metrics(df: pd.DataFrame, cols: dict) -> None:
          int(confs.str.lower().eq("high").sum()),
          "#2E7D32",
          "manual_review_needed = False")
+
+    st.markdown("")
+    # Row 4 — false-positive rejections (sum across all rows)
+    def _sum_col(col_name):
+        col = df.get(col_name, pd.Series(0, index=df.index))
+        return int(pd.to_numeric(col, errors="coerce").fillna(0).sum())
+
+    row4 = st.columns(5)
+    card(row4[0], "Rejected: directory",      _sum_col("rejected_directory"),      "#5D4037",
+         "oraridiapertura, pagine gialle, etc.")
+    card(row4[1], "Rejected: government",     _sum_col("rejected_government"),     "#37474F",
+         ".gov.it, agenziaentrate, comune, etc.")
+    card(row4[2], "Rejected: religious",      _sum_col("rejected_religious"),      "#6A1B9A",
+         "basilica, diocesi, parrocchia, etc.")
+    card(row4[3], "Rejected: academic",       _sum_col("rejected_academic"),       "#1565C0",
+         ".edu, università, politecnico, etc.")
+    card(row4[4], "Rejected: low similarity", _sum_col("rejected_low_similarity"), "#E65100",
+         "domain unrelated to company name")
 
 
 # =============================================================================
