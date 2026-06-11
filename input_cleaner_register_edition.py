@@ -29,6 +29,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    import anthropic as _anthropic_sdk
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _anthropic_sdk = None
+    _ANTHROPIC_AVAILABLE = False
+
 # =============================================================================
 # PAGE CONFIG
 # =============================================================================
@@ -241,6 +248,39 @@ SRC_EMAIL                 = "email_domain"
 SRC_SERPER                = "serper_search"
 SRC_SERPER_EMAIL          = "serper_confirmed_email_domain"
 SRC_NONE                  = ""
+
+# Claude Haiku review mode constants
+_DEFAULT_HAIKU_MODEL  = "claude-haiku-4-5-20251001"
+_HAIKU_MODE_PYTHON    = "Python only"
+_HAIKU_MODE_UNCERTAIN = "Haiku for uncertain rows only"
+_HAIKU_MODE_ALL       = "Haiku for all rows"
+_HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
+
+_HAIKU_SYSTEM_PROMPT = (
+    "You are a B2B sales intelligence assistant specialising in Italian companies. "
+    "Your task: given a company name and candidate websites from Google search results, "
+    "identify the company's official website.\n\n"
+    "Return ONLY a JSON object with exactly these fields:\n"
+    "  decision   — \"accept\" | \"replace\" | \"reject\" | \"uncertain\"\n"
+    "               accept=python suggestion is correct; replace=a different domain is better;\n"
+    "               reject=none of the results are the real site; uncertain=cannot tell\n"
+    "  domain     — the domain you recommend (empty string for reject/uncertain)\n"
+    "  confidence — \"High\" | \"Medium\" | \"Low\"\n"
+    "  reason     — brief explanation, max 120 chars\n"
+    "  risk_flags — JSON array of strings, e.g. [\"directory_site\",\"name_mismatch\"]\n\n"
+    "Do not output any text outside the JSON object. No markdown fences."
+)
+
+_HAIKU_USER_TEMPLATE = (
+    "Company: {company_name}\n"
+    "Location: {city}, {province} (Italy)\n"
+    "Email domain: {email_domain}\n"
+    "Original website in register: {original_website}\n"
+    "Python-suggested domain: {python_domain} (confidence: {python_confidence})\n\n"
+    "Top search results:\n{results_block}\n\n"
+    "Which is the correct official website for this Italian company? "
+    "Reply with JSON only."
+)
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -777,6 +817,7 @@ def search_official_domain_register(
 
             evidence.append({
                 "query": query, "title": title[:120], "url": url,
+                "snippet": snippet[:200],
                 "domain": domain, "score": round(score, 3),
                 "brand_overlap": round(brand_overlap(name_variants.get("brand", ""), domain), 3),
                 "full_overlap":  round(token_overlap(name_variants["full"], domain), 3),
@@ -884,7 +925,7 @@ def validate_register_row(
     postcode: str,
     serper_key: str | None,
     max_queries: int = 5,
-) -> dict:
+) -> tuple[dict, list]:
     """
     Validate one register row. Returns result fields dict.
 
@@ -907,6 +948,8 @@ def validate_register_row(
     city     = str(city or "").strip()
     province = str(province or "").strip()
     postcode = str(postcode or "").strip()
+
+    _all_raw_evidence: list[dict] = []
 
     email_domain = extract_email_domain(email)
     email_is_pec = is_pec_or_personal_email(email_domain)
@@ -954,7 +997,7 @@ def validate_register_row(
             rejection_reason_if_missing="Company name is blank.",
             website_discovery_method="none",
         )
-        return result
+        return result, _all_raw_evidence
 
     # Helper: run Serper and fill result fields
     def _run_serper(existing_email_domain=""):
@@ -974,6 +1017,7 @@ def validate_register_row(
         for cat, cnt in rej.items():
             key = f"rejected_{cat}"
             result[key] = result.get(key, 0) + cnt
+        _all_raw_evidence.extend(ev)
         return sug, conf, reason, ev
 
     # ── Case 1: website present, non-generic ─────────────────────────────────
@@ -990,7 +1034,7 @@ def validate_register_row(
                 manual_review_needed=False,
                 website_discovery_method="original_website_accepted",
             )
-            return result
+            return result, _all_raw_evidence
 
         if best_ov >= 0.15:
             result.update(
@@ -1000,7 +1044,7 @@ def validate_register_row(
                 manual_review_needed=False,
                 website_discovery_method="original_website_partial_match",
             )
-            return result
+            return result, _all_raw_evidence
 
         # Low overlap — search to confirm or find a better domain
         if serper_key:
@@ -1016,7 +1060,7 @@ def validate_register_row(
                     manual_review_needed=(conf < 0.70),
                     website_discovery_method="serper_replaced_low_overlap_website",
                 )
-                return result
+                return result, _all_raw_evidence
             if suggested and suggested == norm_website:
                 result.update(
                     domain_action="LIKELY_OK",
@@ -1025,7 +1069,7 @@ def validate_register_row(
                     manual_review_needed=False,
                     website_discovery_method="serper_confirmed_original_website",
                 )
-                return result
+                return result, _all_raw_evidence
 
         result.update(
             domain_action="REVIEW",
@@ -1034,7 +1078,7 @@ def validate_register_row(
             manual_review_needed=True,
             website_discovery_method="original_website_low_confidence",
         )
-        return result
+        return result, _all_raw_evidence
 
     # ── Case 2: website is a generic/directory site ──────────────────────────
     if norm_website and is_generic(norm_website):
@@ -1052,7 +1096,7 @@ def validate_register_row(
                     manual_review_needed=(conf < 0.70),
                     website_discovery_method="serper_found_after_blacklisted_website",
                 )
-                return result
+                return result, _all_raw_evidence
         result.update(
             validated_domain="",
             domain_action="REVIEW",
@@ -1061,7 +1105,7 @@ def validate_register_row(
             manual_review_needed=True,
             website_discovery_method="none_website_blacklisted",
         )
-        return result
+        return result, _all_raw_evidence
 
     # ── Case 3: website missing — try email domain aggressively ──────────────
     # v2: Use email domain with much lower bar; Serper will confirm if needed.
@@ -1089,7 +1133,7 @@ def validate_register_row(
                         manual_review_needed=(conf < 0.70),
                         website_discovery_method="serper_confirmed_email_domain",
                     )
-                    return result
+                    return result, _all_raw_evidence
                 if suggested and conf >= 0.50:
                     # Serper found something better than the email domain
                     result.update(
@@ -1102,7 +1146,7 @@ def validate_register_row(
                         manual_review_needed=(conf < 0.55),
                         website_discovery_method="serper_found_overrides_email_domain",
                     )
-                    return result
+                    return result, _all_raw_evidence
                 if suggested and conf >= 0.30:
                     # Weak Serper hit — fall back to email domain with Medium confidence
                     result.update(
@@ -1118,7 +1162,7 @@ def validate_register_row(
                         manual_review_needed=True,
                         website_discovery_method="email_domain_serper_inconclusive",
                     )
-                    return result
+                    return result, _all_raw_evidence
 
             # No Serper or Serper found nothing — use email domain if overlap reasonable
             if email_best_overlap >= 0.15:
@@ -1135,7 +1179,7 @@ def validate_register_row(
                     manual_review_needed=True,
                     website_discovery_method="email_domain_proxy",
                 )
-                return result
+                return result, _all_raw_evidence
 
     # ── Case 4: website missing — Serper search (no email signal) ────────────
     if serper_key:
@@ -1190,7 +1234,7 @@ def validate_register_row(
                 website_discovery_method="none",
             )
 
-    return result
+    return result, _all_raw_evidence
 
 
 def _fill_serper_top(result: dict, evidence: list, query: str) -> None:
@@ -1201,6 +1245,172 @@ def _fill_serper_top(result: dict, evidence: list, query: str) -> None:
         result["serper_top_result_title"]  = str(top[0].get("title", ""))[:120]
         result["serper_top_result_url"]    = top[0].get("url", "")
         result["serper_top_result_domain"] = top[0].get("domain", "")
+
+
+# =============================================================================
+# CLAUDE HAIKU REVIEW LAYER
+# =============================================================================
+
+
+def _build_haiku_results_block(raw_evidence: list[dict]) -> str:
+    """Format Serper evidence into a readable block for the Haiku prompt."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    rank = 1
+    for e in raw_evidence:
+        domain = e.get("domain", "")
+        if not domain or domain in seen:
+            continue
+        if not e.get("used", False):
+            continue
+        seen.add(domain)
+        title   = e.get("title", "")[:80]
+        snippet = e.get("snippet", "")[:120]
+        score   = e.get("score", "")
+        b_ov    = e.get("brand_overlap", "")
+        em      = "Yes" if e.get("email_match") else "No"
+        lines.append(
+            f"{rank}. {domain} — \"{title}\"\n"
+            f"   Snippet: {snippet}\n"
+            f"   Score: {score} | Brand overlap: {b_ov} | Email match: {em}"
+        )
+        rank += 1
+        if rank > 10:
+            break
+    if not lines:
+        # Fall back to all evidence even if marked not-used
+        for e in raw_evidence[:10]:
+            domain = e.get("domain", "")
+            if not domain or domain in seen:
+                continue
+            seen.add(domain)
+            lines.append(
+                f"{rank}. {domain} — \"{e.get('title','')[:80]}\"\n"
+                f"   (filtered: {e.get('skip_reason','')}) | Score: {e.get('score','')}"
+            )
+            rank += 1
+    return "\n".join(lines) if lines else "(no search results available)"
+
+
+def _haiku_review_domain(
+    company_name: str,
+    city: str,
+    province: str,
+    email_domain: str,
+    original_website: str,
+    python_result: dict,
+    raw_evidence: list[dict],
+    api_key: str,
+    model: str = _DEFAULT_HAIKU_MODEL,
+) -> dict:
+    """
+    Call Claude Haiku to validate the Python-suggested domain.
+    Returns a dict with haiku_* fields.
+    """
+    out = {
+        "haiku_used":       True,
+        "haiku_decision":   "",
+        "haiku_domain":     "",
+        "haiku_confidence": "",
+        "haiku_reason":     "",
+        "haiku_risk_flags": "",
+        "haiku_error":      "",
+    }
+
+    if not _ANTHROPIC_AVAILABLE or not api_key:
+        out["haiku_used"]  = False
+        out["haiku_error"] = "anthropic SDK not installed or API key missing"
+        return out
+
+    python_domain     = str(python_result.get("validated_domain", "") or "")
+    python_confidence = str(python_result.get("domain_confidence", "") or "")
+    results_block     = _build_haiku_results_block(raw_evidence)
+
+    user_msg = _HAIKU_USER_TEMPLATE.format(
+        company_name=company_name,
+        city=city,
+        province=province,
+        email_domain=email_domain or "(none)",
+        original_website=original_website or "(none)",
+        python_domain=python_domain or "(none)",
+        python_confidence=python_confidence or "(none)",
+        results_block=results_block,
+    )
+
+    try:
+        client = _anthropic_sdk.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=256,
+            system=_HAIKU_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw_text = resp.content[0].text.strip()
+        # Strip optional markdown fences
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
+        raw_text = re.sub(r"\n?```$", "", raw_text)
+        parsed = json.loads(raw_text)
+        out["haiku_decision"]   = str(parsed.get("decision", "uncertain"))
+        out["haiku_domain"]     = str(parsed.get("domain", ""))
+        out["haiku_confidence"] = str(parsed.get("confidence", ""))
+        out["haiku_reason"]     = str(parsed.get("reason", ""))[:200]
+        flags = parsed.get("risk_flags", [])
+        out["haiku_risk_flags"] = ", ".join(flags) if isinstance(flags, list) else str(flags)
+    except Exception as exc:
+        out["haiku_used"]     = True
+        out["haiku_error"]    = str(exc)[:200]
+        out["haiku_decision"] = "uncertain"
+
+    return out
+
+
+def _apply_haiku_decision(
+    python_result: dict,
+    haiku_result: dict,
+    mode: str,
+) -> dict:
+    """
+    Merge Python result and Haiku result into final_* fields.
+    Returns dict with final_selected_domain, final_decision_source, final_confidence.
+    """
+    python_domain = str(python_result.get("validated_domain", "") or "")
+    python_conf   = str(python_result.get("domain_confidence", "") or "")
+
+    if not haiku_result.get("haiku_used") or mode == _HAIKU_MODE_PYTHON:
+        return {
+            "final_selected_domain": python_domain,
+            "final_decision_source": "python",
+            "final_confidence":      python_conf,
+        }
+
+    decision     = haiku_result.get("haiku_decision", "uncertain")
+    haiku_domain = str(haiku_result.get("haiku_domain", "") or "")
+    haiku_conf   = haiku_result.get("haiku_confidence", "")
+
+    if decision == "accept":
+        return {
+            "final_selected_domain": python_domain,
+            "final_decision_source": "haiku_accept",
+            "final_confidence":      haiku_conf or python_conf,
+        }
+    if decision == "replace" and haiku_domain:
+        return {
+            "final_selected_domain": haiku_domain,
+            "final_decision_source": "haiku_replace",
+            "final_confidence":      haiku_conf or "Medium",
+        }
+    if decision == "reject":
+        return {
+            "final_selected_domain": "",
+            "final_decision_source": "haiku_reject",
+            "final_confidence":      "None",
+        }
+    # uncertain or error — keep python result
+    return {
+        "final_selected_domain": python_domain,
+        "final_decision_source": "haiku_uncertain",
+        "final_confidence":      python_conf,
+    }
 
 
 # =============================================================================
@@ -1369,6 +1579,17 @@ _OUTPUT_COLS = [
     "rejected_religious",
     "rejected_academic",
     "rejected_low_similarity",
+    # v4 Haiku review columns
+    "haiku_used",
+    "haiku_decision",
+    "haiku_domain",
+    "haiku_confidence",
+    "haiku_reason",
+    "haiku_risk_flags",
+    "haiku_error",
+    "final_selected_domain",
+    "final_decision_source",
+    "final_confidence",
 ]
 
 
@@ -1384,6 +1605,11 @@ def process_dataframe(
     prior_results: list[dict] | None = None,
     prior_evidence: list[dict] | None = None,
     settings: dict | None = None,
+    # Claude Haiku review layer
+    haiku_mode: str = _HAIKU_MODE_PYTHON,
+    haiku_api_key: str | None = None,
+    haiku_model: str = _DEFAULT_HAIKU_MODEL,
+    haiku_max_rows: int = 0,   # 0 = no limit
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
@@ -1417,9 +1643,45 @@ def process_dataframe(
         province = _sv(province_col)
         postcode = _sv(postcode_col)
 
-        res = validate_register_row(
+        res, raw_ev = validate_register_row(
             name, website, email, city, province, postcode, serper_key, max_queries
         )
+
+        # Default Haiku fields (Python-only values)
+        res.update({
+            "haiku_used": False, "haiku_decision": "", "haiku_domain": "",
+            "haiku_confidence": "", "haiku_reason": "", "haiku_risk_flags": "",
+            "haiku_error": "",
+        })
+
+        # Determine if Haiku should run for this row
+        _haiku_rows_done = global_i - resume_from + 1
+        _haiku_limit_ok  = (haiku_max_rows <= 0 or _haiku_rows_done <= haiku_max_rows)
+        _is_uncertain    = (
+            str(res.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
+            or str(res.get("domain_confidence", "")).lower() in ("low", "medium", "none", "")
+        )
+        _run_haiku = (
+            haiku_mode != _HAIKU_MODE_PYTHON
+            and haiku_api_key
+            and _haiku_limit_ok
+            and (haiku_mode == _HAIKU_MODE_ALL or _is_uncertain)
+        )
+
+        if _run_haiku:
+            email_domain_h = str(res.get("email_domain", "") or "")
+            orig_website_h = str(res.get("normalized_input_website", "") or "")
+            haiku_res = _haiku_review_domain(
+                name, city, province, email_domain_h, orig_website_h,
+                res, raw_ev, haiku_api_key, haiku_model,
+            )
+            res.update(haiku_res)
+        else:
+            haiku_res = {"haiku_used": False}
+
+        final_fields = _apply_haiku_decision(res, haiku_res, haiku_mode)
+        res.update(final_fields)
+
         new_results.append(res)
 
         query = res.get("search_query_used", "")
@@ -1550,8 +1812,12 @@ def _build_best_guess_df(
         action = str(r.get("domain_action", "") or "")
         norm   = str(r.get("normalized_input_website", "") or "").strip()
         recom  = str(r.get("recommended_domain", "") or "").strip()
+        final  = str(r.get("final_selected_domain", "") or "").strip()
 
-        if action in ("OK", "LIKELY_OK"):
+        # If Haiku produced a final domain decision, use it; otherwise fall back to Python logic
+        if final:
+            url = final
+        elif action in ("OK", "LIKELY_OK"):
             url = norm
         elif action in ("SUGGEST_REPLACE", "MISSING_DOMAIN_FIXED", "EMAIL_DERIVED"):
             url = recom or norm
@@ -1680,6 +1946,25 @@ def build_excel(
     ])
     _write_sheet(ws4, ev_df)
 
+    # Sheet 6: Python vs Haiku Comparison (only shown when Haiku was run)
+    haiku_cols = [
+        cols.get("company"),
+        "validated_domain", "domain_confidence", "domain_action",
+        "haiku_used", "haiku_decision", "haiku_domain", "haiku_confidence",
+        "haiku_reason", "haiku_risk_flags", "haiku_error",
+        "final_selected_domain", "final_decision_source", "final_confidence",
+    ]
+    avail_haiku_cols = [c for c in haiku_cols if c and c in enriched_df.columns]
+    haiku_ran = (
+        "haiku_used" in enriched_df.columns
+        and enriched_df["haiku_used"].astype(str).str.lower().isin(["true", "1"]).any()
+    )
+    ws5 = wb.create_sheet("Python vs Haiku Comparison")
+    if haiku_ran and avail_haiku_cols:
+        _write_sheet(ws5, enriched_df[avail_haiku_cols].copy())
+    else:
+        ws5.cell(row=1, column=1, value="Haiku review was not used in this run.")
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1763,6 +2048,23 @@ def _summary_metrics(df: pd.DataFrame, cols: dict) -> None:
          "#2E7D32",
          "manual_review_needed = False")
 
+    # Row 3b — Haiku stats (only shown when Haiku was used)
+    haiku_used_col = df.get("haiku_used", pd.Series(dtype=str)).astype(str).str.lower()
+    n_haiku = int(haiku_used_col.isin(["true", "1"]).sum())
+    if n_haiku > 0:
+        st.markdown("")
+        row3b = st.columns(4)
+        decisions = df.get("haiku_decision", pd.Series(dtype=str)).astype(str)
+        sources   = df.get("final_decision_source", pd.Series(dtype=str)).astype(str)
+        card(row3b[0], "Rows reviewed by Haiku",      n_haiku,                             "#7B1FA2")
+        card(row3b[1], "Haiku: accepted Python",       int(decisions.eq("accept").sum()),  "#2E7D32",
+             "agreed with Python scoring")
+        card(row3b[2], "Haiku: replaced domain",       int(decisions.eq("replace").sum()), "#E65100",
+             "found better domain than Python")
+        card(row3b[3], "Haiku: rejected / uncertain",
+             int(decisions.isin(["reject", "uncertain"]).sum()),                            "#B71C1C",
+             "no confident match")
+
     st.markdown("")
     # Row 4 — false-positive rejections (sum across all rows)
     def _sum_col(col_name):
@@ -1843,7 +2145,8 @@ def _download_section(enriched_df, original_df, evidence_rows, stored_cols,
         "2. **Cleaned Register Input** — all original columns + validation + diagnostic columns  \n"
         "3. **Review Needed** — rows requiring manual check  \n"
         "4. **Original Input** — unchanged source data  \n"
-        "5. **Raw Search Evidence** — Serper queries, results, name variants, rejection reasons"
+        "5. **Raw Search Evidence** — Serper queries, results, name variants, rejection reasons  \n"
+        "6. **Python vs Haiku Comparison** — side-by-side comparison (populated when Haiku mode is active)"
     )
     st.download_button(
         "⬇ Download cleaned register Excel",
@@ -1882,6 +2185,13 @@ def main():
         if manual_key.strip():
             serper_key = manual_key.strip()
 
+    # Anthropic API key for Haiku
+    anthropic_key = None
+    try:
+        anthropic_key = st.secrets.get("ANTHROPIC_API_KEY") or st.secrets.get("anthropic_api_key")
+    except Exception:
+        pass
+
     st.sidebar.markdown("---")
     max_queries = st.sidebar.selectbox(
         "Max Serper queries per company",
@@ -1896,6 +2206,55 @@ def main():
     st.sidebar.caption(
         f"Each missing website tries up to {max_queries} search strategies."
     )
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Claude Haiku Review (Experiment)")
+    if not _ANTHROPIC_AVAILABLE:
+        st.sidebar.warning(
+            "Install `anthropic` package to enable Haiku review:  \n"
+            "`pip install anthropic`"
+        )
+    haiku_mode = st.sidebar.selectbox(
+        "Haiku review mode",
+        options=_HAIKU_MODES,
+        index=0,
+        help=(
+            "Python only: use existing scoring only (no Haiku calls, no cost).  \n"
+            "Uncertain rows: call Haiku only for rows where Python is not confident.  \n"
+            "All rows: call Haiku for every row (most accurate, higher cost)."
+        ),
+    )
+    if haiku_mode != _HAIKU_MODE_PYTHON:
+        if anthropic_key:
+            st.sidebar.success("✓ Anthropic API key loaded from secrets.")
+        else:
+            manual_anthropic = st.sidebar.text_input(
+                "Paste Anthropic API key", type="password", key="reg_anthropic"
+            )
+            if manual_anthropic.strip():
+                anthropic_key = manual_anthropic.strip()
+            if not anthropic_key:
+                st.sidebar.warning("Haiku review requires an Anthropic API key.")
+
+        haiku_model = st.sidebar.text_input(
+            "Haiku model ID",
+            value=_DEFAULT_HAIKU_MODEL,
+            key="reg_haiku_model",
+        )
+        haiku_max_rows = st.sidebar.number_input(
+            "Max rows to send to Haiku (0 = all)",
+            min_value=0, max_value=5000, value=50, step=10,
+            key="reg_haiku_max_rows",
+            help="Limit Haiku calls to keep costs controlled during testing.",
+        )
+        _est_calls = haiku_max_rows if haiku_max_rows > 0 else "all"
+        st.sidebar.caption(
+            f"Estimated Haiku calls: up to **{_est_calls}** rows.  \n"
+            "Haiku input/output tokens ≈ 800/100 per row."
+        )
+    else:
+        haiku_model    = _DEFAULT_HAIKU_MODEL
+        haiku_max_rows = 0
+
     st.sidebar.markdown("---")
     st.sidebar.caption(
         f"Autosave every **{_AUTOSAVE_EVERY} rows** → `{_AUTOSAVE_DIR}/`  \n"
@@ -2045,6 +2404,10 @@ def main():
                 prior_results=prior_results,
                 prior_evidence=prior_evidence,
                 settings=settings_dict,
+                haiku_mode=haiku_mode,
+                haiku_api_key=anthropic_key,
+                haiku_model=haiku_model,
+                haiku_max_rows=int(haiku_max_rows),
             )
 
             progress_bar.progress(1.0)
@@ -2216,6 +2579,10 @@ def main():
             prior_results=[],
             prior_evidence=[],
             settings=settings_dict,
+            haiku_mode=haiku_mode,
+            haiku_api_key=anthropic_key,
+            haiku_model=haiku_model,
+            haiku_max_rows=int(haiku_max_rows),
         )
 
         progress_bar.progress(1.0)
