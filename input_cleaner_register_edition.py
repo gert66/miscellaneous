@@ -1905,6 +1905,10 @@ def process_dataframe(
                         "haiku_mode":            haiku_mode,
                         "haiku_decision":        _haiku_dec,
                         "final_selected_domain": _final_sel,
+                        "selected_candidate":    (
+                            e.get("domain", "") == _final_sel
+                            and bool(_final_sel)
+                        ),
                     })
             else:
                 # No Serper evidence at all (no key, pre-Serper failure, or website
@@ -1932,6 +1936,7 @@ def process_dataframe(
                     "haiku_mode":            haiku_mode,
                     "haiku_decision":        _haiku_dec,
                     "final_selected_domain": _final_sel,
+                    "selected_candidate":    False,
                 })
 
         rows_done = global_i + 1
@@ -2157,6 +2162,194 @@ def _write_run_summary_sheet(ws, run_meta: dict) -> None:
     ws.row_dimensions[1].height = 18
 
 
+def _build_rank_diagnostics(
+    debug_rows: list[dict],
+    enriched_df: pd.DataFrame,
+    cols: dict,
+) -> pd.DataFrame:
+    """Build one row per company with rank/score diagnostics for the selected domain."""
+    if not debug_rows:
+        return pd.DataFrame()
+
+    company_col = cols.get("company", "")
+    rows = []
+    # Group debug rows by company
+    from itertools import groupby as _groupby
+    sorted_debug = sorted(debug_rows, key=lambda r: r.get("company_name", ""))
+    for company_name, group_iter in _groupby(sorted_debug, key=lambda r: r.get("company_name", "")):
+        group = list(group_iter)
+        final_sel = group[0].get("final_selected_domain", "")
+
+        # Find enriched row for this company to get serper_top and confidence
+        if company_col and company_col in enriched_df.columns:
+            match_mask = enriched_df[company_col].astype(str).str.strip() == company_name
+            matched = enriched_df[match_mask]
+        else:
+            matched = pd.DataFrame()
+        serper_top_domain = (
+            matched["serper_top_result_domain"].iloc[0]
+            if not matched.empty and "serper_top_result_domain" in matched.columns
+            else ""
+        )
+        final_confidence = (
+            matched["final_confidence"].iloc[0]
+            if not matched.empty and "final_confidence" in matched.columns
+            else matched["domain_confidence"].iloc[0]
+            if not matched.empty and "domain_confidence" in matched.columns
+            else ""
+        )
+
+        # Scored candidates only (have a numeric score)
+        scored = []
+        for r in group:
+            try:
+                s = float(r.get("score", ""))
+                scored.append((r, s))
+            except (TypeError, ValueError):
+                pass
+
+        # Top Serper domain = first scored candidate in rank 1 of first query
+        if not serper_top_domain:
+            q_order: dict[str, int] = {}
+            for r in group:
+                q = r.get("search_query", "")
+                if q not in q_order:
+                    q_order[q] = len(q_order)
+            rank1_q0 = [
+                r for r in group
+                if q_order.get(r.get("search_query", ""), 99) == 0
+                and r.get("result_rank") == 1
+                and r.get("extracted_domain")
+            ]
+            serper_top_domain = rank1_q0[0].get("extracted_domain", "") if rank1_q0 else ""
+
+        # Selected domain stats
+        sel_entries = [(r, s) for r, s in scored if r.get("extracted_domain") == final_sel]
+        if sel_entries:
+            best_sel_r, best_sel_s = max(sel_entries, key=lambda x: x[1])
+            sel_first_seen_query  = best_sel_r.get("search_query", "")
+            sel_first_seen_rank   = best_sel_r.get("result_rank", "")
+            sel_best_score        = round(best_sel_s, 3)
+            sel_best_title        = best_sel_r.get("title", "")
+            sel_best_url          = best_sel_r.get("url", "")
+            # Find first occurrence (lowest score rank within first query seen)
+            first_q_entries = [
+                (r, s) for r, s in sel_entries
+                if r.get("search_query") == sel_first_seen_query
+            ]
+            if first_q_entries:
+                first_r = min(first_q_entries, key=lambda x: x[0].get("result_rank") or 99)
+                sel_first_seen_rank = first_r[0].get("result_rank", "")
+        else:
+            sel_first_seen_query = sel_first_seen_rank = ""
+            sel_best_score = sel_best_title = sel_best_url = ""
+
+        # Top serper domain stats
+        top_entries = [(r, s) for r, s in scored if r.get("extracted_domain") == serper_top_domain]
+        top_serper_score = round(max(s for _, s in top_entries), 3) if top_entries else ""
+
+        # Reason label
+        if not final_sel:
+            reason = "no_domain_selected"
+        elif final_sel == serper_top_domain:
+            reason = "top_result_selected"
+        elif not serper_top_domain:
+            reason = "no_serper_top_available"
+        else:
+            reason = "lower_rank_selected"
+
+        # Query index of selected domain
+        q_order2: dict[str, int] = {}
+        for r in group:
+            q = r.get("search_query", "")
+            if q not in q_order2:
+                q_order2[q] = len(q_order2)
+        sel_query_idx = q_order2.get(sel_first_seen_query, "") if sel_first_seen_query else ""
+
+        rows.append({
+            "company_name":                  company_name,
+            "final_selected_domain":         final_sel,
+            "final_confidence":              final_confidence,
+            "selected_domain_first_seen_query": sel_first_seen_query,
+            "selected_domain_query_index":   sel_query_idx,
+            "selected_domain_first_seen_rank": sel_first_seen_rank,
+            "selected_domain_best_score":    sel_best_score,
+            "selected_domain_best_title":    sel_best_title,
+            "selected_domain_best_url":      sel_best_url,
+            "top_serper_domain":             serper_top_domain,
+            "top_serper_domain_score":       top_serper_score,
+            "selected_vs_top_reason":        reason,
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_validation_summary(
+    enriched_df: pd.DataFrame,
+    debug_rows: list[dict],
+    cols: dict,
+) -> dict:
+    """Compact validation metrics beyond Run Summary basics."""
+    n = len(enriched_df)
+
+    final_col = "final_selected_domain" if "final_selected_domain" in enriched_df.columns \
+        else "validated_domain"
+    finals = enriched_df.get(final_col, pd.Series(dtype=str)).astype(str).str.strip()
+    unique_domains = int(finals.replace("", pd.NA).dropna().nunique())
+
+    confs = enriched_df.get("final_confidence",
+                enriched_df.get("domain_confidence", pd.Series(dtype=str))).astype(str)
+    n_high   = int(confs.str.lower().eq("high").sum())
+    n_medium = int(confs.str.lower().eq("medium").sum())
+    n_low    = int(confs.str.lower().isin(["low", "none"]).sum())
+
+    review = int(
+        enriched_df.get("manual_review_needed", pd.Series(dtype=str))
+        .astype(str).str.lower().isin(["true", "1", "yes"]).sum()
+    )
+
+    # Serper top vs final divergence (from enriched_df)
+    top_domain_col = "serper_top_result_domain"
+    if top_domain_col in enriched_df.columns:
+        top_doms  = enriched_df[top_domain_col].astype(str).str.strip()
+        diverged  = int(
+            ((top_doms != "") & (finals != "") & (top_doms != finals)).sum()
+        )
+    else:
+        diverged = "n/a"
+
+    # Rank-based diagnostics from debug_rows
+    below_rank1 = 0
+    later_query  = 0
+    if debug_rows:
+        rd = _build_rank_diagnostics(debug_rows, enriched_df, cols)
+        if not rd.empty:
+            has_sel = rd["final_selected_domain"].astype(str).str.strip() != ""
+            # selected domain appeared below rank 1
+            below_rank1 = int(
+                (has_sel & (rd["selected_domain_first_seen_rank"].apply(
+                    lambda v: (int(v) > 1) if str(v).isdigit() else False
+                ))).sum()
+            )
+            # selected domain found in query index > 0
+            later_query = int(
+                (has_sel & (rd["selected_domain_query_index"].apply(
+                    lambda v: (int(v) > 0) if str(v).isdigit() else False
+                ))).sum()
+            )
+
+    return {
+        "processed_rows":                       n,
+        "unique_final_domains":                 unique_domains,
+        "confidence_High":                      n_high,
+        "confidence_Medium":                    n_medium,
+        "confidence_Low_or_None":               n_low,
+        "manual_review_needed":                 review,
+        "top_serper_differs_from_selected":     diverged,
+        "selected_domain_below_rank_1":         below_rank1,
+        "selected_domain_from_later_query":     later_query,
+    }
+
+
 def build_excel(
     enriched_df: pd.DataFrame,
     original_df: pd.DataFrame,
@@ -2222,13 +2415,24 @@ def build_excel(
     else:
         ws5.cell(row=1, column=1, value="Haiku review was not used in this run.")
 
-    # Sheet 7: Candidate Discovery Debug (only when debug_mode is active)
+    # Sheet 7: Candidate Rank Diagnostics (always present when debug_rows available)
+    ws_rank = wb.create_sheet("Candidate Rank Diagnostics")
+    if debug_rows:
+        rank_df = _build_rank_diagnostics(debug_rows, enriched_df, cols)
+        if not rank_df.empty:
+            _write_sheet(ws_rank, rank_df)
+        else:
+            ws_rank.cell(row=1, column=1, value="No rank diagnostics available.")
+    else:
+        ws_rank.cell(row=1, column=1, value="No debug rows collected (debug mode was off).")
+
+    # Sheet 8: Candidate Discovery Debug (only when debug_mode is active)
     if debug_mode:
         ws6 = wb.create_sheet("Candidate Discovery Debug")
         _debug_cols = [
             "company_name", "row_number", "search_query", "result_rank",
             "title", "snippet", "url", "extracted_domain",
-            "score", "used", "skip_reason", "rejection_category",
+            "score", "used", "selected_candidate", "skip_reason", "rejection_category",
             "brand_overlap", "full_overlap", "location_match", "email_match",
             "official_signal", "final_python_domain",
             "haiku_mode", "haiku_decision", "final_selected_domain",
@@ -2244,7 +2448,21 @@ def build_excel(
                      value="Debug mode was enabled but no Serper results were collected "
                            "(no Serper key, or no rows required search).")
 
-    # Sheet 8 (or 7): Run Summary — always last
+    # Validation Diagnostics sheet — always present
+    ws_val = wb.create_sheet("Validation Diagnostics")
+    val_summary = _build_validation_summary(enriched_df, debug_rows or [], cols)
+    import openpyxl.styles as _oxl_styles
+    _key_font_val = _oxl_styles.Font(bold=True)
+    ws_val.cell(row=1, column=1, value="Metric").font = _key_font_val
+    ws_val.cell(row=1, column=2, value="Value").font  = _key_font_val
+    for ri, (k, v) in enumerate(val_summary.items(), 2):
+        ws_val.cell(row=ri, column=1, value=str(k))
+        ws_val.cell(row=ri, column=2, value=str(v) if v is not None else "")
+    ws_val.column_dimensions["A"].width = 42
+    ws_val.column_dimensions["B"].width = 14
+    ws_val.freeze_panes = "A2"
+
+    # Run Summary — always last
     ws_summary = wb.create_sheet("Run Summary")
     if run_meta:
         _write_run_summary_sheet(ws_summary, run_meta)
@@ -2524,14 +2742,17 @@ def _download_section(
         "3. **Review Needed** — rows requiring manual check  \n"
         "4. **Original Input** — unchanged source data  \n"
         "5. **Raw Search Evidence** — Serper queries, results, name variants, rejection reasons  \n"
-        "6. **Python vs Haiku Comparison** — side-by-side comparison (populated when Haiku mode is active)"
+        "6. **Python vs Haiku Comparison** — side-by-side comparison (populated when Haiku mode is active)  \n"
+        "7. **Candidate Rank Diagnostics** — per-company: selected domain rank, score vs. top Serper result  \n"
     )
+    sheet_n = 8
     if debug_mode:
         sheet_list += (
-            "  \n7. **Candidate Discovery Debug** — every Serper result per company with full scoring detail"
+            f"  \n{sheet_n}. **Candidate Discovery Debug** — every Serper result per company with full scoring detail"
         )
-    sheet_list += "  \n8. **Run Summary** — run settings and outcome metrics" if debug_mode \
-        else "  \n7. **Run Summary** — run settings and outcome metrics"
+        sheet_n += 1
+    sheet_list += f"  \n{sheet_n}. **Validation Diagnostics** — coverage, confidence, divergence counts  \n"
+    sheet_list += f"  \n{sheet_n + 1}. **Run Summary** — run settings and outcome metrics"
     st.markdown("**Output sheets:**  \n" + sheet_list)
     st.download_button(
         "⬇ Download cleaned register Excel",
