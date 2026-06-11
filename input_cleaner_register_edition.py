@@ -260,6 +260,11 @@ _HAIKU_SYSTEM_PROMPT = (
     "You are a B2B sales intelligence assistant specialising in Italian companies. "
     "Your task: given a company name and candidate websites from Google search results, "
     "identify the company's official website.\n\n"
+    "The search results include two kinds of entries:\n"
+    "  [SCORED]   — passed the Python brand-similarity filter; scored and ranked\n"
+    "  [FILTERED] — removed by Python heuristics (generic site, low similarity, "
+    "government/religious/directory/academic category). You may override a FILTERED "
+    "result if you are confident it is the correct official site.\n\n"
     "Return ONLY a JSON object with exactly these fields:\n"
     "  decision   — \"accept\" | \"replace\" | \"reject\" | \"uncertain\"\n"
     "               accept=python suggestion is correct; replace=a different domain is better;\n"
@@ -764,6 +769,7 @@ def search_official_domain_register(
             if not domain or is_generic(domain):
                 evidence.append({
                     "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
                     "domain": domain, "used": False,
                     "skip_reason": "generic/blacklisted", "score": 0,
                 })
@@ -777,6 +783,7 @@ def search_official_domain_register(
             if cat:
                 evidence.append({
                     "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
                     "domain": domain, "used": False,
                     "skip_reason": f"category:{cat}", "score": 0,
                     "rejection_category": cat,
@@ -794,6 +801,7 @@ def search_official_domain_register(
             if score < 0.08:
                 evidence.append({
                     "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
                     "domain": domain, "used": False,
                     "skip_reason": f"low_similarity_score({score:.3f})", "score": score,
                 })
@@ -1253,43 +1261,64 @@ def _fill_serper_top(result: dict, evidence: list, query: str) -> None:
 
 
 def _build_haiku_results_block(raw_evidence: list[dict]) -> str:
-    """Format Serper evidence into a readable block for the Haiku prompt."""
-    seen: set[str] = set()
-    lines: list[str] = []
-    rank = 1
+    """
+    Format ALL Serper evidence for the Haiku prompt, grouped by query.
+    Shows up to 10 results per query: used results first, then filtered/rejected ones
+    with their rejection reason so Haiku can override if appropriate.
+    """
+    if not raw_evidence:
+        return "(no search results available)"
+
+    # Group by query, preserving insertion order
+    from collections import OrderedDict
+    by_query: OrderedDict[str, list[dict]] = OrderedDict()
     for e in raw_evidence:
-        domain = e.get("domain", "")
-        if not domain or domain in seen:
-            continue
-        if not e.get("used", False):
-            continue
-        seen.add(domain)
-        title   = e.get("title", "")[:80]
-        snippet = e.get("snippet", "")[:120]
-        score   = e.get("score", "")
-        b_ov    = e.get("brand_overlap", "")
-        em      = "Yes" if e.get("email_match") else "No"
-        lines.append(
-            f"{rank}. {domain} — \"{title}\"\n"
-            f"   Snippet: {snippet}\n"
-            f"   Score: {score} | Brand overlap: {b_ov} | Email match: {em}"
-        )
-        rank += 1
-        if rank > 10:
-            break
-    if not lines:
-        # Fall back to all evidence even if marked not-used
-        for e in raw_evidence[:10]:
-            domain = e.get("domain", "")
-            if not domain or domain in seen:
+        q = e.get("query", "(unknown query)")
+        by_query.setdefault(q, []).append(e)
+
+    sections: list[str] = []
+    for query, items in by_query.items():
+        lines: list[str] = [f'Query: "{query}"']
+        seen_domains: set[str] = set()
+        count = 0
+        for e in items:
+            if count >= 10:
+                break
+            domain  = e.get("domain", "") or "(no domain)"
+            title   = (e.get("title", "") or "")[:80]
+            snippet = (e.get("snippet", "") or "")[:120]
+            url     = e.get("url", "")
+            used    = e.get("used", False)
+
+            if domain in seen_domains:
                 continue
-            seen.add(domain)
-            lines.append(
-                f"{rank}. {domain} — \"{e.get('title','')[:80]}\"\n"
-                f"   (filtered: {e.get('skip_reason','')}) | Score: {e.get('score','')}"
-            )
-            rank += 1
-    return "\n".join(lines) if lines else "(no search results available)"
+            seen_domains.add(domain)
+            count += 1
+
+            if used:
+                score   = e.get("score", "?")
+                b_ov    = e.get("brand_overlap", "?")
+                em      = "Yes" if e.get("email_match") else "No"
+                lines.append(
+                    f"  {count}. [SCORED] {domain}\n"
+                    f"     Title:   {title}\n"
+                    f"     Snippet: {snippet}\n"
+                    f"     URL:     {url}\n"
+                    f"     Score: {score} | Brand overlap: {b_ov} | Email match: {em}"
+                )
+            else:
+                reason = e.get("skip_reason", "filtered")
+                score  = e.get("score", "")
+                score_str = f" | Score: {score}" if score else ""
+                lines.append(
+                    f"  {count}. [FILTERED: {reason}] {domain}\n"
+                    f"     Title:   {title}\n"
+                    f"     Snippet: {snippet}\n"
+                    f"     URL:     {url}{score_str}"
+                )
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
 
 
 def _haiku_review_domain(
@@ -1316,6 +1345,13 @@ def _haiku_review_domain(
         "haiku_risk_flags": "",
         "haiku_error":      "",
     }
+
+    # Do not call Haiku if there is no Serper evidence to reason about
+    if not raw_evidence:
+        out["haiku_used"]     = False
+        out["haiku_decision"] = "skipped_no_serper_evidence"
+        out["haiku_error"]    = "no Serper results available for this row"
+        return out
 
     if not _ANTHROPIC_AVAILABLE or not api_key:
         out["haiku_used"]  = False
@@ -1376,10 +1412,19 @@ def _apply_haiku_decision(
     python_domain = str(python_result.get("validated_domain", "") or "")
     python_conf   = str(python_result.get("domain_confidence", "") or "")
 
-    if not haiku_result.get("haiku_used") or mode == _HAIKU_MODE_PYTHON:
+    if mode == _HAIKU_MODE_PYTHON:
         return {
             "final_selected_domain": python_domain,
             "final_decision_source": "python",
+            "final_confidence":      python_conf,
+        }
+
+    if not haiku_result.get("haiku_used"):
+        decision_h = haiku_result.get("haiku_decision", "")
+        source = "haiku_skipped" if decision_h == "skipped_no_serper_evidence" else "python"
+        return {
+            "final_selected_domain": python_domain,
+            "final_decision_source": source,
             "final_confidence":      python_conf,
         }
 
@@ -1405,10 +1450,11 @@ def _apply_haiku_decision(
             "final_decision_source": "haiku_reject",
             "final_confidence":      "None",
         }
-    # uncertain or error — keep python result
+    # uncertain / skipped / error — keep python result
+    source = "haiku_skipped" if decision == "skipped_no_serper_evidence" else "haiku_uncertain"
     return {
         "final_selected_domain": python_domain,
-        "final_decision_source": "haiku_uncertain",
+        "final_decision_source": source,
         "final_confidence":      python_conf,
     }
 
