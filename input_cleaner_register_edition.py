@@ -313,6 +313,33 @@ _DEFAULT_HAIKU_MODEL  = "claude-haiku-4-5-20251001"
 _HAIKU_MODE_PYTHON    = "Python only"
 _HAIKU_MODE_UNCERTAIN = "Haiku for uncertain rows only"
 _HAIKU_MODE_ALL       = "Haiku for all rows"
+
+# Jina website verifier mode constants
+_JINA_MODE_OFF       = "Off"
+_JINA_MODE_UNCERTAIN = "For uncertain candidates only"
+_JINA_MODE_ALL_DEBUG = "For all selected candidates in debug mode"
+_JINA_MODES          = [_JINA_MODE_OFF, _JINA_MODE_UNCERTAIN, _JINA_MODE_ALL_DEBUG]
+
+_JINA_READER_BASE = "https://r.jina.ai/"
+_JINA_MAX_CHARS   = 3000   # chars to keep per fetched page
+_JINA_SLUGS       = ["/", "/about", "/about-us", "/chi-siamo", "/contatti", "/contact"]
+
+_JINA_RISKY_DOMAIN_RE = re.compile(
+    r"\b(?:forum|fan|club|community|dealer|shop|store|wiki|museum|foundation)\b",
+    re.IGNORECASE,
+)
+
+# Famous / generic single-word brands that need extra Jina verification
+_JINA_FAMOUS_BRANDS: frozenset = frozenset({
+    "ferrari", "lamborghini", "fiat", "alfa", "romeo", "lancia", "ducati",
+    "barilla", "lavazza", "campari", "pirelli", "benetton", "prada", "gucci",
+    "versace", "armani", "valentino", "bulgari", "ferrero",
+    "delta", "omega", "sigma", "alpha", "beta", "gamma",
+    "atlas", "titan", "apollo", "mercury", "saturn", "orion",
+})
+
+# Module-level Jina page cache: (domain, slug) -> (text, fetch_status)
+_JINA_CACHE: dict[tuple[str, str], tuple[str, str]] = {}
 _HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
 
 _HAIKU_SYSTEM_PROMPT = (
@@ -1742,6 +1769,462 @@ def _apply_haiku_decision(
 
 
 # =============================================================================
+# JINA WEBSITE VERIFIER
+# =============================================================================
+
+
+def _jina_should_run(
+    result: dict,
+    name_variants: dict,
+    raw_ev: list[dict],
+    jina_mode: str,
+    debug_mode: bool = False,
+) -> bool:
+    """Return True if Jina verification should be triggered for this row."""
+    if jina_mode == _JINA_MODE_OFF:
+        return False
+    if jina_mode == _JINA_MODE_ALL_DEBUG and debug_mode:
+        return True
+
+    conf = str(result.get("final_confidence") or result.get("domain_confidence") or "").strip().lower()
+    manual = str(result.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
+    final_dom = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
+
+    # Trigger 1: confidence is Medium, Low, None, or empty
+    if conf in ("medium", "low", "none", ""):
+        return True
+
+    # Trigger 2: manual_review_needed
+    if manual:
+        return True
+
+    # Trigger 3: top-2 candidate scores are close (delta < 0.25)
+    scored: dict[str, float] = {}
+    for e in raw_ev:
+        if not e.get("used"):
+            continue
+        dom = e.get("domain", "")
+        try:
+            sc = float(e.get("score", 0))
+        except (TypeError, ValueError):
+            sc = 0.0
+        if dom and sc > scored.get(dom, -1.0):
+            scored[dom] = sc
+    if len(scored) >= 2:
+        top2 = sorted(scored.values(), reverse=True)[:2]
+        if top2[0] - top2[1] < 0.25:
+            return True
+
+    # Trigger 4: selected domain came from a site:.it query
+    query_used = str(result.get("search_query_used", "") or "")
+    if query_used.lower().startswith("site:.it"):
+        return True
+
+    # Trigger 5: no location_match and no email_match for selected domain
+    sel = final_dom.lower()
+    if sel and result.get("domain_source") not in (SRC_ORIGINAL, SRC_EMAIL, SRC_SERPER_EMAIL):
+        has_loc   = any(e.get("domain", "").lower() == sel and e.get("location_match") for e in raw_ev)
+        has_email = any(e.get("domain", "").lower() == sel and e.get("email_match") for e in raw_ev)
+        if not has_loc and not has_email:
+            return True
+
+    # Trigger 6: brand is single-word, short, generic, or famous
+    brand = (name_variants.get("brand") or "").strip()
+    brand_clean = re.sub(r"[^\w]", "", brand.lower())
+    if brand_clean and (
+        len(brand_clean) <= 5
+        or brand_clean in _JINA_FAMOUS_BRANDS
+        or _brand_is_ambiguous(brand)
+    ):
+        return True
+
+    # Trigger 7: selected domain contains risky patterns
+    if final_dom and _JINA_RISKY_DOMAIN_RE.search(final_dom):
+        return True
+
+    return False
+
+
+def _jina_fetch_page(
+    domain: str,
+    slug: str,
+    jina_api_key: str | None = None,
+    timeout: int = 12,
+) -> tuple[str, str]:
+    """
+    Fetch domain+slug via Jina Reader. Returns (text, fetch_status).
+    Caches results by (domain, slug) for the lifetime of the Streamlit session.
+    """
+    if not slug.startswith("/"):
+        slug = f"/{slug}"
+    cache_key = (domain, slug)
+    if cache_key in _JINA_CACHE:
+        return _JINA_CACHE[cache_key]
+
+    jina_url = f"{_JINA_READER_BASE}https://{domain}{slug}"
+    headers = {"Accept": "text/plain", "X-Return-Format": "text"}
+    if jina_api_key:
+        headers["Authorization"] = f"Bearer {jina_api_key}"
+
+    text = ""
+    try:
+        resp = requests.get(jina_url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            text  = resp.text[:_JINA_MAX_CHARS]
+            status = "ok"
+        elif resp.status_code == 404:
+            status = "404"
+        else:
+            status = f"http_{resp.status_code}"
+    except requests.Timeout:
+        status = "timeout"
+    except Exception as exc:
+        status = f"error:{str(exc)[:60]}"
+
+    _JINA_CACHE[cache_key] = (text, status)
+    return text, status
+
+
+def _jina_extract_evidence(text: str, domain: str) -> dict:
+    """Extract identity signals from Jina-fetched page text."""
+    t = text.lower()
+
+    _pi_re    = re.compile(r"p\.?\s*iva[:\s]*([0-9]{11})", re.IGNORECASE)
+    _phone_re = re.compile(
+        r"(?:tel\.?|fax\.?|phone|telefono|cellulare)[:\s]*([\+0][\d\s\-\(\)\.]{7,20})",
+        re.IGNORECASE,
+    )
+    _email_re = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-z]{2,6}", re.IGNORECASE)
+
+    pi_match    = _pi_re.search(text)
+    phone_match = _phone_re.search(text)
+    emails      = _email_re.findall(text)
+    domain_email = next((e for e in emails if domain.split(".")[0] in e.lower()), "")
+
+    directory_signal = bool(re.search(
+        r"fatturato|bilancio|visura|scheda\s+azienda|registro\s+imprese|"
+        r"company\s+profile|business\s+profile|similar\s+companies|competitors|"
+        r"employees\s+count|revenue|founded\s+in\s+\d{4}\s+·",
+        t,
+    ))
+    wrong_country_signal = bool(
+        re.search(r"\b(?:united\s+states|usa|uk\s+company|british|deutschland|français)\b", t)
+        and not re.search(r"\b(?:italia|italian|italy|italiano|italiana)\b", t)
+    )
+    official_signal = bool(re.search(
+        r"sito\s+ufficiale|official\s+(?:website|site)|benvenuti|chi\s+siamo|"
+        r"about\s+us|la\s+nostra\s+azienda|our\s+company|contattaci",
+        t,
+    ))
+    is_italian = bool(re.search(
+        r"\b(?:italia|italiano|italiana|italiani|azienda|prodotti|servizi|contatti|"
+        r"via\s+[a-z]|piazza\s+[a-z]|corso\s+[a-z]|srl|spa|snc|sas)\b",
+        t,
+    ))
+
+    return {
+        "partita_iva_on_site":        pi_match.group(1)     if pi_match    else "",
+        "phone_on_site":              phone_match.group(1).strip() if phone_match else "",
+        "email_on_site":              domain_email or (emails[0] if emails else ""),
+        "directory_or_profile_signal": directory_signal,
+        "wrong_country_signal":       wrong_country_signal,
+        "official_site_signal":       official_signal,
+        "language_country_signal":    "it" if is_italian else "unknown",
+    }
+
+
+def _jina_score_pages(
+    domain: str,
+    company_name: str,
+    city: str,
+    province: str,
+    email_domain: str,
+    name_variants: dict,
+    pages_data: list[dict],
+) -> tuple[float, str, list[str]]:
+    """
+    Aggregate Jina page evidence into a score.
+    Returns (score, hint_str, signal_list).
+    """
+    brand_lower  = re.sub(r"[^\w]", "", (name_variants.get("brand") or company_name).lower())
+    brand_nodot  = re.sub(r"[^\w]", "", (name_variants.get("brand_nodot") or brand_lower).lower())
+
+    any_ok = any(p["fetch_status"] == "ok" and p["text"] for p in pages_data)
+    if not any_ok:
+        return 0.0, "no_pages_fetched", []
+
+    score   = 0.0
+    signals: list[str] = []
+
+    has_dir = has_wrong = has_official = has_italian = has_email = has_brand = has_city = has_prov = False
+
+    for p in pages_data:
+        ev = p.get("evidence", {})
+        tl = p.get("text", "").lower()
+        if ev.get("directory_or_profile_signal"):
+            has_dir = True
+        if ev.get("wrong_country_signal"):
+            has_wrong = True
+        if ev.get("official_site_signal"):
+            has_official = True
+        if ev.get("language_country_signal") == "it":
+            has_italian = True
+        if email_domain and email_domain in ev.get("email_on_site", "").lower():
+            has_email = True
+        if brand_lower in tl or brand_nodot in tl:
+            has_brand = True
+        if city and len(city) >= 3 and city.lower() in tl:
+            has_city = True
+        if province and len(province) >= 2 and province.lower() in tl:
+            has_prov = True
+
+    if has_dir:
+        score -= 1.5
+        signals.append("directory/profile page detected")
+    if has_wrong:
+        score -= 0.8
+        signals.append("wrong country signal")
+    if has_official:
+        score += 0.5
+        signals.append("official site signal")
+    if has_italian:
+        score += 0.3
+        signals.append("Italian language detected")
+    if has_email:
+        score += 0.8
+        signals.append(f"email domain {email_domain} found on site")
+    if has_brand:
+        score += 0.6
+        signals.append(f"brand '{brand_lower}' found on site")
+    if has_city:
+        score += 0.4
+        signals.append(f"city '{city}' found on site")
+    if has_prov:
+        score += 0.3
+        signals.append(f"province '{province}' found on site")
+    if domain.endswith(".it"):
+        score += 0.2
+        signals.append(".it domain")
+
+    if score >= 1.5:
+        hint = "strong_match"
+    elif score >= 0.5:
+        hint = "likely_match"
+    elif score <= -1.0:
+        hint = "directory_or_wrong"
+    elif score < 0:
+        hint = "weak_negative"
+    else:
+        hint = "insufficient_evidence"
+
+    return round(score, 3), hint, signals
+
+
+def _jina_verify_candidates(
+    company_name: str,
+    city: str,
+    province: str,
+    email_domain: str,
+    name_variants: dict,
+    candidates: list[str],
+    current_domain: str,
+    jina_api_key: str | None = None,
+) -> tuple[dict, list[dict]]:
+    """
+    Run Jina verification on candidate domains.
+    Returns (jina_result_dict, jina_debug_rows).
+    """
+    base_out = {
+        "jina_verifier_used":       True,
+        "jina_verified_domain":     "",
+        "jina_verifier_confidence": "",
+        "jina_verifier_decision":   "",
+        "jina_verifier_reason":     "",
+        "jina_evidence_legal_name": "",
+        "jina_evidence_address":    "",
+        "jina_evidence_city":       "",
+        "jina_evidence_phone":      "",
+        "jina_evidence_email":      "",
+        "jina_evidence_partita_iva": "",
+        "jina_pages_fetched":       0,
+        "jina_fetch_status":        "",
+    }
+    debug_rows: list[dict] = []
+
+    if not candidates:
+        base_out.update(
+            jina_verifier_used=False,
+            jina_verifier_decision="no_candidates",
+            jina_verifier_reason="No candidates to verify",
+        )
+        return base_out, debug_rows
+
+    domain_scores: dict[str, tuple[float, str, list[str]]] = {}
+    domain_best_ev: dict[str, dict] = {}
+    total_fetched  = 0
+    all_statuses: list[str] = []
+
+    for domain in candidates[:5]:
+        if not domain:
+            continue
+        pages_data: list[dict] = []
+        for slug in _JINA_SLUGS:
+            text, status = _jina_fetch_page(domain, slug, jina_api_key)
+            all_statuses.append(status)
+            ev: dict = {}
+            if text:
+                total_fetched += 1
+                ev = _jina_extract_evidence(text, domain)
+            pages_data.append({"slug": slug, "text": text, "fetch_status": status,
+                                "chars_fetched": len(text), "evidence": ev})
+            debug_rows.append({
+                "company_name":       company_name,
+                "candidate_domain":   domain,
+                "candidate_url":      f"https://{domain}{slug}",
+                "page_slug":          slug,
+                "fetch_status":       status,
+                "chars_fetched":      len(text),
+                "extracted_legal_name": "",
+                "extracted_address":  "",
+                "extracted_phone":    ev.get("phone_on_site", ""),
+                "extracted_email":    ev.get("email_on_site", ""),
+                "extracted_partita_iva": ev.get("partita_iva_on_site", ""),
+                "verifier_score":     "",  # filled after scoring
+                "verifier_decision":  "",
+                "verifier_reason":    "",
+            })
+
+        sc, hint, sigs = _jina_score_pages(
+            domain, company_name, city, province, email_domain, name_variants, pages_data
+        )
+        domain_scores[domain] = (sc, hint, sigs)
+
+        # Best evidence page for the output columns
+        best_pg_ev = next((p["evidence"] for p in pages_data if p["fetch_status"] == "ok" and p["text"]), {})
+        domain_best_ev[domain] = best_pg_ev
+
+        # Back-fill score into debug rows for this domain
+        reason_str = "; ".join(sigs[:3]) if sigs else hint
+        for row in debug_rows:
+            if row["candidate_domain"] == domain and row["verifier_score"] == "":
+                row["verifier_score"]   = sc
+                row["verifier_decision"] = hint
+                row["verifier_reason"]  = reason_str
+
+    base_out["jina_pages_fetched"] = total_fetched
+    base_out["jina_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
+
+    if not domain_scores:
+        base_out.update(
+            jina_verifier_decision="fetch_failed",
+            jina_verifier_reason="No pages could be fetched",
+            jina_verifier_confidence="None",
+        )
+        return base_out, debug_rows
+
+    sorted_doms = sorted(domain_scores.items(), key=lambda x: x[1][0], reverse=True)
+    best_dom, (best_sc, best_hint, best_sigs) = sorted_doms[0]
+    cur_sc = domain_scores.get(current_domain, (0.0, "not_fetched", []))[0]
+    reason_str = "; ".join(best_sigs[:3]) if best_sigs else best_hint
+
+    def _fill_ev(dom: str) -> dict:
+        ev = domain_best_ev.get(dom, {})
+        return {
+            "jina_evidence_phone":       ev.get("phone_on_site", ""),
+            "jina_evidence_email":       ev.get("email_on_site", ""),
+            "jina_evidence_partita_iva": ev.get("partita_iva_on_site", ""),
+        }
+
+    if best_sc <= -1.0:
+        # Best candidate is a directory/wrong site
+        alt = [(d, s, h, sg) for d, (s, h, sg) in sorted_doms if d != best_dom and s > 0.3]
+        if alt and best_dom == current_domain:
+            alt_dom, alt_sc, _, alt_sg = alt[0]
+            base_out.update(
+                jina_verified_domain=alt_dom,
+                jina_verifier_decision="replace",
+                jina_verifier_confidence="Medium" if alt_sc >= 0.8 else "Low",
+                jina_verifier_reason=f"Current domain is {best_hint}; {alt_dom} shows: {'; '.join(alt_sg[:2]) or 'better signals'}",
+                **_fill_ev(alt_dom),
+            )
+        else:
+            base_out.update(
+                jina_verified_domain="",
+                jina_verifier_decision="reject" if current_domain == best_dom else "uncertain",
+                jina_verifier_confidence="None",
+                jina_verifier_reason=f"All Jina candidates show negative signals: {reason_str}",
+            )
+    elif best_dom != current_domain and best_sc > cur_sc + 0.4:
+        # A different domain has markedly stronger evidence
+        base_out.update(
+            jina_verified_domain=best_dom,
+            jina_verifier_decision="replace",
+            jina_verifier_confidence="High" if best_sc >= 1.5 else "Medium",
+            jina_verifier_reason=f"{best_dom} has stronger evidence than {current_domain}: {reason_str}",
+            **_fill_ev(best_dom),
+        )
+    elif best_sc >= 0.5:
+        # Confirm Python selection (or best domain)
+        confirmed = current_domain if current_domain in domain_scores else best_dom
+        conf_label = "High" if best_sc >= 1.5 else ("Medium" if best_sc >= 0.8 else "Low")
+        base_out.update(
+            jina_verified_domain=confirmed,
+            jina_verifier_decision="confirm",
+            jina_verifier_confidence=conf_label,
+            jina_verifier_reason=f"Jina confirms {confirmed}: {reason_str}",
+            **_fill_ev(confirmed),
+        )
+    else:
+        # Insufficient evidence
+        base_out.update(
+            jina_verified_domain=current_domain,
+            jina_verifier_decision="uncertain",
+            jina_verifier_confidence="Low",
+            jina_verifier_reason="Jina could not gather sufficient identity evidence",
+            **_fill_ev(current_domain),
+        )
+
+    return base_out, debug_rows
+
+
+def _apply_jina_decision(result: dict, jina_result: dict) -> dict:
+    """
+    Apply Jina verifier decision on top of Python+Haiku final_* fields.
+    Returns a dict of fields to update on result.
+    """
+    if not jina_result.get("jina_verifier_used"):
+        return {}
+
+    decision     = jina_result.get("jina_verifier_decision", "")
+    verified_dom = str(jina_result.get("jina_verified_domain", "") or "")
+    jina_conf    = jina_result.get("jina_verifier_confidence", "")
+
+    if decision == "replace" and verified_dom:
+        return {
+            "final_selected_domain": verified_dom,
+            "final_decision_source": "jina_replace",
+            "final_confidence":      jina_conf or "Medium",
+            "manual_review_needed":  False,
+        }
+    if decision == "reject":
+        return {
+            "final_selected_domain": "",
+            "final_decision_source": "jina_reject",
+            "final_confidence":      "None",
+            "manual_review_needed":  True,
+        }
+    if decision == "confirm":
+        updates: dict = {"final_decision_source": "jina_confirm"}
+        # Upgrade confidence if Jina is more certain
+        current_conf = (result.get("final_confidence") or "").lower()
+        if jina_conf == "High" and current_conf in ("medium", "low", "none", ""):
+            updates["final_confidence"] = "High"
+        return updates
+    # uncertain / fetch_failed / no_candidates
+    return {"final_decision_source": f"jina_{decision or 'uncertain'}"}
+
+
+# =============================================================================
 # AUTOSAVE / RESUME
 # =============================================================================
 
@@ -1954,6 +2437,20 @@ _OUTPUT_COLS = [
     "final_selected_domain",
     "final_decision_source",
     "final_confidence",
+    # v5 Jina verifier columns
+    "jina_verifier_used",
+    "jina_verified_domain",
+    "jina_verifier_confidence",
+    "jina_verifier_decision",
+    "jina_verifier_reason",
+    "jina_evidence_legal_name",
+    "jina_evidence_address",
+    "jina_evidence_city",
+    "jina_evidence_phone",
+    "jina_evidence_email",
+    "jina_evidence_partita_iva",
+    "jina_pages_fetched",
+    "jina_fetch_status",
 ]
 
 
@@ -1975,19 +2472,24 @@ def process_dataframe(
     haiku_api_key: str | None = None,
     haiku_model: str = _DEFAULT_HAIKU_MODEL,
     haiku_max_rows: int = 0,   # 0 = no limit
+    # Jina website verifier
+    jina_mode: str = _JINA_MODE_UNCERTAIN,
+    jina_api_key: str | None = None,
     # Debug
     debug_mode: bool = False,
-) -> tuple[pd.DataFrame, list[dict], list[dict]]:
+) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
     """
     Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
     Saves a checkpoint to disk every _AUTOSAVE_EVERY rows and on completion.
 
-    Returns (enriched_df_for_all_rows, all_evidence_rows, all_debug_rows).
+    Returns (enriched_df_for_all_rows, all_evidence_rows, all_debug_rows, all_jina_debug_rows).
     """
-    new_results:  list[dict] = []
-    new_evidence: list[dict] = []
-    new_debug:    list[dict] = []
+    new_results:   list[dict] = []
+    new_evidence:  list[dict] = []
+    new_debug:     list[dict] = []
+    new_jina_debug: list[dict] = []
     n = len(df)
+    process_dataframe._jina_debug = new_jina_debug  # type: ignore[attr-defined]
 
     company_col  = cols.get("company") or ""
     website_col  = cols.get("website") or ""
@@ -2050,7 +2552,62 @@ def process_dataframe(
         final_fields = _apply_haiku_decision(res, haiku_res, haiku_mode)
         res.update(final_fields)
 
+        # ── Default Jina verifier fields ─────────────────────────────────────
+        _jina_defaults = {
+            "jina_verifier_used": False, "jina_verified_domain": "",
+            "jina_verifier_confidence": "", "jina_verifier_decision": "",
+            "jina_verifier_reason": "", "jina_evidence_legal_name": "",
+            "jina_evidence_address": "", "jina_evidence_city": "",
+            "jina_evidence_phone": "", "jina_evidence_email": "",
+            "jina_evidence_partita_iva": "", "jina_pages_fetched": 0,
+            "jina_fetch_status": "",
+        }
+        res.update(_jina_defaults)
+
+        # ── Jina verification ─────────────────────────────────────────────────
+        _jina_debug_rows: list[dict] = []
+        if jina_mode != _JINA_MODE_OFF:
+            _name_variants_j = extract_name_variants(name)
+            _run_jina = _jina_should_run(res, _name_variants_j, raw_ev, jina_mode, debug_mode)
+            if _run_jina:
+                # Collect top unique scored candidates from Serper evidence
+                _cand_scores: dict[str, float] = {}
+                for _e in raw_ev:
+                    if not _e.get("used"):
+                        continue
+                    _d = _e.get("domain", "")
+                    try:
+                        _s = float(_e.get("score", 0))
+                    except (TypeError, ValueError):
+                        _s = 0.0
+                    if _d and _s > _cand_scores.get(_d, -1.0):
+                        _cand_scores[_d] = _s
+                _sorted_cands = sorted(_cand_scores.items(), key=lambda x: x[1], reverse=True)
+                _jina_cands = [d for d, _ in _sorted_cands[:5]]
+                # Ensure current domain is in the list
+                _cur_dom = str(res.get("final_selected_domain") or res.get("validated_domain") or "")
+                if _cur_dom and _cur_dom not in _jina_cands:
+                    _jina_cands = [_cur_dom] + _jina_cands[:4]
+
+                try:
+                    _jina_res, _jina_debug_rows = _jina_verify_candidates(
+                        name, city, province,
+                        str(res.get("email_domain", "") or ""),
+                        _name_variants_j, _jina_cands, _cur_dom,
+                        jina_api_key,
+                    )
+                    res.update(_jina_res)
+                    # Apply Jina decision on top of Haiku-merged final_* fields
+                    _jina_upd = _apply_jina_decision(res, _jina_res)
+                    if _jina_upd:
+                        res.update(_jina_upd)
+                except Exception as _jex:
+                    res["jina_fetch_status"] = f"jina_exception:{str(_jex)[:120]}"
+
         new_results.append(res)
+
+        # Accumulate Jina debug rows for the Jina Verification Debug sheet
+        new_jina_debug.extend(_jina_debug_rows)
 
         query = res.get("search_query_used", "")
         if query:
@@ -2168,12 +2725,13 @@ def process_dataframe(
     # Merge prior completed rows with newly processed rows
     all_results  = list(prior_results or []) + new_results
     all_evidence = list(prior_evidence or []) + new_evidence
-    all_debug    = new_debug   # debug rows only cover the newly processed rows
+    all_debug    = new_debug       # debug rows only cover the newly processed rows
+    all_jina_debug = new_jina_debug
 
     result_df = pd.DataFrame(all_results, index=df.index)
     enriched  = pd.concat([df.copy(), result_df], axis=1)
     enriched  = enriched.loc[:, ~enriched.columns.duplicated()]
-    return enriched, all_evidence, all_debug
+    return enriched, all_evidence, all_debug, all_jina_debug
 
 
 # =============================================================================
@@ -2571,6 +3129,7 @@ def build_excel(
     debug_rows: list[dict] | None = None,
     debug_mode: bool = False,
     run_meta: dict | None = None,
+    jina_debug_rows: list[dict] | None = None,
 ) -> bytes:
     import openpyxl
 
@@ -2661,6 +3220,29 @@ def build_excel(
             ws6.cell(row=1, column=1,
                      value="Debug mode was enabled but no Serper results were collected "
                            "(no Serper key, or no rows required search).")
+
+    # Jina Verification Debug sheet (always shown when Jina was used)
+    jina_ran = (
+        "jina_verifier_used" in enriched_df.columns
+        and enriched_df["jina_verifier_used"].astype(str).str.lower().isin(["true", "1"]).any()
+    )
+    if jina_ran or jina_debug_rows:
+        ws_jina = wb.create_sheet("Jina Verification Debug")
+        _jina_debug_cols = [
+            "company_name", "candidate_domain", "candidate_url", "page_slug",
+            "fetch_status", "chars_fetched",
+            "extracted_legal_name", "extracted_address",
+            "extracted_phone", "extracted_email", "extracted_partita_iva",
+            "verifier_score", "verifier_decision", "verifier_reason",
+        ]
+        if jina_debug_rows:
+            jd_df = pd.DataFrame(jina_debug_rows)
+            for c in _jina_debug_cols:
+                if c not in jd_df.columns:
+                    jd_df[c] = ""
+            _write_sheet(ws_jina, jd_df[_jina_debug_cols])
+        else:
+            ws_jina.cell(row=1, column=1, value="Jina verifier ran but no debug rows were collected.")
 
     # Validation Diagnostics sheet — always present
     ws_val = wb.create_sheet("Validation Diagnostics")
@@ -2783,6 +3365,22 @@ def _summary_metrics(df: pd.DataFrame, cols: dict) -> None:
              int(decisions.isin(["reject", "uncertain"]).sum()),                            "#B71C1C",
              "no confident match")
 
+    # Row 3c — Jina stats (only shown when Jina was used)
+    jina_used_col = df.get("jina_verifier_used", pd.Series(dtype=str)).astype(str).str.lower()
+    n_jina = int(jina_used_col.isin(["true", "1"]).sum())
+    if n_jina > 0:
+        st.markdown("")
+        row3c = st.columns(4)
+        jina_dec = df.get("jina_verifier_decision", pd.Series(dtype=str)).astype(str)
+        card(row3c[0], "Rows verified by Jina",        n_jina,                                 "#00796B")
+        card(row3c[1], "Jina: confirmed Python",        int(jina_dec.eq("confirm").sum()),      "#2E7D32",
+             "Jina evidence matches Python selection")
+        card(row3c[2], "Jina: replaced domain",         int(jina_dec.eq("replace").sum()),      "#E65100",
+             "Jina found stronger alternative")
+        card(row3c[3], "Jina: rejected / uncertain",
+             int(jina_dec.isin(["reject", "uncertain", "fetch_failed"]).sum()),                  "#B71C1C",
+             "no confident Jina evidence")
+
     st.markdown("")
     # Row 4 — false-positive rejections (sum across all rows)
     def _sum_col(col_name):
@@ -2821,6 +3419,7 @@ def _build_run_meta(
     debug_mode: bool,
     serper_key_present: bool,
     anthropic_key_present: bool,
+    jina_mode: str = _JINA_MODE_UNCERTAIN,
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -2834,6 +3433,11 @@ def _build_run_meta(
         enriched_df.get("haiku_used", pd.Series(dtype=str)).astype(str)
         .str.lower().isin(["true", "1"]).sum()
     )
+    n_jina = int(
+        enriched_df.get("jina_verifier_used", pd.Series(dtype=str)).astype(str)
+        .str.lower().isin(["true", "1"]).sum()
+    )
+    jina_decisions = enriched_df.get("jina_verifier_decision", pd.Series(dtype=str)).astype(str)
     review = int(
         enriched_df.get("manual_review_needed", pd.Series(dtype=str))
         .astype(str).str.lower().isin(["true", "1", "yes"]).sum()
@@ -2850,6 +3454,7 @@ def _build_run_meta(
         "haiku_mode":                haiku_mode,
         "haiku_model":               haiku_model,
         "haiku_max_rows":            haiku_max_rows if haiku_max_rows > 0 else "all",
+        "jina_mode":                 jina_mode,
         "candidate_debug_mode":      "on" if debug_mode else "off",
         "serper_key_present":        "yes" if serper_key_present else "no",
         "anthropic_key_present":     "yes" if anthropic_key_present else "no",
@@ -2860,6 +3465,11 @@ def _build_run_meta(
         "haiku_replaced_python":     int(decisions.eq("replace").sum()),
         "haiku_rejected":            int(decisions.eq("reject").sum()),
         "haiku_uncertain":           int(decisions.eq("uncertain").sum()),
+        "rows_verified_by_jina":     n_jina,
+        "jina_confirmed":            int(jina_decisions.eq("confirm").sum()),
+        "jina_replaced":             int(jina_decisions.eq("replace").sum()),
+        "jina_rejected":             int(jina_decisions.eq("reject").sum()),
+        "jina_uncertain":            int(jina_decisions.isin(["uncertain", "insufficient_evidence"]).sum()),
         "no_confident_match_count":  no_match,
         "manual_review_count":       review,
     }
@@ -2943,11 +3553,17 @@ def _download_section(
     debug_rows: list[dict] | None = None,
     debug_mode: bool = False,
     run_meta: dict | None = None,
+    jina_debug_rows: list[dict] | None = None,
 ) -> None:
     """Render the output-sheet legend + download button."""
     excel_bytes = build_excel(
         enriched_df, original_df, evidence_rows, stored_cols,
         debug_rows=debug_rows, debug_mode=debug_mode, run_meta=run_meta,
+        jina_debug_rows=jina_debug_rows,
+    )
+    jina_ran = (
+        "jina_verifier_used" in enriched_df.columns
+        and enriched_df["jina_verifier_used"].astype(str).str.lower().isin(["true", "1"]).any()
     )
     sheet_list = (
         "1. **Best Guess Input** — company, website, email, city, province, phone "
@@ -2963,6 +3579,11 @@ def _download_section(
     if debug_mode:
         sheet_list += (
             f"  \n{sheet_n}. **Candidate Discovery Debug** — every Serper result per company with full scoring detail"
+        )
+        sheet_n += 1
+    if jina_ran or jina_debug_rows:
+        sheet_list += (
+            f"  \n{sheet_n}. **Jina Verification Debug** — one row per company/candidate/page fetched by Jina"
         )
         sheet_n += 1
     sheet_list += f"  \n{sheet_n}. **Validation Diagnostics** — coverage, confidence, divergence counts  \n"
@@ -3074,6 +3695,43 @@ def main():
     else:
         haiku_model    = _DEFAULT_HAIKU_MODEL
         haiku_max_rows = 0
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Jina Website Verifier")
+    jina_mode = st.sidebar.selectbox(
+        "Jina website verifier",
+        options=_JINA_MODES,
+        index=1,  # default: "For uncertain candidates only"
+        key="reg_jina_mode",
+        help=(
+            "Off: skip Jina verification entirely.  \n"
+            "For uncertain candidates only: call Jina when Python scoring is ambiguous "
+            "(low/medium confidence, close scores, generic brand, risky domain pattern, etc.).  \n"
+            "For all selected candidates in debug mode: call Jina for every selected domain "
+            "when debug mode is also ON. Useful for full validation runs."
+        ),
+    )
+    # Jina API key (optional — Jina Reader works without a key at lower rate limits)
+    jina_api_key: str | None = None
+    try:
+        jina_api_key = st.secrets.get("JINA_API_KEY") or st.secrets.get("jina_api_key")
+    except Exception:
+        pass
+    if jina_mode != _JINA_MODE_OFF:
+        if jina_api_key:
+            st.sidebar.success("✓ Jina API key loaded from secrets.")
+        else:
+            _manual_jina = st.sidebar.text_input(
+                "Jina API key (optional — improves rate limits)",
+                type="password",
+                key="reg_jina_key",
+            )
+            if _manual_jina.strip():
+                jina_api_key = _manual_jina.strip()
+        st.sidebar.caption(
+            "Jina Reader fetches homepage + /about + /chi-siamo + /contatti per each candidate.  \n"
+            "Results are cached within the session."
+        )
 
     st.sidebar.markdown("---")
     debug_mode = st.sidebar.checkbox(
@@ -3227,6 +3885,7 @@ def main():
         settings_dict = {
             "max_queries": int(max_queries), "batch_n": total_rows,
             "haiku_mode": haiku_mode, "debug_mode": debug_mode,
+            "jina_mode": jina_mode,
             "run_label": _resume_label,
         }
 
@@ -3240,7 +3899,7 @@ def main():
                 progress_bar.progress(i / total)
                 status_text.caption(f"Processing {i} / {total}…")
 
-            enriched_df, evidence_rows, debug_rows = process_dataframe(
+            enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
                 run_df, cols, serper_key, int(max_queries),
                 progress_cb=progress_cb,
                 run_id=run_id,
@@ -3253,6 +3912,8 @@ def main():
                 haiku_api_key=anthropic_key,
                 haiku_model=haiku_model,
                 haiku_max_rows=int(haiku_max_rows),
+                jina_mode=jina_mode,
+                jina_api_key=jina_api_key,
                 debug_mode=debug_mode,
             )
 
@@ -3270,11 +3931,13 @@ def main():
                 debug_mode=debug_mode,
                 serper_key_present=bool(serper_key),
                 anthropic_key_present=bool(anthropic_key),
+                jina_mode=jina_mode,
             )
 
-            st.session_state["reg_enriched"]   = enriched_df
-            st.session_state["reg_evidence"]   = evidence_rows
-            st.session_state["reg_debug"]      = debug_rows
+            st.session_state["reg_enriched"]    = enriched_df
+            st.session_state["reg_evidence"]    = evidence_rows
+            st.session_state["reg_debug"]       = debug_rows
+            st.session_state["reg_jina_debug"]  = jina_debug_rows
             st.session_state["reg_original"]   = run_df
             st.session_state["reg_cols"]       = cols
             st.session_state["reg_run_id"]     = run_id
@@ -3331,6 +3994,7 @@ def main():
                 debug_rows=st.session_state.get("reg_debug", []),
                 debug_mode=_stored_dm,
                 run_meta=st.session_state.get("reg_run_meta"),
+                jina_debug_rows=st.session_state.get("reg_jina_debug", []),
             )
         return   # ← resume path ends here
 
@@ -3445,6 +4109,7 @@ def main():
         settings_dict = {
             "max_queries": int(max_queries), "batch_n": n,
             "haiku_mode": haiku_mode, "debug_mode": debug_mode,
+            "jina_mode": jina_mode,
             "run_label": _run_label,
         }
 
@@ -3455,7 +4120,7 @@ def main():
             progress_bar.progress(i / total)
             status_text.caption(f"Processing {i} / {total}…")
 
-        enriched_df, evidence_rows, debug_rows = process_dataframe(
+        enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
             run_df, cols, serper_key, int(max_queries),
             progress_cb=progress_cb,
             run_id=run_id,
@@ -3468,6 +4133,8 @@ def main():
             haiku_api_key=anthropic_key,
             haiku_model=haiku_model,
             haiku_max_rows=int(haiku_max_rows),
+            jina_mode=jina_mode,
+            jina_api_key=jina_api_key,
             debug_mode=debug_mode,
         )
 
@@ -3485,15 +4152,17 @@ def main():
             debug_mode=debug_mode,
             serper_key_present=bool(serper_key),
             anthropic_key_present=bool(anthropic_key),
+            jina_mode=jina_mode,
         )
 
         # Mark complete in checkpoint
         _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict,
                          run_label=_run_label)
 
-        st.session_state["reg_enriched"]   = enriched_df
-        st.session_state["reg_evidence"]   = evidence_rows
-        st.session_state["reg_debug"]      = debug_rows
+        st.session_state["reg_enriched"]    = enriched_df
+        st.session_state["reg_evidence"]    = evidence_rows
+        st.session_state["reg_debug"]       = debug_rows
+        st.session_state["reg_jina_debug"]  = jina_debug_rows
         st.session_state["reg_original"]   = run_df
         st.session_state["reg_cols"]       = cols
         st.session_state["reg_run_id"]     = run_id
@@ -3537,6 +4206,7 @@ def main():
         debug_rows=st.session_state.get("reg_debug", []),
         debug_mode=_out_dm,
         run_meta=st.session_state.get("reg_run_meta"),
+        jina_debug_rows=st.session_state.get("reg_jina_debug", []),
     )
 
 
