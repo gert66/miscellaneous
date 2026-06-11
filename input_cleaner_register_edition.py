@@ -16,8 +16,11 @@ Website Discovery Upgrade v2:
 Entry point:  streamlit run input_cleaner_register_edition.py
 """
 
+import hashlib
 import io
+import json
 import re
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -41,7 +44,9 @@ st.set_page_config(
 # CONSTANTS
 # =============================================================================
 
-SERPER_URL = "https://google.serper.dev/search"
+SERPER_URL      = "https://google.serper.dev/search"
+_AUTOSAVE_DIR   = Path("autosave")
+_AUTOSAVE_EVERY = 10   # write checkpoint every N processed rows
 
 # Generic / directory / social / database domains to skip (global + Italian-specific)
 _GENERIC_DOMAINS: frozenset = frozenset({
@@ -1199,6 +1204,139 @@ def _fill_serper_top(result: dict, evidence: list, query: str) -> None:
 
 
 # =============================================================================
+# AUTOSAVE / RESUME
+# =============================================================================
+
+
+def _file_hash(data: bytes) -> str:
+    """Return a short, stable identifier for a file's byte content."""
+    return hashlib.sha1(data).hexdigest()[:16]
+
+
+def _cp_dir(run_id: str) -> Path:
+    return _AUTOSAVE_DIR / run_id
+
+
+def _save_checkpoint(
+    run_id: str,
+    all_results: list[dict],
+    all_evidence: list[dict],
+    row_idx: int,        # number of rows completed so far
+    total_rows: int,
+    input_df: pd.DataFrame,
+    cols: dict,
+    settings: dict,
+) -> None:
+    """Persist current progress to autosave/{run_id}/."""
+    d = _cp_dir(run_id)
+    d.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "run_id":     run_id,
+        "row_idx":    row_idx,
+        "total_rows": total_rows,
+        "timestamp":  pd.Timestamp.now().isoformat(timespec="seconds"),
+        "cols":       {k: v for k, v in cols.items() if v},
+        "settings":   settings,
+        "complete":   row_idx >= total_rows,
+    }
+    (d / "meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+    if all_results:
+        pd.DataFrame(all_results).to_csv(d / "results.csv", index=False)
+
+    if all_evidence:
+        (d / "evidence.json").write_text(
+            json.dumps(all_evidence, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+
+    # Input snapshot — written once; never overwritten (needed for crash-resume)
+    input_path = d / "input.csv"
+    if not input_path.exists() and input_df is not None:
+        input_df.to_csv(input_path, index=False)
+
+
+def _load_checkpoint(run_id: str) -> dict | None:
+    """Load checkpoint from disk. Returns None if missing or unreadable."""
+    d = _cp_dir(run_id)
+    meta_path = d / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        results: list[dict] = []
+        results_path = d / "results.csv"
+        if results_path.exists():
+            results = pd.read_csv(results_path, dtype=str).fillna("").to_dict("records")
+
+        evidence: list[dict] = []
+        ev_path = d / "evidence.json"
+        if ev_path.exists():
+            evidence = json.loads(ev_path.read_text(encoding="utf-8"))
+
+        input_df: pd.DataFrame | None = None
+        input_path = d / "input.csv"
+        if input_path.exists():
+            input_df = pd.read_csv(input_path, dtype=str).fillna("")
+
+        return {
+            "meta":     meta,
+            "results":  results,
+            "evidence": evidence,
+            "input_df": input_df,
+        }
+    except Exception:
+        return None
+
+
+def _list_checkpoints() -> list[dict]:
+    """Return all checkpoint meta dicts sorted newest-first."""
+    if not _AUTOSAVE_DIR.exists():
+        return []
+    out = []
+    for d in _AUTOSAVE_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        mp = d / "meta.json"
+        if not mp.exists():
+            continue
+        try:
+            out.append(json.loads(mp.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return sorted(out, key=lambda m: m.get("timestamp", ""), reverse=True)
+
+
+def _delete_checkpoint(run_id: str) -> None:
+    shutil.rmtree(_cp_dir(run_id), ignore_errors=True)
+
+
+def _checkpoint_excel_bytes(run_id: str, cols: dict) -> bytes | None:
+    """Build and return an Excel file from a checkpoint's saved data."""
+    cp = _load_checkpoint(run_id)
+    if not cp or not cp["results"] or cp["input_df"] is None:
+        return None
+    try:
+        input_df   = cp["input_df"]
+        results    = cp["results"]
+        evidence   = cp["evidence"]
+        n_done     = len(results)
+
+        result_df  = pd.DataFrame(results)
+        partial_in = input_df.iloc[:n_done].copy().reset_index(drop=True)
+        result_df  = result_df.reset_index(drop=True)
+
+        # Re-align index so concat works
+        enriched   = pd.concat([partial_in, result_df], axis=1)
+        enriched   = enriched.loc[:, ~enriched.columns.duplicated()]
+
+        return build_excel(enriched, input_df, evidence, cols)
+    except Exception:
+        return None
+
+
+# =============================================================================
 # DATAFRAME PROCESSOR
 # =============================================================================
 
@@ -1240,14 +1378,21 @@ def process_dataframe(
     serper_key: str | None,
     max_queries: int = 5,
     progress_cb=None,
+    # Autosave / resume parameters
+    run_id: str | None = None,
+    resume_from: int = 0,
+    prior_results: list[dict] | None = None,
+    prior_evidence: list[dict] | None = None,
+    settings: dict | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
-    Process all rows. Returns (enriched_df, evidence_rows).
-    cols: dict from detect_columns().
-    max_queries: max Serper queries per company.
+    Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
+    Saves a checkpoint to disk every _AUTOSAVE_EVERY rows and on completion.
+
+    Returns (enriched_df_for_all_rows, all_evidence_rows).
     """
-    results = []
-    evidence_rows: list[dict] = []
+    new_results:  list[dict] = []
+    new_evidence: list[dict] = []
     n = len(df)
 
     company_col  = cols.get("company") or ""
@@ -1257,9 +1402,13 @@ def process_dataframe(
     province_col = cols.get("province") or ""
     postcode_col = cols.get("postcode") or ""
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        def _sv(col):
-            return str(row.get(col, "") or "").strip() if col else ""
+    rows_list = list(df.iterrows())
+
+    for local_i, (_, row) in enumerate(rows_list[resume_from:]):
+        global_i = resume_from + local_i
+
+        def _sv(col, _row=row):
+            return str(_row.get(col, "") or "").strip() if col else ""
 
         name     = _sv(company_col)
         website  = _sv(website_col)
@@ -1271,36 +1420,49 @@ def process_dataframe(
         res = validate_register_row(
             name, website, email, city, province, postcode, serper_key, max_queries
         )
-        results.append(res)
+        new_results.append(res)
 
-        # Collect evidence for Raw Search Evidence sheet
         query = res.get("search_query_used", "")
         if query:
-            evidence_rows.append({
-                "company_name":          name,
-                "city":                  city,
-                "province":              province,
-                "search_query_used":     query,
-                "serper_top_title":      res.get("serper_top_result_title", ""),
-                "serper_top_url":        res.get("serper_top_result_url", ""),
-                "serper_top_domain":     res.get("serper_top_result_domain", ""),
-                "validated_domain":      res.get("validated_domain", ""),
-                "domain_source":         res.get("domain_source", ""),
-                "domain_action":         res.get("domain_action", ""),
-                "domain_confidence":     res.get("domain_confidence", ""),
-                "name_variant_used":     res.get("name_variant_used", ""),
-                "top_3_candidates":      res.get("top_3_candidate_domains", ""),
-                "rejection_reason":      res.get("rejection_reason_if_missing", ""),
-                "discovery_method":      res.get("website_discovery_method", ""),
+            new_evidence.append({
+                "company_name":      name,
+                "city":              city,
+                "province":          province,
+                "search_query_used": query,
+                "serper_top_title":  res.get("serper_top_result_title", ""),
+                "serper_top_url":    res.get("serper_top_result_url", ""),
+                "serper_top_domain": res.get("serper_top_result_domain", ""),
+                "validated_domain":  res.get("validated_domain", ""),
+                "domain_source":     res.get("domain_source", ""),
+                "domain_action":     res.get("domain_action", ""),
+                "domain_confidence": res.get("domain_confidence", ""),
+                "name_variant_used": res.get("name_variant_used", ""),
+                "top_3_candidates":  res.get("top_3_candidate_domains", ""),
+                "rejection_reason":  res.get("rejection_reason_if_missing", ""),
+                "discovery_method":  res.get("website_discovery_method", ""),
             })
 
-        if progress_cb:
-            progress_cb(i + 1, n)
+        rows_done = global_i + 1
+        # Checkpoint every N rows and on the final row
+        if run_id and (rows_done % _AUTOSAVE_EVERY == 0 or rows_done == n):
+            all_r = list(prior_results or []) + new_results
+            all_e = list(prior_evidence or []) + new_evidence
+            _save_checkpoint(
+                run_id, all_r, all_e, rows_done, n,
+                df, cols, settings or {},
+            )
 
-    result_df = pd.DataFrame(results, index=df.index)
+        if progress_cb:
+            progress_cb(rows_done, n)
+
+    # Merge prior completed rows with newly processed rows
+    all_results  = list(prior_results or []) + new_results
+    all_evidence = list(prior_evidence or []) + new_evidence
+
+    result_df = pd.DataFrame(all_results, index=df.index)
     enriched  = pd.concat([df.copy(), result_df], axis=1)
     enriched  = enriched.loc[:, ~enriched.columns.duplicated()]
-    return enriched, evidence_rows
+    return enriched, all_evidence
 
 
 # =============================================================================
@@ -1632,11 +1794,10 @@ def _load_secrets_key() -> str | None:
         return None
 
 
-def _load_file(uploaded) -> pd.DataFrame | None:
-    raw  = uploaded.read()
-    name = uploaded.name.lower()
+def _parse_bytes(raw: bytes, filename: str) -> pd.DataFrame | None:
+    """Parse CSV or Excel bytes into a DataFrame."""
     try:
-        if name.endswith(".csv"):
+        if filename.lower().endswith(".csv"):
             return pd.read_csv(io.BytesIO(raw), dtype=str).fillna("")
         else:
             return pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
@@ -1645,13 +1806,62 @@ def _load_file(uploaded) -> pd.DataFrame | None:
         return None
 
 
+def _show_results(enriched_df: pd.DataFrame, stored_cols: dict) -> None:
+    """Render the results table and review expander."""
+    show_cols = [c for c in [
+        stored_cols.get("company"),
+        stored_cols.get("website"),
+        "normalized_input_website",
+        "validated_domain",
+        "domain_source",
+        "domain_action",
+        "domain_confidence",
+        "website_discovery_method",
+        "manual_review_needed",
+    ] if c and c in enriched_df.columns]
+    st.dataframe(enriched_df[show_cols], use_container_width=True, height=360)
+
+    review_mask = (
+        enriched_df.get("manual_review_needed", pd.Series(False))
+        .astype(str).str.lower().isin(["true", "1", "yes"])
+    )
+    if review_mask.any():
+        with st.expander(
+            f"🔴 Rows needing manual review ({int(review_mask.sum())})", expanded=False
+        ):
+            st.dataframe(enriched_df[review_mask][show_cols], use_container_width=True)
+
+
+def _download_section(enriched_df, original_df, evidence_rows, stored_cols,
+                      filename="register_cleaned_output.xlsx") -> None:
+    """Render the output-sheet legend + download button."""
+    excel_bytes = build_excel(enriched_df, original_df, evidence_rows, stored_cols)
+    st.markdown(
+        "**Output sheets:**  \n"
+        "1. **Best Guess Input** — company, website, email, city, province, phone "
+        "+ discovery method (ready for Lead Prioritizer)  \n"
+        "2. **Cleaned Register Input** — all original columns + validation + diagnostic columns  \n"
+        "3. **Review Needed** — rows requiring manual check  \n"
+        "4. **Original Input** — unchanged source data  \n"
+        "5. **Raw Search Evidence** — Serper queries, results, name variants, rejection reasons"
+    )
+    st.download_button(
+        "⬇ Download cleaned register Excel",
+        data=excel_bytes,
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
+
+
 def main():
     st.title("🇮🇹 Input Cleaner · Register Edition")
     st.caption(
         "Layer 0 · mYngle Sales Intelligence · "
         "Cleans Italian Business Register exports before Lead Prioritizer enrichment  \n"
         "Website Discovery v2 — multi-variant brand extraction, 8 query strategies, "
-        "aggressive email-domain usage"
+        "category rejection, brand-similarity gate"
     )
 
     # ── Sidebar: API key + settings ───────────────────────────────────────────
@@ -1680,15 +1890,214 @@ def main():
         help=(
             "3 = fast/cheap · 5 = default, good balance · 8 = maximum discovery.\n\n"
             "Each query costs 1 Serper credit. For 200 companies: "
-            "3 queries = up to 600 credits, 5 = up to 1000, 8 = up to 1600."
+            "3 queries ≈ up to 600 credits, 5 ≈ up to 1000, 8 ≈ up to 1600."
         ),
     )
     st.sidebar.caption(
-        f"With {max_queries} queries/company, each missing website will try up to "
-        f"{max_queries} search strategies (name variants, location, site:.it)."
+        f"Each missing website tries up to {max_queries} search strategies."
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        f"Autosave every **{_AUTOSAVE_EVERY} rows** → `{_AUTOSAVE_DIR}/`  \n"
+        "If the app crashes or your browser refreshes, reopen the app and use "
+        "**Resume previous run** to continue without reprocessing completed rows."
     )
 
-    # ── Upload ────────────────────────────────────────────────────────────────
+    # ── Previous-run panel (shown even without a file uploaded) ──────────────
+    checkpoints = _list_checkpoints()
+    if checkpoints:
+        n_cp = len(checkpoints)
+        with st.expander(f"📂 Previous runs available ({n_cp})", expanded=False):
+            for cp_meta in checkpoints[:8]:
+                run_id_cp  = cp_meta.get("run_id", "?")
+                row_idx    = cp_meta.get("row_idx", 0)
+                total      = cp_meta.get("total_rows", "?")
+                ts         = str(cp_meta.get("timestamp", "?"))[:19]
+                complete   = cp_meta.get("complete", False)
+                pct        = f"{row_idx / total * 100:.0f}%" if isinstance(total, int) and total else "?"
+                label_str  = (
+                    f"{'✅ Complete' if complete else '⏸ Partial'} · "
+                    f"**{row_idx}/{total}** rows ({pct}) · saved {ts}  \n"
+                    f"Run ID `{run_id_cp}`"
+                )
+
+                c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
+                c1.markdown(label_str)
+
+                if c2.button("Resume", key=f"resume_{run_id_cp}", use_container_width=True):
+                    cp_data = _load_checkpoint(run_id_cp)
+                    if cp_data and cp_data.get("input_df") is not None:
+                        st.session_state["reg_resume_data"] = cp_data
+                        st.session_state["reg_run_id"]      = run_id_cp
+                        st.rerun()
+                    else:
+                        st.error("Could not load checkpoint (input snapshot missing). Re-upload the file.")
+
+                # Download partial Excel directly from checkpoint
+                saved_cols = cp_meta.get("cols", {})
+                partial_xl = _checkpoint_excel_bytes(run_id_cp, saved_cols)
+                if partial_xl and c3.download_button(
+                    "Download",
+                    data=partial_xl,
+                    file_name=f"partial_{run_id_cp[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_{run_id_cp}",
+                    use_container_width=True,
+                ):
+                    pass  # button handles download
+
+                if c4.button("Delete", key=f"del_{run_id_cp}", use_container_width=True):
+                    _delete_checkpoint(run_id_cp)
+                    st.rerun()
+
+    # ── Handle resume-from-checkpoint (no upload needed if snapshot present) ─
+    resume_data = st.session_state.get("reg_resume_data")
+    if resume_data is not None:
+        cp_meta    = resume_data["meta"]
+        run_id     = cp_meta["run_id"]
+        resume_from = cp_meta["row_idx"]
+        total_rows  = cp_meta["total_rows"]
+        prior_results  = resume_data["results"]
+        prior_evidence = resume_data["evidence"]
+        resume_input_df = resume_data["input_df"]
+        saved_cols = cp_meta.get("cols", {})
+
+        st.info(
+            f"⏸ **Resuming run `{run_id}`** — "
+            f"{resume_from} of {total_rows} rows already completed.  \n"
+            "Re-upload your file below to continue from where processing stopped, "
+            "or click **Start fresh** to reprocess from the beginning."
+        )
+
+        uploaded = st.file_uploader(
+            "Re-upload the same file to continue (or upload a new file for a fresh run)",
+            type=["csv", "xlsx"],
+            key="reg_upload_resume",
+        )
+
+        col_a, col_b = st.columns(2)
+        if col_b.button("✖ Start fresh instead", use_container_width=True):
+            st.session_state.pop("reg_resume_data", None)
+            st.session_state.pop("reg_run_id", None)
+            st.rerun()
+
+        if uploaded is None:
+            # Offer download of partial results from checkpoint while user locates file
+            partial_xl = _checkpoint_excel_bytes(run_id, saved_cols)
+            if partial_xl:
+                st.download_button(
+                    f"⬇ Download partial results ({resume_from} rows so far)",
+                    data=partial_xl,
+                    file_name=f"partial_{run_id[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            return
+
+        raw_bytes  = uploaded.read()
+        file_hash  = _file_hash(raw_bytes)
+        upload_run_id = file_hash   # run_id based on file content
+
+        if upload_run_id != run_id:
+            # Different file uploaded — treat as fresh run
+            st.warning(
+                "The uploaded file does not match the previous run's input.  \n"
+                "Starting a fresh run with this file."
+            )
+            st.session_state.pop("reg_resume_data", None)
+            prior_results  = []
+            prior_evidence = []
+            resume_from    = 0
+            run_id = upload_run_id
+        else:
+            st.success(
+                f"✅ File matches previous run. Will continue from row **{resume_from + 1}**."
+            )
+
+        df = _parse_bytes(raw_bytes, uploaded.name)
+        if df is None:
+            return
+
+        cols = detect_columns(df)
+        # Apply saved column mapping
+        for role, col_name in saved_cols.items():
+            if col_name and col_name in df.columns:
+                cols[role] = col_name
+
+        run_df  = df.head(total_rows).copy()
+        settings_dict = {"max_queries": int(max_queries), "batch_n": total_rows}
+
+        if col_a.button(
+            f"▶ Continue from row {resume_from + 1}", type="primary", use_container_width=True
+        ):
+            progress_bar = st.progress(resume_from / total_rows if total_rows else 0.0)
+            status_text  = st.empty()
+
+            def progress_cb(i, total):
+                progress_bar.progress(i / total)
+                status_text.caption(f"Processing {i} / {total}…")
+
+            enriched_df, evidence_rows = process_dataframe(
+                run_df, cols, serper_key, int(max_queries),
+                progress_cb=progress_cb,
+                run_id=run_id,
+                resume_from=resume_from,
+                prior_results=prior_results,
+                prior_evidence=prior_evidence,
+                settings=settings_dict,
+            )
+
+            progress_bar.progress(1.0)
+            status_text.caption(f"Done — {total_rows} companies processed.")
+
+            st.session_state["reg_enriched"] = enriched_df
+            st.session_state["reg_evidence"] = evidence_rows
+            st.session_state["reg_original"] = run_df
+            st.session_state["reg_cols"]     = cols
+            st.session_state["reg_run_id"]   = run_id
+            st.session_state.pop("reg_resume_data", None)
+
+            # Mark checkpoint complete
+            _save_checkpoint(
+                run_id, list(prior_results or []) + evidence_rows,
+                evidence_rows, total_rows, total_rows, run_df, cols, settings_dict,
+            )
+
+        # Show partial download while waiting for user to click Continue
+        else:
+            partial_xl = _checkpoint_excel_bytes(run_id, cols)
+            if partial_xl:
+                st.download_button(
+                    f"⬇ Download partial results ({resume_from} rows so far)",
+                    data=partial_xl,
+                    file_name=f"partial_{run_id[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+        # Fall through to results section if enriched_df is available
+        enriched_df = st.session_state.get("reg_enriched")
+        if enriched_df is not None:
+            st.markdown("---")
+            st.markdown("### Results")
+            stored_cols = st.session_state.get("reg_cols", cols)
+            _summary_metrics(enriched_df, stored_cols)
+            st.markdown("")
+            _show_results(enriched_df, stored_cols)
+            st.markdown("---")
+            _download_section(
+                enriched_df,
+                st.session_state.get("reg_original", run_df),
+                st.session_state.get("reg_evidence", []),
+                stored_cols,
+                filename=f"register_cleaned_{run_id[:8]}.xlsx",
+            )
+        return   # ← resume path ends here
+
+    # =========================================================================
+    # NORMAL (fresh) UPLOAD PATH
+    # =========================================================================
+
     uploaded = st.file_uploader(
         "Upload Italian Business Register export (CSV or Excel .xlsx)",
         type=["csv", "xlsx"],
@@ -1703,11 +2112,36 @@ def main():
         )
         return
 
-    df = _load_file(uploaded)
+    raw_bytes = uploaded.read()
+    file_hash = _file_hash(raw_bytes)
+    run_id    = file_hash   # one run_id per unique file
+
+    df = _parse_bytes(raw_bytes, uploaded.name)
     if df is None:
         return
 
     st.success(f"✅ Loaded **{len(df)} companies**, {len(df.columns)} columns from `{uploaded.name}`")
+
+    # Offer resume if a checkpoint exists for this exact file
+    existing_cp = _load_checkpoint(run_id)
+    if existing_cp and not existing_cp["meta"].get("complete", False):
+        row_idx   = existing_cp["meta"].get("row_idx", 0)
+        total_rows_saved = existing_cp["meta"].get("total_rows", len(df))
+        ts = str(existing_cp["meta"].get("timestamp", ""))[:19]
+        st.warning(
+            f"⏸ **Unfinished run found** for this file — "
+            f"**{row_idx}/{total_rows_saved}** rows completed (saved {ts}).  \n"
+            "Click **Resume** to continue, or **Start fresh** to reprocess from the beginning."
+        )
+        rc1, rc2 = st.columns(2)
+        if rc1.button("⏩ Resume previous run", type="primary", use_container_width=True):
+            st.session_state["reg_resume_data"] = existing_cp
+            st.session_state["reg_run_id"]      = run_id
+            st.rerun()
+        if rc2.button("🔄 Start fresh (discard saved progress)", use_container_width=True):
+            _delete_checkpoint(run_id)
+            st.rerun()
+        return
 
     # ── Column detection ──────────────────────────────────────────────────────
     cols = detect_columns(df)
@@ -1761,10 +2195,12 @@ def main():
         else:
             batch_n = max_rows
 
+    settings_dict = {"max_queries": int(max_queries), "batch_n": int(batch_n)}
+
     # ── Run ───────────────────────────────────────────────────────────────────
     if st.button("🧹 Clean and validate register data", type="primary", use_container_width=True):
-        run_df  = df.head(int(batch_n)).copy()
-        n       = len(run_df)
+        run_df = df.head(int(batch_n)).copy()
+        n      = len(run_df)
         progress_bar = st.progress(0.0)
         status_text  = st.empty()
 
@@ -1773,16 +2209,26 @@ def main():
             status_text.caption(f"Processing {i} / {total}…")
 
         enriched_df, evidence_rows = process_dataframe(
-            run_df, cols, serper_key, int(max_queries), progress_cb
+            run_df, cols, serper_key, int(max_queries),
+            progress_cb=progress_cb,
+            run_id=run_id,
+            resume_from=0,
+            prior_results=[],
+            prior_evidence=[],
+            settings=settings_dict,
         )
 
         progress_bar.progress(1.0)
-        status_text.caption(f"Done — {n} companies processed.")
+        status_text.caption(f"✅ Done — {n} companies processed.")
 
-        st.session_state["reg_enriched"]  = enriched_df
-        st.session_state["reg_evidence"]  = evidence_rows
-        st.session_state["reg_original"]  = run_df
-        st.session_state["reg_cols"]      = cols
+        # Mark complete in checkpoint
+        _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict)
+
+        st.session_state["reg_enriched"] = enriched_df
+        st.session_state["reg_evidence"] = evidence_rows
+        st.session_state["reg_original"] = run_df
+        st.session_state["reg_cols"]     = cols
+        st.session_state["reg_run_id"]   = run_id
 
     # ── Results ───────────────────────────────────────────────────────────────
     enriched_df = st.session_state.get("reg_enriched")
@@ -1794,57 +2240,17 @@ def main():
     stored_cols = st.session_state.get("reg_cols", cols)
     _summary_metrics(enriched_df, stored_cols)
     st.markdown("")
-
-    # Results table — show key columns only
-    show_cols = [c for c in [
-        stored_cols.get("company"),
-        stored_cols.get("website"),
-        "normalized_input_website",
-        "validated_domain",
-        "domain_source",
-        "domain_action",
-        "domain_confidence",
-        "website_discovery_method",
-        "manual_review_needed",
-    ] if c and c in enriched_df.columns]
-    st.dataframe(enriched_df[show_cols], use_container_width=True, height=360)
-
-    # Review expander
-    review_mask = (
-        enriched_df.get("manual_review_needed", pd.Series(False))
-        .astype(str).str.lower().isin(["true", "1", "yes"])
-    )
-    if review_mask.any():
-        with st.expander(
-            f"🔴 Rows needing manual review ({int(review_mask.sum())})", expanded=False
-        ):
-            st.dataframe(enriched_df[review_mask][show_cols], use_container_width=True)
+    _show_results(enriched_df, stored_cols)
 
     # ── Download ──────────────────────────────────────────────────────────────
-    evidence_rows = st.session_state.get("reg_evidence", [])
-    original_df   = st.session_state.get("reg_original", df)
-
-    excel_bytes = build_excel(
-        enriched_df, original_df, evidence_rows, stored_cols
-    )
-
     st.markdown("---")
-    st.markdown(
-        "**Output sheets:**  \n"
-        "1. **Best Guess Input** — company, website, email, city, province, phone + discovery method (ready for Lead Prioritizer)  \n"
-        "2. **Cleaned Register Input** — all original columns + all validation + diagnostic columns  \n"
-        "3. **Review Needed** — rows requiring manual check  \n"
-        "4. **Original Input** — unchanged source data  \n"
-        "5. **Raw Search Evidence** — Serper queries, top results, name variants, rejection reasons"
-    )
-
-    st.download_button(
-        "⬇ Download cleaned register Excel",
-        data=excel_bytes,
-        file_name="register_cleaned_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
+    active_run_id = st.session_state.get("reg_run_id", run_id)
+    _download_section(
+        enriched_df,
+        st.session_state.get("reg_original", df),
+        st.session_state.get("reg_evidence", []),
+        stored_cols,
+        filename=f"register_cleaned_{active_run_id[:8]}.xlsx",
     )
 
 
