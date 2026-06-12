@@ -6280,35 +6280,81 @@ def run_cli() -> None:
     print(f"\n[enricher] Done — {total} rows processed.", flush=True)
 
     # ── Build output dataframe ────────────────────────────────────────────────
-    df_out, _ = build_and_finish(
-        results=results,
-        debug_records=debug_records,
-        df_work=df_in,
-        company_col=company_col,
-        domain_col=domain_col or "",
-    )
+    _active_fields = ALL_ENRICHMENT_FIELDS + EMPLOYEE_RANGE_RESOLVER_FIELDS
+    df_out = df_in.head(len(results)).copy().reset_index(drop=True)
+    enriched_df_raw = pd.DataFrame(results)
+    for col in _active_fields:
+        df_out[col] = enriched_df_raw[col].values if col in enriched_df_raw.columns else ""
+
+    # ── Employee range resolver ───────────────────────────────────────────────
+    def _is_blank_val(v) -> bool:
+        return v is None or str(v).strip() in ("", "nan", "None", "N/A", "-")
+
+    _er_records = df_out.to_dict("records")
+    _er_results: list[dict] = []
+    for _rec in _er_records:
+        _cname  = str(_rec.get("lusha_company_name") or _rec.get("company_name") or "")
+        _domain = str(_rec.get("canonical_company_domain") or _rec.get("domain") or "")
+        _er = resolve_employee_range(_rec, company_name=_cname)
+        if _er["employee_range_confidence"] in ("None", "Low") and serper_key:
+            _er_s = resolve_employee_range_from_serper(_cname, _domain, serper_key)
+            if _er_s.get("employee_range_resolved"):
+                _er = _er_s
+        if _er.get("employee_range_resolved") and _er.get("employee_range_confidence") in ("High", "Medium"):
+            _er["employee_range_for_scoring"]        = _er["employee_range_resolved"]
+            _er["employee_range_for_scoring_source"] = _er["employee_range_source"]
+        else:
+            _er["employee_range_for_scoring"]        = DEFAULT_EMPLOYEE_RANGE_FOR_SCORING
+            _er["employee_range_for_scoring_source"] = "default_commercial_minimum_assumption"
+            if not _er.get("employee_range_notes"):
+                _er["employee_range_notes"] = (
+                    "No employee count found; default commercial minimum range used for scoring only."
+                )
+            if _er["employee_range_confidence"] in ("None",):
+                _er["employee_range_confidence"] = "Low"
+        _er_results.append(_er)
+
+    for col in EMPLOYEE_RANGE_RESOLVER_FIELDS:
+        df_out[col] = [r.get(col, "") for r in _er_results]
+
+    _resolved_vals  = [r.get("employee_range_resolved", "") for r in _er_results]
+    _resolved_confs = [r.get("employee_range_confidence", "None") for r in _er_results]
+    if "lusha_employee_range" not in df_out.columns:
+        df_out["lusha_employee_range"] = ""
+    _existing_lusha = df_out["lusha_employee_range"].tolist()
+    df_out["lusha_employee_range"] = [
+        _resolved_vals[i]
+        if (_is_blank_val(_existing_lusha[i])
+            and _resolved_vals[i]
+            and _resolved_confs[i] in ("High", "Medium"))
+        else _existing_lusha[i]
+        for i in range(len(df_out))
+    ]
+
+    # ── Commercial scoring ────────────────────────────────────────────────────
+    try:
+        df_out = apply_results_compatible_scoring(df_out)
+    except Exception as _score_exc:
+        print(f"[enricher] Scoring skipped: {_score_exc}", flush=True)
 
     # ── Write output ──────────────────────────────────────────────────────────
     stamp    = ts()
     out_stem = input_path.stem
-    xl_path  = out_dir / f"{out_stem}_enriched_{stamp}.xlsx"
+    xl_path  = out_dir / f"{out_stem}_lead_prioritized_{stamp}.xlsx"
 
     try:
         xl_bytes = build_rich_excel_bytes(
-            df_enriched=df_out,
-            df_input=df_in,
-            debug_records=debug_records,
-            company_col=company_col,
-            domain_col=domain_col or "",
-            run_tag="cli",
-            debug_mode=args.debug,
+            df_out,
+            name_col=company_col,
+            domain_col=domain_col or None,
+            df_input_original=df_in,
         )
         xl_path.write_bytes(xl_bytes)
-        print(f"[enricher] Output (rich Excel): {xl_path}", flush=True)
+        print(f"[enricher] Saved: {xl_path}", flush=True)
     except Exception as exc:
         print(f"[enricher] Rich Excel failed ({exc}), falling back to flat Excel.", flush=True)
         df_to_excel_bytes_write(df_out, str(xl_path))
-        print(f"[enricher] Output (flat Excel): {xl_path}", flush=True)
+        print(f"[enricher] Saved (flat): {xl_path}", flush=True)
 
 
 
