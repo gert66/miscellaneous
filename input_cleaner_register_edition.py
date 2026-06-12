@@ -16,13 +16,17 @@ Website Discovery Upgrade v2:
 Entry point:  streamlit run input_cleaner_register_edition.py
 """
 
+import argparse
+import csv
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -4779,6 +4783,142 @@ def _file_hash(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()[:16]
 
 
+def parse_pipeline_filename(input_path: str) -> dict:
+    """
+    Parse batch filename convention: {cohort}_{batch_number}_{row_range}.xlsx
+    e.g. Italy100_1_R0001_0500.xlsx  → cohort=Italy100, batch_number=1, row_range=R0001_0500
+
+    Accepts any file; returns valid=False when the name doesn't match the pattern.
+    The pattern is: one or more non-underscore parts forming cohort, then a numeric
+    batch-number segment, then an optional row-range segment starting with R.
+    """
+    stem = Path(input_path).stem  # drop extension
+    parts = stem.split("_")
+    result: dict = {
+        "cohort": stem,
+        "batch_number": None,
+        "row_range": None,
+        "batch_stem": stem,
+        "valid": False,
+    }
+    # Scan left-to-right for the first purely-numeric segment (= batch number).
+    # Everything before it = cohort; everything after = row_range.
+    # Italy100_1_R0001_0500 → cohort=Italy100, batch=1, row_range=R0001_0500
+    batch_idx = None
+    for i in range(len(parts)):
+        if re.fullmatch(r"\d+", parts[i]):
+            batch_idx = i
+            break
+    if batch_idx is None or batch_idx == 0:
+        return result
+    result["cohort"]        = "_".join(parts[:batch_idx])
+    result["batch_number"]  = int(parts[batch_idx])
+    row_parts               = parts[batch_idx + 1:]
+    result["row_range"]     = "_".join(row_parts) if row_parts else None
+    result["batch_stem"]    = stem
+    result["valid"]         = True
+    return result
+
+
+def resolve_pipeline_output_paths(
+    input_path: str,
+    project_root: str | None = None,
+    ts: str | None = None,
+) -> dict:
+    """
+    Resolve standard pipeline output paths from an input file path.
+
+    Expected layout (project_root auto-detected as grandparent of 00_raw/ when not given):
+      {project_root}/
+        {cohort}/
+          00_raw/          ← input file lives here
+          01_cleaned_domains/
+          _logs/
+          _archive/
+
+    Returns a dict with keys:
+      cohort, batch_stem, batch_number, row_range, valid_name,
+      project_root, cohort_dir,
+      cleaned_dir, logs_dir, archive_dir,
+      output_xlsx, partial_prefix, run_log_csv
+    """
+    if ts is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+    input_p   = Path(input_path).resolve()
+    meta      = parse_pipeline_filename(str(input_p))
+    batch_stem = meta["batch_stem"]
+    cohort     = meta["cohort"]
+
+    # Auto-detect project root: if input lives in a folder named "00_raw",
+    # its parent is the cohort folder and grandparent is project_root.
+    if project_root is not None:
+        _pr = Path(project_root).resolve()
+        cohort_dir = _pr / cohort
+    elif input_p.parent.name.lower() == "00_raw":
+        cohort_dir = input_p.parent.parent
+        _pr        = cohort_dir.parent
+    else:
+        # Fallback: cohort folder = input file's parent
+        cohort_dir = input_p.parent
+        _pr        = cohort_dir.parent
+
+    cleaned_dir = cohort_dir / "01_cleaned_domains"
+    logs_dir    = cohort_dir / "_logs"
+    archive_dir = cohort_dir / "_archive"
+
+    output_xlsx    = cleaned_dir / f"{batch_stem}_cleaned_{ts}.xlsx"
+    partial_prefix = cleaned_dir / f"{batch_stem}_cleaned_PARTIAL_"
+    run_log_csv    = logs_dir    / f"{cohort}_cleaner_runlog.csv"
+
+    return {
+        "cohort":        cohort,
+        "batch_stem":    batch_stem,
+        "batch_number":  meta["batch_number"],
+        "row_range":     meta["row_range"],
+        "valid_name":    meta["valid"],
+        "project_root":  str(_pr),
+        "cohort_dir":    str(cohort_dir),
+        "cleaned_dir":   str(cleaned_dir),
+        "logs_dir":      str(logs_dir),
+        "archive_dir":   str(archive_dir),
+        "output_xlsx":   str(output_xlsx),
+        "partial_prefix": str(partial_prefix),
+        "run_log_csv":   str(run_log_csv),
+        "ts":            ts,
+    }
+
+
+_RUN_LOG_FIELDS = [
+    "timestamp", "cohort", "batch_stem", "batch_number", "row_range",
+    "input_path", "output_xlsx", "rows_processed", "rows_input",
+    "coverage_pct", "manual_review_count", "no_match_count",
+    "haiku_mode", "verifier_provider", "serper_queries",
+    "firecrawl_keys_loaded", "run_id", "run_label", "status", "notes",
+]
+
+
+def _append_run_log_csv(csv_path: Path, log_row: dict) -> None:
+    """Append one row to the pipeline run-log CSV; creates file with headers on first write."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_RUN_LOG_FIELDS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(log_row)
+
+
+def _write_pipeline_output(
+    output_path: Path,
+    excel_bytes: bytes,
+    partial: bool = False,
+) -> None:
+    """Write excel_bytes to output_path, creating parent directories as needed."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(excel_bytes)
+
+
 def _cp_dir(run_id: str, run_label: str = "") -> Path:
     folder = f"{run_label}_{run_id}" if run_label else run_id
     return _AUTOSAVE_DIR / folder
@@ -6655,6 +6795,181 @@ def _download_section(
     )
 
 
+def cli_batch_run() -> None:
+    """
+    Non-Streamlit batch entry point.
+
+    Usage:
+        python input_cleaner_register_edition.py \\
+            --input  Italy100/00_raw/Italy100_1_R0001_0500.xlsx \\
+            --project-root C:\\Users\\gertm\\Nextcloud\\Myngle \\
+            --serper-key sk-xxx \\
+            --max-rows 0
+
+    Options:
+        --input           Path to the input .xlsx or .csv file. Required.
+        --project-root    Project root folder (auto-detected from 00_raw/ when omitted).
+        --serper-key      Serper API key (falls back to SERPER_API_KEY env var / secrets).
+        --max-rows        Process only the first N rows (0 = all). Default 0.
+        --max-queries     Serper queries per company (3/5/8). Default 5.
+        --haiku-mode      Haiku review mode. Default 'uncertain'.
+        --verifier        Website verifier: off/firecrawl/jina/fc_jina. Default 'off'.
+        --debug           Enable debug output sheet.
+        --dry-run-paths   Print resolved output paths and exit without processing.
+    """
+    parser = argparse.ArgumentParser(
+        description="Input Cleaner · Register Edition — CLI batch mode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--input",          required=True,  help="Input .xlsx or .csv path")
+    parser.add_argument("--project-root",   default=None,   help="Pipeline project root folder")
+    parser.add_argument("--serper-key",     default=None,   help="Serper API key")
+    parser.add_argument("--anthropic-key",  default=None,   help="Anthropic API key for Haiku")
+    parser.add_argument("--firecrawl-key",  default=None,   help="Firecrawl API key")
+    parser.add_argument("--max-rows",       type=int, default=0,  help="Rows to process (0=all)")
+    parser.add_argument("--max-queries",    type=int, default=5,  choices=[3, 5, 8])
+    parser.add_argument("--haiku-mode",     default=_HAIKU_MODE_UNCERTAIN,
+                        choices=_HAIKU_MODES, help="Haiku review mode")
+    parser.add_argument("--verifier",       default=_VP_OFF,
+                        choices=_VP_OPTIONS, help="Website verifier provider")
+    parser.add_argument("--debug",          action="store_true", help="Enable debug output sheet")
+    parser.add_argument("--dry-run-paths",  action="store_true",
+                        help="Print resolved pipeline paths and exit (no processing)")
+    args = parser.parse_args()
+
+    input_path = Path(args.input).resolve()
+    if not input_path.exists():
+        print(f"ERROR: input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ts       = datetime.now().strftime("%Y%m%d_%H%M")
+    pl_paths = resolve_pipeline_output_paths(str(input_path), args.project_root, ts=ts)
+
+    if args.dry_run_paths:
+        import json as _json
+        print(_json.dumps(pl_paths, indent=2))
+        sys.exit(0)
+
+    # ── API keys: CLI arg → env var → secrets file ────────────────────────────
+    serper_key = (
+        args.serper_key
+        or os.environ.get("SERPER_API_KEY", "")
+        or _load_secrets_key()
+        or ""
+    )
+    anthropic_key = (
+        args.anthropic_key
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+        or ""
+    ) or None
+    fc_keys_cli: list[str] = []
+    if args.firecrawl_key:
+        fc_keys_cli = [args.firecrawl_key]
+    else:
+        fc_keys_cli = _fc_load_keys()
+    fc_key_arg: str | list[str] | None = fc_keys_cli if fc_keys_cli else None
+
+    # ── Load input ────────────────────────────────────────────────────────────
+    raw_bytes = input_path.read_bytes()
+    file_hash = _file_hash(raw_bytes)
+    df = _parse_bytes(raw_bytes, input_path.name)
+    if df is None:
+        print(f"ERROR: could not parse input file: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    batch_n = len(df) if args.max_rows <= 0 else min(args.max_rows, len(df))
+    run_df  = df.head(batch_n).copy()
+    cols    = detect_columns(run_df)
+
+    run_label    = _make_run_label(args.haiku_mode, batch_n, args.max_queries, args.debug, ts=ts)
+    run_filename = _make_filename(run_label, file_hash)
+
+    print(f"[cleaner] Input:      {input_path}")
+    print(f"[cleaner] Rows:       {batch_n} / {len(df)}")
+    print(f"[cleaner] Output:     {pl_paths['output_xlsx']}")
+    print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
+    print(f"[cleaner] Haiku mode: {args.haiku_mode}")
+    print(f"[cleaner] Verifier:   {args.verifier}")
+
+    def _cli_progress(i, total):
+        pct = round(i / total * 100) if total else 0
+        print(f"\r[cleaner] {i}/{total} ({pct}%)   ", end="", flush=True)
+
+    enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
+        run_df, cols, serper_key or None, args.max_queries,
+        progress_cb=_cli_progress,
+        run_id=file_hash,
+        resume_from=0,
+        prior_results=[],
+        prior_evidence=[],
+        run_label=run_label,
+        haiku_mode=args.haiku_mode,
+        haiku_api_key=anthropic_key,
+        haiku_model=_DEFAULT_HAIKU_MODEL,
+        haiku_max_rows=0,
+        jina_mode=_JINA_MODE_OFF,
+        verifier_provider=args.verifier,
+        verifier_mode=_VM_UNCERTAIN,
+        fc_key=fc_key_arg,
+        eligibility_filter_mode=_PF_MODE_MAYBE,
+        debug_mode=args.debug,
+    )
+    print()  # newline after progress
+
+    run_meta = _build_run_meta(
+        enriched_df=enriched_df,
+        input_filename=input_path.name,
+        run_id=file_hash, run_label=run_label,
+        total_rows_input=len(df), batch_n=batch_n,
+        max_queries=args.max_queries, haiku_mode=args.haiku_mode,
+        haiku_model=_DEFAULT_HAIKU_MODEL, haiku_max_rows=0,
+        debug_mode=args.debug,
+        serper_key_present=bool(serper_key),
+        anthropic_key_present=bool(anthropic_key),
+        jina_mode=_JINA_MODE_OFF,
+        verifier_provider=args.verifier,
+        verifier_mode=_VM_UNCERTAIN,
+        firecrawl_keys_loaded=len(fc_keys_cli),
+    )
+
+    excel_bytes = build_excel(
+        enriched_df, run_df, evidence_rows, cols,
+        debug_rows=debug_rows, debug_mode=args.debug,
+        run_meta=run_meta, jina_debug_rows=jina_debug_rows,
+    )
+
+    out_path = Path(pl_paths["output_xlsx"])
+    _write_pipeline_output(out_path, excel_bytes)
+    print(f"[cleaner] Saved:      {out_path}")
+
+    # Run log
+    _pl_log_row = {
+        "timestamp":             ts,
+        "cohort":                pl_paths["cohort"],
+        "batch_stem":            pl_paths["batch_stem"],
+        "batch_number":          pl_paths["batch_number"],
+        "row_range":             pl_paths["row_range"],
+        "input_path":            str(input_path),
+        "output_xlsx":           pl_paths["output_xlsx"],
+        "rows_processed":        batch_n,
+        "rows_input":            len(df),
+        "coverage_pct":          run_meta.get("coverage_pct", ""),
+        "manual_review_count":   run_meta.get("manual_review_count", ""),
+        "no_match_count":        run_meta.get("no_confident_match_count", ""),
+        "haiku_mode":            args.haiku_mode,
+        "verifier_provider":     args.verifier,
+        "serper_queries":        args.max_queries,
+        "firecrawl_keys_loaded": len(fc_keys_cli),
+        "run_id":                file_hash,
+        "run_label":             run_label,
+        "status":                "complete",
+        "notes":                 "",
+    }
+    _append_run_log_csv(Path(pl_paths["run_log_csv"]), _pl_log_row)
+    print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
+    print(f"[cleaner] Done.")
+
+
 def main():
     st.title("🇮🇹 Input Cleaner · Register Edition")
     st.caption(
@@ -6949,6 +7264,35 @@ def main():
         st.sidebar.caption(
             "🔍 Debug sheet will include all raw Serper candidates + rejection reasons."
         )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Pipeline output (optional)")
+    st.sidebar.caption(
+        "When enabled, the cleaned Excel is automatically written to the standard "
+        "`01_cleaned_domains/` folder next to the source `00_raw/` folder, "
+        "and a run-log entry is appended to `_logs/{cohort}_cleaner_runlog.csv`."
+    )
+    pipeline_output_enabled = st.sidebar.checkbox(
+        "Save to pipeline folder automatically",
+        value=False,
+        key="reg_pipeline_output",
+        help=(
+            "Requires the input file to live inside a …/{cohort}/00_raw/ folder.  \n"
+            "Output: …/{cohort}/01_cleaned_domains/{batch_stem}_cleaned_YYYYMMDD_HHMM.xlsx  \n"
+            "Log:    …/{cohort}/_logs/{cohort}_cleaner_runlog.csv"
+        ),
+    )
+    pipeline_project_root = ""
+    if pipeline_output_enabled:
+        pipeline_project_root = st.sidebar.text_input(
+            "Project root (leave blank to auto-detect from file path)",
+            value="",
+            key="reg_pipeline_project_root",
+            help=(
+                "e.g. C:\\Users\\gertm\\Nextcloud\\Myngle  \n"
+                "Leave blank: auto-detected as grandparent of 00_raw/."
+            ),
+        ).strip()
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
@@ -7456,6 +7800,53 @@ def main():
         _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict,
                          run_label=_run_label)
 
+        # ── Pipeline folder auto-save ─────────────────────────────────────────
+        if pipeline_output_enabled:
+            try:
+                _pl_ts    = datetime.now().strftime("%Y%m%d_%H%M")
+                _pl_paths = resolve_pipeline_output_paths(
+                    getattr(uploaded, "name", ""),
+                    project_root=pipeline_project_root or None,
+                    ts=_pl_ts,
+                )
+                _pl_excel = build_excel(
+                    enriched_df, run_df, evidence_rows, cols,
+                    debug_rows=debug_rows, debug_mode=debug_mode,
+                    run_meta=_run_meta, jina_debug_rows=jina_debug_rows,
+                )
+                _pl_out_path = Path(_pl_paths["output_xlsx"])
+                _write_pipeline_output(_pl_out_path, _pl_excel)
+                _pl_rm = _run_meta or {}
+                _pl_log_row = {
+                    "timestamp":             _pl_ts,
+                    "cohort":                _pl_paths["cohort"],
+                    "batch_stem":            _pl_paths["batch_stem"],
+                    "batch_number":          _pl_paths["batch_number"],
+                    "row_range":             _pl_paths["row_range"],
+                    "input_path":            getattr(uploaded, "name", ""),
+                    "output_xlsx":           _pl_paths["output_xlsx"],
+                    "rows_processed":        n,
+                    "rows_input":            len(df),
+                    "coverage_pct":          _pl_rm.get("coverage_pct", ""),
+                    "manual_review_count":   _pl_rm.get("manual_review_count", ""),
+                    "no_match_count":        _pl_rm.get("no_confident_match_count", ""),
+                    "haiku_mode":            haiku_mode,
+                    "verifier_provider":     verifier_provider,
+                    "serper_queries":        int(max_queries),
+                    "firecrawl_keys_loaded": len(_fc_keys),
+                    "run_id":                run_id,
+                    "run_label":             _run_label,
+                    "status":                "complete",
+                    "notes":                 "",
+                }
+                _append_run_log_csv(Path(_pl_paths["run_log_csv"]), _pl_log_row)
+                st.success(
+                    f"✅ Pipeline output saved → `{_pl_paths['output_xlsx']}`  \n"
+                    f"Run log → `{_pl_paths['run_log_csv']}`"
+                )
+            except Exception as _pl_exc:
+                st.warning(f"⚠ Pipeline auto-save failed: {_pl_exc}")
+
         st.session_state["reg_enriched"]         = enriched_df
         st.session_state["reg_evidence"]         = evidence_rows
         st.session_state["reg_debug"]            = debug_rows
@@ -7582,4 +7973,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # CLI batch mode when --input is passed; otherwise Streamlit UI (invoked via `streamlit run`).
+    if "--input" in sys.argv:
+        cli_batch_run()
+    else:
+        main()
