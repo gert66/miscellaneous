@@ -353,6 +353,62 @@ def _make_fc_cache_key(url: str, fc_location: dict | None) -> tuple:
     loc = fc_location or {}
     return (url, loc.get("country", ""), tuple(loc.get("languages", []) or []))
 
+
+_REDIRECT_CACHE: dict[str, dict] = {}   # domain -> redirect result dict
+
+
+def _resolve_redirect(domain: str) -> dict:
+    """
+    Lightweight HEAD/GET redirect resolver.  Follows redirects and returns
+    the final URL and domain.  Results are cached per domain.
+
+    Returns a dict with keys:
+      redirect_checked       bool
+      redirect_status        str  "ok" | "timeout" | "error:<msg>"
+      redirect_final_url     str  final URL after redirects (may equal original)
+      redirect_final_domain  str  root domain of final URL (empty if same as input)
+    """
+    if domain in _REDIRECT_CACHE:
+        return _REDIRECT_CACHE[domain]
+
+    result = {
+        "redirect_checked":       True,
+        "redirect_status":        "ok",
+        "redirect_final_url":     "",
+        "redirect_final_domain":  "",
+    }
+    _headers = {"User-Agent": "Mozilla/5.0 (compatible; mYngle-Verifier/1.0)"}
+    _origin  = domain.lower().lstrip("www.")
+
+    def _try(scheme: str) -> str | None:
+        try:
+            r = requests.get(
+                f"{scheme}://{domain}",
+                allow_redirects=True,
+                timeout=5,
+                headers=_headers,
+            )
+            return r.url
+        except requests.Timeout:
+            result["redirect_status"] = "timeout"
+        except Exception as exc:
+            result["redirect_status"] = f"error:{str(exc)[:80]}"
+        return None
+
+    final_url = _try("https") or _try("http")
+
+    if final_url:
+        result["redirect_final_url"] = final_url
+        _rd = re.sub(r"^https?://([^/]+).*$", r"\1", final_url).lower().lstrip("www.")
+        if _rd and _rd != _origin:
+            result["redirect_final_domain"] = _rd
+    else:
+        result["redirect_checked"] = True  # attempted but failed
+
+    _REDIRECT_CACHE[domain] = result
+    return result
+
+
 # =============================================================================
 # ORGANIZATION ELIGIBILITY PRE-FILTER
 # =============================================================================
@@ -2861,6 +2917,36 @@ def _fc_verify_candidates(
     _best_evidence_url: str = ""
     import time as _time_mod
 
+    # ── Pre-flight redirect check ─────────────────────────────────────────────
+    # For each candidate, run a cheap HTTP redirect check.  If the candidate
+    # redirects to a different root domain, insert that as the primary candidate
+    # (it becomes the first domain Firecrawl actually scrapes).
+    _redirect_info: dict[str, dict] = {}   # original domain -> redirect result
+    _expanded_candidates: list[str] = []
+    _suspicious_re = re.compile(r"\b(forum|fan|club|community|archive|directory)\b", re.I)
+    for _cdom in candidates:
+        if not _cdom:
+            continue
+        _rr = _resolve_redirect(_cdom)
+        _redirect_info[_cdom] = _rr
+        _redir_final = _rr.get("redirect_final_domain", "")
+        if _redir_final and _redir_final not in _expanded_candidates:
+            # Prioritise the redirect destination when original looks suspicious
+            if _suspicious_re.search(_cdom):
+                _expanded_candidates.insert(0, _redir_final)
+            else:
+                _expanded_candidates.append(_redir_final)
+        if _cdom not in _expanded_candidates:
+            _expanded_candidates.append(_cdom)
+    # Deduplicate preserving order
+    _seen_cands: set[str] = set()
+    _deduped: list[str] = []
+    for _c in _expanded_candidates:
+        if _c not in _seen_cands:
+            _deduped.append(_c)
+            _seen_cands.add(_c)
+    candidates = _deduped
+
     for ci, domain in enumerate(candidates):
         if not domain:
             continue
@@ -3044,6 +3130,13 @@ def _fc_verify_candidates(
     fc_out["firecrawl_pages_fetched"] = total_pages_fetched
     fc_out["firecrawl_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
     fc_out["firecrawl_evidence_url"]  = _best_evidence_url
+
+    # Store redirect info for the original current_domain candidate
+    _cur_rr = _redirect_info.get(current_domain, {})
+    if _cur_rr.get("redirect_final_domain"):
+        fc_out.setdefault("redirect_final_url",    _cur_rr.get("redirect_final_url", ""))
+        fc_out.setdefault("redirect_final_domain", _cur_rr.get("redirect_final_domain", ""))
+        fc_out.setdefault("original_candidate_domain", current_domain)
     if fc_errors:
         fc_out["firecrawl_error"] = "; ".join(fc_errors[:5])
 
@@ -3363,6 +3456,33 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     cur_conf_py = (result.get("final_confidence") or "").strip().lower()
     _py_high    = cur_conf_py == "high"
 
+    # ── Timeout-on-high-risk protection ──────────────────────────────────────
+    # If Firecrawl timed out and the row has high-risk signals, force manual review.
+    _fc_status   = str(verif_res.get("firecrawl_fetch_status", "") or "")
+    _had_timeout = "timeout" in _fc_status
+    _verify_rsn  = str(result.get("verification_reason", "") or "")
+    _final_dom   = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
+    _brand_clean = re.sub(r"[^\w]", "", (result.get("cleaned_company_name") or "").lower().split()[0] if result.get("cleaned_company_name") else "")
+
+    _is_high_risk_timeout = _had_timeout and (
+        "famous_brand"        in _verify_rsn
+        or "close_scores"     in _verify_rsn
+        or "risky_domain"     in _verify_rsn
+        or _JINA_RISKY_DOMAIN_RE.search(_final_dom or "")
+        or _brand_clean in _JINA_FAMOUS_BRANDS
+    )
+    if _is_high_risk_timeout and decision not in ("confirm", "replace"):
+        _timeout_note = (
+            "Firecrawl timeout on high-risk row; selected domain may be a redirect/forum. "
+            "Manual review required."
+        )
+        return {
+            "final_decision_source": "verifier_timeout_high_risk",
+            "manual_review_needed":  True,
+            "verifier_reason":       _timeout_note,
+            "firecrawl_reason":      _timeout_note,
+        }
+
     if decision == "replace" and replace_ok and sel_domain:
         return {
             "final_selected_domain": _root_domain(sel_domain) or sel_domain,
@@ -3390,7 +3510,13 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
             updates["final_confidence"] = "High"
         return updates
     # uncertain / fetch_failed / no_candidates
-    return {"final_decision_source": f"verifier_{decision or 'uncertain'}"}
+    _updates: dict = {"final_decision_source": f"verifier_{decision or 'uncertain'}"}
+    if _had_timeout:
+        _updates["verifier_reason"] = (
+            str(verif_res.get("verifier_reason", "") or "")
+            or "Firecrawl timed out; could not verify selected domain."
+        )
+    return _updates
 
 
 def _run_website_verifier(
