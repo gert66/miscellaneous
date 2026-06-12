@@ -3064,6 +3064,210 @@ _FC_KEY_FAILURE_TERMS = (
     "unauthorized", "forbidden", "invalid api key", "invalid_api_key",
 )
 
+# Fail-fast thresholds — checked at runtime during batch processing.
+_FC_FAIL_FAST_CONSECUTIVE_FAILURES: int   = 10
+_FC_FAIL_FAST_MIN_ATTEMPTS:         int   = 30
+_FC_FAIL_FAST_MIN_SUCCESS_RATE:     float = 0.20
+_FC_HEALTH_LOG_EVERY:               int   = 25   # print status every N FC attempts (CLI)
+
+
+class FcFailFastError(RuntimeError):
+    """Raised when Firecrawl health exceeds a fail-fast threshold."""
+
+
+def firecrawl_preflight_check(
+    fc_keys: list[str],
+    test_url: str = "https://www.myngle.com",
+    timeout: int = 10,
+    fc_location: dict | None = None,
+) -> dict:
+    """
+    Test each Firecrawl API key independently (no failover).
+    Returns a summary dict — never exposes actual key values.
+
+    preflight_status values:
+      "OK"       — all keys work
+      "DEGRADED" — at least one key works but not all
+      "FAILED"   — no keys work
+    """
+    key_statuses: dict[str, str] = {}   # "key1" -> "ok" / "http_402" / "timeout" / …
+    keys_ok: int   = 0
+    keys_fail: int = 0
+    first_error: str = ""
+
+    _payload: dict = {"url": test_url, "formats": ["markdown"]}
+    if fc_location:
+        _payload["location"] = fc_location
+
+    for _ki, _key in enumerate(fc_keys, start=1):
+        _label = f"key{_ki}"
+        try:
+            resp = requests.post(
+                _FC_API_URL,
+                headers={"Authorization": f"Bearer {_key}", "Content-Type": "application/json"},
+                json=_payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                key_statuses[_label] = "ok"
+                keys_ok += 1
+            else:
+                _raw = f"http_{resp.status_code}"
+                if _fc_is_key_failure(resp.status_code, resp.text):
+                    _raw = f"key_failure:{resp.status_code}"
+                key_statuses[_label] = _raw
+                keys_fail += 1
+                if not first_error:
+                    first_error = f"{_label}: {_raw}"
+        except requests.Timeout:
+            key_statuses[_label] = "timeout"
+            keys_fail += 1
+            if not first_error:
+                first_error = f"{_label}: timeout"
+        except Exception as exc:
+            _err = f"error:{str(exc)[:80]}"
+            key_statuses[_label] = _err
+            keys_fail += 1
+            if not first_error:
+                first_error = f"{_label}: {_err}"
+
+    if not fc_keys:
+        preflight_status = "FAILED"
+        preflight_error  = "No Firecrawl API keys provided."
+    elif keys_ok == 0:
+        preflight_status = "FAILED"
+        preflight_error  = f"No working Firecrawl keys. First error: {first_error}"
+    elif keys_fail > 0:
+        preflight_status = "DEGRADED"
+        preflight_error  = f"{keys_fail} of {len(fc_keys)} key(s) failed. First: {first_error}"
+    else:
+        preflight_status = "OK"
+        preflight_error  = ""
+
+    return {
+        "keys_total":       len(fc_keys),
+        "keys_ok":          keys_ok,
+        "keys_failed":      keys_fail,
+        "key_statuses":     key_statuses,   # {"key1": "ok", "key2": "key_failure:402"}
+        "preflight_status": preflight_status,
+        "preflight_error":  preflight_error,
+    }
+
+
+def _make_fc_health() -> dict:
+    """Return a zeroed Firecrawl health-counter dict."""
+    return {
+        "requests_attempted":       0,
+        "pages_successful":         0,
+        "key_failovers":            0,
+        "key_failure_events":       0,
+        "quota_or_billing_errors":  0,
+        "rate_limit_errors":        0,
+        "timeouts":                 0,
+        "exceptions":               0,
+        "consecutive_failures":     0,
+        "consecutive_failures_max": 0,
+        "last_statuses":            [],
+        "fail_fast_triggered":      False,
+        "fail_fast_reason":         "",
+    }
+
+
+def _fc_health_update(
+    health: dict,
+    fetch_status: str,
+    key_statuses_str: str,
+    failover_count: int,
+    fc_was_used: bool,
+) -> None:
+    """
+    Update runtime health counters from a single row's Firecrawl result.
+    fc_was_used: True when Firecrawl was actually invoked for this row.
+    """
+    if not fc_was_used:
+        return
+
+    health["requests_attempted"] = health.get("requests_attempted", 0) + 1
+    health["key_failovers"]      = health.get("key_failovers", 0) + max(failover_count, 0)
+    if failover_count > 0:
+        health["key_failure_events"] = health.get("key_failure_events", 0) + 1
+
+    _st = fetch_status.lower()
+    if _st == "ok":
+        health["pages_successful"]    = health.get("pages_successful", 0) + 1
+        health["consecutive_failures"] = 0
+    elif _st == "timeout":
+        health["timeouts"]             = health.get("timeouts", 0) + 1
+        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+    elif _st.startswith("error:"):
+        health["exceptions"]           = health.get("exceptions", 0) + 1
+        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+    else:
+        # HTTP error or other non-ok, non-timeout status
+        if _fc_is_key_failure(
+            int(_st.replace("http_", "")) if _st.startswith("http_") else 0,
+            _st,
+        ):
+            health["quota_or_billing_errors"] = health.get("quota_or_billing_errors", 0) + 1
+        if "429" in _st or "rate" in _st:
+            health["rate_limit_errors"] = health.get("rate_limit_errors", 0) + 1
+        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+
+    health["consecutive_failures_max"] = max(
+        health.get("consecutive_failures_max", 0),
+        health.get("consecutive_failures", 0),
+    )
+    _last: list[str] = health.get("last_statuses", [])
+    _last.append(fetch_status or "unknown")
+    health["last_statuses"] = _last[-10:]
+
+
+def _fc_health_check_fail_fast(
+    health: dict,
+    enabled: bool = True,
+) -> str | None:
+    """
+    Return a human-readable fail-fast reason if a threshold is exceeded.
+    Returns None when processing should continue.
+    """
+    if not enabled:
+        return None
+    consec = health.get("consecutive_failures", 0)
+    if consec >= _FC_FAIL_FAST_CONSECUTIVE_FAILURES:
+        return (
+            f"Firecrawl fail-fast: {consec} consecutive failures "
+            f"(threshold {_FC_FAIL_FAST_CONSECUTIVE_FAILURES}). "
+            "Check API keys and account status."
+        )
+    att  = health.get("requests_attempted", 0)
+    succ = health.get("pages_successful", 0)
+    if att >= _FC_FAIL_FAST_MIN_ATTEMPTS:
+        rate = succ / att if att else 0.0
+        if rate < _FC_FAIL_FAST_MIN_SUCCESS_RATE:
+            return (
+                f"Firecrawl fail-fast: success rate {rate:.1%} after {att} attempts "
+                f"is below minimum {_FC_FAIL_FAST_MIN_SUCCESS_RATE:.0%}."
+            )
+    return None
+
+
+def _fc_health_summary_line(health: dict) -> str:
+    """Return a one-line Firecrawl health status string for logging."""
+    att   = health.get("requests_attempted", 0)
+    succ  = health.get("pages_successful", 0)
+    rate  = round(succ / att * 100, 1) if att else 0.0
+    fo    = health.get("key_failovers", 0)
+    quota = health.get("quota_or_billing_errors", 0)
+    to    = health.get("timeouts", 0)
+    consec = health.get("consecutive_failures", 0)
+    ff    = health.get("fail_fast_triggered", False)
+    status = "FAILED" if ff else ("OK" if rate >= 50 or att == 0 else "DEGRADED")
+    return (
+        f"attempts={att}, ok={succ}, success_rate={rate}%, "
+        f"failovers={fo}, quota_errors={quota}, timeouts={to}, "
+        f"consecutive_failures={consec}, status={status}"
+    )
+
 
 def _fc_is_key_failure(status_code: int, resp_text: str) -> bool:
     """Return True if the response indicates a key/account/quota problem."""
@@ -5217,6 +5421,8 @@ def process_dataframe(
     fc_location: dict | None = None,
     # Organization eligibility pre-filter
     eligibility_filter_mode: str = _PF_MODE_COMMERCIAL,
+    # Firecrawl health / fail-fast
+    fc_fail_fast: bool = True,
     # Debug
     debug_mode: bool = False,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
@@ -5514,6 +5720,32 @@ def process_dataframe(
             res.update(_safety_upd)
 
         new_results.append(res)
+
+        # ── Firecrawl runtime health update + fail-fast check ─────────────────
+        if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
+            _fc_was_used = str(res.get("firecrawl_used", "") or "").lower() in ("true", "1")
+            _fc_fetch_st = str(
+                res.get("firecrawl_fetch_status")
+                or res.get("verifier_fetch_status")
+                or ""
+            )
+            _fc_fo_count = int(res.get("firecrawl_key_failover_count") or 0)
+            _fc_key_sts  = str(res.get("firecrawl_key_statuses") or "")
+            _fc_health_update(
+                _live_fc_counters, _fc_fetch_st, _fc_key_sts,
+                _fc_fo_count, _fc_was_used,
+            )
+            _ff = _fc_health_check_fail_fast(_live_fc_counters, enabled=fc_fail_fast)
+            if _ff:
+                _live_fc_counters["fail_fast_triggered"] = True
+                _live_fc_counters["fail_fast_reason"]    = _ff
+                raise FcFailFastError(_ff)
+            _att = _live_fc_counters.get("requests_attempted", 0)
+            if _att > 0 and _att % _FC_HEALTH_LOG_EVERY == 0:
+                print(
+                    f"[FC HEALTH] {_fc_health_summary_line(_live_fc_counters)}",
+                    flush=True,
+                )
 
         # Accumulate verifier debug rows; back-fill Haiku + candidate metadata
         if _verifier_debug_rows:
@@ -6173,6 +6405,64 @@ def _build_validation_summary(
     }
 
 
+def _xl_write_fc_audit(ws, fc_audit: dict) -> None:
+    """Write Firecrawl Audit sheet — key-value table, no actual API key values."""
+    import openpyxl.styles as _oxl_styles
+    _bold = _oxl_styles.Font(bold=True)
+    ws.cell(row=1, column=1, value="Field").font       = _bold
+    ws.cell(row=1, column=2, value="Value").font       = _bold
+    ws.cell(row=1, column=3, value="Description").font = _bold
+
+    _rows = [
+        ("firecrawl_enabled",            fc_audit.get("firecrawl_enabled", ""),
+         "Whether Firecrawl verifier was selected for this run"),
+        ("firecrawl_preflight_status",   fc_audit.get("firecrawl_preflight_status", ""),
+         "OK / DEGRADED / FAILED / SKIPPED"),
+        ("firecrawl_keys_total",         fc_audit.get("firecrawl_keys_total", ""),
+         "Number of Firecrawl API keys available"),
+        ("firecrawl_keys_ok",            fc_audit.get("firecrawl_keys_ok", ""),
+         "Keys that passed the preflight test"),
+        ("firecrawl_keys_failed",        fc_audit.get("firecrawl_keys_failed", ""),
+         "Keys that failed the preflight test (key labels only — key1, key2, …)"),
+        ("firecrawl_key_statuses_preflight", fc_audit.get("firecrawl_key_statuses_preflight", ""),
+         "Per-key preflight result: {key1: ok, key2: failed, …} — no actual key values"),
+        ("firecrawl_requests_attempted", fc_audit.get("firecrawl_requests_attempted", ""),
+         "Total Firecrawl rows attempted during processing"),
+        ("firecrawl_pages_successful",   fc_audit.get("firecrawl_pages_successful", ""),
+         "Rows where Firecrawl returned OK"),
+        ("firecrawl_success_rate",       fc_audit.get("firecrawl_success_rate", ""),
+         "pages_successful / requests_attempted"),
+        ("firecrawl_key_failovers",      fc_audit.get("firecrawl_key_failovers", ""),
+         "Total failover-to-next-key events"),
+        ("firecrawl_key_failure_events", fc_audit.get("firecrawl_key_failure_events", ""),
+         "Rows that triggered at least one key failover"),
+        ("firecrawl_quota_or_billing_errors", fc_audit.get("firecrawl_quota_or_billing_errors", ""),
+         "Quota / billing / auth errors across all keys"),
+        ("firecrawl_rate_limit_errors",  fc_audit.get("firecrawl_rate_limit_errors", ""),
+         "HTTP 429 / rate-limit errors"),
+        ("firecrawl_timeouts",           fc_audit.get("firecrawl_timeouts", ""),
+         "Request timeouts"),
+        ("firecrawl_exceptions",         fc_audit.get("firecrawl_exceptions", ""),
+         "Unexpected exceptions during Firecrawl calls"),
+        ("firecrawl_consecutive_failures_max", fc_audit.get("firecrawl_consecutive_failures_max", ""),
+         "Longest streak of consecutive failures in this run"),
+        ("batch_firecrawl_status",       fc_audit.get("batch_firecrawl_status", ""),
+         "Overall batch outcome: ok / degraded / fail_fast / not_used"),
+        ("batch_firecrawl_notes",        fc_audit.get("batch_firecrawl_notes", ""),
+         "Human-readable notes or fail-fast reason"),
+    ]
+
+    for ri, (field, value, desc) in enumerate(_rows, 2):
+        ws.cell(row=ri, column=1, value=field)
+        ws.cell(row=ri, column=2, value=str(value) if value != "" else "")
+        ws.cell(row=ri, column=3, value=desc)
+
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 60
+    ws.freeze_panes = "A2"
+
+
 def build_excel(
     enriched_df: pd.DataFrame,
     original_df: pd.DataFrame,
@@ -6182,6 +6472,7 @@ def build_excel(
     debug_mode: bool = False,
     run_meta: dict | None = None,
     jina_debug_rows: list[dict] | None = None,
+    fc_audit: dict | None = None,
 ) -> bytes:
     import openpyxl
 
@@ -6408,6 +6699,11 @@ def build_excel(
         _write_sheet(ws_pfs, pd.DataFrame(_pf_rows))
     else:
         ws_pfs.cell(row=1, column=1, value="Pre-filter columns not present in output.")
+
+    # Firecrawl Audit sheet (always present when fc_audit provided)
+    if fc_audit is not None:
+        ws_fc_audit = wb.create_sheet("Firecrawl Audit")
+        _xl_write_fc_audit(ws_fc_audit, fc_audit)
 
     # Run Summary — always last
     ws_summary = wb.create_sheet("Run Summary")
@@ -6750,12 +7046,13 @@ def _download_section(
     debug_mode: bool = False,
     run_meta: dict | None = None,
     jina_debug_rows: list[dict] | None = None,
+    fc_audit: dict | None = None,
 ) -> None:
     """Render the output-sheet legend + download button."""
     excel_bytes = build_excel(
         enriched_df, original_df, evidence_rows, stored_cols,
         debug_rows=debug_rows, debug_mode=debug_mode, run_meta=run_meta,
-        jina_debug_rows=jina_debug_rows,
+        jina_debug_rows=jina_debug_rows, fc_audit=fc_audit,
     )
     jina_ran = (
         "jina_verifier_used" in enriched_df.columns
@@ -6783,7 +7080,13 @@ def _download_section(
         )
         sheet_n += 1
     sheet_list += f"  \n{sheet_n}. **Validation Diagnostics** — coverage, confidence, divergence counts  \n"
-    sheet_list += f"  \n{sheet_n + 1}. **Run Summary** — run settings and outcome metrics"
+    sheet_n += 1
+    if fc_audit is not None:
+        sheet_list += (
+            f"  \n{sheet_n}. **Firecrawl Audit** — preflight result + runtime health counters (no API key values)  \n"
+        )
+        sheet_n += 1
+    sheet_list += f"  \n{sheet_n}. **Run Summary** — run settings and outcome metrics"
     st.markdown("**Output sheets:**  \n" + sheet_list)
     st.download_button(
         "⬇ Download cleaned register Excel",
@@ -6793,6 +7096,65 @@ def _download_section(
         use_container_width=True,
         type="primary",
     )
+
+
+def _smoke_test_firecrawl_health() -> None:
+    """
+    Self-contained smoke test for Firecrawl health helpers.
+    Simulates 6 scenarios and asserts expected outcomes.
+    Call from the REPL or CI: python -c "from input_cleaner_register_edition import _smoke_test_firecrawl_health; _smoke_test_firecrawl_health()"
+    """
+    def _apply(health, statuses, failovers=None):
+        """Feed a sequence of fetch_status strings into the health counter."""
+        if failovers is None:
+            failovers = [0] * len(statuses)
+        for st, fo in zip(statuses, failovers):
+            _fc_health_update(health, st, "", fo, fc_was_used=True)
+
+    # Case 1: all OK — no fail-fast
+    h1 = _make_fc_health()
+    _apply(h1, ["ok"] * 50)
+    assert h1["pages_successful"] == 50
+    assert h1["consecutive_failures"] == 0
+    assert _fc_health_check_fail_fast(h1) is None, "Case 1 fail"
+
+    # Case 2: 10 consecutive non-ok → fail-fast triggered
+    h2 = _make_fc_health()
+    _apply(h2, ["ok"] * 5 + ["timeout"] * 10)
+    reason2 = _fc_health_check_fail_fast(h2)
+    assert reason2 is not None and "consecutive" in reason2.lower(), f"Case 2 fail: {reason2}"
+
+    # Case 3: 30+ attempts with <20% success rate → fail-fast (interleave ok+fail to avoid consecutive threshold)
+    h3 = _make_fc_health()
+    # Pattern: 1 ok then 8 fails, repeat — keeps consecutive < 10 but success rate ~11%
+    _pattern3 = (["ok"] + ["http_500"] * 8) * 4  # 36 attempts, 4 ok = 11%
+    _apply(h3, _pattern3)
+    reason3 = _fc_health_check_fail_fast(h3)
+    assert reason3 is not None and "success rate" in reason3.lower(), f"Case 3 fail: {reason3}"
+
+    # Case 4: fail-fast disabled → no trigger
+    h4 = _make_fc_health()
+    _apply(h4, ["timeout"] * 10)
+    assert _fc_health_check_fail_fast(h4, enabled=False) is None, "Case 4 fail"
+
+    # Case 5: failovers counted correctly
+    h5 = _make_fc_health()
+    _apply(h5, ["ok", "ok", "ok"], failovers=[2, 0, 1])
+    assert h5["key_failovers"] == 3, f"Case 5 fail: key_failovers={h5['key_failovers']}"
+    assert h5["key_failure_events"] == 2, f"Case 5 fail: key_failure_events={h5['key_failure_events']}"
+
+    # Case 6: quota errors counted
+    h6 = _make_fc_health()
+    _apply(h6, ["http_402", "http_429", "ok"])
+    assert h6["quota_or_billing_errors"] >= 1, f"Case 6 fail: quota_or_billing_errors={h6['quota_or_billing_errors']}"
+    assert h6["rate_limit_errors"] >= 1, f"Case 6 fail: rate_limit_errors={h6['rate_limit_errors']}"
+
+    # Case 7: fc_was_used=False → counters unchanged
+    h7 = _make_fc_health()
+    _fc_health_update(h7, "ok", "", 0, fc_was_used=False)
+    assert h7["requests_attempted"] == 0, "Case 7 fail"
+
+    print("[SMOKE TEST] _smoke_test_firecrawl_health: all 7 cases passed.", flush=True)
 
 
 def cli_batch_run() -> None:
@@ -6835,6 +7197,10 @@ def cli_batch_run() -> None:
     parser.add_argument("--debug",          action="store_true", help="Enable debug output sheet")
     parser.add_argument("--dry-run-paths",  action="store_true",
                         help="Print resolved pipeline paths and exit (no processing)")
+    parser.add_argument("--skip-firecrawl-preflight", action="store_true",
+                        help="Skip the per-key Firecrawl preflight health check before processing")
+    parser.add_argument("--no-firecrawl-fail-fast", action="store_true",
+                        help="Disable the runtime Firecrawl fail-fast safety check")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -6869,6 +7235,39 @@ def cli_batch_run() -> None:
         fc_keys_cli = _fc_load_keys()
     fc_key_arg: str | list[str] | None = fc_keys_cli if fc_keys_cli else None
 
+    # ── Firecrawl preflight ───────────────────────────────────────────────────
+    _fc_preflight: dict = {}
+    _fc_fail_fast = not args.no_firecrawl_fail_fast
+    if args.verifier in (_VP_FIRECRAWL, _VP_FC_JINA) and fc_keys_cli:
+        if args.skip_firecrawl_preflight:
+            print("[FC PREFLIGHT] Skipped (--skip-firecrawl-preflight).", flush=True)
+            _fc_preflight = {"preflight_status": "SKIPPED"}
+        else:
+            print(f"[FC PREFLIGHT] Testing {len(fc_keys_cli)} key(s)…", flush=True)
+            _fc_preflight = firecrawl_preflight_check(fc_keys_cli)
+            _pst = _fc_preflight.get("preflight_status", "UNKNOWN")
+            _pok  = _fc_preflight.get("keys_ok", 0)
+            _ptot = _fc_preflight.get("keys_total", 0)
+            print(
+                f"[FC PREFLIGHT] Status: {_pst} · "
+                f"{_pok}/{_ptot} keys ok · "
+                f"statuses: {_fc_preflight.get('key_statuses', {})}",
+                flush=True,
+            )
+            if _pst == "FAILED":
+                print(
+                    "[FC PREFLIGHT] ERROR: All Firecrawl keys failed preflight. "
+                    "Check API keys and account status. Aborting.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if _pst == "DEGRADED":
+                print(
+                    "[FC PREFLIGHT] WARNING: Some Firecrawl keys failed — "
+                    "will use available working keys.",
+                    flush=True,
+                )
+
     # ── Load input ────────────────────────────────────────────────────────────
     raw_bytes = input_path.read_bytes()
     file_hash = _file_hash(raw_bytes)
@@ -6895,9 +7294,11 @@ def cli_batch_run() -> None:
         pct = round(i / total * 100) if total else 0
         print(f"\r[cleaner] {i}/{total} ({pct}%)   ", end="", flush=True)
 
+    _cli_fc_health: dict = _make_fc_health()
     enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
         run_df, cols, serper_key or None, args.max_queries,
         progress_cb=_cli_progress,
+        live_counters_out=_cli_fc_health,
         run_id=file_hash,
         resume_from=0,
         prior_results=[],
@@ -6913,6 +7314,7 @@ def cli_batch_run() -> None:
         fc_key=fc_key_arg,
         eligibility_filter_mode=_PF_MODE_MAYBE,
         debug_mode=args.debug,
+        fc_fail_fast=_fc_fail_fast,
     )
     print()  # newline after progress
 
@@ -6932,10 +7334,43 @@ def cli_batch_run() -> None:
         firecrawl_keys_loaded=len(fc_keys_cli),
     )
 
+    # Build fc_audit dict for the Firecrawl Audit sheet
+    _fc_enabled = args.verifier in (_VP_FIRECRAWL, _VP_FC_JINA)
+    _fc_att  = _cli_fc_health.get("requests_attempted", 0)
+    _fc_succ = _cli_fc_health.get("pages_successful", 0)
+    _fc_audit_dict: dict | None = None
+    if _fc_enabled:
+        _pf_key_sts = _fc_preflight.get("key_statuses", {})
+        _fc_audit_dict = {
+            "firecrawl_enabled":                True,
+            "firecrawl_preflight_status":       _fc_preflight.get("preflight_status", "SKIPPED"),
+            "firecrawl_keys_total":             _fc_preflight.get("keys_total", len(fc_keys_cli)),
+            "firecrawl_keys_ok":                _fc_preflight.get("keys_ok", ""),
+            "firecrawl_keys_failed":            _fc_preflight.get("keys_failed", ""),
+            "firecrawl_key_statuses_preflight": str(_pf_key_sts),
+            "firecrawl_requests_attempted":     _fc_att,
+            "firecrawl_pages_successful":       _fc_succ,
+            "firecrawl_success_rate":           f"{_fc_succ / _fc_att:.1%}" if _fc_att else "n/a",
+            "firecrawl_key_failovers":          _cli_fc_health.get("key_failovers", 0),
+            "firecrawl_key_failure_events":     _cli_fc_health.get("key_failure_events", 0),
+            "firecrawl_quota_or_billing_errors": _cli_fc_health.get("quota_or_billing_errors", 0),
+            "firecrawl_rate_limit_errors":      _cli_fc_health.get("rate_limit_errors", 0),
+            "firecrawl_timeouts":               _cli_fc_health.get("timeouts", 0),
+            "firecrawl_exceptions":             _cli_fc_health.get("exceptions", 0),
+            "firecrawl_consecutive_failures_max": _cli_fc_health.get("consecutive_failures_max", 0),
+            "batch_firecrawl_status":           (
+                "fail_fast" if _cli_fc_health.get("fail_fast_triggered")
+                else "ok" if _fc_att > 0
+                else "not_used"
+            ),
+            "batch_firecrawl_notes":            _cli_fc_health.get("fail_fast_reason", ""),
+        }
+
     excel_bytes = build_excel(
         enriched_df, run_df, evidence_rows, cols,
         debug_rows=debug_rows, debug_mode=args.debug,
         run_meta=run_meta, jina_debug_rows=jina_debug_rows,
+        fc_audit=_fc_audit_dict,
     )
 
     out_path = Path(pl_paths["output_xlsx"])
@@ -7194,7 +7629,26 @@ def main():
             )
             if _fc_key_input.strip():
                 _fc_keys = [_fc_key_input.strip()]
-        if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
+        if st.sidebar.button("Preflight-check Firecrawl keys", key="reg_fc_preflight"):
+            if not _fc_keys:
+                st.sidebar.warning("No Firecrawl API key provided.")
+            else:
+                with st.sidebar:
+                    with st.spinner("Running preflight check…"):
+                        _pf = firecrawl_preflight_check(_fc_keys)
+                _pf_st = _pf.get("preflight_status", "UNKNOWN")
+                _pf_ok = _pf.get("keys_ok", 0)
+                _pf_tot = _pf.get("keys_total", 0)
+                _pf_msg = f"Preflight: **{_pf_st}** · {_pf_ok}/{_pf_tot} keys OK"
+                if _pf_st == "OK":
+                    st.sidebar.success(_pf_msg)
+                elif _pf_st == "DEGRADED":
+                    st.sidebar.warning(_pf_msg)
+                else:
+                    st.sidebar.error(_pf_msg + "  \nAll keys failed — check account status.")
+                st.session_state["_fc_preflight_result"] = _pf
+
+    if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
             if not _fc_keys:
                 st.sidebar.warning("No Firecrawl API key provided.")
             else:
@@ -7554,6 +8008,7 @@ def main():
                 debug_mode=_stored_dm,
                 run_meta=st.session_state.get("reg_run_meta"),
                 jina_debug_rows=st.session_state.get("reg_jina_debug", []),
+                fc_audit=st.session_state.get("_fc_audit"),
             )
         return   # ← resume path ends here
 
@@ -7796,6 +8251,40 @@ def main():
             firecrawl_keys_loaded=len(_fc_keys),
         )
 
+        # Build Firecrawl Audit dict
+        _fc_enabled_st = verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA)
+        _fc_pf_result  = st.session_state.get("_fc_preflight_result", {})
+        _fc_att_st     = _fc_live.get("requests_attempted", 0)
+        _fc_succ_st    = _fc_live.get("pages_successful", 0)
+        _fc_audit_st: dict | None = None
+        if _fc_enabled_st:
+            _pf_ks = _fc_pf_result.get("key_statuses", {})
+            _fc_audit_st = {
+                "firecrawl_enabled":                True,
+                "firecrawl_preflight_status":       _fc_pf_result.get("preflight_status", "SKIPPED"),
+                "firecrawl_keys_total":             _fc_pf_result.get("keys_total", len(_fc_keys)),
+                "firecrawl_keys_ok":                _fc_pf_result.get("keys_ok", ""),
+                "firecrawl_keys_failed":            _fc_pf_result.get("keys_failed", ""),
+                "firecrawl_key_statuses_preflight": str(_pf_ks),
+                "firecrawl_requests_attempted":     _fc_att_st,
+                "firecrawl_pages_successful":       _fc_succ_st,
+                "firecrawl_success_rate":           f"{_fc_succ_st / _fc_att_st:.1%}" if _fc_att_st else "n/a",
+                "firecrawl_key_failovers":          _fc_live.get("key_failovers", 0),
+                "firecrawl_key_failure_events":     _fc_live.get("key_failure_events", 0),
+                "firecrawl_quota_or_billing_errors": _fc_live.get("quota_or_billing_errors", 0),
+                "firecrawl_rate_limit_errors":      _fc_live.get("rate_limit_errors", 0),
+                "firecrawl_timeouts":               _fc_live.get("timeouts", 0),
+                "firecrawl_exceptions":             _fc_live.get("exceptions", 0),
+                "firecrawl_consecutive_failures_max": _fc_live.get("consecutive_failures_max", 0),
+                "batch_firecrawl_status":           (
+                    "fail_fast" if _fc_live.get("fail_fast_triggered")
+                    else "ok" if _fc_att_st > 0
+                    else "not_used"
+                ),
+                "batch_firecrawl_notes":            _fc_live.get("fail_fast_reason", ""),
+            }
+        st.session_state["_fc_audit"] = _fc_audit_st
+
         # Mark complete in checkpoint
         _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict,
                          run_label=_run_label)
@@ -7969,6 +8458,7 @@ def main():
         debug_mode=_out_dm,
         run_meta=st.session_state.get("reg_run_meta"),
         jina_debug_rows=st.session_state.get("reg_jina_debug", []),
+        fc_audit=st.session_state.get("_fc_audit"),
     )
 
 
