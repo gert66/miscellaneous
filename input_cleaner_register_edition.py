@@ -3215,6 +3215,32 @@ _OUTPUT_COLS = [
     "jina_evidence_partita_iva",
     "jina_pages_fetched",
     "jina_fetch_status",
+    # v6 unified website verifier columns
+    "verification_needed",
+    "verification_reason",
+    "verifier_provider_used",
+    "verifier_used",
+    "verifier_decision",
+    "verifier_confidence",
+    "verifier_selected_domain",
+    "verifier_replace_allowed",
+    "verifier_reason",
+    "verifier_evidence_strength",
+    "verifier_negative_source_type",
+    "verifier_pages_fetched",
+    "verifier_fetch_status",
+    "verifier_error",
+    # v6 Firecrawl-specific columns
+    "firecrawl_used",
+    "firecrawl_verified_domain",
+    "firecrawl_decision",
+    "firecrawl_confidence",
+    "firecrawl_reason",
+    "firecrawl_evidence_strength",
+    "firecrawl_negative_source_type",
+    "firecrawl_pages_fetched",
+    "firecrawl_fetch_status",
+    "firecrawl_error",
 ]
 
 
@@ -3236,9 +3262,16 @@ def process_dataframe(
     haiku_api_key: str | None = None,
     haiku_model: str = _DEFAULT_HAIKU_MODEL,
     haiku_max_rows: int = 0,   # 0 = no limit
-    # Jina website verifier
+    # Jina website verifier (legacy — now routed through unified verifier)
     jina_mode: str = _JINA_MODE_UNCERTAIN,
     jina_api_key: str | None = None,
+    # Unified website verifier
+    verifier_provider: str = _VP_OFF,
+    verifier_mode: str = _VM_UNCERTAIN,
+    fc_key: str | None = None,
+    max_cands_per_company: int = 3,
+    max_pages_per_cand: int = 3,
+    page_timeout: int = 15,
     # Debug
     debug_mode: bool = False,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
@@ -3328,13 +3361,39 @@ def process_dataframe(
         }
         res.update(_jina_defaults)
 
-        # ── Jina verification ─────────────────────────────────────────────────
-        _jina_debug_rows: list[dict] = []
-        if jina_mode != _JINA_MODE_OFF:
-            _name_variants_j = extract_name_variants(name)
-            _run_jina = _jina_should_run(res, _name_variants_j, raw_ev, jina_mode, debug_mode)
-            if _run_jina:
-                # Collect top unique scored candidates from Serper evidence
+        # ── Default unified verifier fields ──────────────────────────────────
+        _verifier_defaults = {
+            "verification_needed": False, "verification_reason": "",
+            "verifier_provider_used": verifier_provider,
+            "verifier_used": False, "verifier_decision": "",
+            "verifier_confidence": "", "verifier_selected_domain": "",
+            "verifier_replace_allowed": False, "verifier_reason": "",
+            "verifier_evidence_strength": "none",
+            "verifier_negative_source_type": "",
+            "verifier_pages_fetched": 0, "verifier_fetch_status": "",
+            "verifier_error": "",
+            "firecrawl_used": False, "firecrawl_verified_domain": "",
+            "firecrawl_decision": "", "firecrawl_confidence": "",
+            "firecrawl_reason": "", "firecrawl_evidence_strength": "",
+            "firecrawl_negative_source_type": "",
+            "firecrawl_pages_fetched": 0, "firecrawl_fetch_status": "",
+            "firecrawl_error": "",
+        }
+        res.update(_verifier_defaults)
+
+        # ── Unified website verifier ──────────────────────────────────────────
+        _verifier_debug_rows: list[dict] = []
+        _verifier_active = verifier_provider != _VP_OFF
+        if _verifier_active:
+            _name_variants_v = extract_name_variants(name)
+            _cur_dom = str(res.get("final_selected_domain") or res.get("validated_domain") or "")
+            _should_run_v, _verify_reason = _should_verify(
+                res, _name_variants_v, raw_ev, verifier_mode, debug_mode
+            )
+            res["verification_needed"] = _should_run_v
+            res["verification_reason"] = _verify_reason
+            if _should_run_v:
+                # Collect top scored candidates
                 _cand_scores: dict[str, float] = {}
                 for _e in raw_ev:
                     if not _e.get("used"):
@@ -3347,31 +3406,38 @@ def process_dataframe(
                     if _d and _s > _cand_scores.get(_d, -1.0):
                         _cand_scores[_d] = _s
                 _sorted_cands = sorted(_cand_scores.items(), key=lambda x: x[1], reverse=True)
-                _jina_cands = [d for d, _ in _sorted_cands[:5]]
-                # Ensure current domain is in the list
-                _cur_dom = str(res.get("final_selected_domain") or res.get("validated_domain") or "")
-                if _cur_dom and _cur_dom not in _jina_cands:
-                    _jina_cands = [_cur_dom] + _jina_cands[:4]
+                _v_cands = [d for d, _ in _sorted_cands[:max_cands_per_company]]
+                if _cur_dom and _cur_dom not in _v_cands:
+                    _v_cands = [_cur_dom] + _v_cands[: max_cands_per_company - 1]
 
                 try:
-                    _jina_res, _jina_debug_rows = _jina_verify_candidates(
-                        name, city, province,
-                        str(res.get("email_domain", "") or ""),
-                        _name_variants_j, _jina_cands, _cur_dom,
-                        jina_api_key,
+                    _verif_res, _verifier_debug_rows = _run_website_verifier(
+                        company_name=name,
+                        city=city,
+                        province=province,
+                        email_domain=str(res.get("email_domain", "") or ""),
+                        input_partita_iva=str(res.get("partita_iva", "") or ""),
+                        name_variants=_name_variants_v,
+                        candidates=_v_cands,
+                        current_domain=_cur_dom,
+                        verifier_provider=verifier_provider,
+                        jina_api_key=jina_api_key,
+                        fc_key=fc_key,
+                        max_cands=max_cands_per_company,
+                        max_pages=max_pages_per_cand,
+                        page_timeout=page_timeout,
                     )
-                    res.update(_jina_res)
-                    # Apply Jina decision on top of Haiku-merged final_* fields
-                    _jina_upd = _apply_jina_decision(res, _jina_res)
-                    if _jina_upd:
-                        res.update(_jina_upd)
-                except Exception as _jex:
-                    res["jina_fetch_status"] = f"jina_exception:{str(_jex)[:120]}"
+                    res.update(_verif_res)
+                    _verif_upd = _apply_verifier_decision(res, _verif_res)
+                    if _verif_upd:
+                        res.update(_verif_upd)
+                except Exception as _vex:
+                    res["verifier_error"] = f"verifier_exception:{str(_vex)[:120]}"
 
         new_results.append(res)
 
-        # Accumulate Jina debug rows for the Jina Verification Debug sheet
-        new_jina_debug.extend(_jina_debug_rows)
+        # Accumulate verifier debug rows for the Website Verification Debug sheet
+        new_jina_debug.extend(_verifier_debug_rows)
 
         query = res.get("search_query_used", "")
         if query:
@@ -4461,27 +4527,50 @@ def main():
         haiku_max_rows = 0
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Jina Website Verifier")
-    jina_mode = st.sidebar.selectbox(
-        "Jina website verifier",
-        options=_JINA_MODES,
-        index=1,  # default: "For uncertain candidates only"
-        key="reg_jina_mode",
+    st.sidebar.subheader("Website Verifier")
+    verifier_provider = st.sidebar.selectbox(
+        "Website verifier provider",
+        options=_VP_OPTIONS,
+        index=_VP_OPTIONS.index(_VP_FIRECRAWL),
+        key="reg_verifier_provider",
         help=(
-            "Off: skip Jina verification entirely.  \n"
-            "For uncertain candidates only: call Jina when Python scoring is ambiguous "
-            "(low/medium confidence, close scores, generic brand, risky domain pattern, etc.).  \n"
-            "For all selected candidates in debug mode: call Jina for every selected domain "
-            "when debug mode is also ON. Useful for full validation runs."
+            "Off: skip website verification entirely.  \n"
+            "Jina: lightweight free verifier (no API key required).  \n"
+            "Firecrawl: high-fidelity scraper (API key required).  \n"
+            "Firecrawl first, Jina fallback: use Firecrawl; fall back to Jina when uncertain."
         ),
     )
+    verifier_mode = st.sidebar.selectbox(
+        "Verification mode",
+        options=_VM_OPTIONS,
+        index=0,
+        key="reg_verifier_mode",
+        help=(
+            "Uncertain candidates only: verify when Python scoring is ambiguous.  \n"
+            "All selected candidates in debug mode: verify every row when debug mode is ON."
+        ),
+    )
+    verifier_max_candidates = int(st.sidebar.number_input(
+        "Max candidates per company", min_value=1, max_value=10, value=3, step=1,
+        key="reg_verifier_max_cands",
+    ))
+    verifier_max_pages = int(st.sidebar.number_input(
+        "Max pages per candidate", min_value=1, max_value=6, value=3, step=1,
+        key="reg_verifier_max_pages",
+    ))
+    verifier_page_timeout = int(st.sidebar.number_input(
+        "Page timeout (seconds)", min_value=5, max_value=60, value=15, step=5,
+        key="reg_verifier_page_timeout",
+    ))
+
+    # ── API keys ──────────────────────────────────────────────────────────────
     # Jina API key (optional — Jina Reader works without a key at lower rate limits)
     jina_api_key: str | None = None
     try:
         jina_api_key = st.secrets.get("JINA_API_KEY") or st.secrets.get("jina_api_key")
     except Exception:
         pass
-    if jina_mode != _JINA_MODE_OFF:
+    if verifier_provider in (_VP_JINA, _VP_FC_JINA):
         if jina_api_key:
             st.sidebar.success("✓ Jina API key loaded from secrets.")
         else:
@@ -4492,14 +4581,8 @@ def main():
             )
             if _manual_jina.strip():
                 jina_api_key = _manual_jina.strip()
-        st.sidebar.caption(
-            "Jina Reader fetches homepage + /about + /chi-siamo + /contatti per each candidate.  \n"
-            "Results are cached within the session."
-        )
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Firecrawl")
-    # Resolve Firecrawl API key: secrets → env → manual input (never displayed)
+    # Firecrawl API key: secrets → env → manual input (never displayed)
     _fc_key: str | None = None
     try:
         _fc_key = st.secrets.get("FIRECRAWL_API_KEY") or st.secrets.get("firecrawl_api_key")
@@ -4507,53 +4590,56 @@ def main():
         pass
     if not _fc_key:
         _fc_key = os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key")
-    if not _fc_key:
-        _fc_key_input = st.sidebar.text_input(
-            "Firecrawl API key (optional)",
-            type="password",
-            key="reg_firecrawl_key",
-        )
-        if _fc_key_input.strip():
-            _fc_key = _fc_key_input.strip()
-    else:
-        st.sidebar.success("✓ Firecrawl API key loaded.")
-
-    if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
-        if not _fc_key:
-            st.sidebar.warning("No Firecrawl API key provided.")
+    if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
+        if _fc_key:
+            st.sidebar.success("✓ Firecrawl API key loaded.")
         else:
-            _fc_start = time.time()
-            try:
-                _fc_resp = requests.post(
-                    "https://api.firecrawl.dev/v1/scrape",
-                    headers={
-                        "Authorization": f"Bearer {_fc_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"url": "https://www.firecrawl.dev", "formats": ["markdown"]},
-                    timeout=20,
-                )
-                _fc_elapsed = round(time.time() - _fc_start, 2)
-                if _fc_resp.status_code == 200:
-                    _fc_data = _fc_resp.json()
-                    _fc_text = (
-                        (_fc_data.get("data") or {}).get("markdown", "")
-                        or str(_fc_data)
+            _fc_key_input = st.sidebar.text_input(
+                "Firecrawl API key",
+                type="password",
+                key="reg_firecrawl_key",
+            )
+            if _fc_key_input.strip():
+                _fc_key = _fc_key_input.strip()
+        if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
+            if not _fc_key:
+                st.sidebar.warning("No Firecrawl API key provided.")
+            else:
+                _fc_start = time.time()
+                try:
+                    _fc_resp = requests.post(
+                        "https://api.firecrawl.dev/v1/scrape",
+                        headers={
+                            "Authorization": f"Bearer {_fc_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"url": "https://www.firecrawl.dev", "formats": ["markdown"]},
+                        timeout=20,
                     )
-                    st.sidebar.success(
-                        f"✓ Success · {len(_fc_text):,} chars · {_fc_elapsed}s"
-                    )
-                else:
-                    st.sidebar.error(
-                        f"✗ HTTP {_fc_resp.status_code} · {_fc_elapsed}s  \n"
-                        f"{_fc_resp.text[:200]}"
-                    )
-            except requests.Timeout:
-                _fc_elapsed = round(time.time() - _fc_start, 2)
-                st.sidebar.error(f"✗ Timeout after {_fc_elapsed}s")
-            except Exception as _fc_exc:
-                _fc_elapsed = round(time.time() - _fc_start, 2)
-                st.sidebar.error(f"✗ Error · {_fc_elapsed}s  \n{str(_fc_exc)[:200]}")
+                    _fc_elapsed = round(time.time() - _fc_start, 2)
+                    if _fc_resp.status_code == 200:
+                        _fc_data = _fc_resp.json()
+                        _fc_text = (
+                            (_fc_data.get("data") or {}).get("markdown", "")
+                            or str(_fc_data)
+                        )
+                        st.sidebar.success(
+                            f"✓ Success · {len(_fc_text):,} chars · {_fc_elapsed}s"
+                        )
+                    else:
+                        st.sidebar.error(
+                            f"✗ HTTP {_fc_resp.status_code} · {_fc_elapsed}s  \n"
+                            f"{_fc_resp.text[:200]}"
+                        )
+                except requests.Timeout:
+                    _fc_elapsed = round(time.time() - _fc_start, 2)
+                    st.sidebar.error(f"✗ Timeout after {_fc_elapsed}s")
+                except Exception as _fc_exc:
+                    _fc_elapsed = round(time.time() - _fc_start, 2)
+                    st.sidebar.error(f"✗ Error · {_fc_elapsed}s  \n{str(_fc_exc)[:200]}")
+
+    # legacy jina_mode — kept for backward compat with checkpoint resume logic
+    jina_mode = _JINA_MODE_OFF
 
     st.sidebar.markdown("---")
     debug_mode = st.sidebar.checkbox(
