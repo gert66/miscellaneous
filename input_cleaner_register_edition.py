@@ -4535,6 +4535,13 @@ def _build_best_guess_df(
     Best Guess Input — contains all fields useful for Lead Prioritizer:
     company_name, website_url (best guess), email, city, province, phone,
     plus key diagnostic columns.
+
+    Column naming:
+    - python_validated_domain   = what Python scoring selected (may be a forum/redirect)
+    - python_recommended_domain = what Python suggested as replacement
+    - final_selected_domain     = the actual business output domain (may differ from Python)
+    - website_url               = same as final_selected_domain (or Python fallback)
+    - firecrawl_original_checked_domain = which domain Firecrawl actually scraped
     """
     company_col  = cols.get("company") or ""
     email_col    = cols.get("email") or ""
@@ -4547,12 +4554,17 @@ def _build_best_guess_df(
         def _sv(col):
             return str(r.get(col, "") or "").strip() if col else ""
 
-        action = str(r.get("domain_action", "") or "")
-        norm   = str(r.get("normalized_input_website", "") or "").strip()
-        recom  = str(r.get("recommended_domain", "") or "").strip()
-        final  = str(r.get("final_selected_domain", "") or "").strip()
+        action       = str(r.get("domain_action", "") or "")
+        norm         = str(r.get("normalized_input_website", "") or "").strip()
+        recom        = str(r.get("recommended_domain", "") or "").strip()
+        final        = str(r.get("final_selected_domain", "") or "").strip()
+        orig_cand    = str(r.get("original_candidate_domain", "") or "").strip()
+        redir_dom    = str(r.get("redirect_final_domain", "") or "").strip()
+        redir_url    = str(r.get("redirect_final_url", "") or "").strip()
+        py_validated = str(r.get("validated_domain", "") or "").strip()
+        dec_src      = str(r.get("final_decision_source", "") or "")
 
-        # If Haiku produced a final domain decision, use it; otherwise fall back to Python logic
+        # Business output URL: final_selected_domain wins, then Python fallback
         if final:
             url = final
         elif action in ("OK", "LIKELY_OK"):
@@ -4564,42 +4576,97 @@ def _build_best_guess_df(
         else:
             url = norm
 
+        # Was the final domain overridden from what Python selected?
+        _override = dec_src in (
+            "redirect_canonical_unverified", "verifier_replace",
+            "verifier_flag_high_conf", "verifier_reject",
+        )
+        _final_is_output = bool(url)
+
+        # Human-readable explanation of how the final domain was chosen
+        if dec_src == "redirect_canonical_unverified":
+            _reason = (
+                f"Python first selected {orig_cand or py_validated or 'unknown'}, "
+                f"but redirect resolver found {redir_dom}. "
+                f"Final output uses {final}; manual review kept because Firecrawl evidence was weak."
+            )
+        elif dec_src == "verifier_replace":
+            _reason = (
+                f"Firecrawl verified and replaced Python domain "
+                f"({orig_cand or py_validated}) with {final}."
+            )
+        elif dec_src == "verifier_confirm":
+            _reason = f"Firecrawl confirmed Python-selected domain ({final})."
+        elif dec_src == "verifier_reject":
+            _reason = (
+                f"Firecrawl rejected Python-selected domain ({orig_cand or py_validated}). "
+                "No confident replacement found; manual review required."
+            )
+        elif dec_src == "verifier_timeout_high_risk":
+            _reason = (
+                f"Firecrawl timed out on high-risk row. "
+                f"Domain {final or py_validated} kept but requires manual review."
+            )
+        elif dec_src == "pre_filter_skip":
+            _reason = f"Row skipped by eligibility pre-filter: {str(r.get('pre_filter_reason', '') or '')}."
+        elif final and final == py_validated:
+            _reason = f"Python scoring selected {final} (no verifier override)."
+        elif final and final != py_validated and py_validated:
+            _reason = f"Python selected {py_validated}; haiku/verifier overrode to {final}."
+        else:
+            _reason = ""
+
         rows.append({
-            "company_name":               _sv(company_col),
-            "website_url":                url,
-            "email":                      _sv(email_col),
-            "city":                       _sv(city_col),
-            "province":                   _sv(province_col),
-            "phone":                      _sv(phone_col),
-            "final_selected_domain":      str(r.get("final_selected_domain", "") or ""),
-            "final_decision_source":      str(r.get("final_decision_source", "") or ""),
-            "final_confidence":           str(r.get("final_confidence", "") or ""),
-            "domain_action":              action,
-            "domain_confidence":          str(r.get("domain_confidence", "") or ""),
-            "domain_source":              str(r.get("domain_source", "") or ""),
-            "website_discovery_method":   str(r.get("website_discovery_method", "") or ""),
-            "manual_review_needed":       r.get("manual_review_needed", False),
-            "verification_needed":        r.get("verification_needed", False),
-            "verification_reason":        str(r.get("verification_reason", "") or ""),
-            "verifier_used":              r.get("verifier_used", False),
-            "verifier_decision":          str(r.get("verifier_decision", "") or ""),
-            "verifier_reason":            str(r.get("verifier_reason", "") or ""),
-            "verifier_evidence_strength": str(r.get("verifier_evidence_strength", "") or ""),
-            "verifier_negative_source_type": str(r.get("verifier_negative_source_type", "") or ""),
-            "original_candidate_domain":  str(r.get("original_candidate_domain", "") or ""),
-            "redirect_final_domain":      str(r.get("redirect_final_domain", "") or ""),
-            "redirect_final_url":         str(r.get("redirect_final_url", "") or ""),
-            "canonical_domain_used":      str(r.get("canonical_domain_used", "") or ""),
-            "wrong_entity_type_signal":   r.get("wrong_entity_type_signal", False),
-            "wrong_location_signal":      r.get("wrong_location_signal", False),
-            "firecrawl_decision":         str(r.get("firecrawl_decision", "") or ""),
-            "firecrawl_reason":           str(r.get("firecrawl_reason", "") or ""),
-            "firecrawl_pages_fetched":    r.get("firecrawl_pages_fetched", 0),
-            "firecrawl_fetch_status":     str(r.get("firecrawl_fetch_status", "") or ""),
-            "verifier_evidence_url":      str(r.get("verifier_evidence_url", "") or ""),
-            "firecrawl_evidence_url":     str(r.get("firecrawl_evidence_url", "") or ""),
-            "organization_type":          str(r.get("organization_type", "") or ""),
-            "myngle_target_eligibility":  str(r.get("myngle_target_eligibility", "") or ""),
+            # ── Business-facing (lead prioritiser input) ──────────────────────
+            "company_name":                      _sv(company_col),
+            "website_url":                       url,
+            "email":                             _sv(email_col),
+            "city":                              _sv(city_col),
+            "province":                          _sv(province_col),
+            "phone":                             _sv(phone_col),
+            "final_selected_domain":             final,
+            "final_domain_is_business_output":   _final_is_output,
+            "final_decision_source":             dec_src,
+            "final_confidence":                  str(r.get("final_confidence", "") or ""),
+            "manual_review_needed":              r.get("manual_review_needed", False),
+            "business_output_reason":            _reason,
+            # ── Redirect / canonical resolution ───────────────────────────────
+            "original_candidate_domain":         orig_cand,
+            "redirect_final_domain":             redir_dom,
+            "redirect_final_url":                redir_url,
+            "redirect_canonical_override_applied": bool(r.get("redirect_canonical_override_applied", False)),
+            "canonical_domain_verification_status": str(r.get("canonical_domain_verification_status", "") or ""),
+            # ── Python scoring (for traceability, renamed for clarity) ────────
+            "python_validated_domain":           py_validated,
+            "python_recommended_domain":         recom,
+            "domain_action":                     action,
+            "domain_confidence":                 str(r.get("domain_confidence", "") or ""),
+            "domain_source":                     str(r.get("domain_source", "") or ""),
+            "website_discovery_method":          str(r.get("website_discovery_method", "") or ""),
+            # ── Verifier summary ──────────────────────────────────────────────
+            "verification_needed":               r.get("verification_needed", False),
+            "verification_reason":               str(r.get("verification_reason", "") or ""),
+            "verifier_used":                     r.get("verifier_used", False),
+            "verifier_decision":                 str(r.get("verifier_decision", "") or ""),
+            "verifier_reason":                   str(r.get("verifier_reason", "") or ""),
+            "verifier_evidence_strength":        str(r.get("verifier_evidence_strength", "") or ""),
+            "verifier_evidence_url":             str(r.get("verifier_evidence_url", "") or ""),
+            "verifier_negative_source_type":     str(r.get("verifier_negative_source_type", "") or ""),
+            # ── Firecrawl detail ──────────────────────────────────────────────
+            "firecrawl_original_checked_domain": str(r.get("firecrawl_verified_domain", "") or ""),
+            "firecrawl_decision":                str(r.get("firecrawl_decision", "") or ""),
+            "firecrawl_reason":                  str(r.get("firecrawl_reason", "") or ""),
+            "firecrawl_pages_fetched":           r.get("firecrawl_pages_fetched", 0),
+            "firecrawl_fetch_status":            str(r.get("firecrawl_fetch_status", "") or ""),
+            "firecrawl_evidence_url":            str(r.get("firecrawl_evidence_url", "") or ""),
+            # ── Wrong entity / location signals ───────────────────────────────
+            "wrong_entity_type_signal":          r.get("wrong_entity_type_signal", False),
+            "wrong_location_signal":             r.get("wrong_location_signal", False),
+            "original_domain_risky_marker":      bool(r.get("original_domain_risky_marker", False)),
+            "risky_marker_reason":               str(r.get("risky_marker_reason", "") or ""),
+            # ── Eligibility pre-filter ────────────────────────────────────────
+            "organization_type":                 str(r.get("organization_type", "") or ""),
+            "myngle_target_eligibility":         str(r.get("myngle_target_eligibility", "") or ""),
         })
     return pd.DataFrame(rows)
 
@@ -4984,12 +5051,16 @@ def build_excel(
         cols.get("website") or "website_url",
         "final_selected_domain", "final_confidence", "final_decision_source",
         "domain_action", "domain_confidence",
+        "final_domain_is_business_output", "business_output_reason",
         "manual_review_needed",
         "verification_needed", "verification_reason",
         "verifier_decision", "verifier_reason",
         "verifier_evidence_strength", "verifier_negative_source_type",
         "original_candidate_domain", "redirect_final_domain", "redirect_final_url",
+        "redirect_canonical_override_applied",
         "wrong_entity_type_signal", "wrong_location_signal",
+        "python_validated_domain", "python_recommended_domain",
+        "firecrawl_original_checked_domain",
         "firecrawl_decision", "firecrawl_reason", "firecrawl_fetch_status",
         "verifier_evidence_url", "firecrawl_evidence_url",
         "organization_type", "myngle_target_eligibility",
