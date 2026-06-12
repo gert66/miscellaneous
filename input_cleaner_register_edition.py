@@ -375,10 +375,7 @@ _FC_SPEED_DEFAULTS  = {
 # Negative source-type patterns that block replacement
 _NEG_SOURCE_RES: dict[str, re.Pattern] = {
     "news_media":       re.compile(
-        # Only flag pages that are clearly third-party editorial/journalism —
-        # NOT company websites that happen to have a news/press section.
-        # Require terms that imply the PAGE ITSELF is a news outlet, not just
-        # that the company publishes updates.
+        # Only flag pages that are clearly third-party editorial/journalism
         r"\b(testata\s+giornalistica|giornale\s+online|quotidiano|settimanale|mensile|"
         r"rivista\s+di\s+settore|redazione\s+di|notizie\s+di\s+cronaca|ultime\s+notizie|"
         r"breaking\s+news|newsroom|press\s+release\s+wire|comunicato\s+stampa\s+agenzia)\b",
@@ -400,7 +397,36 @@ _NEG_SOURCE_RES: dict[str, re.Pattern] = {
         r"\b(offerte\s+di\s+lavoro\s+candidatura|curriculum\s+vitae\s+candidati|job\s+listing)\b", re.I),
     "government":       re.compile(
         r"\b(comune\s+di|regione\s+[a-z]+|provincia\s+di|ministero|agenzia\s+delle\s+entrate)\b", re.I),
+    "public_school":    re.compile(
+        r"\b(istituto\s+tecnico\s+statale|istituto\s+statale|istituto\s+comprensivo|"
+        r"liceo\s+statale|scuola\s+media\s+statale|scuola\s+primaria|"
+        r"ministero\s+dell.istruzione|ministero\s+dell.istruzione\s+e\s+del\s+merito|"
+        r"scuola\s+in\s+chiaro|ptof\b|piano\s+triennale\s+dell.offerta\s+formativa|"
+        r"\bdocenti?\b.*\bstudenti?\b|\bstudenti?\b.*\bdocenti?\b)\b",
+        re.I),
+    "university":       re.compile(
+        r"\b(universit[àa]\s+degli\s+studi|universit[àa]\s+di|dipartimento\s+di|"
+        r"facolt[àa]\s+di|corso\s+di\s+laurea|rettore|prorettore|dottorato\s+di\s+ricerca)\b",
+        re.I),
 }
+
+# Public school / education signal — applied to the domain TLD as well
+_PUBLIC_SCHOOL_RE = re.compile(
+    r"\b(istituto\s+tecnico\s+statale|istituto\s+statale|istituto\s+comprensivo|"
+    r"liceo\s+statale|scuola\s+media\s+statale|scuola\s+primaria|"
+    r"ministero\s+dell.istruzione|ministero\s+dell.istruzione\s+e\s+del\s+merito|"
+    r"scuola\s+in\s+chiaro|ptof\b|piano\s+triennale\s+dell.offerta\s+formativa|"
+    r"\bdocenti?\b|\bstudenti?\b|istruzione\s+e\s+merito)\b",
+    re.I,
+)
+
+# Domain TLD/SLD patterns that signal non-commercial entities for Italian companies
+_EDU_IT_RE = re.compile(r"\.edu\.it$", re.I)
+_GOV_IT_RE = re.compile(r"\.(gov|governo|istruzione|giustizia|interno|esteri)\.it$", re.I)
+
+# Hard negative source types — always block even for High-confidence Python domains
+_HARD_NEG_SOURCES = frozenset({"directory", "government", "marketplace", "job_board",
+                                "public_school", "university"})
 
 _HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
 
@@ -2306,6 +2332,10 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
     """
     Scrape a single URL via Firecrawl v1 scrape endpoint.
     Returns (markdown_text, fetch_status, metadata_dict).
+    metadata_dict includes:
+      - redirect_url: final URL after any redirects (from Firecrawl sourceURL/url metadata)
+      - redirect_domain: extracted domain of redirect_url if different from original
+      - canonical_url: og:url or canonical link if present
     Results cached by URL for the lifetime of the Streamlit session.
     """
     if url in _FC_CACHE:
@@ -2323,7 +2353,28 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
             body = resp.json()
             page_data = body.get("data") or {}
             text  = (page_data.get("markdown") or "")[:_FC_MAX_CHARS]
-            meta  = page_data.get("metadata") or {}
+            raw_meta = page_data.get("metadata") or {}
+            meta = dict(raw_meta)
+
+            # Capture redirect / canonical destination
+            redirect_url = (
+                meta.get("sourceURL") or meta.get("url") or meta.get("ogUrl") or ""
+            )
+            canonical_url = meta.get("canonicalUrl") or meta.get("canonical") or ""
+            final_url = canonical_url or redirect_url or ""
+            meta["redirect_url"]    = redirect_url
+            meta["canonical_url"]   = canonical_url
+            meta["final_url"]       = final_url
+
+            # Extract redirect domain
+            _redirect_domain = ""
+            _origin_domain = re.sub(r"^https?://([^/]+).*$", r"\1", url).lower().lstrip("www.")
+            if final_url:
+                _rd = re.sub(r"^https?://([^/]+).*$", r"\1", final_url).lower().lstrip("www.")
+                if _rd and _rd != _origin_domain:
+                    _redirect_domain = _rd
+            meta["redirect_domain"] = _redirect_domain
+
             status = "ok"
         elif resp.status_code == 404:
             status = "404"
@@ -2338,20 +2389,36 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
     return text, status, meta
 
 
-def _detect_neg_source(text: str) -> str:
+def _detect_neg_source(text: str, domain: str = "") -> str:
     """
     Return the first matching negative-source-type key, or empty string if none.
-    Only matches when the page is clearly that source type.
 
-    news_media requires 3+ matches because many company websites contain a news
-    or press section with words like "comunicato stampa", "aggiornamenti", etc.
-    Other types require 2+ matches.
+    Thresholds:
+    - news_media: 3+ matches (company websites often have news sections)
+    - public_school / university: 1+ match (very distinctive vocabulary)
+    - others: 2+ matches
+
+    Also checks domain TLD: .edu.it → public_school, .gov.it etc. → government.
     """
+    if not text and not domain:
+        return ""
+
+    # Domain-level hard signals (checked before text)
+    if domain:
+        if _EDU_IT_RE.search(domain.lower()):
+            return "public_school"
+        if _GOV_IT_RE.search(domain.lower()):
+            return "government"
+
     if not text:
         return ""
     tl = text.lower()
-    # news_media is the most likely to false-positive on company sites → stricter threshold
-    _thresholds = {"news_media": 3}
+
+    _thresholds = {
+        "news_media": 3,
+        "public_school": 1,   # very specific vocabulary, 1 match is enough
+        "university": 1,
+    }
     for src_type, pat in _NEG_SOURCE_RES.items():
         hits = pat.findall(tl)
         threshold = _thresholds.get(src_type, 2)
@@ -2447,23 +2514,39 @@ def _extract_fc_evidence(
     ph_m = _ph_re.search(text)
     extracted_phone = ph_m.group(1).strip() if ph_m else ""
 
-    # Negative source type
-    negative_source_type = _detect_neg_source(text)
+    # Negative source type (pass domain for TLD-level checks)
+    negative_source_type = _detect_neg_source(text, domain)
+
+    # Wrong entity type: the detected source type is non-commercial and hard
+    wrong_entity_type_signal = negative_source_type in _HARD_NEG_SOURCES
+
+    # Wrong location: a specific Italian city is prominently mentioned on the page
+    # that does NOT match the register city/province — only flag when city is known
+    wrong_location_signal = False
+    if city and len(city) >= 3:
+        # If city appears → location matches, so no conflict
+        if not city_match and not province_match:
+            # Look for any Italian city-like mention that contradicts register
+            # We treat the absence of our city as a weak wrong-location signal
+            # only when combined with wrong_entity_type
+            wrong_location_signal = wrong_entity_type_signal
 
     return {
-        "legal_name_match":    legal_name_match,
-        "partita_iva_match":   partita_iva_match,
-        "city_match":          city_match,
-        "province_match":      province_match,
-        "email_domain_match":  email_domain_match,
-        "brand_strong":        brand_strong,
-        "brand_token":         brand_token,
-        "official_signal":     official_signal,
-        "italian_language":    italian_language,
-        "extracted_iva":       extracted_iva,
-        "extracted_email":     extracted_email,
-        "extracted_phone":     extracted_phone,
-        "negative_source_type": negative_source_type,
+        "legal_name_match":         legal_name_match,
+        "partita_iva_match":        partita_iva_match,
+        "city_match":               city_match,
+        "province_match":           province_match,
+        "email_domain_match":       email_domain_match,
+        "brand_strong":             brand_strong,
+        "brand_token":              brand_token,
+        "official_signal":          official_signal,
+        "italian_language":         italian_language,
+        "extracted_iva":            extracted_iva,
+        "extracted_email":          extracted_email,
+        "extracted_phone":          extracted_phone,
+        "negative_source_type":     negative_source_type,
+        "wrong_entity_type_signal": wrong_entity_type_signal,
+        "wrong_location_signal":    wrong_location_signal,
     }
 
 
@@ -2662,30 +2745,45 @@ def _fc_verify_candidates(
                         neg_src_domain = ev["negative_source_type"]
                     pages_evidence.append(ev)
 
+                    _redirect_url    = meta.get("final_url", "") or meta.get("redirect_url", "")
+                    _redirect_domain = meta.get("redirect_domain", "")
+                    _canonical_url   = meta.get("canonical_url", "")
+                    # If there's a meaningful redirect to a different domain, track it
+                    _canonical_domain_used = _redirect_domain or domain
+
                     debug_rows.append({
-                        "company_name":         company_name,
-                        "candidate_domain":     domain,
-                        "provider_used":        "firecrawl",
-                        "page_url":             url,
-                        "page_type":            slot_name,
-                        "fetch_status":         status,
-                        "chars_fetched":        len(text),
-                        "elapsed_secs":         round(_elapsed, 2),
-                        "extracted_legal_name": "yes" if ev.get("legal_name_match") else "",
-                        "extracted_company_name": "",
-                        "extracted_address":    "",
-                        "extracted_city":       city if ev.get("city_match") else "",
-                        "extracted_phone":      ev.get("extracted_phone", ""),
-                        "extracted_email":      ev.get("extracted_email", ""),
-                        "extracted_partita_iva": ev.get("extracted_iva", ""),
-                        "source_type":          ev.get("negative_source_type", "") or "company",
-                        "evidence_strength":    "",   # filled after domain scoring
-                        "negative_source_type": ev.get("negative_source_type", ""),
-                        "verifier_score":       "",
-                        "verifier_decision":    "",
-                        "verifier_reason":      "",
-                        "replace_allowed":      "",
+                        "company_name":             company_name,
+                        "candidate_domain":         domain,
+                        "original_candidate_url":   url,
+                        "page_url":                 _redirect_url or url,
+                        "page_type":                slot_name,
+                        "redirect_final_url":       _redirect_url,
+                        "redirect_final_domain":    _redirect_domain,
+                        "canonical_domain_used":    _canonical_domain_used,
+                        "fetch_status":             status,
+                        "chars_fetched":            len(text),
+                        "elapsed_secs":             round(_elapsed, 2),
+                        "source_type":              ev.get("negative_source_type", "") or "company",
+                        "wrong_entity_type_signal": ev.get("wrong_entity_type_signal", False),
+                        "wrong_location_signal":    ev.get("wrong_location_signal", False),
+                        "evidence_strength":        "",   # filled after domain scoring
+                        "negative_source_type":     ev.get("negative_source_type", ""),
+                        "verifier_decision":        "",
+                        "verifier_reason":          "",
+                        "replace_allowed":          "",
                     })
+
+                    # If this page redirected to a different domain, also evaluate
+                    # that redirected domain's identity evidence
+                    if _redirect_domain and _redirect_domain != domain:
+                        _redir_ev = _extract_fc_evidence(
+                            text, _redirect_domain, company_name, city, province,
+                            email_domain, input_partita_iva, name_variants,
+                        )
+                        # Store redirect info for decision logic
+                        ev["redirect_domain"]       = _redirect_domain
+                        ev["redirect_ev"]           = _redir_ev
+                        ev["redirect_final_url"]    = _redirect_url
                     break  # slot satisfied; move to next slot
                 elif status == "404":
                     continue  # try next slug in this slot
@@ -2695,24 +2793,63 @@ def _fc_verify_candidates(
                 else:
                     continue  # other HTTP error — try next slug
 
-        # Score this domain
+        # Aggregate wrong entity / wrong location signals across pages
+        _any_wrong_entity = any(e.get("wrong_entity_type_signal") for e in pages_evidence)
+        _any_wrong_loc    = any(e.get("wrong_location_signal")    for e in pages_evidence)
+
+        # Check for canonical redirect to a different domain that passes evidence
+        _redirect_domain_winner = ""
+        _redirect_domain_ev: dict = {}
+        for _pe in pages_evidence:
+            _rd = _pe.get("redirect_domain", "")
+            _rev = _pe.get("redirect_ev")
+            if _rd and _rev:
+                _r_str, _r_repl, _r_rsn = _compute_evidence_strength([_rev], "")
+                if _r_str in ("strong", "medium") and not _redirect_domain_winner:
+                    _redirect_domain_winner = _rd
+                    _redirect_domain_ev = {
+                        "evidence_strength": _r_str,
+                        "replace_allowed":   _r_repl,
+                        "reason":            _r_rsn,
+                        "redirect_url":      _pe.get("redirect_final_url", ""),
+                    }
+
+        # Score this domain (use the redirected domain evidence if it's stronger)
         strength, replace_ok, reason = _compute_evidence_strength(pages_evidence, neg_src_domain)
 
+        # If original domain is a wrong entity type but redirects cleanly to a strong domain,
+        # override the score to allow replacement with the redirect destination
+        if _any_wrong_entity and _redirect_domain_winner and _redirect_domain_ev.get("replace_allowed"):
+            strength   = _redirect_domain_ev["evidence_strength"]
+            replace_ok = True
+            reason     = (
+                f"Original candidate is {neg_src_domain or 'wrong entity type'}; "
+                f"redirects to {_redirect_domain_winner}: "
+                f"{_redirect_domain_ev['reason']}"
+            )
+            neg_src_domain = ""  # clear the blocker so redirect can win
+
         domain_results[domain] = {
-            "pages_evidence":      pages_evidence,
-            "evidence_strength":   strength,
-            "replace_allowed":     replace_ok,
-            "reason":              reason,
-            "negative_source_type": neg_src_domain,
+            "pages_evidence":           pages_evidence,
+            "evidence_strength":        strength,
+            "replace_allowed":          replace_ok,
+            "reason":                   reason,
+            "negative_source_type":     neg_src_domain,
+            "wrong_entity_type_signal": _any_wrong_entity,
+            "wrong_location_signal":    _any_wrong_loc,
+            "redirect_domain_winner":   _redirect_domain_winner,
+            "redirect_domain_ev":       _redirect_domain_ev,
         }
 
         # Back-fill debug rows for this domain
         for row in debug_rows:
             if row["candidate_domain"] == domain and row["evidence_strength"] == "":
-                row["evidence_strength"]   = strength
-                row["verifier_decision"]   = "replace" if replace_ok and domain != current_domain else "confirm" if replace_ok else "uncertain"
-                row["verifier_reason"]     = reason
-                row["replace_allowed"]     = replace_ok
+                row["evidence_strength"]        = strength
+                row["wrong_entity_type_signal"] = _any_wrong_entity
+                row["wrong_location_signal"]    = _any_wrong_loc
+                row["verifier_decision"]        = "replace" if replace_ok and domain != current_domain else "confirm" if replace_ok else "uncertain"
+                row["verifier_reason"]          = reason
+                row["replace_allowed"]          = replace_ok
 
     fc_out["firecrawl_pages_fetched"] = total_pages_fetched
     fc_out["firecrawl_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
@@ -2747,12 +2884,50 @@ def _fc_verify_candidates(
     cur_dr = domain_results.get(current_domain, {})
     _is_high_conf_python = python_confidence.strip().lower() == "high"
 
-    # Hard negative sources — directories, databases, government portals, marketplaces —
-    # are always considered reliable enough to reject/replace regardless of Python confidence.
-    _HARD_NEG_SOURCES = {"directory", "government", "marketplace", "job_board"}
+    # Check if any candidate domain redirected to a winner domain
+    _global_redirect_winner = ""
+    _global_redirect_ev: dict = {}
+    for _dom, _dr in domain_results.items():
+        _rw = _dr.get("redirect_domain_winner", "")
+        _rev = _dr.get("redirect_domain_ev", {})
+        if _rw and _rev.get("replace_allowed") and not _global_redirect_winner:
+            _global_redirect_winner = _rw
+            _global_redirect_ev    = _rev
+            _global_redirect_from  = _dom
 
     cur_neg = cur_dr.get("negative_source_type", "")
     _cur_neg_is_hard = cur_neg in _HARD_NEG_SOURCES
+    _cur_wrong_entity = cur_dr.get("wrong_entity_type_signal", False)
+    _cur_wrong_loc    = cur_dr.get("wrong_location_signal", False)
+
+    # If the current domain redirects to a provably better domain, use that as replacement
+    _cur_redirect_winner = cur_dr.get("redirect_domain_winner", "")
+    _cur_redirect_ev     = cur_dr.get("redirect_domain_ev", {})
+
+    # Also check global (any candidate redirected to a winner)
+    if not _cur_redirect_winner and _global_redirect_winner:
+        _cur_redirect_winner = _global_redirect_winner
+        _cur_redirect_ev     = _global_redirect_ev
+
+    # ── Redirect canonical domain wins ───────────────────────────────────────
+    # If the original candidate is a wrong entity type (e.g. fan forum, school) but
+    # cleanly redirects to a strong official domain, replace with the redirect destination.
+    if _cur_redirect_winner and _cur_redirect_ev.get("replace_allowed"):
+        _redir_url = _cur_redirect_ev.get("redirect_url", "")
+        fc_out.update(
+            firecrawl_verified_domain=_cur_redirect_winner,
+            firecrawl_decision="replace",
+            firecrawl_confidence="High",
+            firecrawl_reason=(
+                f"Candidate {current_domain} redirected to {_cur_redirect_winner}: "
+                f"{_cur_redirect_ev.get('reason', 'strong identity evidence on redirect destination')}"
+            ),
+            firecrawl_evidence_strength=_cur_redirect_ev.get("evidence_strength", "strong"),
+            firecrawl_negative_source_type="",
+            firecrawl_redirect_final_url=_redir_url,
+            firecrawl_redirect_final_domain=_cur_redirect_winner,
+        )
+        return fc_out, debug_rows
 
     if cur_neg and not cur_dr.get("replace_allowed"):
         if _is_high_conf_python and not _cur_neg_is_hard:
@@ -3413,6 +3588,15 @@ _OUTPUT_COLS = [
     "firecrawl_pages_fetched",
     "firecrawl_fetch_status",
     "firecrawl_error",
+    # v7 redirect / wrong entity columns
+    "original_candidate_domain",
+    "redirect_final_url",
+    "redirect_final_domain",
+    "canonical_domain_used",
+    "wrong_entity_type_signal",
+    "wrong_location_signal",
+    "firecrawl_redirect_final_url",
+    "firecrawl_redirect_final_domain",
 ]
 
 
@@ -3562,6 +3746,15 @@ def process_dataframe(
             "firecrawl_negative_source_type": "",
             "firecrawl_pages_fetched": 0, "firecrawl_fetch_status": "",
             "firecrawl_error": "",
+            # v7 redirect / wrong entity
+            "original_candidate_domain": "",
+            "redirect_final_url": "",
+            "redirect_final_domain": "",
+            "canonical_domain_used": "",
+            "wrong_entity_type_signal": False,
+            "wrong_location_signal": False,
+            "firecrawl_redirect_final_url": "",
+            "firecrawl_redirect_final_domain": "",
         }
         res.update(_verifier_defaults)
 
@@ -3851,17 +4044,37 @@ def _build_best_guess_df(
             url = norm
 
         rows.append({
-            "company_name":           _sv(company_col),
-            "website_url":            url,
-            "email":                  _sv(email_col),
-            "city":                   _sv(city_col),
-            "province":               _sv(province_col),
-            "phone":                  _sv(phone_col),
-            "domain_action":          action,
-            "domain_confidence":      str(r.get("domain_confidence", "") or ""),
-            "domain_source":          str(r.get("domain_source", "") or ""),
-            "website_discovery_method": str(r.get("website_discovery_method", "") or ""),
-            "manual_review_needed":   r.get("manual_review_needed", False),
+            "company_name":               _sv(company_col),
+            "website_url":                url,
+            "email":                      _sv(email_col),
+            "city":                       _sv(city_col),
+            "province":                   _sv(province_col),
+            "phone":                      _sv(phone_col),
+            "final_selected_domain":      str(r.get("final_selected_domain", "") or ""),
+            "final_decision_source":      str(r.get("final_decision_source", "") or ""),
+            "final_confidence":           str(r.get("final_confidence", "") or ""),
+            "domain_action":              action,
+            "domain_confidence":          str(r.get("domain_confidence", "") or ""),
+            "domain_source":              str(r.get("domain_source", "") or ""),
+            "website_discovery_method":   str(r.get("website_discovery_method", "") or ""),
+            "manual_review_needed":       r.get("manual_review_needed", False),
+            "verification_needed":        r.get("verification_needed", False),
+            "verification_reason":        str(r.get("verification_reason", "") or ""),
+            "verifier_used":              r.get("verifier_used", False),
+            "verifier_decision":          str(r.get("verifier_decision", "") or ""),
+            "verifier_reason":            str(r.get("verifier_reason", "") or ""),
+            "verifier_evidence_strength": str(r.get("verifier_evidence_strength", "") or ""),
+            "verifier_negative_source_type": str(r.get("verifier_negative_source_type", "") or ""),
+            "original_candidate_domain":  str(r.get("original_candidate_domain", "") or ""),
+            "redirect_final_domain":      str(r.get("redirect_final_domain", "") or ""),
+            "redirect_final_url":         str(r.get("redirect_final_url", "") or ""),
+            "canonical_domain_used":      str(r.get("canonical_domain_used", "") or ""),
+            "wrong_entity_type_signal":   r.get("wrong_entity_type_signal", False),
+            "wrong_location_signal":      r.get("wrong_location_signal", False),
+            "firecrawl_decision":         str(r.get("firecrawl_decision", "") or ""),
+            "firecrawl_reason":           str(r.get("firecrawl_reason", "") or ""),
+            "firecrawl_pages_fetched":    r.get("firecrawl_pages_fetched", 0),
+            "firecrawl_fetch_status":     str(r.get("firecrawl_fetch_status", "") or ""),
         })
     return pd.DataFrame(rows)
 
@@ -4238,28 +4451,63 @@ def build_excel(
                      value="Debug mode was enabled but no Serper results were collected "
                            "(no Serper key, or no rows required search).")
 
-    # Jina Verification Debug sheet (always shown when Jina was used)
+    # Manual Review Queue sheet
+    _mrq_cols = [
+        cols.get("company") or "company_name",
+        cols.get("city") or "city",
+        cols.get("province") or "province",
+        cols.get("website") or "website_url",
+        "final_selected_domain", "final_confidence", "final_decision_source",
+        "domain_action", "domain_confidence",
+        "manual_review_needed",
+        "verification_needed", "verification_reason",
+        "verifier_decision", "verifier_reason",
+        "verifier_evidence_strength", "verifier_negative_source_type",
+        "original_candidate_domain", "redirect_final_domain", "redirect_final_url",
+        "wrong_entity_type_signal", "wrong_location_signal",
+        "firecrawl_decision", "firecrawl_reason", "firecrawl_fetch_status",
+        "top_3_candidate_domains", "serper_top_result_title", "serper_top_result_url",
+    ]
+    ws_mrq = wb.create_sheet("Manual Review Queue")
+    _mrq_mask = (
+        enriched_df.get("manual_review_needed", pd.Series(False, index=enriched_df.index))
+        .astype(str).str.lower().isin(["true", "1", "yes"])
+    )
+    _mrq_df = enriched_df[_mrq_mask].copy() if _mrq_mask.any() else enriched_df.iloc[:0].copy()
+    if not _mrq_df.empty:
+        _avail_mrq = [c for c in _mrq_cols if c and c in _mrq_df.columns]
+        _write_sheet(ws_mrq, _mrq_df[_avail_mrq])
+    else:
+        ws_mrq.cell(row=1, column=1, value="No rows require manual review.")
+
+    # Website Verification Debug sheet (always shown when any verifier was used)
     jina_ran = (
         "jina_verifier_used" in enriched_df.columns
         and enriched_df["jina_verifier_used"].astype(str).str.lower().isin(["true", "1"]).any()
     )
-    if jina_ran or jina_debug_rows:
+    _verif_ran = (
+        "verifier_used" in enriched_df.columns
+        and enriched_df["verifier_used"].astype(str).str.lower().isin(["true", "1"]).any()
+    )
+    if jina_ran or _verif_ran or jina_debug_rows:
         ws_jina = wb.create_sheet("Website Verification Debug")
-        _jina_debug_cols = [
-            "company_name", "candidate_domain", "candidate_url", "page_slug",
-            "fetch_status", "chars_fetched",
-            "extracted_legal_name", "extracted_address",
-            "extracted_phone", "extracted_email", "extracted_partita_iva",
-            "verifier_score", "verifier_decision", "verifier_reason",
+        _verif_debug_cols = [
+            "company_name", "candidate_domain",
+            "original_candidate_url", "page_url",
+            "page_type", "redirect_final_url", "redirect_final_domain",
+            "canonical_domain_used", "fetch_status", "chars_fetched", "elapsed_secs",
+            "source_type", "wrong_entity_type_signal", "wrong_location_signal",
+            "evidence_strength", "negative_source_type",
+            "verifier_decision", "verifier_reason", "replace_allowed",
         ]
         if jina_debug_rows:
             jd_df = pd.DataFrame(jina_debug_rows)
-            for c in _jina_debug_cols:
+            for c in _verif_debug_cols:
                 if c not in jd_df.columns:
                     jd_df[c] = ""
-            _write_sheet(ws_jina, jd_df[_jina_debug_cols])
+            _write_sheet(ws_jina, jd_df[_verif_debug_cols])
         else:
-            ws_jina.cell(row=1, column=1, value="Jina verifier ran but no debug rows were collected.")
+            ws_jina.cell(row=1, column=1, value="Verifier ran but no debug rows were collected.")
 
     # Validation Diagnostics sheet — always present
     ws_val = wb.create_sheet("Validation Diagnostics")
