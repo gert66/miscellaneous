@@ -205,6 +205,20 @@ _IN_SIGLA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Regex to extract SIGLABILE/IN SIGLA content for brand extraction
+_SIGLABILE_EXTRACT_RE = re.compile(
+    r"[\(\[]*\s*(?:IN\s+SIGLA|SIGLABILE)\s+(.+?)[\)\]]*$", re.I
+)
+
+# First-token brand rule: generic descriptors that indicate brand is first token
+_GENERIC_DESCRIPTORS_RE = re.compile(
+    r"^(TECNOLOGIE|IMPIANTI|SISTEMI|SERVIZI|SICUREZZA|ENERGIA|INNOVAZIONE|"
+    r"SOLUZIONI|AUTOMAZIONE|COSTRUZIONI|PRODUZIONE|DISTRIBUZIONE|LOGISTICA|"
+    r"TRASPORTI|CONSULENZA|INGEGNERIA|INFORMATICA|ELETTRONICA|MECCANICA|"
+    r"CHIMICA|FARMACEUTICA|ALIMENTARE|INDUSTRIALE|COMMERCIALE|INTERNAZIONALE)$", re.I
+)
+_LEGAL_SUFFIX_TOKENS = {"spa", "srl", "sas", "snc", "srls", "sapa", "ss"}
+
 # Extra Italian register legal phrases not caught by _LEGAL_TOKENS / _ITALIAN_DESCRIPTORS
 _EXTRA_LEGAL_PHRASES_RE = re.compile(
     r"\bSOCIETA\'?\s+PER\s+AZIONI\b"
@@ -496,6 +510,17 @@ _PUBLIC_OVERRIDE_RE = re.compile(
 )
 
 
+def _normalize_legal_text(s: str) -> str:
+    """Strip accents, apostrophes, and non-alphanumeric chars for regex matching."""
+    s = (s or "").upper()
+    for old, new in [("'", ""), ("’", ""), ("`", ""), ("´", ""),
+                     ("À", "A"), ("È", "E"), ("É", "E"),
+                     ("Ì", "I"), ("Ò", "O"), ("Ù", "U")]:
+        s = s.replace(old, new)
+    s = re.sub(r"[^A-Z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def classify_organization(company_name: str) -> tuple[str, str, str, str]:
     """
     Classify a company name for mYngle eligibility.
@@ -503,30 +528,32 @@ def classify_organization(company_name: str) -> tuple[str, str, str, str]:
     """
     n = (company_name or "").strip()
     nl = n.lower()
+    n_norm = _normalize_legal_text(n)
 
-    has_keep    = bool(_KEEP_FORMS_RE.search(n))
-    has_maybe   = bool(_MAYBE_FORMS_RE.search(n))
-    has_exclude = bool(_EXCLUDE_FORMS_RE.search(n))
-    has_public  = bool(_PUBLIC_OVERRIDE_RE.search(n))
+    has_keep    = bool(_KEEP_FORMS_RE.search(n) or _KEEP_FORMS_RE.search(n_norm))
+    has_maybe   = bool(_MAYBE_FORMS_RE.search(n) or _MAYBE_FORMS_RE.search(n_norm))
+    has_exclude = bool(_EXCLUDE_FORMS_RE.search(n) or _EXCLUDE_FORMS_RE.search(n_norm))
+    has_public  = bool(_PUBLIC_OVERRIDE_RE.search(n) or _PUBLIC_OVERRIDE_RE.search(n_norm))
 
     # Determine organization type label
-    if _EXCLUDE_FORMS_RE.search(n):
+    nl_norm = n_norm.lower()
+    if _EXCLUDE_FORMS_RE.search(n) or _EXCLUDE_FORMS_RE.search(n_norm):
         # Find the first matching exclude term
-        _em = _EXCLUDE_FORMS_RE.search(n)
+        _em = _EXCLUDE_FORMS_RE.search(n) or _EXCLUDE_FORMS_RE.search(n_norm)
         _et = _em.group(0).strip().lower() if _em else "non_commercial"
-        if any(t in nl for t in ("asl", "ausl", "ats", "asp", "sanitaria", "ospedaliera", "irccs", "ospedale")):
+        if any(t in nl or t in nl_norm for t in ("asl", "ausl", "ats", "asp", "sanitaria", "ospedaliera", "irccs", "ospedale")):
             org_type = "public_health"
-        elif any(t in nl for t in ("universit", "politecnico")):
+        elif any(t in nl or t in nl_norm for t in ("universit", "politecnico")):
             org_type = "university_education"
-        elif any(t in nl for t in ("scuola", "istituto statale", "istituto tecnico", "istituto comprensivo")):
+        elif any(t in nl or t in nl_norm for t in ("scuola", "istituto statale", "istituto tecnico", "istituto comprensivo")):
             org_type = "public_school"
-        elif any(t in nl for t in ("associazione", "odv", "aps", "onlus", "ets")):
+        elif any(t in nl or t in nl_norm for t in ("associazione", "odv", "aps", "onlus", "ets")):
             org_type = "nonprofit_association"
-        elif any(t in nl for t in ("fondazione",)):
+        elif any(t in nl or t in nl_norm for t in ("fondazione",)):
             org_type = "foundation"
-        elif any(t in nl for t in ("comune", "regione", "provincia", "ministero")):
+        elif any(t in nl or t in nl_norm for t in ("comune", "regione", "provincia", "ministero")):
             org_type = "government_body"
-        elif any(t in nl for t in ("parrocchia", "diocesi", "congregazione", "caritas", "ente ecclesiastico")):
+        elif any(t in nl or t in nl_norm for t in ("parrocchia", "diocesi", "congregazione", "caritas", "ente ecclesiastico")):
             org_type = "religious_body"
         else:
             org_type = "non_commercial"
@@ -831,6 +858,33 @@ def extract_name_variants(name: str) -> dict:
     """
     original = name.strip()
 
+    # ── Extract SIGLABILE brand before stripping ──────────────────────────────
+    _siglabile_raw = ""
+    _siglabile_m = _SIGLABILE_EXTRACT_RE.search(original)
+    if _siglabile_m:
+        _siglabile_raw = _siglabile_m.group(1).strip().rstrip(")].").strip()
+
+    siglabile_variants: list[str] = []
+    if _siglabile_raw:
+        _sig_no_legal = strip_legal(_siglabile_raw)
+        _sig_compact = re.sub(r"[^a-zA-Z0-9]", "", _sig_no_legal).lower()
+        if _sig_no_legal:
+            siglabile_variants.append(_sig_no_legal)
+        if _sig_compact and _sig_compact != _sig_no_legal.lower():
+            siglabile_variants.append(_sig_compact)
+
+    # ── First-token brand rule ────────────────────────────────────────────────
+    first_token_brand = ""
+    _name_tokens = re.split(r"[\s\-_/&,]+", original)
+    if len(_name_tokens) >= 2:
+        _ft = _name_tokens[0].strip().rstrip(".'")
+        _ft_clean = re.sub(r"[^A-Za-z0-9]", "", _ft)
+        if (3 <= len(_ft_clean) <= 6
+                and _ft_clean.upper() == _ft_clean
+                and _ft_clean.lower() not in _LEGAL_SUFFIX_TOKENS
+                and _GENERIC_DESCRIPTORS_RE.match(_name_tokens[1].strip())):
+            first_token_brand = _ft_clean
+
     # Pre-clean: resolve IN FORMA ABBREVIATA and strip extra legal phrases
     full = _pre_clean_register_name(original)
     if not full:
@@ -889,14 +943,37 @@ def extract_name_variants(name: str) -> dict:
     brand_is_acronym = _is_acronym(brand)
     brand_nodot = _acronym_nodot(brand) if brand_is_acronym else brand
 
+    # ── Descriptor transformation variants ────────────────────────────────────
+    descriptor_variants: list[tuple[str, str]] = []
+    _nolegal_upper = (no_legal or "").upper()
+
+    if "RISERIA" in _nolegal_upper:
+        _riso = re.sub(r"\bRISERIA\b", "RISO", no_legal, flags=re.I)
+        descriptor_variants.append(("riso_variant", _riso.strip()))
+
+    if "IMMOBILIARE" in _nolegal_upper:
+        _re_variant = re.sub(r"\bIMMOBILIARE\b", "REAL ESTATE", no_legal, flags=re.I)
+        descriptor_variants.append(("real_estate_variant", _re_variant.strip()))
+        _compact = re.sub(r"\s+", "", _re_variant.lower())
+        if len(_compact) <= 30:
+            descriptor_variants.append(("real_estate_compact", _compact))
+
+    if "TECNOLOGIE" in _nolegal_upper:
+        _tech_variant = re.sub(r"\bTECNOLOGIE\b", "TECHNOLOGIES", no_legal, flags=re.I)
+        descriptor_variants.append(("technologies_variant", _tech_variant.strip()))
+
     return {
-        "full":         full,
-        "no_legal":     no_legal,
-        "no_desc":      no_desc,
-        "brand":        brand,
-        "brand_nodot":  brand_nodot,
-        "original":     original,
-        "is_acronym":   brand_is_acronym,
+        "full":               full,
+        "no_legal":           no_legal,
+        "no_desc":            no_desc,
+        "brand":              brand,
+        "brand_nodot":        brand_nodot,
+        "original":           original,
+        "is_acronym":         brand_is_acronym,
+        "siglabile_brand":    siglabile_variants[0] if siglabile_variants else "",
+        "siglabile_compact":  siglabile_variants[1] if len(siglabile_variants) > 1 else "",
+        "first_token_brand":  first_token_brand,
+        "descriptor_variants": descriptor_variants,
     }
 
 
@@ -1124,6 +1201,38 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+_URL_IN_TEXT_RE = re.compile(
+    r"(?:https?://|www\.)[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]{4,200}", re.I
+)
+
+
+def _extract_urls_from_text(text: str) -> list:
+    """Extract http/https/www URLs embedded in snippet/title text."""
+    urls = []
+    for m in _URL_IN_TEXT_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;)'\"")
+        if not u.startswith("http"):
+            u = "https://" + u
+        urls.append(u)
+    return urls
+
+
+def _classify_candidate_type(url: str, domain: str, title: str, snippet: str) -> str:
+    """Classify the candidate type based on URL path and content signals."""
+    path = ""
+    try:
+        path = urlparse(url).path or ""
+    except Exception:
+        pass
+    path_parts = [p for p in path.strip("/").split("/") if p]
+    if len(path_parts) >= 2:
+        combined = (title + " " + snippet).lower()
+        if any(sig in combined for sig in ["companies", "aziende", "business-sector", "gruppo", "group"]):
+            return "group_site_subsidiary_page"
+        return "deep_page"
+    return "root_domain"
+
+
 def _brand_is_ambiguous(brand: str) -> bool:
     """
     True if brand is likely too generic or short to confidently identify an Italian company
@@ -1204,6 +1313,31 @@ def _build_search_queries(
     if use_nodot_queries:
         queries.append(f'"{brand_nodot}" Italy sito ufficiale')
         queries.append(f'site:.it "{brand_nodot}"')
+
+    # ── SIGLABILE brand queries (high priority — insert near front) ───────────
+    siglabile_brand   = name_variants.get("siglabile_brand", "")
+    siglabile_compact = name_variants.get("siglabile_compact", "")
+    if siglabile_brand and siglabile_brand.lower() != clean_name.lower():
+        queries.insert(0, f'"{siglabile_brand}" sito ufficiale')
+        queries.insert(1, f'"{siglabile_brand}" official website')
+        if siglabile_compact and siglabile_compact != siglabile_brand.lower():
+            queries.append(f'"{siglabile_compact}"')
+
+    # ── First-token brand queries ─────────────────────────────────────────────
+    first_token_brand = name_variants.get("first_token_brand", "")
+    if first_token_brand and first_token_brand.lower() != brand.lower():
+        queries.insert(0, f'"{first_token_brand}" "{clean_name}" sito ufficiale')
+        if loc:
+            queries.append(f'"{first_token_brand}" "{loc}" Italy official website')
+        queries.append(f'site:.it "{first_token_brand}"')
+
+    # ── Descriptor variant queries ────────────────────────────────────────────
+    for _dv_label, _dv_val in name_variants.get("descriptor_variants", []):
+        if _dv_val and _dv_val.lower() != clean_name.lower():
+            queries.append(f'"{_dv_val}" official website')
+            queries.append(f'"{_dv_val}" sito ufficiale')
+            if loc:
+                queries.append(f'"{_dv_val}" {loc}')
 
     # Deduplicate while preserving order
     seen: set = set()
@@ -1426,7 +1560,42 @@ def search_official_domain_register(
                 "email_match": (domain == email_domain),
                 "official_signal": has_official_signal(title + " " + snippet),
                 "used": True,
+                "candidate_url": url,
+                "candidate_type": _classify_candidate_type(url, domain, title, snippet),
+                "candidate_source": "serper_result",
+                "evidence_source_url": url,
             })
+
+            # Check for URLs embedded in snippet (e.g. LinkedIn showing "Sito Web: http://...")
+            _snippet_urls = _extract_urls_from_text(snippet)
+            for _su in _snippet_urls:
+                _su_domain = _extract_domain(_su)
+                if (_su_domain and not is_generic(_su_domain)
+                        and not classify_domain(_su_domain, title, snippet)):
+                    _su_score = _score_candidate(
+                        _su_domain, rank, title, snippet,
+                        name_variants, email_domain, city, province,
+                    )
+                    if _su_score >= 0.08:
+                        if _su_domain not in candidates or _su_score > candidates[_su_domain]:
+                            candidates[_su_domain] = _su_score
+                            domain_variant[_su_domain] = f"snippet_url:{_su_domain}"
+                        evidence.append({
+                            "query": query, "title": title[:120], "url": _su,
+                            "snippet": snippet[:200],
+                            "domain": _su_domain, "score": round(_su_score, 3),
+                            "brand_overlap": round(brand_overlap_variants(name_variants, _su_domain), 3),
+                            "full_overlap": round(token_overlap(name_variants["full"], _su_domain), 3),
+                            "location_match": location_in_text(title + " " + snippet, city, province),
+                            "email_match": (_su_domain == email_domain),
+                            "official_signal": has_official_signal(title + " " + snippet),
+                            "used": True,
+                            "candidate_source": "snippet_extracted_url",
+                            "candidate_url": _su,
+                            "candidate_type": "snippet_url",
+                            "evidence_source_url": url,
+                        })
+
         time.sleep(0.25)
 
     if not candidates:
@@ -1833,6 +2002,18 @@ def validate_register_row(
                 domain_reason=f"Website missing in register. {reason}",
                 manual_review_needed=(conf < 0.70),
                 website_discovery_method="serper_search",
+            )
+        elif suggested and conf >= 0.15:
+            # Plausible candidate — output with manual review flag instead of blank
+            result.update(
+                validated_domain=suggested,
+                recommended_domain=suggested,
+                domain_source=SRC_SERPER,
+                domain_action="PLAUSIBLE_NEEDS_REVIEW",
+                domain_confidence="Low",
+                domain_reason=f"Website missing. Plausible candidate found but confidence is low ({conf:.2f}). Manual review needed. {reason}",
+                manual_review_needed=True,
+                website_discovery_method="serper_search_plausible",
             )
         else:
             result.update(
@@ -2547,6 +2728,82 @@ def _apply_jina_decision(result: dict, jina_result: dict) -> dict:
 
 
 # =============================================================================
+# PROFESSIONAL SITE SIGNALS SCORING
+# =============================================================================
+
+_PRO_SITE_NAV_RE = re.compile(
+    r"\b(chi\s+siamo|la\s+nostra\s+azienda|azienda|servizi|prodotti|settori|"
+    r"business\s+sectors|companies|sustainability|sostenibilit[àa]|media|"
+    r"contatti|contacts|lavora\s+con\s+noi|work\s+with\s+us|about\s+us)\b", re.I
+)
+_PRO_SITE_LEGAL_RE = re.compile(
+    r"\b(privacy\s+policy|cookie\s+policy|terms\s+and\s+conditions|"
+    r"p\.?\s*iva|c\.?\s*f\.|codice\s+fiscale|vat\s+number|"
+    r"sede\s+legale|capitale\s+sociale|rea\s+\w+|pec\b|"
+    r"registered\s+office)\b", re.I
+)
+_PRO_SITE_MULTI_RE = re.compile(
+    r"\b(italiano|english|français|deutsch|español|"
+    r"language|lingua)\b|/en/|/it/|/fr/|/de/", re.I
+)
+_PRO_SITE_MEDIA_RE = re.compile(
+    r"\b(wp-content|elementor|webflow|cms|slider|carousel|hero|banner|"
+    r"\.jpg|\.jpeg|\.png|\.webp|\.mp4|\.svg)\b", re.I
+)
+
+
+def _score_professional_site(text: str, domain: str) -> dict:
+    """Score professional site signals from Firecrawl markdown text."""
+    if not text:
+        return {
+            "professional_site_score": 0,
+            "professional_site_level": "none",
+            "professional_site_signals": "",
+        }
+    score = 0
+    signals = []
+
+    # HTTPS bonus
+    if not (domain or "").startswith("http://"):
+        score += 1
+        signals.append("https")
+
+    nav_matches = _PRO_SITE_NAV_RE.findall(text)
+    if len(nav_matches) >= 3:
+        score += 1
+        signals.append(f"navigation({len(nav_matches)} labels)")
+
+    legal_matches = _PRO_SITE_LEGAL_RE.findall(text)
+    if legal_matches:
+        score += 1
+        signals.append(f"legal/footer({len(legal_matches)} terms)")
+
+    if _PRO_SITE_MULTI_RE.search(text):
+        score += 1
+        signals.append("multilanguage")
+
+    if _PRO_SITE_MEDIA_RE.search(text):
+        score += 1
+        signals.append("media/cms")
+
+    if len(nav_matches) >= 5:
+        score += 1
+        signals.append("rich_navigation")
+
+    if len(legal_matches) >= 3:
+        score += 1
+        signals.append("rich_footer")
+
+    level = "none" if score < 3 else "weak" if score < 5 else "medium" if score < 8 else "strong"
+
+    return {
+        "professional_site_score": score,
+        "professional_site_level": level,
+        "professional_site_signals": "; ".join(signals),
+    }
+
+
+# =============================================================================
 # FIRECRAWL WEBSITE VERIFIER
 # =============================================================================
 
@@ -2939,6 +3196,7 @@ def _fc_verify_candidates(
         _active_slots = _ALL_SLOTS       # all three slots
 
     domain_results: dict[str, dict] = {}  # domain -> aggregated result
+    domain_page_texts: dict[str, list] = {}  # domain -> list of scraped texts
     all_statuses: list[str] = []
     total_pages_fetched = 0
     fc_errors: list[str] = []
@@ -3062,6 +3320,7 @@ def _fc_verify_candidates(
                     if _ev_partial.get("negative_source_type") and not neg_src_domain:
                         neg_src_domain = _ev_partial["negative_source_type"]
                     pages_evidence.append(_ev_partial)
+                    domain_page_texts.setdefault(domain, []).append(text)
 
                     # Track best evidence URL for firecrawl_evidence_url
                     if _best_evidence_url == "":
@@ -3154,6 +3413,10 @@ def _fc_verify_candidates(
             )
             neg_src_domain = ""  # clear the blocker so redirect can win
 
+        # Score professional site quality from all scraped text
+        _all_page_texts = " ".join(domain_page_texts.get(domain, []))
+        _pro_site_info = _score_professional_site(_all_page_texts, domain)
+
         domain_results[domain] = {
             "pages_evidence":           pages_evidence,
             "evidence_strength":        strength,
@@ -3164,6 +3427,9 @@ def _fc_verify_candidates(
             "wrong_location_signal":    _any_wrong_loc,
             "redirect_domain_winner":   _redirect_domain_winner,
             "redirect_domain_ev":       _redirect_domain_ev,
+            "professional_site_score":  _pro_site_info["professional_site_score"],
+            "professional_site_level":  _pro_site_info["professional_site_level"],
+            "professional_site_signals": _pro_site_info["professional_site_signals"],
         }
 
         # Back-fill debug rows for this domain
@@ -3372,6 +3638,13 @@ def _fc_verify_candidates(
             firecrawl_evidence_strength="none",
         )
 
+    # Add professional site scoring for the winning domain
+    _winning_dom = fc_out.get("firecrawl_verified_domain") or current_domain
+    _win_dr = domain_results.get(_winning_dom, {})
+    fc_out["professional_site_score"]   = _win_dr.get("professional_site_score", 0)
+    fc_out["professional_site_level"]   = _win_dr.get("professional_site_level", "none")
+    fc_out["professional_site_signals"] = _win_dr.get("professional_site_signals", "")
+
     return fc_out, debug_rows
 
 
@@ -3504,6 +3777,15 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     confidence  = verif_res.get("verifier_confidence", "")
     cur_conf_py = (result.get("final_confidence") or "").strip().lower()
     _py_high    = cur_conf_py == "high"
+
+    # Handle group_subsidiary_page candidate type
+    _raw_ev = result.get("_raw_evidence", [])
+    _final_dom_check = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
+    for _ev in _raw_ev:
+        if (_ev.get("candidate_type") == "group_site_subsidiary_page"
+                and _ev.get("domain", "").lower() == _final_dom_check.lower()):
+            result["final_decision_source"] = result.get("final_decision_source") or "group_subsidiary_page"
+            break
 
     # Shared context
     _fc_status   = str(verif_res.get("firecrawl_fetch_status", "") or "")
@@ -4071,6 +4353,10 @@ _OUTPUT_COLS = [
     "myngle_target_eligibility",
     "pre_filter_decision",
     "pre_filter_reason",
+    # v10 professional site scoring
+    "professional_site_score",
+    "professional_site_level",
+    "professional_site_signals",
 ]
 
 
@@ -4609,6 +4895,16 @@ def _build_best_guess_df(
             )
         elif dec_src == "pre_filter_skip":
             _reason = f"Row skipped by eligibility pre-filter: {str(r.get('pre_filter_reason', '') or '')}."
+        elif dec_src == "plausible_serper_result":
+            _reason = (
+                f"Plausible candidate ({final or py_validated}) found in search but with low confidence. "
+                "Manual review required before use."
+            )
+        elif dec_src == "group_subsidiary_page":
+            _reason = (
+                f"Domain ({final or py_validated}) matched via group/subsidiary page in search results. "
+                "Verify this is the correct company entity."
+            )
         elif final and final == py_validated:
             _reason = f"Python scoring selected {final} (no verifier override)."
         elif final and final != py_validated and py_validated:
@@ -4667,6 +4963,10 @@ def _build_best_guess_df(
             # ── Eligibility pre-filter ────────────────────────────────────────
             "organization_type":                 str(r.get("organization_type", "") or ""),
             "myngle_target_eligibility":         str(r.get("myngle_target_eligibility", "") or ""),
+            # ── Professional site scoring ─────────────────────────────────────
+            "professional_site_score":           r.get("professional_site_score", ""),
+            "professional_site_level":           str(r.get("professional_site_level", "") or ""),
+            "professional_site_signals":         str(r.get("professional_site_signals", "") or ""),
         })
     return pd.DataFrame(rows)
 
