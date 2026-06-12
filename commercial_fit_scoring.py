@@ -186,6 +186,9 @@ SCORE_OUTPUT_COLS: list[str] = [
     "lr_rapid_growth_component",
     # ── Audit: size ──────────────────────────────────────────────────────────
     "employee_range_normalized",
+    "employee_range_source",
+    "employee_range_confidence",
+    "size_needs_manual_review",
     # ── Audit: sigmoid ───────────────────────────────────────────────────────
     "sigmoid_k",
     "sigmoid_s_min",
@@ -291,6 +294,44 @@ def _resolve_size_score(row: dict) -> tuple[float, bool, str]:
     return SIZE_SCORE_MISSING, True, ""
 
 
+# Priority order for employee_range source attribution.
+# lusha_api_employee_range is always "" in Layer 1 (live API disabled),
+# so it falls through to lusha_employee_range (uploaded static data),
+# then employee_range (input file), then company_size (input file).
+_EMPLOYEE_RANGE_SOURCE_PRIORITY: list[tuple[str, str, str]] = [
+    # (field_name, source_label, confidence)
+    ("employee_range",             "input_file",                 "high"),
+    ("lusha_employee_range",       "uploaded_lusha_company_data","medium"),
+    ("lusha_api_employee_range",   "uploaded_lusha_company_data","medium"),
+    ("company_size",               "input_file",                 "high"),
+]
+
+
+def _resolve_employee_range_provenance(row: dict) -> tuple[str, str, bool]:
+    """Return (employee_range_source, employee_range_confidence, size_needs_manual_review).
+
+    Priority:
+    1. employee_range in input file        → input_file / high
+    2. lusha_employee_range (uploaded)     → uploaded_lusha_company_data / medium
+    3. lusha_api_employee_range (uploaded) → uploaded_lusha_company_data / medium
+       (live API is disabled in Layer 1; this field is always "" at runtime)
+    4. company_size in input file          → input_file / high
+    5. missing                             → missing / missing / True
+    """
+    for field, source, confidence in _EMPLOYEE_RANGE_SOURCE_PRIORITY:
+        raw = row.get(field)
+        if not _is_missing(raw):
+            # Only credit the field if the value is parseable (not garbage)
+            norm_key = _normalize_range_str(str(raw))
+            if norm_key in SIZE_BAND_LOOKUP:
+                return source, confidence, False
+            if str(raw).strip() in SIZE_BAND_LOOKUP:
+                return source, confidence, False
+            if _parse_range_midpoint(raw) is not None:
+                return source, confidence, False
+    return "missing", "missing", True
+
+
 def _composite_score(row: dict, fields: list[str], max_per_field: float = 3.0) -> float:
     total   = sum(_to_float(row.get(f, 0)) for f in fields)
     ceiling = max_per_field * len(fields)
@@ -391,6 +432,7 @@ def score_company(
 
     # ── 4. Size score ─────────────────────────────────────────────────────────
     size_score, size_missing, range_key = _resolve_size_score(row)
+    er_source, er_confidence, er_needs_review = _resolve_employee_range_provenance(row)
     out["score_input_employee_range"] = str(
         next((row.get(f) for f in ("lusha_api_employee_range", "lusha_employee_range",
                                    "employee_range", "company_size")
@@ -492,6 +534,10 @@ def score_company(
         "weak_score_drivers":     "; ".join(weak_drivers) if weak_drivers else "none",
         "scoring_notes":          " | ".join(notes),
         "missing_scoring_fields": ", ".join(missing) if missing else "",
+        # ── Employee range provenance (added after Lusha live API disabled) ───
+        "employee_range_source":      er_source,
+        "employee_range_confidence":  er_confidence,
+        "size_needs_manual_review":   er_needs_review,
     })
     return out
 
