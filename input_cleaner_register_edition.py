@@ -19,6 +19,7 @@ Entry point:  streamlit run input_cleaner_register_edition.py
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import time
@@ -3732,6 +3733,64 @@ def main():
             "Jina Reader fetches homepage + /about + /chi-siamo + /contatti per each candidate.  \n"
             "Results are cached within the session."
         )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Firecrawl")
+    # Resolve Firecrawl API key: secrets → env → manual input (never displayed)
+    _fc_key: str | None = None
+    try:
+        _fc_key = st.secrets.get("FIRECRAWL_API_KEY") or st.secrets.get("firecrawl_api_key")
+    except Exception:
+        pass
+    if not _fc_key:
+        _fc_key = os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key")
+    if not _fc_key:
+        _fc_key_input = st.sidebar.text_input(
+            "Firecrawl API key (optional)",
+            type="password",
+            key="reg_firecrawl_key",
+        )
+        if _fc_key_input.strip():
+            _fc_key = _fc_key_input.strip()
+    else:
+        st.sidebar.success("✓ Firecrawl API key loaded.")
+
+    if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
+        if not _fc_key:
+            st.sidebar.warning("No Firecrawl API key provided.")
+        else:
+            _fc_start = time.time()
+            try:
+                _fc_resp = requests.post(
+                    "https://api.firecrawl.dev/v1/scrape",
+                    headers={
+                        "Authorization": f"Bearer {_fc_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"url": "https://www.firecrawl.dev", "formats": ["markdown"]},
+                    timeout=20,
+                )
+                _fc_elapsed = round(time.time() - _fc_start, 2)
+                if _fc_resp.status_code == 200:
+                    _fc_data = _fc_resp.json()
+                    _fc_text = (
+                        (_fc_data.get("data") or {}).get("markdown", "")
+                        or str(_fc_data)
+                    )
+                    st.sidebar.success(
+                        f"✓ Success · {len(_fc_text):,} chars · {_fc_elapsed}s"
+                    )
+                else:
+                    st.sidebar.error(
+                        f"✗ HTTP {_fc_resp.status_code} · {_fc_elapsed}s  \n"
+                        f"{_fc_resp.text[:200]}"
+                    )
+            except requests.Timeout:
+                _fc_elapsed = round(time.time() - _fc_start, 2)
+                st.sidebar.error(f"✗ Timeout after {_fc_elapsed}s")
+            except Exception as _fc_exc:
+                _fc_elapsed = round(time.time() - _fc_start, 2)
+                st.sidebar.error(f"✗ Error · {_fc_elapsed}s  \n{str(_fc_exc)[:200]}")
 
     st.sidebar.markdown("---")
     debug_mode = st.sidebar.checkbox(
