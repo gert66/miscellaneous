@@ -345,7 +345,13 @@ _JINA_CACHE: dict[tuple[str, str], tuple[str, str]] = {}
 # Firecrawl verifier constants
 _FC_API_URL   = "https://api.firecrawl.dev/v1/scrape"
 _FC_MAX_CHARS = 5000  # chars to keep per scraped page
-_FC_CACHE: dict[str, tuple[str, str, dict]] = {}  # url -> (text, status, meta)
+_FC_CACHE: dict[tuple, tuple[str, str, dict]] = {}  # (url, country, languages) -> (text, status, meta)
+
+
+def _make_fc_cache_key(url: str, fc_location: dict | None) -> tuple:
+    """Build a hashable cache key from URL + location (list values are converted to tuple)."""
+    loc = fc_location or {}
+    return (url, loc.get("country", ""), tuple(loc.get("languages", []) or []))
 
 # =============================================================================
 # ORGANIZATION ELIGIBILITY PRE-FILTER
@@ -2482,7 +2488,7 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15, fc_location: dict | Non
       - canonical_url: og:url or canonical link if present
     Results cached by (URL, location) for the lifetime of the Streamlit session.
     """
-    _cache_key = (url, frozenset((fc_location or {}).items()))
+    _cache_key = _make_fc_cache_key(url, fc_location)
     if _cache_key in _FC_CACHE:
         return _FC_CACHE[_cache_key]
 
@@ -2889,7 +2895,15 @@ def _fc_verify_candidates(
                     progress_update_fn(ci, len(candidates), requests_attempted, max_pages, domain)
 
                 _t0 = _time_mod.time()
-                text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout, fc_location=fc_location)
+                _exc_text = ""
+                try:
+                    text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout, fc_location=fc_location)
+                except Exception as _scrape_exc:
+                    text, status, meta = "", "exception", {}
+                    _exc_text = str(_scrape_exc)[:200]
+                    fc_errors.append(f"{domain}{slug}:exception:{_exc_text}")
+                    live_counters.setdefault("fc_exceptions", 0)
+                    live_counters["fc_exceptions"] = live_counters.get("fc_exceptions", 0) + 1
                 _elapsed = _time_mod.time() - _t0
 
                 requests_attempted += 1
@@ -2900,72 +2914,74 @@ def _fc_verify_candidates(
                 if status == "timeout":
                     live_counters["fc_timeouts"] += 1
                     fc_errors.append(f"{domain}{slug}:timeout")
-                    break  # don't try more slugs in this slot on timeout
 
+                # Always emit a debug row for every attempt (even failures)
+                _ev_partial: dict = {}
                 if status == "ok" and text:
                     total_pages_fetched += 1
                     live_counters["fc_pages_successful"] += 1
-                    ev = _extract_fc_evidence(
+                    _ev_partial = _extract_fc_evidence(
                         text, domain, company_name, city, province,
                         email_domain, input_partita_iva, name_variants,
                     )
-                    if ev.get("negative_source_type") and not neg_src_domain:
-                        neg_src_domain = ev["negative_source_type"]
-                    pages_evidence.append(ev)
+                    if _ev_partial.get("negative_source_type") and not neg_src_domain:
+                        neg_src_domain = _ev_partial["negative_source_type"]
+                    pages_evidence.append(_ev_partial)
 
                     # Track best evidence URL for firecrawl_evidence_url
-                    if _best_evidence_url == "" and status == "ok":
+                    if _best_evidence_url == "":
                         _interim_str, _, _ = _compute_evidence_strength(pages_evidence, neg_src_domain)
                         if _interim_str in ("medium", "strong"):
                             _best_evidence_url = url
 
-                    _redirect_url    = meta.get("final_url", "") or meta.get("redirect_url", "")
-                    _redirect_domain = meta.get("redirect_domain", "")
-                    _canonical_url   = meta.get("canonical_url", "")
-                    # If there's a meaningful redirect to a different domain, track it
-                    _canonical_domain_used = _redirect_domain or domain
+                _redirect_url    = meta.get("final_url", "") or meta.get("redirect_url", "")
+                _redirect_domain = meta.get("redirect_domain", "")
+                _canonical_domain_used = _redirect_domain or domain
 
-                    debug_rows.append({
-                        "company_name":             company_name,
-                        "candidate_domain":         domain,
-                        "original_candidate_url":   url,
-                        "page_url":                 _redirect_url or url,
-                        "page_type":                slot_name,
-                        "redirect_final_url":       _redirect_url,
-                        "redirect_final_domain":    _redirect_domain,
-                        "canonical_domain_used":    _canonical_domain_used,
-                        "fetch_status":             status,
-                        "chars_fetched":            len(text),
-                        "elapsed_secs":             round(_elapsed, 2),
-                        "source_type":              ev.get("negative_source_type", "") or "company",
-                        "wrong_entity_type_signal": ev.get("wrong_entity_type_signal", False),
-                        "wrong_location_signal":    ev.get("wrong_location_signal", False),
-                        "evidence_strength":        "",   # filled after domain scoring
-                        "negative_source_type":     ev.get("negative_source_type", ""),
-                        "verifier_decision":        "",
-                        "verifier_reason":          "",
-                        "replace_allowed":          "",
-                    })
+                debug_rows.append({
+                    "company_name":             company_name,
+                    "candidate_domain":         domain,
+                    "original_candidate_url":   url,
+                    "page_url":                 _redirect_url or url,
+                    "page_type":                slot_name,
+                    "redirect_final_url":       _redirect_url,
+                    "redirect_final_domain":    _redirect_domain,
+                    "canonical_domain_used":    _canonical_domain_used,
+                    "fetch_status":             status,
+                    "chars_fetched":            len(text),
+                    "elapsed_secs":             round(_elapsed, 2),
+                    "source_type":              _ev_partial.get("negative_source_type", "") or ("company" if status == "ok" else ""),
+                    "wrong_entity_type_signal": _ev_partial.get("wrong_entity_type_signal", False),
+                    "wrong_location_signal":    _ev_partial.get("wrong_location_signal", False),
+                    "evidence_strength":        "",   # filled after domain scoring
+                    "negative_source_type":     _ev_partial.get("negative_source_type", ""),
+                    "verifier_decision":        "",
+                    "verifier_reason":          "",
+                    "replace_allowed":          "",
+                    "firecrawl_error":          _exc_text,
+                })
 
-                    # If this page redirected to a different domain, also evaluate
-                    # that redirected domain's identity evidence
+                if status != "ok":
+                    if status == "timeout":
+                        break  # don't try more slugs on timeout
+                    elif status.startswith("error:") or status == "exception":
+                        break  # hard error — don't try more slugs
+                    elif status == "404":
+                        continue  # try next slug
+                    else:
+                        continue  # other HTTP error — try next slug
+                else:
+                    # Success: handle redirect evidence
+                    ev = _ev_partial
                     if _redirect_domain and _redirect_domain != domain:
                         _redir_ev = _extract_fc_evidence(
                             text, _redirect_domain, company_name, city, province,
                             email_domain, input_partita_iva, name_variants,
                         )
-                        # Store redirect info for decision logic
                         ev["redirect_domain"]       = _redirect_domain
                         ev["redirect_ev"]           = _redir_ev
                         ev["redirect_final_url"]    = _redirect_url
                     break  # slot satisfied; move to next slot
-                elif status == "404":
-                    continue  # try next slug in this slot
-                elif status.startswith("error:"):
-                    fc_errors.append(f"{domain}{slug}:{status}")
-                    break  # hard error — don't try more slugs
-                else:
-                    continue  # other HTTP error — try next slug
 
         # Aggregate wrong entity / wrong location signals across pages
         _any_wrong_entity = any(e.get("wrong_entity_type_signal") for e in pages_evidence)
@@ -3440,24 +3456,39 @@ def _run_website_verifier(
     all_debug: list[dict] = []
     fc_res: dict = {}
     jina_res: dict = {}
+    _provider_ran = False  # tracks whether any provider actually attempted requests
 
     # ── Firecrawl ────────────────────────────────────────────────────────────
-    if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) and fc_key:
-        try:
-            fc_res, fc_debug = _fc_verify_candidates(
-                company_name, city, province, email_domain, input_partita_iva,
-                name_variants, cands, current_domain, fc_key,
-                max_pages=max_pages, page_timeout=page_timeout,
-                fc_speed_mode=fc_speed_mode,
-                python_confidence=python_confidence,
-                live_counters=live_counters,
-                progress_update_fn=progress_update_fn,
-                fc_location=fc_location,
+    if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
+        if not fc_key:
+            # Key missing — do not count as verified
+            _verif_defaults.update(
+                firecrawl_used=False,
+                firecrawl_decision="skipped_no_firecrawl_key",
+                verifier_decision="skipped_no_firecrawl_key",
+                verifier_error="Firecrawl selected but no API key was provided.",
+                firecrawl_error="No Firecrawl API key.",
             )
-            _verif_defaults.update(fc_res)
-            all_debug.extend(fc_debug)
-        except Exception as exc:
-            _verif_defaults["firecrawl_error"] = str(exc)[:200]
+        else:
+            try:
+                fc_res, fc_debug = _fc_verify_candidates(
+                    company_name, city, province, email_domain, input_partita_iva,
+                    name_variants, cands, current_domain, fc_key,
+                    max_pages=max_pages, page_timeout=page_timeout,
+                    fc_speed_mode=fc_speed_mode,
+                    python_confidence=python_confidence,
+                    live_counters=live_counters,
+                    progress_update_fn=progress_update_fn,
+                    fc_location=fc_location,
+                )
+                _verif_defaults.update(fc_res)
+                all_debug.extend(fc_debug)
+                _provider_ran = True
+            except Exception as exc:
+                _err = str(exc)[:200]
+                _verif_defaults["firecrawl_error"] = _err
+                _verif_defaults["verifier_error"] = _err
+                _provider_ran = True  # attempted but errored
 
     # ── Jina (standalone or fallback) ────────────────────────────────────────
     _jina_needed = (
@@ -3476,11 +3507,14 @@ def _run_website_verifier(
                 if k.startswith("jina_")
             })
             all_debug.extend(jina_debug)
+            _provider_ran = True
         except Exception as exc:
             _verif_defaults["jina_fetch_status"] = f"jina_exception:{str(exc)[:120]}"
+            _provider_ran = True
 
     # ── Build unified verifier_* fields from the winning provider ────────────
-    _verif_defaults["verifier_used"] = True
+    # verifier_used=True only when a provider actually ran (not just "selected")
+    _verif_defaults["verifier_used"] = _provider_ran
 
     # Prefer Firecrawl result if available and actionable
     if fc_res.get("firecrawl_decision") in ("confirm", "replace", "reject"):
@@ -5042,10 +5076,12 @@ def _build_run_meta(
             enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("confirm").sum()
         ),
         "firecrawl_replaced":        int(
-            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("replace").sum()
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str)
+            .str.startswith("replace").sum()
         ),
         "firecrawl_rejected":        int(
-            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("reject").sum()
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str)
+            .str.startswith("reject").sum()
         ),
         "firecrawl_uncertain":       int(
             enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("uncertain").sum()
@@ -5969,17 +6005,18 @@ def main():
         _save_checkpoint(run_id, [], evidence_rows, n, n, run_df, cols, settings_dict,
                          run_label=_run_label)
 
-        st.session_state["reg_enriched"]    = enriched_df
-        st.session_state["reg_evidence"]    = evidence_rows
-        st.session_state["reg_debug"]       = debug_rows
-        st.session_state["reg_jina_debug"]  = jina_debug_rows
-        st.session_state["reg_original"]   = run_df
-        st.session_state["reg_cols"]       = cols
-        st.session_state["reg_run_id"]     = run_id
-        st.session_state["reg_run_label"]  = _run_label
-        st.session_state["reg_filename"]   = _run_filename
-        st.session_state["reg_run_meta"]   = _run_meta
+        st.session_state["reg_enriched"]         = enriched_df
+        st.session_state["reg_evidence"]         = evidence_rows
+        st.session_state["reg_debug"]            = debug_rows
+        st.session_state["reg_jina_debug"]       = jina_debug_rows
+        st.session_state["reg_original"]         = run_df
+        st.session_state["reg_cols"]             = cols
+        st.session_state["reg_run_id"]           = run_id
+        st.session_state["reg_run_label"]        = _run_label
+        st.session_state["reg_filename"]         = _run_filename
+        st.session_state["reg_run_meta"]         = _run_meta
         st.session_state["reg_debug_mode_value"] = debug_mode
+        st.session_state["_fc_live_counters"]    = _fc_live
 
     # ── Results ───────────────────────────────────────────────────────────────
     enriched_df = st.session_state.get("reg_enriched")
@@ -5999,39 +6036,77 @@ def main():
     st.markdown("")
     _show_results(enriched_df, stored_cols)
 
-    # ── Firecrawl live counters (shown when verifier ran) ─────────────────────
-    if "firecrawl_pages_fetched" in enriched_df.columns:
+    # ── Firecrawl diagnostics (shown when Firecrawl was selected) ────────────
+    _active_vp = st.session_state.get("reg_verifier_provider", _VP_OFF)
+    if _active_vp in (_VP_FIRECRAWL, _VP_FC_JINA):
         _fc_pages_total = int(pd.to_numeric(
-            enriched_df["firecrawl_pages_fetched"], errors="coerce").fillna(0).sum())
+            enriched_df.get("firecrawl_pages_fetched", pd.Series(dtype=int)),
+            errors="coerce").fillna(0).sum())
         _fc_rows_used = int(
             enriched_df.get("firecrawl_used", pd.Series(dtype=str)).astype(str)
             .str.lower().isin(["true", "1"]).sum()
         )
-        if _fc_rows_used > 0:
-            with st.expander("Firecrawl request stats", expanded=False):
-                _fc_confirmed = int(
-                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
-                    .astype(str).eq("confirm").sum()
-                )
-                _fc_replaced = int(
-                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
-                    .astype(str).eq("replace").sum()
-                )
-                _fc_rejected = int(
-                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
-                    .astype(str).eq("reject").sum()
-                )
-                _fc_uncertain = int(
-                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
-                    .astype(str).eq("uncertain").sum()
-                )
-                st.markdown(
-                    f"**Rows verified:** {_fc_rows_used}  \n"
-                    f"**Pages fetched (successful):** {_fc_pages_total}  \n"
-                    f"**Avg pages/row:** {round(_fc_pages_total / _fc_rows_used, 1) if _fc_rows_used else 0}  \n"
-                    f"**Decisions:** confirm={_fc_confirmed} · replace={_fc_replaced} · "
-                    f"reject={_fc_rejected} · uncertain={_fc_uncertain}"
-                )
+        _rows_planned = int(
+            enriched_df.get("verification_needed", pd.Series(dtype=str)).astype(str)
+            .str.lower().isin(["true", "1"]).sum()
+        )
+        _verifier_rows = int(
+            enriched_df.get("verifier_used", pd.Series(dtype=str)).astype(str)
+            .str.lower().isin(["true", "1"]).sum()
+        )
+
+        # ── Sanity warning (Fix 6) ──────────────────────────────────────────
+        if _rows_planned > 0 and _fc_pages_total == 0:
+            st.error(
+                f"⚠️ Firecrawl was selected and {_rows_planned} rows were planned for verification, "
+                "but **no Firecrawl pages were fetched**. "
+                "This usually means the Firecrawl cache key raised a TypeError (unhashable list) "
+                "or the API key is missing/invalid. Check _fc_scrape, the API key, and the location payload."
+            )
+
+        _fc_confirmed = int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+            .astype(str).eq("confirm").sum()
+        )
+        _fc_replaced = int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+            .astype(str).str.startswith("replace").sum()
+        )
+        _fc_rejected = int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+            .astype(str).str.startswith("reject").sum()
+        )
+        _fc_uncertain = int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+            .astype(str).eq("uncertain").sum()
+        )
+        # Collect errors for diagnostics (Fix 7)
+        _fc_errors_series = (
+            enriched_df.get("firecrawl_error", pd.Series(dtype=str))
+            .astype(str).replace("", pd.NA).dropna()
+        )
+        _live = st.session_state.get("_fc_live_counters", {})
+
+        with st.expander(
+            f"Firecrawl diagnostics — {_fc_pages_total} pages fetched / {_rows_planned} planned",
+            expanded=(_fc_pages_total == 0 and _rows_planned > 0),
+        ):
+            st.markdown(
+                f"**Planned rows (verification_needed):** {_rows_planned}  \n"
+                f"**Rows with verifier_used=True:** {_verifier_rows}  \n"
+                f"**Rows with firecrawl_used=True:** {_fc_rows_used}  \n"
+                f"**Firecrawl requests attempted:** {_live.get('fc_requests_attempted', '—')}  \n"
+                f"**Pages fetched (successful):** {_fc_pages_total}  \n"
+                f"**Timeouts:** {_live.get('fc_timeouts', '—')}  \n"
+                f"**Exceptions:** {_live.get('fc_exceptions', '—')}  \n"
+                f"**Avg pages/row verified:** "
+                f"{round(_fc_pages_total / _fc_rows_used, 1) if _fc_rows_used else 0}  \n"
+                f"**Decisions:** confirm={_fc_confirmed} · replace={_fc_replaced} · "
+                f"reject={_fc_rejected} · uncertain={_fc_uncertain}"
+            )
+            if not _fc_errors_series.empty:
+                st.markdown("**First 10 firecrawl_error values:**")
+                st.code("\n".join(_fc_errors_series.head(10).tolist()))
 
     _show_run_info_block(
         run_label=_out_label, run_id=active_run_id,
