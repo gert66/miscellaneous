@@ -6272,11 +6272,16 @@ def main():
         )
         haiku_max_rows = st.sidebar.number_input(
             "Max rows to send to Haiku (0 = all)",
-            min_value=0, max_value=5000, value=50, step=10,
+            min_value=0, max_value=5000, value=0, step=10,
             key="reg_haiku_max_rows",
-            help="Limit Haiku calls to keep costs controlled during testing.",
+            help=(
+                "0 = all rows selected by the current Haiku mode.  \n"
+                "For 'Haiku for uncertain rows only', this means all uncertain rows, "
+                "not all input rows.  \n"
+                "Set a positive number to cap Haiku calls during testing."
+            ),
         )
-        _est_calls = haiku_max_rows if haiku_max_rows > 0 else "all"
+        _est_calls = haiku_max_rows if haiku_max_rows > 0 else "all eligible"
         st.sidebar.caption(
             f"Estimated Haiku calls: up to **{_est_calls}** rows.  \n"
             "Haiku input/output tokens ≈ 800/100 per row."
