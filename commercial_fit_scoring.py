@@ -15,7 +15,10 @@ Formula summary
 5.  Size score: exact band lookup (9 bands, 1–10 float scale)
 6.  Blend:
       final_commercial_fit_score =
-          clamp(0.75 × icp_similarity_score + 0.25 × company_size_score, 1, 10)
+          clamp(0.90 × icp_similarity_score + 0.10 × company_size_score, 1, 10)
+
+      (Legacy 75/25 formula also stored as final_commercial_fit_score_75_25_legacy
+       for ranking-impact audit — will be removed once distribution is stable.)
 
 Backward-compatible aliases (calculated from canonical fields, not independently)
 -----------------------------------------------------------------------------------
@@ -28,7 +31,7 @@ Reference validation (Capgemini, all 7 signals supplied)
   lean_model_prob     ≈ 0.7285
   icp_similarity_score ≈ 9.69
   company_size_score  = 10.0
-  final_commercial_fit_score ≈ 9.77
+  final_commercial_fit_score ≈ 9.72  (90/10 blend)
   commercial_tier     = 🥇 Hot
 """
 
@@ -104,9 +107,19 @@ _SIGMOID_P_HI: float = 0.76427
 SIGMOID_S_MIN: float = 1.0 / (1.0 + math.exp(-SIGMOID_K * (_SIGMOID_P_LO - 0.5)))
 SIGMOID_S_MAX: float = 1.0 / (1.0 + math.exp(-SIGMOID_K * (_SIGMOID_P_HI - 0.5)))
 
-#: Blend weights.
-MODEL_WEIGHT: float = 0.75
-SIZE_WEIGHT:  float = 0.25
+#: Blend weights — ICP similarity dominates; size is a secondary commercial factor.
+ICP_SIMILARITY_WEIGHT: float = 0.90
+COMPANY_SIZE_WEIGHT:   float = 0.10
+assert abs((ICP_SIMILARITY_WEIGHT + COMPANY_SIZE_WEIGHT) - 1.0) < 1e-9, \
+    "Blend weights must sum to 1.0"
+
+# Legacy aliases kept for backward compatibility with callers that import MODEL_WEIGHT / SIZE_WEIGHT.
+MODEL_WEIGHT: float = ICP_SIMILARITY_WEIGHT
+SIZE_WEIGHT:  float = COMPANY_SIZE_WEIGHT
+
+# Legacy 75/25 weights — used only to compute the comparison column.
+_LEGACY_MODEL_WEIGHT: float = 0.75
+_LEGACY_SIZE_WEIGHT:  float = 0.25
 
 #: Tier thresholds — inclusive lower bounds, checked in descending order.
 TIER_THRESHOLDS: list[tuple[float, str]] = [
@@ -154,6 +167,7 @@ SCORE_OUTPUT_COLS: list[str] = [
     "company_size_score",
     "company_size_missing",
     "final_commercial_fit_score",
+    "final_commercial_fit_score_75_25_legacy",   # audit comparison — temporary
     "commercial_tier",
     # ── Backward-compat aliases ──────────────────────────────────────────────
     "lean_model_logit",       # = lr_z_score
@@ -458,10 +472,15 @@ def score_company(
             f"{_src_label}: {range_key} → company_size_score {round(size_score, 2)}/10."
         )
 
-    # ── 5. Blend ──────────────────────────────────────────────────────────────
-    w_model = MODEL_WEIGHT * icp_sim
-    w_size  = SIZE_WEIGHT  * size_score
+    # ── 5. Blend — 90% ICP signal similarity + 10% company size ─────────────
+    w_model = ICP_SIMILARITY_WEIGHT * icp_sim
+    w_size  = COMPANY_SIZE_WEIGHT   * size_score
     final   = _clamp(w_model + w_size, 1.0, 10.0)
+    # Legacy 75/25 formula — kept temporarily for ranking-impact audit.
+    _legacy_final = _clamp(
+        _LEGACY_MODEL_WEIGHT * icp_sim + _LEGACY_SIZE_WEIGHT * size_score,
+        1.0, 10.0,
+    )
 
     # ── 6. Tier ───────────────────────────────────────────────────────────────
     tier = TIER_THRESHOLDS[-1][1]
@@ -509,7 +528,10 @@ def score_company(
     elif manual_rev:
         notes.append("Flagged for manual review; score reliability is reduced.")
 
-    notes.append(f"Company size score: {size_score}/10.")
+    notes.append(
+        f"Final score = 90% ICP signal similarity + 10% company size "
+        f"({round(icp_sim, 2)} × 0.90 + {round(size_score, 2)} × 0.10 = {round(final, 2)}/10)."
+    )
 
     # ── Assemble result ───────────────────────────────────────────────────────
     out.update({
@@ -519,8 +541,9 @@ def score_company(
         "icp_similarity_score":        round(icp_sim, 2),
         "company_size_score":          round(size_score, 2),
         "company_size_missing":        size_missing,
-        "final_commercial_fit_score":  round(final, 2),
-        "commercial_tier":             tier,
+        "final_commercial_fit_score":              round(final, 2),
+        "final_commercial_fit_score_75_25_legacy": round(_legacy_final, 2),
+        "commercial_tier":                         tier,
         # Backward-compat aliases (derived from canonical — not a separate calculation)
         "lean_model_logit":            round(lr_z, 6),
         "model_probability":           round(lean_model_prob, 7),
@@ -588,6 +611,14 @@ if __name__ == "__main__":
     def _section(title: str) -> None:
         print(f"\n{'─'*60}\n  {title}\n{'─'*60}")
 
+    def _tier_for(score: float) -> str:
+        t = TIER_THRESHOLDS[-1][1]
+        for thresh, lbl in TIER_THRESHOLDS:
+            if score >= thresh:
+                t = lbl
+                break
+        return t
+
     # ── Smoke Test 1: Capgemini reference ─────────────────────────────────────
     _section("Smoke Test 1: Capgemini reference values (Results(8).xlsx)")
 
@@ -626,12 +657,12 @@ if __name__ == "__main__":
     _chk("company_size_score = 10",
          r1["company_size_score"] == 10.0,
          str(r1["company_size_score"]))
-    _chk("final_commercial_fit_score ≈ 9.77  (k=10)",
-         abs(r1["final_commercial_fit_score"] - 9.77) < 0.05,
+    _chk("final_commercial_fit_score ≈ 9.72  (90/10 blend, k=10)",
+         abs(r1["final_commercial_fit_score"] - 9.72) < 0.05,
          str(r1["final_commercial_fit_score"]))
-    _chk("final_commercial_fit_score ≠ 9.99  (old wrong value)",
-         abs(r1["final_commercial_fit_score"] - 9.99) > 0.1,
-         str(r1["final_commercial_fit_score"]))
+    _chk("final_commercial_fit_score_75_25_legacy ≈ 9.77  (old 75/25 formula)",
+         abs(r1["final_commercial_fit_score_75_25_legacy"] - 9.77) < 0.05,
+         str(r1["final_commercial_fit_score_75_25_legacy"]))
     _chk("commercial_tier = 🥇 Hot",
          r1["commercial_tier"] == "🥇 Hot",
          r1["commercial_tier"])
@@ -757,6 +788,65 @@ if __name__ == "__main__":
         _chk(f"score {score_val} → {expected_tier}",
              computed_tier == expected_tier,
              computed_tier)
+
+    # ── Smoke Test 11: 90/10 weight verification ─────────────────────────────
+    _section("Smoke Test 11: 90/10 blend — weights, legacy, tier")
+
+    # Sanity: weights sum to 1
+    _chk("ICP_SIMILARITY_WEIGHT + COMPANY_SIZE_WEIGHT == 1.0",
+         abs((ICP_SIMILARITY_WEIGHT + COMPANY_SIZE_WEIGHT) - 1.0) < 1e-9)
+    _chk("ICP_SIMILARITY_WEIGHT == 0.90", ICP_SIMILARITY_WEIGHT == 0.90)
+    _chk("COMPANY_SIZE_WEIGHT   == 0.10", COMPANY_SIZE_WEIGHT   == 0.10)
+
+    # Case A: High ICP, low size — score should stay high because ICP dominates
+    case_a = {
+        "sig_foreign_hq_score": 3, "sig_explicit_lnd_score": 3,
+        "sig_intl_footprint_score": 3, "sig_employer_branding_score": 3,
+        "sig_lnd_onboarding_score": 3, "ti_onboarding_score": 3,
+        "sig_rapid_growth_score": 3,
+        "lusha_api_employee_range": "1 - 10",   # size_score = 1.0
+    }
+    ra = score_company(case_a)
+    _chk("Case A: final > 8.0  (high ICP dominates over low size)",
+         ra["final_commercial_fit_score"] > 8.0,
+         str(ra["final_commercial_fit_score"]))
+    _chk("Case A: final > final_75_25_legacy  (90/10 helps high-ICP rows)",
+         ra["final_commercial_fit_score"] >= ra["final_commercial_fit_score_75_25_legacy"],
+         f"{ra['final_commercial_fit_score']} vs {ra['final_commercial_fit_score_75_25_legacy']}")
+    _chk("Case A: legacy column present",
+         "final_commercial_fit_score_75_25_legacy" in ra)
+
+    # Case B: Medium ICP, very high size — should NOT be artificially inflated
+    case_b_signals = {f: 1 for f in LEAN_COEFFICIENTS}
+    case_b_signals["lusha_api_employee_range"] = "100001 - 10000000"  # size_score = 10.0
+    rb = score_company(case_b_signals)
+    _chk("Case B: final < 7.0  (medium ICP, size barely helps now)",
+         rb["final_commercial_fit_score"] < 7.0,
+         str(rb["final_commercial_fit_score"]))
+    _chk("Case B: final < final_75_25_legacy  (90/10 correctly deflates size-inflated rows)",
+         rb["final_commercial_fit_score"] <= rb["final_commercial_fit_score_75_25_legacy"],
+         f"{rb['final_commercial_fit_score']} vs {rb['final_commercial_fit_score_75_25_legacy']}")
+
+    # Case C: High ICP, high size — should be among the highest
+    case_c = {
+        "sig_foreign_hq_score": 3, "sig_explicit_lnd_score": 3,
+        "sig_intl_footprint_score": 3, "sig_employer_branding_score": 3,
+        "sig_lnd_onboarding_score": 3, "ti_onboarding_score": 3,
+        "sig_rapid_growth_score": 3,
+        "lusha_api_employee_range": "100001 - 10000000",  # size_score = 10.0
+    }
+    rc = score_company(case_c)
+    _chk("Case C: final > 9.5  (high ICP + high size = top score)",
+         rc["final_commercial_fit_score"] > 9.5,
+         str(rc["final_commercial_fit_score"]))
+    _chk("Case C: final >= Case A final  (size still adds a small boost)",
+         rc["final_commercial_fit_score"] >= ra["final_commercial_fit_score"],
+         f"{rc['final_commercial_fit_score']} vs {ra['final_commercial_fit_score']}")
+    _chk("Case C: tier = 🥇 Hot", rc["commercial_tier"] == "🥇 Hot", rc["commercial_tier"])
+
+    # Confirm tier uses the NEW score, not legacy
+    _chk("Case A: tier computed from final_commercial_fit_score (not legacy)",
+         ra["commercial_tier"] == _tier_for(ra["final_commercial_fit_score"]))
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'═'*60}")

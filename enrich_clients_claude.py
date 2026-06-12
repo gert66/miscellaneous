@@ -4357,6 +4357,7 @@ def _xl_write_scoring_settings(ws) -> None:
             INTERCEPT as _INT, LEAN_COEFFICIENTS as _LC,
             SIZE_BAND_LOOKUP as _SB, TIER_THRESHOLDS as _TT,
             SIGMOID_K as _SIGMOID_K,
+            ICP_SIMILARITY_WEIGHT as _ICW, COMPANY_SIZE_WEIGHT as _CSW,
         )
     except ImportError:
         ws.cell(row=1, column=1, value="Scoring module not available")
@@ -4376,6 +4377,16 @@ def _xl_write_scoring_settings(ws) -> None:
     r += 1
     ws.cell(row=r, column=1, value="Sigmoid steepness k").font = bold
     ws.cell(row=r, column=2, value=_SIGMOID_K).font = norm
+    r += 1
+    ws.cell(row=r, column=1, value="ICP similarity weight").font = bold
+    ws.cell(row=r, column=2, value=_ICW).font = norm
+    r += 1
+    ws.cell(row=r, column=1, value="Company size weight").font = bold
+    ws.cell(row=r, column=2, value=_CSW).font = norm
+    r += 1
+    ws.cell(row=r, column=1,
+            value="Legacy 75/25 comparison score: final_commercial_fit_score_75_25_legacy "
+                  "(temporary audit column — will be removed once distribution is stable)").font = norm
     r += 2
 
     ws.cell(row=r, column=1, value="Lean Model Coefficients").font = bold
@@ -4961,8 +4972,9 @@ def _xl_write_opportunity_input(
         ("score_employee_range_source",        ["score_employee_range_source"]),
         ("score_employee_range_confidence",    ["score_employee_range_confidence"]),
         # ── Commercial scoring ────────────────────────────────────────────────
-        ("commercial_fit_score", ["final_commercial_fit_score"]),
-        ("commercial_tier",      ["commercial_tier"]),
+        ("commercial_fit_score",         ["final_commercial_fit_score"]),
+        ("commercial_fit_score_75_25_legacy", ["final_commercial_fit_score_75_25_legacy"]),
+        ("commercial_tier",              ["commercial_tier"]),
         ("model_probability",    ["model_probability", "lean_model_prob"]),
         ("lean_model_prob",      ["lean_model_prob"]),
         ("scoring_notes",        ["scoring_notes"]),
