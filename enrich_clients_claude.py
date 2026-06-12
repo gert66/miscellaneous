@@ -518,6 +518,188 @@ ALL_ENRICHMENT_FIELDS = (
     + META_FIELDS + DOMAIN_VALIDATION_FIELDS + MODEL_SIGNAL_FIELDS
 )
 
+# Employee range resolver output fields (populated before scoring)
+EMPLOYEE_RANGE_RESOLVER_FIELDS = [
+    "employee_range_resolved",
+    "employee_range_source",
+    "employee_range_confidence",
+    "employee_range_notes",
+]
+
+# ── Canonical size bands (must match commercial_fit_scoring.SIZE_BAND_LOOKUP) ─
+_SIZE_BANDS_ORDERED = [
+    (10,       "1 - 10"),
+    (50,       "11 - 50"),
+    (200,      "51 - 200"),
+    (500,      "201 - 500"),
+    (1_000,    "501 - 1000"),
+    (5_000,    "1001 - 5000"),
+    (10_000,   "5001 - 10000"),
+    (100_000,  "10001 - 100000"),
+    (10_000_000, "100001 - 10000000"),
+]
+
+_EMPLOYEE_NUMBER_RE = re.compile(
+    r"(?:(?:over|more\s+than|beyond|circa|approximately|about|~)?\s*)"
+    r"([\d][,\d]*(?:\.\d+)?)\s*"
+    r"(?:k\b)?"
+    r"(?:[,\s]+(?:to|[-–—])\s*([\d][,\d]*(?:\.\d+)?))?(?:\s*k\b)?"
+    r"\s*(?:employees?|people|staff|workforce|collaboratori|dipendenti|"
+    r"team\s+members?|risorse|headcount)",
+    re.IGNORECASE,
+)
+_TEAM_OF_RE = re.compile(
+    r"team\s+of\s+([\d][,\d]*)",
+    re.IGNORECASE,
+)
+_EMPLOYS_RE = re.compile(
+    r"employs?\s+([\d][,\d]*)",
+    re.IGNORECASE,
+)
+
+
+def _num_to_size_band(n: float) -> str:
+    """Map a numeric employee count to the nearest canonical size band."""
+    for upper, band in _SIZE_BANDS_ORDERED:
+        if n <= upper:
+            return band
+    return "100001 - 10000000"
+
+
+def _parse_employee_number(text: str) -> tuple[float | None, str]:
+    """Extract employee count from free text. Returns (midpoint, matched_text)."""
+    def _clean(s: str) -> float:
+        return float(s.replace(",", "").replace(" ", ""))
+
+    for pat in (_EMPLOYEE_NUMBER_RE, _TEAM_OF_RE, _EMPLOYS_RE):
+        m = pat.search(text)
+        if m:
+            groups = [g for g in m.groups() if g]
+            try:
+                if len(groups) >= 2:
+                    lo, hi = _clean(groups[0]), _clean(groups[1])
+                    return (lo + hi) / 2.0, m.group(0).strip()
+                else:
+                    n = _clean(groups[0])
+                    if "k" in m.group(0).lower():
+                        n *= 1_000
+                    return n, m.group(0).strip()
+            except (ValueError, IndexError):
+                continue
+    return None, ""
+
+
+def resolve_employee_range(row: dict, company_name: str = "") -> dict:
+    """
+    Determine the best available employee range for a row.
+    Returns a dict with: employee_range_resolved, employee_range_source,
+    employee_range_confidence, employee_range_notes.
+
+    Priority:
+    1. Existing Lucia/Lusha API or input data (lusha_api_employee_range,
+       lusha_employee_range, employee_range, company_size, Company Number of Employees)
+    2. Explicit number/range in text fields (lusha_description, icp_evidence, etc.)
+    3. Conservative heuristic from profile signals (Low confidence)
+    4. Unknown — leave blank
+    """
+    def _is_blank(v) -> bool:
+        return v is None or str(v).strip() in ("", "nan", "None", "N/A", "-")
+
+    result = {
+        "employee_range_resolved":  "",
+        "employee_range_source":    "missing",
+        "employee_range_confidence": "None",
+        "employee_range_notes":     "",
+    }
+
+    # ── Priority 1: existing structured data ─────────────────────────────────
+    for field in (
+        "lusha_api_employee_range", "lusha_employee_range",
+        "employee_range", "company_size",
+        "Company Number of Employees",
+    ):
+        raw = row.get(field)
+        if _is_blank(raw):
+            continue
+        raw_s = str(raw).strip()
+        # Normalise to canonical band via midpoint
+        n, _ = _parse_employee_number(raw_s)
+        band = _num_to_size_band(n) if n is not None else raw_s
+        # Accept if it looks like a valid range string or number
+        if band or raw_s:
+            result["employee_range_resolved"]  = band or raw_s
+            result["employee_range_source"]    = "existing_lucia_or_input_employee_range"
+            result["employee_range_confidence"] = "High"
+            result["employee_range_notes"]     = f"From field '{field}': {raw_s}"
+            return result
+
+    # ── Priority 2: explicit text evidence ───────────────────────────────────
+    text_fields = [
+        "lusha_description", "icp_evidence", "icp_why_relevant",
+        "scoring_notes",
+    ]
+    # Also include any *_evidence column
+    for k in row:
+        if k.endswith("_evidence") and k not in text_fields:
+            text_fields.append(k)
+    for field in text_fields:
+        val = row.get(field)
+        if _is_blank(val):
+            continue
+        n, matched = _parse_employee_number(str(val))
+        if n is not None and n > 0:
+            band = _num_to_size_band(n)
+            conf = "High" if n >= 100 else "Medium"
+            result["employee_range_resolved"]  = band
+            result["employee_range_source"]    = "explicit_text_employee_evidence"
+            result["employee_range_confidence"] = conf
+            result["employee_range_notes"]     = f"Parsed from '{field}': \"{matched}\""
+            return result
+
+    # ── Priority 3: conservative heuristic ───────────────────────────────────
+    # Combine available text for signal detection
+    _profile_text = " ".join(
+        str(row.get(f) or "")
+        for f in ("lusha_description", "icp_evidence", "icp_why_relevant",
+                  "lusha_specialties", "lusha_company_type", "lusha_industry",
+                  "lusha_continent", "lusha_country")
+    ).lower()
+
+    _LARGE_SIGNALS = (
+        "multinational", "global enterprise", "worldwide", "major bank",
+        "large consulting", "listed", "publicly listed", "fortune", "nyse", "nasdaq",
+        "stock exchange", "group of companies", "international group",
+        "340,000", "100,000", "50,000",
+    )
+    _MID_SIGNALS = (
+        "multiple plants", "multiple offices", "several offices", "national",
+        "manufacturing company", "industrial company", "multi-site",
+    )
+    _SMALL_SIGNALS = (
+        "local", "small agency", "boutique", "studio", "freelance",
+        "startup", "start-up",
+    )
+
+    if any(s in _profile_text for s in _LARGE_SIGNALS):
+        band = "10001 - 100000"
+        note = "Heuristic: large/global enterprise signals detected. Conservative estimate — Low confidence."
+    elif any(s in _profile_text for s in _MID_SIGNALS):
+        band = "201 - 500"
+        note = "Heuristic: mid-sized company signals detected. Conservative estimate — Low confidence."
+    elif any(s in _profile_text for s in _SMALL_SIGNALS):
+        band = "11 - 50"
+        note = "Heuristic: small/local company signals detected. Conservative estimate — Low confidence."
+    else:
+        # No useful signal — leave blank
+        result["employee_range_notes"] = "No employee range data found in any source."
+        return result
+
+    result["employee_range_resolved"]  = band
+    result["employee_range_source"]    = "heuristic_size_estimate"
+    result["employee_range_confidence"] = "Low"
+    result["employee_range_notes"]     = note
+    return result
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Extreme Light Mode (ELM) — zero-token, no API key, keyword-only extraction
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5482,6 +5664,30 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
     enriched_df = pd.DataFrame(results)
     for col in flist:
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
+
+    # ── Employee range resolver — runs before scoring ─────────────────────────
+    # Populates employee_range_resolved, employee_range_source, etc.
+    # Then back-fills lusha_employee_range only when empty so the scoring
+    # module picks up the resolved value.
+    _er_records = df_out.to_dict("records")
+    _er_results = []
+    for _rec in _er_records:
+        _cname = str(_rec.get("lusha_company_name") or _rec.get("company_name") or "")
+        _er = resolve_employee_range(_rec, company_name=_cname)
+        _er_results.append(_er)
+    for col in EMPLOYEE_RANGE_RESOLVER_FIELDS:
+        df_out[col] = [r.get(col, "") for r in _er_results]
+    # Back-fill lusha_employee_range with resolved value only when currently empty
+    def _is_blank_val(v) -> bool:
+        return v is None or str(v).strip() in ("", "nan", "None", "N/A", "-")
+    _resolved_vals = df_out["employee_range_resolved"].tolist()
+    _existing_lusha = df_out.get("lusha_employee_range",
+                                  pd.Series([""] * len(df_out))).tolist()
+    df_out["lusha_employee_range"] = [
+        _resolved_vals[i] if _is_blank_val(_existing_lusha[i]) else _existing_lusha[i]
+        for i in range(len(df_out))
+    ]
+
     if not st.session_state.get("_elm_mode", False):
         try:
             df_out = apply_results_compatible_scoring(df_out)

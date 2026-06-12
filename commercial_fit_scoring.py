@@ -444,6 +444,17 @@ def score_company(
             "No employee range data found; company_size_score defaulted to "
             f"{SIZE_SCORE_MISSING}."
         )
+    else:
+        _src_label = {
+            "input_file":                  "Employee range from input/Lucia data",
+            "uploaded_lusha_company_data": "Employee range from uploaded Lusha data",
+            "explicit_text_employee_evidence": "Employee range extracted from text evidence",
+            "heuristic_size_estimate":     "Employee range estimated heuristically (Low confidence)",
+            "existing_lucia_or_input_employee_range": "Employee range from Lucia/input data",
+        }.get(er_source, f"Employee range (source: {er_source})")
+        notes.append(
+            f"{_src_label}: {range_key} → company_size_score {round(size_score, 2)}/10."
+        )
 
     # ── 5. Blend ──────────────────────────────────────────────────────────────
     w_model = MODEL_WEIGHT * icp_sim
