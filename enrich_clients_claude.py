@@ -7458,7 +7458,7 @@ if ss("enrichment_done", False):
                 _xl_autosave_final_done=True,
             )
             st.caption(
-                f"📄 Autosaved to **{_XL_AUTOSAVE_DIR}/{_xl_fin_fname}**"
+                f"📄 Autosaved to **{_xl_fin_msg}**"
             )
         else:
             ss_set(_xl_autosave_final_done=True)
