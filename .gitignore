@@ -15,3 +15,4 @@ company_enrichment_runs/
 !test.csv
 .venv/
 venv/
+autosave/
