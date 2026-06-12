@@ -2989,79 +2989,202 @@ def _score_professional_site(text: str, domain: str) -> dict:
 # =============================================================================
 
 
-def _fc_load_key() -> str | None:
-    """Load Firecrawl API key from st.secrets, then os.getenv. Never logs or displays it."""
+def _fc_load_keys() -> list[str]:
+    """
+    Load all Firecrawl API keys from st.secrets and environment variables.
+    Sources tried in order:
+      1. st.secrets["FIRECRAWL_API_KEYS"]  (list)
+      2. st.secrets["FIRECRAWL_API_KEY"] / ["firecrawl_api_key"]
+      3. st.secrets["FIRECRAWL_API_KEY_1"] … ["FIRECRAWL_API_KEY_5"]
+      4. os.getenv("FIRECRAWL_API_KEYS") (comma-separated)
+      5. os.getenv("FIRECRAWL_API_KEY") / os.getenv("firecrawl_api_key")
+      6. os.getenv("FIRECRAWL_API_KEY_1") … os.getenv("FIRECRAWL_API_KEY_5")
+    Never logs or displays key values.
+    """
+    raw: list[str] = []
     try:
-        k = st.secrets.get("FIRECRAWL_API_KEY") or st.secrets.get("firecrawl_api_key")
-        if k:
-            return k
+        _keys_list = st.secrets.get("FIRECRAWL_API_KEYS")
+        if _keys_list:
+            if isinstance(_keys_list, (list, tuple)):
+                raw.extend(str(k) for k in _keys_list)
+            else:
+                raw.append(str(_keys_list))
+        for _name in ("FIRECRAWL_API_KEY", "firecrawl_api_key"):
+            _v = st.secrets.get(_name)
+            if _v:
+                raw.append(str(_v))
+        for _i in range(1, 6):
+            _v = st.secrets.get(f"FIRECRAWL_API_KEY_{_i}")
+            if _v:
+                raw.append(str(_v))
     except Exception:
         pass
-    return os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key") or None
+    _env_multi = os.getenv("FIRECRAWL_API_KEYS", "")
+    if _env_multi:
+        raw.extend(_env_multi.split(","))
+    for _name in ("FIRECRAWL_API_KEY", "firecrawl_api_key"):
+        _v = os.getenv(_name)
+        if _v:
+            raw.append(_v)
+    for _i in range(1, 6):
+        _v = os.getenv(f"FIRECRAWL_API_KEY_{_i}")
+        if _v:
+            raw.append(_v)
+    # Deduplicate preserving order, strip whitespace, drop empty
+    seen: set[str] = set()
+    result: list[str] = []
+    for k in raw:
+        k = k.strip()
+        if k and k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result
 
 
-def _fc_scrape(url: str, fc_key: str, timeout: int = 15, fc_location: dict | None = None) -> tuple[str, str, dict]:
+def _fc_load_key() -> str | None:
+    """Load a single Firecrawl API key (backward-compatible wrapper)."""
+    keys = _fc_load_keys()
+    return keys[0] if keys else None
+
+
+# HTTP status codes / response text patterns that indicate a key/account problem
+# and should trigger failover to the next key.
+_FC_KEY_FAILURE_CODES = {401, 402, 403, 429}
+_FC_KEY_FAILURE_TERMS = (
+    "quota", "credits", "rate limit", "payment", "billing",
+    "unauthorized", "forbidden", "invalid api key", "invalid_api_key",
+)
+
+
+def _fc_is_key_failure(status_code: int, resp_text: str) -> bool:
+    """Return True if the response indicates a key/account/quota problem."""
+    if status_code in _FC_KEY_FAILURE_CODES:
+        return True
+    _lower = resp_text.lower()
+    return any(t in _lower for t in _FC_KEY_FAILURE_TERMS)
+
+
+def _fc_scrape(
+    url: str,
+    fc_key: str | list[str],
+    timeout: int = 15,
+    fc_location: dict | None = None,
+) -> tuple[str, str, dict]:
     """
     Scrape a single URL via Firecrawl v1 scrape endpoint.
     Returns (markdown_text, fetch_status, metadata_dict).
     metadata_dict includes:
-      - redirect_url: final URL after any redirects (from Firecrawl sourceURL/url metadata)
-      - redirect_domain: extracted domain of redirect_url if different from original
-      - canonical_url: og:url or canonical link if present
+      - redirect_url / redirect_domain / canonical_url / final_url
+      - firecrawl_key_index_used   (1-based)
+      - firecrawl_key_failover_count
+      - firecrawl_key_statuses     (e.g. "key1:http_402; key2:ok")
+    Accepts a single key string or a list of keys.
+    On key/quota/auth failure tries each key in order; does NOT failover for
+    timeout / 404 / page-content issues.
     Results cached by (URL, location) for the lifetime of the Streamlit session.
     """
     _cache_key = _make_fc_cache_key(url, fc_location)
     if _cache_key in _FC_CACHE:
         return _FC_CACHE[_cache_key]
 
+    # Normalise to list
+    if isinstance(fc_key, list):
+        keys = [k for k in fc_key if k]
+    else:
+        keys = [fc_key] if fc_key else []
+    if not keys:
+        result = ("", "no_key", {"firecrawl_key_index_used": 0,
+                                  "firecrawl_key_failover_count": 0,
+                                  "firecrawl_key_statuses": "no_key"})
+        _FC_CACHE[_cache_key] = result
+        return result
+
+    _payload: dict = {"url": url, "formats": ["markdown"]}
+    if fc_location:
+        _payload["location"] = fc_location
+
     text, status, meta = "", "not_attempted", {}
-    try:
-        _payload: dict = {"url": url, "formats": ["markdown"]}
-        if fc_location:
-            _payload["location"] = fc_location
-        resp = requests.post(
-            _FC_API_URL,
-            headers={"Authorization": f"Bearer {fc_key}", "Content-Type": "application/json"},
-            json=_payload,
-            timeout=timeout,
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            page_data = body.get("data") or {}
-            text  = (page_data.get("markdown") or "")[:_FC_MAX_CHARS]
-            raw_meta = page_data.get("metadata") or {}
-            meta = dict(raw_meta)
+    key_statuses: list[str] = []
+    key_index_used = 1
+    failover_count = 0
 
-            # Capture redirect / canonical destination
-            redirect_url = (
-                meta.get("sourceURL") or meta.get("url") or meta.get("ogUrl") or ""
+    for _ki, _key in enumerate(keys, start=1):
+        try:
+            resp = requests.post(
+                _FC_API_URL,
+                headers={"Authorization": f"Bearer {_key}", "Content-Type": "application/json"},
+                json=_payload,
+                timeout=timeout,
             )
-            canonical_url = meta.get("canonicalUrl") or meta.get("canonical") or ""
-            final_url = canonical_url or redirect_url or ""
-            meta["redirect_url"]    = redirect_url
-            meta["canonical_url"]   = canonical_url
-            meta["final_url"]       = final_url
+            if resp.status_code == 200:
+                body = resp.json()
+                page_data = body.get("data") or {}
+                text  = (page_data.get("markdown") or "")[:_FC_MAX_CHARS]
+                raw_meta = page_data.get("metadata") or {}
+                meta = dict(raw_meta)
 
-            # Extract redirect domain
-            _redirect_domain = ""
-            _origin_domain = re.sub(r"^https?://([^/]+).*$", r"\1", url).lower().lstrip("www.")
-            if final_url:
-                _rd = re.sub(r"^https?://([^/]+).*$", r"\1", final_url).lower().lstrip("www.")
-                if _rd and _rd != _origin_domain:
-                    _redirect_domain = _rd
-            meta["redirect_domain"] = _redirect_domain
+                redirect_url  = meta.get("sourceURL") or meta.get("url") or meta.get("ogUrl") or ""
+                canonical_url = meta.get("canonicalUrl") or meta.get("canonical") or ""
+                final_url     = canonical_url or redirect_url or ""
+                meta["redirect_url"]    = redirect_url
+                meta["canonical_url"]   = canonical_url
+                meta["final_url"]       = final_url
 
-            status = "ok"
-        elif resp.status_code == 404:
-            status = "404"
-        else:
-            status = f"http_{resp.status_code}"
-    except requests.Timeout:
-        status = "timeout"
-    except Exception as exc:
-        status = f"error:{str(exc)[:80]}"
+                _redirect_domain = ""
+                _origin_domain = re.sub(r"^https?://([^/]+).*$", r"\1", url).lower().lstrip("www.")
+                if final_url:
+                    _rd = re.sub(r"^https?://([^/]+).*$", r"\1", final_url).lower().lstrip("www.")
+                    if _rd and _rd != _origin_domain:
+                        _redirect_domain = _rd
+                meta["redirect_domain"] = _redirect_domain
 
-    _FC_CACHE[_cache_key] = (text, status, meta)
+                status = "ok"
+                key_statuses.append(f"key{_ki}:ok")
+                key_index_used = _ki
+                break  # success — stop trying keys
+
+            elif resp.status_code == 404:
+                status = "404"
+                key_statuses.append(f"key{_ki}:404")
+                break  # page problem, not a key problem
+
+            else:
+                _raw_status = f"http_{resp.status_code}"
+                key_statuses.append(f"key{_ki}:{_raw_status}")
+                if _fc_is_key_failure(resp.status_code, resp.text):
+                    # Key/quota problem — try next key
+                    status = _raw_status
+                    key_index_used = _ki
+                    if _ki < len(keys):
+                        failover_count += 1
+                    continue
+                # Non-key HTTP error — stop trying
+                status = _raw_status
+                key_index_used = _ki
+                break
+
+        except requests.Timeout:
+            status = "timeout"
+            key_statuses.append(f"key{_ki}:timeout")
+            key_index_used = _ki
+            break  # timeout is a page/network problem, not a key problem
+        except Exception as exc:
+            status = f"error:{str(exc)[:80]}"
+            key_statuses.append(f"key{_ki}:{status}")
+            key_index_used = _ki
+            break
+
+    meta["firecrawl_key_index_used"]   = key_index_used
+    meta["firecrawl_key_failover_count"] = failover_count
+    meta["firecrawl_key_statuses"]     = "; ".join(key_statuses)
+
+    # Only cache if the final status is not a key/account failure
+    # (prevents blocking a future run from trying another key)
+    _is_key_fail = status.startswith("http_") and any(
+        str(c) in status for c in _FC_KEY_FAILURE_CODES
+    )
+    if not _is_key_fail:
+        _FC_CACHE[_cache_key] = (text, status, meta)
     return text, status, meta
 
 
@@ -3311,7 +3434,7 @@ def _fc_verify_candidates(
     name_variants: dict,
     candidates: list[str],
     current_domain: str,
-    fc_key: str,
+    fc_key: str | list[str],
     max_pages: int = 3,
     page_timeout: int = 15,
     fc_speed_mode: str = _FC_SPEED_FAST,
@@ -3356,9 +3479,10 @@ def _fc_verify_candidates(
     live_counters.setdefault("fc_timeouts", 0)
     live_counters.setdefault("fc_total_secs", 0.0)
 
-    if not candidates or not fc_key:
+    _fc_keys_norm = fc_key if isinstance(fc_key, list) else ([fc_key] if fc_key else [])
+    if not candidates or not _fc_keys_norm:
         fc_out.update(
-            firecrawl_used=bool(fc_key),
+            firecrawl_used=bool(_fc_keys_norm),
             firecrawl_decision="no_candidates" if not candidates else "no_key",
             firecrawl_reason="No candidates to verify" if not candidates else "No Firecrawl key",
         )
@@ -3486,7 +3610,7 @@ def _fc_verify_candidates(
                 _t0 = _time_mod.time()
                 _exc_text = ""
                 try:
-                    text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout, fc_location=fc_location)
+                    text, status, meta = _fc_scrape(url, _fc_keys_norm, timeout=page_timeout, fc_location=fc_location)
                 except Exception as _scrape_exc:
                     text, status, meta = "", "exception", {}
                     _exc_text = str(_scrape_exc)[:200]
@@ -3549,6 +3673,9 @@ def _fc_verify_candidates(
                     "verifier_reason":          "",
                     "replace_allowed":          "",
                     "firecrawl_error":          _exc_text,
+                    "firecrawl_key_index_used":     meta.get("firecrawl_key_index_used", ""),
+                    "firecrawl_key_failover_count": meta.get("firecrawl_key_failover_count", ""),
+                    "firecrawl_key_statuses":       meta.get("firecrawl_key_statuses", ""),
                 })
 
                 if status != "ok":
@@ -3641,6 +3768,10 @@ def _fc_verify_candidates(
     fc_out["firecrawl_pages_fetched"] = total_pages_fetched
     fc_out["firecrawl_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
     fc_out["firecrawl_evidence_url"]  = _best_evidence_url
+    # Aggregate key-failover count across all pages fetched for this company
+    fc_out["firecrawl_key_failover_count"] = sum(
+        int(r.get("firecrawl_key_failover_count") or 0) for r in debug_rows
+    )
 
     # Store redirect info for the original current_domain candidate
     _cur_rr = _redirect_info.get(current_domain, {})
@@ -4175,7 +4306,7 @@ def _run_website_verifier(
     current_domain: str,
     verifier_provider: str,
     jina_api_key: str | None,
-    fc_key: str | None,
+    fc_key: str | list[str] | None,
     max_cands: int = 3,
     max_pages: int = 3,
     page_timeout: int = 15,
@@ -4231,8 +4362,12 @@ def _run_website_verifier(
     _provider_ran = False  # tracks whether any provider actually attempted requests
 
     # ── Firecrawl ────────────────────────────────────────────────────────────
+    _fc_key_norm = (
+        fc_key if isinstance(fc_key, list)
+        else ([fc_key] if fc_key else [])
+    )
     if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
-        if not fc_key:
+        if not _fc_key_norm:
             # Key missing — do not count as verified
             _verif_defaults.update(
                 firecrawl_used=False,
@@ -4245,7 +4380,7 @@ def _run_website_verifier(
             try:
                 fc_res, fc_debug = _fc_verify_candidates(
                     company_name, city, province, email_domain, input_partita_iva,
-                    name_variants, cands, current_domain, fc_key,
+                    name_variants, cands, current_domain, _fc_key_norm,
                     max_pages=max_pages, page_timeout=page_timeout,
                     fc_speed_mode=fc_speed_mode,
                     python_confidence=python_confidence,
@@ -4649,7 +4784,7 @@ def process_dataframe(
     # Unified website verifier
     verifier_provider: str = _VP_OFF,
     verifier_mode: str = _VM_UNCERTAIN,
-    fc_key: str | None = None,
+    fc_key: str | list[str] | None = None,
     max_cands_per_company: int = 3,
     max_pages_per_cand: int = 3,
     page_timeout: int = 15,
@@ -5734,6 +5869,7 @@ def build_excel(
             "evidence_strength", "negative_source_type",
             "verifier_decision", "verifier_reason", "replace_allowed",
             "haiku_decision", "haiku_confidence",
+            "firecrawl_key_index_used", "firecrawl_key_failover_count", "firecrawl_key_statuses",
         ]
         if jina_debug_rows:
             jd_df = pd.DataFrame(jina_debug_rows)
@@ -5974,6 +6110,7 @@ def _build_run_meta(
     jina_mode: str = _JINA_MODE_UNCERTAIN,
     verifier_provider: str = _VP_OFF,
     verifier_mode: str = _VM_UNCERTAIN,
+    firecrawl_keys_loaded: int = 0,
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -6051,6 +6188,13 @@ def _build_run_meta(
         ),
         "no_confident_match_count":  no_match,
         "manual_review_count":       review,
+        # v12 Firecrawl multi-key counters
+        "firecrawl_keys_loaded":     firecrawl_keys_loaded,
+        "firecrawl_key_failovers":   int(
+            pd.to_numeric(
+                enriched_df.get("firecrawl_key_failover_count", pd.Series(dtype=int)), errors="coerce"
+            ).fillna(0).sum()
+        ),
         # v11 Haiku extended counters
         "haiku_needs_firecrawl":     int(decisions.eq("needs_firecrawl").sum()),
         "firecrawl_forced_by_haiku": int(
@@ -6399,17 +6543,11 @@ def main():
             if _manual_jina.strip():
                 jina_api_key = _manual_jina.strip()
 
-    # Firecrawl API key: secrets → env → manual input (never displayed)
-    _fc_key: str | None = None
-    try:
-        _fc_key = st.secrets.get("FIRECRAWL_API_KEY") or st.secrets.get("firecrawl_api_key")
-    except Exception:
-        pass
-    if not _fc_key:
-        _fc_key = os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key")
+    # Firecrawl API keys: secrets → env → manual input (never displayed)
+    _fc_keys: list[str] = _fc_load_keys()
     if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
-        if _fc_key:
-            st.sidebar.success("✓ Firecrawl API key loaded.")
+        if _fc_keys:
+            st.sidebar.success(f"✓ Firecrawl API keys loaded: {len(_fc_keys)}")
         else:
             _fc_key_input = st.sidebar.text_input(
                 "Firecrawl API key",
@@ -6417,43 +6555,58 @@ def main():
                 key="reg_firecrawl_key",
             )
             if _fc_key_input.strip():
-                _fc_key = _fc_key_input.strip()
+                _fc_keys = [_fc_key_input.strip()]
         if st.sidebar.button("Test Firecrawl connection", key="reg_firecrawl_test"):
-            if not _fc_key:
+            if not _fc_keys:
                 st.sidebar.warning("No Firecrawl API key provided.")
             else:
-                _fc_start = time.time()
-                try:
-                    _fc_resp = requests.post(
-                        "https://api.firecrawl.dev/v1/scrape",
-                        headers={
-                            "Authorization": f"Bearer {_fc_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={"url": "https://www.firecrawl.dev", "formats": ["markdown"]},
-                        timeout=20,
-                    )
-                    _fc_elapsed = round(time.time() - _fc_start, 2)
-                    if _fc_resp.status_code == 200:
-                        _fc_data = _fc_resp.json()
-                        _fc_text = (
-                            (_fc_data.get("data") or {}).get("markdown", "")
-                            or str(_fc_data)
+                _test_url = "https://www.firecrawl.dev"
+                _any_ok = False
+                _first_ok_idx = -1
+                for _tki, _tkey in enumerate(_fc_keys, start=1):
+                    _fc_start = time.time()
+                    try:
+                        _fc_resp = requests.post(
+                            "https://api.firecrawl.dev/v1/scrape",
+                            headers={
+                                "Authorization": f"Bearer {_tkey}",
+                                "Content-Type": "application/json",
+                            },
+                            json={"url": _test_url, "formats": ["markdown"]},
+                            timeout=20,
                         )
-                        st.sidebar.success(
-                            f"✓ Success · {len(_fc_text):,} chars · {_fc_elapsed}s"
-                        )
-                    else:
+                        _fc_elapsed = round(time.time() - _fc_start, 2)
+                        if _fc_resp.status_code == 200:
+                            _fc_data = _fc_resp.json()
+                            _fc_chars = len(
+                                ((_fc_data.get("data") or {}).get("markdown", "") or str(_fc_data))
+                            )
+                            st.sidebar.success(
+                                f"Key {_tki}: ✓ OK · {_fc_chars:,} chars · {_fc_elapsed}s"
+                            )
+                            _any_ok = True
+                            if _first_ok_idx < 0:
+                                _first_ok_idx = _tki
+                        else:
+                            _is_quota = _fc_is_key_failure(_fc_resp.status_code, _fc_resp.text)
+                            _label = "quota/auth" if _is_quota else f"HTTP {_fc_resp.status_code}"
+                            st.sidebar.error(
+                                f"Key {_tki}: ✗ {_label} · {_fc_elapsed}s"
+                            )
+                    except requests.Timeout:
+                        _fc_elapsed = round(time.time() - _fc_start, 2)
+                        st.sidebar.error(f"Key {_tki}: ✗ Timeout after {_fc_elapsed}s")
+                    except Exception as _fc_exc:
+                        _fc_elapsed = round(time.time() - _fc_start, 2)
                         st.sidebar.error(
-                            f"✗ HTTP {_fc_resp.status_code} · {_fc_elapsed}s  \n"
-                            f"{_fc_resp.text[:200]}"
+                            f"Key {_tki}: ✗ Error · {_fc_elapsed}s  \n{str(_fc_exc)[:120]}"
                         )
-                except requests.Timeout:
-                    _fc_elapsed = round(time.time() - _fc_start, 2)
-                    st.sidebar.error(f"✗ Timeout after {_fc_elapsed}s")
-                except Exception as _fc_exc:
-                    _fc_elapsed = round(time.time() - _fc_start, 2)
-                    st.sidebar.error(f"✗ Error · {_fc_elapsed}s  \n{str(_fc_exc)[:200]}")
+                if _any_ok and _first_ok_idx > 1:
+                    st.sidebar.info(
+                        f"✓ Firecrawl failover available: key {_first_ok_idx} works"
+                    )
+    # Expose as a single key for callers that still use the old scalar API
+    _fc_key: str | list[str] | None = _fc_keys if _fc_keys else None
 
     # legacy jina_mode — kept for backward compat with checkpoint resume logic
     jina_mode = _JINA_MODE_OFF
@@ -6670,6 +6823,7 @@ def main():
                 jina_mode=jina_mode,
                 verifier_provider=verifier_provider,
                 verifier_mode=verifier_mode,
+                firecrawl_keys_loaded=len(_fc_keys),
             )
 
             st.session_state["reg_enriched"]    = enriched_df
@@ -6972,6 +7126,7 @@ def main():
             jina_mode=jina_mode,
             verifier_provider=verifier_provider,
             verifier_mode=verifier_mode,
+            firecrawl_keys_loaded=len(_fc_keys),
         )
 
         # Mark complete in checkpoint
