@@ -4085,6 +4085,126 @@ def _root_domain(url_or_domain: str) -> str:
     return s
 
 
+def _apply_final_safety_guard(result: dict) -> dict:
+    """
+    Final safety pass applied after Python + Haiku + verifier decisions are merged.
+    Detects and corrects unsafe combinations where the final result would be
+    High-confidence / no-review despite weak or absent verification evidence.
+
+    Returns a dict of fields to update (empty if nothing needs correcting).
+    False positives are worse than missing domains.
+    """
+    updates: dict = {}
+
+    conf       = str(result.get("final_confidence", "") or "").strip().lower()
+    manual     = str(result.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
+    dec_src    = str(result.get("final_decision_source", "") or "")
+    haiku_dec  = str(result.get("haiku_decision", "") or "")
+
+    verif_used   = str(result.get("verifier_used", "")).lower() in ("true", "1")
+    verif_dec    = str(result.get("verifier_decision", "") or "")
+    verif_ev_str = str(result.get("verifier_evidence_strength", "") or "").lower()
+
+    fc_used   = str(result.get("firecrawl_used", "")).lower() in ("true", "1")
+    fc_dec    = str(result.get("firecrawl_decision", "") or "")
+    fc_ev_str = str(result.get("firecrawl_evidence_strength", "") or "").lower()
+    fc_status = str(result.get("firecrawl_fetch_status", "") or "")
+
+    wrong_loc    = str(result.get("wrong_location_signal", "")).lower() in ("true", "1")
+    wrong_entity = str(result.get("wrong_entity_type_signal", "")).lower() in ("true", "1")
+    had_timeout  = "timeout" in fc_status
+
+    _verif_inconclusive = verif_dec in ("uncertain", "fetch_failed", "no_candidates", "")
+    _verif_weak_ev      = verif_ev_str in ("none", "weak", "")
+    _fc_uncertain       = fc_dec in ("uncertain", "")
+    _fc_weak_ev         = fc_ev_str in ("none", "weak", "")
+    _verif_confirmed    = verif_dec == "confirm" and verif_ev_str in ("medium", "strong")
+    _verif_replaced     = verif_dec == "replace" and result.get("verifier_replace_allowed")
+
+    # Pre-save snapshot of current values (populated only if we change something)
+    def _snapshot():
+        return {
+            "pre_safety_final_confidence":       result.get("final_confidence", ""),
+            "pre_safety_manual_review_needed":   result.get("manual_review_needed", ""),
+            "pre_safety_final_decision_source":  result.get("final_decision_source", ""),
+        }
+
+    # Rule 5 / 6: verifier confirmed or replaced with good evidence — do not downgrade
+    if _verif_confirmed or (_verif_replaced and not wrong_loc and not wrong_entity):
+        # Only allow no-review for strong confirmation
+        if _verif_confirmed and verif_ev_str == "strong":
+            return {}
+        # Medium confirmation: keep manual_review as-is, but ensure not High without review
+        if _verif_confirmed and verif_ev_str == "medium" and conf == "high" and not manual:
+            updates = _snapshot()
+            updates["manual_review_needed"] = True
+            updates["safety_guard_applied"] = True
+            updates["safety_guard_reason"] = "verifier_medium_evidence_requires_manual_review"
+            updates["final_decision_source"] = dec_src or "verifier_confirm_medium_guard"
+        return updates
+
+    # Rule 3: wrong location or entity type signal — always flag
+    if wrong_loc or wrong_entity:
+        if conf == "high" or not manual:
+            updates = _snapshot()
+            updates["manual_review_needed"] = True
+            if conf == "high":
+                updates["final_confidence"] = "Low"
+            updates["safety_guard_applied"] = True
+            updates["safety_guard_reason"] = "wrong_location_or_entity_signal"
+            updates["final_decision_source"] = "wrong_location_or_entity_safety_guard"
+        return updates
+
+    # Rule 4: Haiku rejected but verifier did not confirm/replace
+    if haiku_dec == "reject" and not _verif_confirmed and not _verif_replaced:
+        py_conf = str(result.get("domain_confidence", "") or "").lower()
+        _py_weak = py_conf in ("low", "none", "")
+        if conf in ("high", "medium") or not manual:
+            updates = _snapshot()
+            updates["manual_review_needed"] = True
+            updates["safety_guard_applied"] = True
+            updates["safety_guard_reason"] = "haiku_reject_without_verifier_confirmation"
+            updates["final_decision_source"] = "haiku_reject_safety_guard"
+            if _py_weak:
+                updates["final_selected_domain"] = ""
+                updates["final_confidence"] = "None"
+            else:
+                updates["final_confidence"] = "Low"
+        return updates
+
+    # Rule 1: verifier ran and returned inconclusive with weak evidence
+    if verif_used and _verif_inconclusive and _verif_weak_ev:
+        if conf == "high" or not manual:
+            updates = _snapshot()
+            updates["manual_review_needed"] = True
+            updates["safety_guard_applied"] = True
+            if conf == "high":
+                if had_timeout or wrong_loc or wrong_entity:
+                    updates["final_confidence"] = "Low"
+                else:
+                    updates["final_confidence"] = "Medium"
+            updates["safety_guard_reason"] = "verifier_uncertain_with_weak_evidence"
+            updates["final_decision_source"] = "verifier_uncertain_safety_guard"
+        return updates
+
+    # Rule 2: Firecrawl ran and returned uncertain with weak evidence
+    if fc_used and _fc_uncertain and _fc_weak_ev:
+        if conf == "high" or not manual:
+            updates = _snapshot()
+            updates["manual_review_needed"] = True
+            updates["safety_guard_applied"] = True
+            if conf == "high":
+                if had_timeout or wrong_loc or wrong_entity:
+                    updates["final_confidence"] = "Low"
+                else:
+                    updates["final_confidence"] = "Medium"
+            updates["safety_guard_reason"] = "firecrawl_uncertain_with_weak_evidence"
+            updates["final_decision_source"] = "verifier_uncertain_safety_guard"
+        return updates
+
+    return updates
+
+
 def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     """
     Apply the unified verifier result on top of final_* fields.
@@ -4756,6 +4876,12 @@ _OUTPUT_COLS = [
     # v11 haiku extended fields
     "haiku_candidate_url",
     "haiku_recommended_action",
+    # v12 final safety guard fields
+    "safety_guard_applied",
+    "safety_guard_reason",
+    "pre_safety_final_confidence",
+    "pre_safety_manual_review_needed",
+    "pre_safety_final_decision_source",
 ]
 
 
@@ -4876,6 +5002,15 @@ def process_dataframe(
         res["myngle_target_eligibility"] = eligibility
         res["pre_filter_decision"] = pf_decision
         res["pre_filter_reason"] = pf_reason
+
+        # Default safety-guard fields (overwritten by _apply_final_safety_guard if triggered)
+        res.update({
+            "safety_guard_applied":           False,
+            "safety_guard_reason":            "",
+            "pre_safety_final_confidence":    "",
+            "pre_safety_manual_review_needed": "",
+            "pre_safety_final_decision_source": "",
+        })
 
         # Default Haiku fields (Python-only values)
         res.update({
@@ -5074,9 +5209,37 @@ def process_dataframe(
                 except Exception as _vex:
                     res["verifier_error"] = f"verifier_exception:{str(_vex)[:120]}"
 
+        # ── Final safety guard ────────────────────────────────────────────────
+        _safety_upd = _apply_final_safety_guard(res)
+        if _safety_upd:
+            res.update(_safety_upd)
+
         new_results.append(res)
 
-        # Accumulate verifier debug rows for the Website Verification Debug sheet
+        # Accumulate verifier debug rows; back-fill Haiku + candidate metadata
+        if _verifier_debug_rows:
+            _haiku_meta = {
+                "haiku_decision":          res.get("haiku_decision", ""),
+                "haiku_confidence":        res.get("haiku_confidence", ""),
+                "haiku_candidate_url":     res.get("haiku_candidate_url", ""),
+                "haiku_recommended_action": res.get("haiku_recommended_action", ""),
+                "candidate_url":           res.get("candidate_url", ""),
+                "candidate_type":          res.get("candidate_type", ""),
+                "candidate_source":        res.get("candidate_source", ""),
+                "candidate_path":          res.get("candidate_path", ""),
+            }
+            for _vdr in _verifier_debug_rows:
+                for _k, _v in _haiku_meta.items():
+                    if not _vdr.get(_k):
+                        _vdr[_k] = _v
+                # Derive candidate_path from original_candidate_url if still missing
+                if not _vdr.get("candidate_path"):
+                    _oc_url = _vdr.get("original_candidate_url", "")
+                    if _oc_url:
+                        try:
+                            _vdr["candidate_path"] = urlparse(_oc_url).path
+                        except Exception:
+                            pass
         new_jina_debug.extend(_verifier_debug_rows)
 
         query = res.get("search_query_used", "")
