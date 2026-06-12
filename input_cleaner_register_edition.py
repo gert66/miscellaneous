@@ -6705,6 +6705,11 @@ def build_excel(
         ws_fc_audit = wb.create_sheet("Firecrawl Audit")
         _xl_write_fc_audit(ws_fc_audit, fc_audit)
 
+    # API Usage Summary — always present when run_meta available
+    if run_meta:
+        ws_usage = wb.create_sheet("API Usage Summary")
+        _xl_write_api_usage_summary(ws_usage, run_meta)
+
     # Run Summary — always last
     ws_summary = wb.create_sheet("Run Summary")
     if run_meta:
@@ -6852,6 +6857,207 @@ def _summary_metrics(df: pd.DataFrame, cols: dict) -> None:
 # =============================================================================
 
 
+def _build_fc_usage_fields(
+    enriched_df: pd.DataFrame,
+    firecrawl_keys_loaded: int,
+    fc_health: dict,
+) -> dict:
+    """
+    Build Firecrawl credit/usage fields for the Run Summary sheet.
+    Uses runtime health counters when available; falls back to per-row df columns.
+    Never exposes actual API key values.
+    """
+    # Pages fetched — from df column (ground truth, same as before)
+    pages_total = int(
+        pd.to_numeric(
+            enriched_df.get("firecrawl_pages_fetched", pd.Series(dtype=int)), errors="coerce"
+        ).fillna(0).sum()
+    )
+    # Firecrawl API does not return exact credit cost in its v1 scrape response.
+    # We estimate: 1 credit per page fetched (Firecrawl's standard pricing unit).
+    estimated_credits = pages_total
+    credit_method = (
+        "Estimated as 1 credit per fetched page; "
+        "exact Firecrawl billing not returned by API"
+    )
+
+    # Runtime health counters (populated when _make_fc_health() was used)
+    att      = fc_health.get("requests_attempted", 0)
+    succ     = fc_health.get("pages_successful",   0)
+    timeouts = fc_health.get("timeouts", 0)
+    excepts  = fc_health.get("exceptions", 0)
+    failovers= fc_health.get("key_failovers", 0)
+    failed   = att - succ if att > 0 else 0
+
+    # Firecrawl decisions (from enriched df)
+    fc_dec = enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str)
+    fc_used = enriched_df.get("firecrawl_used", pd.Series(dtype=str)).astype(str).str.lower().isin(["true","1"])
+
+    # Per-key usage (from firecrawl_key_statuses column — "key1:ok; key2:http_402" etc.)
+    _per_key: dict[str, dict] = {}
+    if "firecrawl_key_statuses" in enriched_df.columns:
+        for _ks_str in enriched_df["firecrawl_key_statuses"].astype(str):
+            for _part in _ks_str.split(";"):
+                _part = _part.strip()
+                if ":" not in _part:
+                    continue
+                _klabel, _kst = _part.split(":", 1)
+                _klabel = _klabel.strip()
+                _kst    = _kst.strip()
+                if _klabel not in _per_key:
+                    _per_key[_klabel] = {"requests": 0, "successes": 0, "failures": 0}
+                _per_key[_klabel]["requests"] += 1
+                if _kst == "ok":
+                    _per_key[_klabel]["successes"] += 1
+                else:
+                    _per_key[_klabel]["failures"] += 1
+
+    fields: dict = {
+        "firecrawl_pages_fetched_total":     pages_total,
+        "firecrawl_estimated_credits_used":  estimated_credits,
+        "firecrawl_credit_estimation_method": credit_method,
+        "firecrawl_requests_attempted":      att if att > 0 else pages_total,
+        "firecrawl_requests_successful":     succ if att > 0 else pages_total,
+        "firecrawl_requests_failed":         failed if att > 0 else 0,
+        "firecrawl_timeouts":                timeouts,
+        "firecrawl_exceptions":              excepts,
+        "firecrawl_key_failovers_total":     failovers,
+        "firecrawl_keys_loaded":             firecrawl_keys_loaded,
+        "firecrawl_rows_attempted":          int(fc_used.sum()),
+        "firecrawl_rows_confirmed":          int(fc_dec.eq("confirm").sum()),
+        "firecrawl_rows_uncertain":          int(fc_dec.eq("uncertain").sum()),
+        "firecrawl_rows_failed":             int(fc_dec.isin(["failed", "error", "no_fetch"]).sum()),
+    }
+    # Per-key usage (key labels only — no actual key values)
+    for _klabel in sorted(_per_key.keys()):
+        _kd = _per_key[_klabel]
+        fields[f"firecrawl_{_klabel}_requests"]  = _kd["requests"]
+        fields[f"firecrawl_{_klabel}_successes"] = _kd["successes"]
+        fields[f"firecrawl_{_klabel}_failures"]  = _kd["failures"]
+
+    return fields
+
+
+def _xl_write_api_usage_summary(ws, run_meta: dict) -> None:
+    """Write the API Usage Summary sheet — provider breakdown, credits, key usage."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    hdr_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    sec_font = Font(bold=True, size=10, color="1F497D")
+    val_font = Font(size=10)
+
+    def _hdr(row, col, text):
+        c = ws.cell(row=row, column=col, value=text)
+        c.fill = hdr_fill
+        c.font = hdr_font
+        c.alignment = Alignment(horizontal="left")
+
+    def _sec(row, col, text):
+        c = ws.cell(row=row, column=col, value=text)
+        c.font = sec_font
+
+    def _row(ws_row, label, value):
+        a = ws.cell(row=ws_row, column=1, value=label)
+        a.font = Font(bold=True, size=10)
+        b = ws.cell(row=ws_row, column=2, value=str(value) if value is not None else "")
+        b.font = val_font
+
+    ws.column_dimensions["A"].width = 44
+    ws.column_dimensions["B"].width = 60
+    ws.freeze_panes = "A2"
+
+    ri = 1
+    _hdr(ri, 1, "Metric")
+    _hdr(ri, 2, "Value")
+    ri += 1
+
+    # ── Firecrawl section ─────────────────────────────────────────────────────
+    _sec(ri, 1, "── Firecrawl ──")
+    ri += 1
+    _fc_fields = [
+        ("firecrawl_pages_fetched_total",     "Pages fetched"),
+        ("firecrawl_estimated_credits_used",  "Estimated credits used"),
+        ("firecrawl_credit_estimation_method","Credit estimation method"),
+        ("firecrawl_requests_attempted",      "Requests attempted"),
+        ("firecrawl_requests_successful",     "Requests successful"),
+        ("firecrawl_requests_failed",         "Requests failed"),
+        ("firecrawl_timeouts",                "Timeouts"),
+        ("firecrawl_exceptions",              "Exceptions"),
+        ("firecrawl_key_failovers_total",     "Key failovers (total)"),
+        ("firecrawl_keys_loaded",             "Keys loaded"),
+        ("firecrawl_rows_attempted",          "Rows attempted"),
+        ("firecrawl_rows_confirmed",          "Rows confirmed"),
+        ("firecrawl_rows_uncertain",          "Rows uncertain"),
+        ("firecrawl_rows_failed",             "Rows failed"),
+    ]
+    for _key, _label in _fc_fields:
+        val = run_meta.get(_key, "")
+        _row(ri, _label, val)
+        ri += 1
+
+    # Per-key usage (key labels only — no actual key values)
+    _per_key_rows = [(k, v) for k, v in run_meta.items() if k.startswith("firecrawl_key") and
+                     any(k.endswith(s) for s in ("_requests", "_successes", "_failures"))]
+    if _per_key_rows:
+        ri += 1
+        _sec(ri, 1, "── Firecrawl per-key usage (labels only, no actual key values) ──")
+        ri += 1
+        for _key, _val in sorted(_per_key_rows):
+            _label = _key.replace("firecrawl_", "").replace("_", " ").title()
+            _row(ri, _label, _val)
+            ri += 1
+
+    # ── Serper section ────────────────────────────────────────────────────────
+    ri += 1
+    _sec(ri, 1, "── Serper ──")
+    ri += 1
+    _serper_fields = [
+        ("max_serper_queries",  "Max queries per company (setting)"),
+    ]
+    for _key, _label in _serper_fields:
+        _row(ri, _label, run_meta.get(_key, ""))
+        ri += 1
+    _row(ri, "Serper key present", run_meta.get("serper_key_present", ""))
+    ri += 1
+
+    # ── Haiku section ─────────────────────────────────────────────────────────
+    ri += 1
+    _sec(ri, 1, "── Claude Haiku ──")
+    ri += 1
+    _haiku_fields = [
+        ("rows_reviewed_by_haiku", "Rows reviewed by Haiku"),
+        ("haiku_accepted_python",  "Haiku accepted Python decision"),
+        ("haiku_replaced_python",  "Haiku replaced Python decision"),
+        ("haiku_rejected",         "Haiku rejected domain"),
+        ("haiku_uncertain",        "Haiku uncertain"),
+        ("haiku_mode",             "Haiku mode"),
+        ("haiku_model",            "Haiku model"),
+        ("anthropic_key_present",  "Anthropic key present"),
+    ]
+    for _key, _label in _haiku_fields:
+        _row(ri, _label, run_meta.get(_key, ""))
+        ri += 1
+
+    ws.row_dimensions[1].height = 18
+
+
+def _fc_usage_console_summary(run_meta: dict) -> str:
+    """Return a multi-line Firecrawl usage summary for CLI output."""
+    lines = [
+        "Firecrawl usage:",
+        f"  Pages fetched:          {run_meta.get('firecrawl_pages_fetched_total', 0)}",
+        f"  Estimated credits used: {run_meta.get('firecrawl_estimated_credits_used', 0)}",
+        f"  Requests attempted:     {run_meta.get('firecrawl_requests_attempted', 0)}",
+        f"  Successful:             {run_meta.get('firecrawl_requests_successful', 0)}",
+        f"  Failed:                 {run_meta.get('firecrawl_requests_failed', 0)}",
+        f"  Timeouts:               {run_meta.get('firecrawl_timeouts', 0)}",
+        f"  Key failovers:          {run_meta.get('firecrawl_key_failovers_total', 0)}",
+        f"  Keys loaded:            {run_meta.get('firecrawl_keys_loaded', 0)}",
+    ]
+    return "\n".join(lines)
+
+
 def _build_run_meta(
     enriched_df: pd.DataFrame,
     input_filename: str,
@@ -6870,6 +7076,7 @@ def _build_run_meta(
     verifier_provider: str = _VP_OFF,
     verifier_mode: str = _VM_UNCERTAIN,
     firecrawl_keys_loaded: int = 0,
+    fc_health: dict | None = None,
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -6964,6 +7171,8 @@ def _build_run_meta(
             enriched_df.get("final_decision_source", pd.Series(dtype=str)).astype(str)
             .str.contains("timeout_fallback", na=False).sum()
         ),
+        # ── Firecrawl credit / usage counters (from runtime health) ──────────
+        **(_build_fc_usage_fields(enriched_df, firecrawl_keys_loaded, fc_health or {})),
     }
 
 
@@ -7086,7 +7295,8 @@ def _download_section(
             f"  \n{sheet_n}. **Firecrawl Audit** — preflight result + runtime health counters (no API key values)  \n"
         )
         sheet_n += 1
-    sheet_list += f"  \n{sheet_n}. **Run Summary** — run settings and outcome metrics"
+    sheet_list += f"  \n{sheet_n}. **API Usage Summary** — Firecrawl credits, Serper queries, Haiku calls  \n"
+    sheet_list += f"  \n{sheet_n + 1}. **Run Summary** — run settings and outcome metrics"
     st.markdown("**Output sheets:**  \n" + sheet_list)
     st.download_button(
         "⬇ Download cleaned register Excel",
@@ -7332,6 +7542,7 @@ def cli_batch_run() -> None:
         verifier_provider=args.verifier,
         verifier_mode=_VM_UNCERTAIN,
         firecrawl_keys_loaded=len(fc_keys_cli),
+        fc_health=_cli_fc_health,
     )
 
     # Build fc_audit dict for the Firecrawl Audit sheet
@@ -7402,6 +7613,8 @@ def cli_batch_run() -> None:
     }
     _append_run_log_csv(Path(pl_paths["run_log_csv"]), _pl_log_row)
     print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
+    if args.verifier in (_VP_FIRECRAWL, _VP_FC_JINA):
+        print(f"\n{_fc_usage_console_summary(run_meta)}")
     print(f"[cleaner] Done.")
 
 
@@ -7945,6 +8158,7 @@ def main():
                 verifier_provider=verifier_provider,
                 verifier_mode=verifier_mode,
                 firecrawl_keys_loaded=len(_fc_keys),
+                fc_health={},
             )
 
             st.session_state["reg_enriched"]    = enriched_df
@@ -8249,6 +8463,7 @@ def main():
             verifier_provider=verifier_provider,
             verifier_mode=verifier_mode,
             firecrawl_keys_loaded=len(_fc_keys),
+            fc_health=_fc_live,
         )
 
         # Build Firecrawl Audit dict
