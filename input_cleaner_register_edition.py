@@ -341,6 +341,47 @@ _JINA_FAMOUS_BRANDS: frozenset = frozenset({
 
 # Module-level Jina page cache: (domain, slug) -> (text, fetch_status)
 _JINA_CACHE: dict[tuple[str, str], tuple[str, str]] = {}
+
+# Firecrawl verifier constants
+_FC_API_URL   = "https://api.firecrawl.dev/v1/scrape"
+_FC_MAX_CHARS = 5000  # chars to keep per scraped page
+_FC_CACHE: dict[str, tuple[str, str, dict]] = {}  # url -> (text, status, meta)
+
+# Unified website verifier provider options
+_VP_OFF       = "Off"
+_VP_JINA      = "Jina"
+_VP_FIRECRAWL = "Firecrawl"
+_VP_FC_JINA   = "Firecrawl first, Jina fallback"
+_VP_OPTIONS   = [_VP_OFF, _VP_JINA, _VP_FIRECRAWL, _VP_FC_JINA]
+
+# Verification trigger mode options
+_VM_UNCERTAIN = "Uncertain candidates only"
+_VM_ALL_DEBUG = "All selected candidates in debug mode"
+_VM_OPTIONS   = [_VM_UNCERTAIN, _VM_ALL_DEBUG]
+
+# Negative source-type patterns that block replacement
+_NEG_SOURCE_RES: dict[str, re.Pattern] = {
+    "news_media":       re.compile(
+        r"\b(giornale|notizie|news|article|blog|press|media|redazione|editoriale|testata)\b", re.I),
+    "directory":        re.compile(
+        r"\b(fatturato|bilancio|visura|scheda\s+azienda|scheda\s+impresa|"
+        r"company\s+profile|business\s+profile|registro\s+imprese|dati\s+aziendali)\b", re.I),
+    "foundation":       re.compile(
+        r"\b(fondazione(?!\s+di\s+(?:Pompe|Delta|Garbarino))|onlus|ente\s+non\s+profit)\b", re.I),
+    "event_conference": re.compile(
+        r"\b(conferenza|convegno|fiera\s+di|exhibition|congress|summit)\b", re.I),
+    "association":      re.compile(
+        r"\b(associazione\s+di\s+categoria|federazione\s+nazionale|confindustria|confcommercio)\b", re.I),
+    "marketplace":      re.compile(
+        r"\b(confronta\s+prezzi|trova\s+prezzi|acquista\s+online|e-commerce\s+shop)\b", re.I),
+    "dealer_reseller":  re.compile(
+        r"\b(concessionaria\s+ufficiale|rivenditore\s+autorizzato|franchising)\b", re.I),
+    "job_board":        re.compile(
+        r"\b(offerte\s+di\s+lavoro\s+candidatura|curriculum\s+vitae\s+candidati|job\s+listing)\b", re.I),
+    "government":       re.compile(
+        r"\b(comune\s+di|regione\s+[a-z]+|provincia\s+di|ministero|agenzia\s+delle\s+entrate)\b", re.I),
+}
+
 _HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
 
 _HAIKU_SYSTEM_PROMPT = (
