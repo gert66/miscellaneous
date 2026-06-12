@@ -186,8 +186,8 @@ SCORE_OUTPUT_COLS: list[str] = [
     "lr_rapid_growth_component",
     # ── Audit: size ──────────────────────────────────────────────────────────
     "employee_range_normalized",
-    "employee_range_source",
-    "employee_range_confidence",
+    "score_employee_range_source",
+    "score_employee_range_confidence",
     "size_needs_manual_review",
     # ── Audit: sigmoid ───────────────────────────────────────────────────────
     "sigmoid_k",
@@ -299,11 +299,11 @@ def _resolve_size_score(row: dict) -> tuple[float, bool, str]:
 # so it falls through to lusha_employee_range (uploaded static data),
 # then employee_range (input file), then company_size (input file).
 _EMPLOYEE_RANGE_SOURCE_PRIORITY: list[tuple[str, str, str]] = [
-    # (field_name, source_label, confidence)
-    ("employee_range",             "input_file",                 "high"),
-    ("lusha_employee_range",       "uploaded_lusha_company_data","medium"),
-    ("lusha_api_employee_range",   "uploaded_lusha_company_data","medium"),
-    ("company_size",               "input_file",                 "high"),
+    # (field_name, source_label, confidence)  — confidence title-cased to match resolver
+    ("employee_range",             "input_file",                 "High"),
+    ("lusha_employee_range",       "uploaded_lusha_company_data","Medium"),
+    ("lusha_api_employee_range",   "uploaded_lusha_company_data","Medium"),
+    ("company_size",               "input_file",                 "High"),
 ]
 
 
@@ -329,7 +329,7 @@ def _resolve_employee_range_provenance(row: dict) -> tuple[str, str, bool]:
                 return source, confidence, False
             if _parse_range_midpoint(raw) is not None:
                 return source, confidence, False
-    return "missing", "missing", True
+    return "missing", "None", True
 
 
 def _composite_score(row: dict, fields: list[str], max_per_field: float = 3.0) -> float:
@@ -446,11 +446,13 @@ def score_company(
         )
     else:
         _src_label = {
-            "input_file":                  "Employee range from input/Lucia data",
-            "uploaded_lusha_company_data": "Employee range from uploaded Lusha data",
-            "explicit_text_employee_evidence": "Employee range extracted from text evidence",
-            "heuristic_size_estimate":     "Employee range estimated heuristically (Low confidence)",
+            "input_file":                       "Employee range from input/Lucia data",
+            "uploaded_lusha_company_data":      "Employee range from uploaded Lusha data",
+            "explicit_text_employee_evidence":  "Employee range extracted from text evidence",
+            "heuristic_size_estimate":          "Employee range estimated heuristically (Low confidence)",
             "existing_lucia_or_input_employee_range": "Employee range from Lucia/input data",
+            "serper_employee_search":           "Employee range from Serper web search",
+            "default_commercial_minimum_assumption": "Employee range: scoring default (no data found)",
         }.get(er_source, f"Employee range (source: {er_source})")
         notes.append(
             f"{_src_label}: {range_key} → company_size_score {round(size_score, 2)}/10."
@@ -545,10 +547,10 @@ def score_company(
         "weak_score_drivers":     "; ".join(weak_drivers) if weak_drivers else "none",
         "scoring_notes":          " | ".join(notes),
         "missing_scoring_fields": ", ".join(missing) if missing else "",
-        # ── Employee range provenance (added after Lusha live API disabled) ───
-        "employee_range_source":      er_source,
-        "employee_range_confidence":  er_confidence,
-        "size_needs_manual_review":   er_needs_review,
+        # ── Employee range provenance as seen by scoring (separate from resolver fields) ───
+        "score_employee_range_source":      er_source,
+        "score_employee_range_confidence":  er_confidence,
+        "size_needs_manual_review":         er_needs_review,
     })
     return out
 

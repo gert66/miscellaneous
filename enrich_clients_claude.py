@@ -4942,9 +4942,9 @@ def _xl_write_opportunity_input(
         ("domain_check_reason",       ["domain_check_reason"]),
         ("domain_source",             ["domain_source"]),
         ("needs_domain_review",       ["needs_domain_review"]),
-        ("country",         ["lusha_api_country", "Company Country", "company_hq_country"]),
-        ("city",            ["lusha_api_city", "Company City"]),
-        ("industry",        ["lusha_api_industry", "Company Main Industry"]),
+        ("country",         ["lusha_country", "lusha_api_country", "Company Country", "company_hq_country"]),
+        ("city",            ["lusha_city", "lusha_api_city", "Company City"]),
+        ("industry",        ["lusha_industry", "lusha_api_industry", "Company Main Industry"]),
         ("employee_range",  [
             "employee_range_for_scoring",     # scoring default if nothing else
             "employee_range_resolved",        # High/Medium resolver output
@@ -4958,6 +4958,8 @@ def _xl_write_opportunity_input(
         ("employee_range_confidence",          ["employee_range_confidence"]),
         ("employee_range_notes",               ["employee_range_notes"]),
         ("employee_range_for_scoring_source",  ["employee_range_for_scoring_source"]),
+        ("score_employee_range_source",        ["score_employee_range_source"]),
+        ("score_employee_range_confidence",    ["score_employee_range_confidence"]),
         # ── Commercial scoring ────────────────────────────────────────────────
         ("commercial_fit_score", ["final_commercial_fit_score"]),
         ("commercial_tier",      ["commercial_tier"]),
