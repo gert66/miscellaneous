@@ -2815,22 +2815,19 @@ def _should_verify(
     """
     Decide whether to run the website verifier for this row.
     Returns (should_run, trigger_reason).
+
+    Pre-skip rule: High-confidence rows with strong brand-domain overlap and
+    clear score separation are skipped even if minor soft triggers are present.
+    This prevents wasting Firecrawl credits on obvious correct matches.
     """
     if verifier_mode == _VM_ALL_DEBUG and debug_mode:
         return True, "all_debug_mode"
 
-    reasons: list[str] = []
-
-    conf   = str(result.get("final_confidence") or result.get("domain_confidence") or "").strip().lower()
-    manual = str(result.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
+    conf      = str(result.get("final_confidence") or result.get("domain_confidence") or "").strip().lower()
+    manual    = str(result.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
     final_dom = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
 
-    if conf in ("medium", "low", "none", ""):
-        reasons.append(f"confidence={conf or 'empty'}")
-    if manual:
-        reasons.append("manual_review_needed")
-
-    # Top-2 candidate score delta < 0.25
+    # ── Collect top-2 score delta ─────────────────────────────────────────────
     scored: dict[str, float] = {}
     for e in raw_ev:
         if not e.get("used"):
@@ -2842,30 +2839,61 @@ def _should_verify(
             sc = 0.0
         if dom and sc > scored.get(dom, -1.0):
             scored[dom] = sc
-    if len(scored) >= 2:
-        top2 = sorted(scored.values(), reverse=True)[:2]
-        if top2[0] - top2[1] < 0.25:
-            reasons.append("close_scores")
+    sorted_scores = sorted(scored.values(), reverse=True)
+    score_delta = (sorted_scores[0] - sorted_scores[1]) if len(sorted_scores) >= 2 else 1.0
+
+    # ── Brand-domain overlap for selected domain ──────────────────────────────
+    bov = brand_overlap_variants(name_variants, final_dom) if final_dom else 0.0
+
+    brand       = (name_variants.get("brand") or "").strip()
+    brand_clean = re.sub(r"[^\w]", "", brand.lower())
+
+    # ── Pre-skip: High confidence + strong brand-domain match ────────────────
+    # If all these hold, verification adds no value and wastes credits.
+    _is_high_conf   = conf == "high"
+    _domain_ok      = bool(final_dom) and not is_generic(final_dom)
+    _strong_overlap = bov >= 0.60
+    _clear_winner   = score_delta >= 0.25
+    _not_famous     = brand_clean not in _JINA_FAMOUS_BRANDS
+    _not_risky      = not _JINA_RISKY_DOMAIN_RE.search(final_dom) if final_dom else True
+
+    if _is_high_conf and _domain_ok and _strong_overlap and _clear_winner and _not_famous and _not_risky:
+        return False, f"skipped: high confidence + strong brand-domain overlap ({round(bov, 2)}) + clear score winner"
+
+    # ── Positive triggers ─────────────────────────────────────────────────────
+    reasons: list[str] = []
+
+    if conf in ("medium", "low", "none", ""):
+        reasons.append(f"confidence={conf or 'empty'}")
+    if manual:
+        reasons.append("manual_review_needed")
+    if len(sorted_scores) >= 2 and score_delta < 0.25:
+        reasons.append("close_scores")
 
     # site:.it query used
     if str(result.get("search_query_used", "") or "").lower().startswith("site:.it"):
         reasons.append("site_it_query")
 
-    # No location or email match for selected domain
-    sel = final_dom.lower()
-    if sel and result.get("domain_source") not in (SRC_ORIGINAL, SRC_EMAIL, SRC_SERPER_EMAIL):
-        has_loc   = any(e.get("domain", "").lower() == sel and e.get("location_match") for e in raw_ev)
-        has_email = any(e.get("domain", "").lower() == sel and e.get("email_match")    for e in raw_ev)
-        if not has_loc and not has_email:
-            reasons.append("no_location_or_email_evidence")
+    # No location or email evidence — only trigger for non-High confidence rows
+    # or when brand-domain overlap is weak (< 0.40).
+    if not _is_high_conf or bov < 0.40:
+        sel = final_dom.lower()
+        if sel and result.get("domain_source") not in (SRC_ORIGINAL, SRC_EMAIL, SRC_SERPER_EMAIL):
+            has_loc   = any(e.get("domain", "").lower() == sel and e.get("location_match") for e in raw_ev)
+            has_email = any(e.get("domain", "").lower() == sel and e.get("email_match")    for e in raw_ev)
+            if not has_loc and not has_email:
+                reasons.append("no_location_or_email_evidence")
 
-    # Brand single-word, short, generic, or famous
-    brand       = (name_variants.get("brand") or "").strip()
-    brand_clean = re.sub(r"[^\w]", "", brand.lower())
-    if brand_clean and (len(brand_clean) <= 5 or brand_clean in _JINA_FAMOUS_BRANDS or _brand_is_ambiguous(brand)):
-        reasons.append("ambiguous_brand")
+    # Ambiguous/famous brand — only trigger when confidence is not already High
+    if not _is_high_conf:
+        if brand_clean and (len(brand_clean) <= 5 or brand_clean in _JINA_FAMOUS_BRANDS or _brand_is_ambiguous(brand)):
+            reasons.append("ambiguous_brand")
+    else:
+        # For High-confidence rows, only flag famous brands as a trigger
+        if brand_clean in _JINA_FAMOUS_BRANDS:
+            reasons.append("famous_brand")
 
-    # Risky domain pattern
+    # Risky domain pattern — always a trigger
     if final_dom and _JINA_RISKY_DOMAIN_RE.search(final_dom):
         reasons.append("risky_domain_pattern")
 
@@ -3314,6 +3342,7 @@ def process_dataframe(
     serper_key: str | None,
     max_queries: int = 5,
     progress_cb=None,
+    live_counters_out: dict | None = None,  # caller-supplied dict updated in-place with FC stats
     # Autosave / resume parameters
     run_id: str | None = None,
     resume_from: int = 0,
@@ -3352,12 +3381,16 @@ def process_dataframe(
     new_jina_debug: list[dict] = []
     n = len(df)
     process_dataframe._jina_debug = new_jina_debug  # type: ignore[attr-defined]
-    _live_fc_counters: dict = {
-        "fc_requests_attempted": 0,
-        "fc_pages_successful": 0,
-        "fc_timeouts": 0,
-        "fc_total_secs": 0.0,
-    }
+    _live_fc_counters: dict = (
+        live_counters_out
+        if live_counters_out is not None
+        else {"fc_requests_attempted": 0, "fc_pages_successful": 0,
+              "fc_timeouts": 0, "fc_total_secs": 0.0}
+    )
+    _live_fc_counters.setdefault("fc_requests_attempted", 0)
+    _live_fc_counters.setdefault("fc_pages_successful", 0)
+    _live_fc_counters.setdefault("fc_timeouts", 0)
+    _live_fc_counters.setdefault("fc_total_secs", 0.0)
 
     company_col  = cols.get("company") or ""
     website_col  = cols.get("website") or ""
@@ -5138,6 +5171,63 @@ def main():
         else:
             batch_n = max_rows
 
+    # ── Verifier Preview ──────────────────────────────────────────────────────
+    if verifier_provider not in (_VP_OFF,):
+        _preview_n = int(batch_n)
+        _spd_def = _FC_SPEED_DEFAULTS.get(verifier_speed_mode, _FC_SPEED_DEFAULTS[_FC_SPEED_FAST])
+        _preview_max_cands = verifier_max_candidates
+        _preview_max_pages = verifier_max_pages
+
+        # Quick heuristic: count how many rows in the batch are likely to trigger verification.
+        # We apply only the fast pre-skip rule (high-conf + strong brand-domain) on already-known
+        # company names; since we haven't run Python scoring yet, we use the input domain column.
+        _company_col_p = cols.get("company") or ""
+        _website_col_p = cols.get("website") or ""
+        _preview_df = df.head(_preview_n)
+        _estimated_verified = 0
+        _preview_rows: list[dict] = []
+        for _, _prow in _preview_df.iterrows():
+            _pname = str(_prow.get(_company_col_p, "") or "").strip()
+            _pdom  = str(_prow.get(_website_col_p, "") or "").strip()
+            # Conservative estimate: assume verification runs unless domain exactly matches brand
+            _nv = extract_name_variants(_pname) if _pname else {}
+            _bov = brand_overlap_variants(_nv, _pdom) if _pdom and _nv else 0.0
+            _will_verify = not (_bov >= 0.60 and _pdom and not is_generic(_pdom))
+            if _will_verify:
+                _estimated_verified += 1
+            if len(_preview_rows) < 20 and _will_verify:
+                _preview_rows.append({
+                    "company": _pname,
+                    "input_domain": _pdom,
+                    "brand_domain_overlap": round(_bov, 2),
+                    "estimated_reason": "will verify" if _will_verify else "pre-skip (strong match)",
+                })
+
+        _est_requests = _estimated_verified * _preview_max_cands * _preview_max_pages
+        with st.expander(
+            f"Verifier preview — est. {_estimated_verified}/{_preview_n} rows → "
+            f"~{_est_requests} max FC requests",
+            expanded=_estimated_verified > 0,
+        ):
+            st.caption(
+                f"Provider: **{verifier_provider}** · Speed: **{verifier_speed_mode}** · "
+                f"Max cands: {_preview_max_cands} · Max pages/cand: {_preview_max_pages} · "
+                f"Timeout: {verifier_page_timeout}s"
+            )
+            st.markdown(
+                f"- Total rows in batch: **{_preview_n}**  \n"
+                f"- Estimated rows using Firecrawl: **{_estimated_verified}**  \n"
+                f"- Estimated max Firecrawl requests: **{_est_requests}**  \n"
+                f"- *(Actual count will be lower due to early-stop and high-confidence pre-skips)*"
+            )
+            if _preview_rows:
+                st.markdown("**First ≤20 companies estimated to be verified:**")
+                st.dataframe(
+                    pd.DataFrame(_preview_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     # ── Run ───────────────────────────────────────────────────────────────────
     if st.button("🧹 Clean and validate register data", type="primary", use_container_width=True):
         run_df = df.head(int(batch_n)).copy()
@@ -5154,14 +5244,27 @@ def main():
 
         progress_bar = st.progress(0.0)
         status_text  = st.empty()
+        _fc_live: dict = {}  # live counters written by process_dataframe via _live_fc_counters
 
         def progress_cb(i, total):
             progress_bar.progress(i / total)
-            status_text.caption(f"Processing {i} / {total}…")
+            if verifier_provider != _VP_OFF and _fc_live:
+                _att  = _fc_live.get("fc_requests_attempted", 0)
+                _succ = _fc_live.get("fc_pages_successful", 0)
+                _to   = _fc_live.get("fc_timeouts", 0)
+                _secs = _fc_live.get("fc_total_secs", 0.0)
+                _avg  = round(_secs / _att, 1) if _att else 0.0
+                status_text.caption(
+                    f"Row {i}/{total} · FC requests: {_att} attempted / {_succ} ok / "
+                    f"{_to} timeouts · avg {_avg}s/req"
+                )
+            else:
+                status_text.caption(f"Processing {i} / {total}…")
 
         enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
             run_df, cols, serper_key, int(max_queries),
             progress_cb=progress_cb,
+            live_counters_out=_fc_live,
             run_id=run_id,
             resume_from=0,
             prior_results=[],
