@@ -682,23 +682,42 @@ _HARD_NEG_SOURCES = frozenset({"directory", "government", "marketplace", "job_bo
 _HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
 
 _HAIKU_SYSTEM_PROMPT = (
-    "You are a B2B sales intelligence assistant specialising in Italian companies. "
-    "Your task: given a company name and candidate websites from Google search results, "
-    "identify the company's official website.\n\n"
-    "The search results include two kinds of entries:\n"
-    "  [SCORED]   — passed the Python brand-similarity filter; scored and ranked\n"
-    "  [FILTERED] — removed by Python heuristics (generic site, low similarity, "
-    "government/religious/directory/academic category). You may override a FILTERED "
-    "result if you are confident it is the correct official site.\n\n"
-    "Return ONLY a JSON object with exactly these fields:\n"
-    "  decision   — \"accept\" | \"replace\" | \"reject\" | \"uncertain\"\n"
-    "               accept=python suggestion is correct; replace=a different domain is better;\n"
-    "               reject=none of the results are the real site; uncertain=cannot tell\n"
-    "  domain     — the domain you recommend (empty string for reject/uncertain)\n"
-    "  confidence — \"High\" | \"Medium\" | \"Low\"\n"
-    "  reason     — brief explanation, max 120 chars\n"
-    "  risk_flags — JSON array of strings, e.g. [\"directory_site\",\"name_mismatch\"]\n\n"
-    "Do not output any text outside the JSON object. No markdown fences."
+    "You are a conservative B2B sales intelligence reviewer for Italian companies.\n"
+    "Your task: given a company name, location, and candidate search results, decide whether "
+    "the Python-selected domain is the correct official website.\n\n"
+    "Classify the Python domain as one of:\n"
+    "  accept          — confirmed official company or group/subsidiary site\n"
+    "  replace         — a different domain already in the evidence is clearly better\n"
+    "  reject          — none of the results represent the real official site\n"
+    "  uncertain       — insufficient evidence to decide\n"
+    "  needs_firecrawl — plausible candidate, but live page confirmation required\n\n"
+    "The search results include:\n"
+    "  [SCORED]   — passed Python brand-similarity filter; scored and ranked\n"
+    "  [FILTERED] — removed by Python heuristics; you may override if clearly correct\n\n"
+    "IMPORTANT DOMAIN RESTRICTION:\n"
+    "You may ONLY suggest a domain that already appears in the evidence block.\n"
+    "You must NOT invent, guess, or construct any domain not present in the evidence.\n\n"
+    "For group/subsidiary pages, accept when ALL of the following hold:\n"
+    "  - the candidate URL path contains /aziende/, /companies/, /company/, /business-sector/,\n"
+    "    /business-sectors/, /settori/, /settori-di-attivita/, /subsidiary/, /societa/, /gruppo/\n"
+    "  - the title or snippet contains the company name or a close variant\n"
+    "  - the snippet contains at least one of: activity, contact, registered office, city,\n"
+    "    province, address, or business sector\n\n"
+    "Risk flags to include when relevant (use exact strings):\n"
+    "  group_domain_not_company_domain, snippet_only_evidence, no_address_city_evidence,\n"
+    "  name_domain_mismatch, possible_directory_profile, generic_or_ambiguous_name,\n"
+    "  no_location_match\n\n"
+    "Return ONLY a JSON object. No text before or after. No markdown fences.\n"
+    "Use exactly this schema:\n"
+    "{\n"
+    "  \"decision\": \"accept|replace|reject|uncertain|needs_firecrawl\",\n"
+    "  \"domain\": \"selected domain or empty string\",\n"
+    "  \"candidate_url\": \"exact full URL from evidence or empty string\",\n"
+    "  \"confidence\": \"High|Medium|Low|None\",\n"
+    "  \"reason\": \"max 180 chars\",\n"
+    "  \"risk_flags\": [\"...\"],\n"
+    "  \"recommended_action\": \"skip_firecrawl|firecrawl_exact_url|firecrawl_root|manual_review\"\n"
+    "}"
 )
 
 _HAIKU_USER_TEMPLATE = (
@@ -707,8 +726,9 @@ _HAIKU_USER_TEMPLATE = (
     "Email domain: {email_domain}\n"
     "Original website in register: {original_website}\n"
     "Python-suggested domain: {python_domain} (confidence: {python_confidence})\n\n"
-    "Top search results:\n{results_block}\n\n"
-    "Which is the correct official website for this Italian company? "
+    "Search results (pay attention to full URLs and path segments):\n{results_block}\n\n"
+    "Decide whether the Python-suggested domain is the correct official website for this "
+    "Italian company. If a group/subsidiary page URL exists, evaluate it carefully. "
     "Reply with JSON only."
 )
 
@@ -1217,6 +1237,20 @@ def _extract_urls_from_text(text: str) -> list:
     return urls
 
 
+_GROUP_PATH_SEGMENTS = (
+    "/aziende/",
+    "/companies/",
+    "/company/",
+    "/business-sector/",
+    "/business-sectors/",
+    "/settori/",
+    "/settori-di-attivita/",
+    "/subsidiary/",
+    "/societa/",
+    "/gruppo/",
+)
+
+
 def _classify_candidate_type(url: str, domain: str, title: str, snippet: str) -> str:
     """Classify the candidate type based on URL path and content signals."""
     path = ""
@@ -1224,6 +1258,11 @@ def _classify_candidate_type(url: str, domain: str, title: str, snippet: str) ->
         path = urlparse(url).path or ""
     except Exception:
         pass
+    path_lower = path.lower()
+    # Ensure trailing slash for segment matching
+    path_check = path_lower if path_lower.endswith("/") else path_lower + "/"
+    if any(seg in path_check for seg in _GROUP_PATH_SEGMENTS):
+        return "group_site_subsidiary_page"
     path_parts = [p for p in path.strip("/").split("/") if p]
     if len(path_parts) >= 2:
         combined = (title + " " + snippet).lower()
@@ -2107,16 +2146,24 @@ def _build_haiku_results_block(raw_evidence: list[dict]) -> str:
             seen_domains.add(domain)
             count += 1
 
+            cand_url  = e.get("candidate_url", "") or url
+            cand_type = e.get("candidate_type", "") or _classify_candidate_type(url, domain, title, snippet)
+            cand_src  = e.get("candidate_source", "serper_result")
             if used:
                 score   = e.get("score", "?")
                 b_ov    = e.get("brand_overlap", "?")
+                f_ov    = e.get("full_overlap", "?")
                 em      = "Yes" if e.get("email_match") else "No"
+                loc     = "Yes" if e.get("location_match") else "No"
+                off     = "Yes" if e.get("official_signal") else "No"
                 lines.append(
                     f"  {count}. [SCORED] {domain}\n"
-                    f"     Title:   {title}\n"
-                    f"     Snippet: {snippet}\n"
-                    f"     URL:     {url}\n"
-                    f"     Score: {score} | Brand overlap: {b_ov} | Email match: {em}"
+                    f"     Title:       {title}\n"
+                    f"     Snippet:     {snippet}\n"
+                    f"     URL:         {cand_url}\n"
+                    f"     Type:        {cand_type} | Source: {cand_src}\n"
+                    f"     Score: {score} | Brand overlap: {b_ov} | Full overlap: {f_ov} | "
+                    f"Email match: {em} | Location: {loc} | Official signal: {off}"
                 )
             else:
                 reason = e.get("skip_reason", "filtered")
@@ -2126,7 +2173,8 @@ def _build_haiku_results_block(raw_evidence: list[dict]) -> str:
                     f"  {count}. [FILTERED: {reason}] {domain}\n"
                     f"     Title:   {title}\n"
                     f"     Snippet: {snippet}\n"
-                    f"     URL:     {url}{score_str}"
+                    f"     URL:     {cand_url}\n"
+                    f"     Type:    {cand_type}{score_str}"
                 )
         sections.append("\n".join(lines))
 
@@ -2149,20 +2197,24 @@ def _haiku_review_domain(
     Returns a dict with haiku_* fields.
     """
     out = {
-        "haiku_used":       True,
-        "haiku_decision":   "",
-        "haiku_domain":     "",
-        "haiku_confidence": "",
-        "haiku_reason":     "",
-        "haiku_risk_flags": "",
-        "haiku_error":      "",
+        "haiku_used":               True,
+        "haiku_decision":           "",
+        "haiku_domain":             "",
+        "haiku_confidence":         "",
+        "haiku_reason":             "",
+        "haiku_risk_flags":         "",
+        "haiku_error":              "",
+        "haiku_candidate_url":      "",
+        "haiku_recommended_action": "",
     }
 
     # Do not call Haiku if there is no Serper evidence to reason about
     if not raw_evidence:
-        out["haiku_used"]     = False
-        out["haiku_decision"] = "skipped_no_serper_evidence"
-        out["haiku_error"]    = "no Serper results available for this row"
+        out["haiku_used"]               = False
+        out["haiku_decision"]           = "skipped_no_serper_evidence"
+        out["haiku_error"]              = "no Serper results available for this row"
+        out["haiku_candidate_url"]      = ""
+        out["haiku_recommended_action"] = ""
         return out
 
     if not _ANTHROPIC_AVAILABLE or not api_key:
@@ -2198,12 +2250,14 @@ def _haiku_review_domain(
         raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
         raw_text = re.sub(r"\n?```$", "", raw_text)
         parsed = json.loads(raw_text)
-        out["haiku_decision"]   = str(parsed.get("decision", "uncertain"))
-        out["haiku_domain"]     = str(parsed.get("domain", ""))
-        out["haiku_confidence"] = str(parsed.get("confidence", ""))
-        out["haiku_reason"]     = str(parsed.get("reason", ""))[:200]
+        out["haiku_decision"]           = str(parsed.get("decision", "uncertain"))
+        out["haiku_domain"]             = str(parsed.get("domain", ""))
+        out["haiku_confidence"]         = str(parsed.get("confidence", ""))
+        out["haiku_reason"]             = str(parsed.get("reason", ""))[:200]
         flags = parsed.get("risk_flags", [])
-        out["haiku_risk_flags"] = ", ".join(flags) if isinstance(flags, list) else str(flags)
+        out["haiku_risk_flags"]         = ", ".join(flags) if isinstance(flags, list) else str(flags)
+        out["haiku_candidate_url"]      = str(parsed.get("candidate_url", ""))
+        out["haiku_recommended_action"] = str(parsed.get("recommended_action", ""))
     except Exception as exc:
         out["haiku_used"]     = True
         out["haiku_error"]    = str(exc)[:200]
@@ -2212,10 +2266,85 @@ def _haiku_review_domain(
     return out
 
 
+def _serper_exact_page_identity_evidence(
+    company_name: str,
+    city: str,
+    province: str,
+    evidence_row: dict,
+) -> dict:
+    """
+    Evaluate how strongly a single Serper evidence row identifies the exact company.
+    Uses title + snippet + URL path.
+    Returns a dict with strength rating and component flags.
+    """
+    title   = (evidence_row.get("title",   "") or "").lower()
+    snippet = (evidence_row.get("snippet", "") or "").lower()
+    url     = (evidence_row.get("url",     "") or "").lower()
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        path = ""
+
+    combined = title + " " + snippet + " " + path
+
+    # Tokenise company name
+    _name_clean = re.sub(r"[^\w\s]", " ", company_name.lower())
+    _tokens = [t for t in _name_clean.split() if len(t) >= 3
+               and t not in ("spa", "srl", "srl", "snc", "sas", "spa", "soc", "per", "azioni",
+                             "societa", "delle", "degli", "della", "dello", "dei", "gli", "the",
+                             "and", "di", "da", "del", "dal", "con", "tra", "fra")]
+
+    _has_name       = any(tok in combined for tok in _tokens) if _tokens else False
+    _most_tokens    = (sum(1 for t in _tokens if t in combined) / len(_tokens) >= 0.6) if _tokens else False
+
+    _city_prov = [v.lower() for v in [city, province] if v and len(v) >= 3]
+    _has_loc   = any(v in combined for v in _city_prov) if _city_prov else False
+
+    _contact_kw  = ("telefono", "fax", "tel.", "tel:", "email", "indirizzo", "sede legale",
+                    "sede operativa", "p.iva", "partita iva", "cap ", "via ", "viale ", "corso ")
+    _activity_kw = ("attivita", "settore", "servizi", "prodotti", "trasporti", "logistica",
+                    "produzione", "commercio", "industria", "lavorazione", "costruzioni",
+                    "impianti", "tecnologie", "forniture", "distribuzione")
+
+    _has_contact  = any(kw in combined for kw in _contact_kw)
+    _has_activity = any(kw in combined for kw in _activity_kw)
+
+    # Determine strength
+    if _most_tokens and (_has_loc or _has_contact):
+        strength = "strong"
+        reason   = "company name tokens + location/contact evidence"
+    elif _most_tokens and _has_activity:
+        strength = "strong"
+        reason   = "company name tokens + activity description"
+    elif _has_name and (_has_loc or _has_contact):
+        strength = "medium"
+        reason   = "partial name match + location or contact"
+    elif _has_name and _has_activity:
+        strength = "medium"
+        reason   = "partial name match + activity signal"
+    elif _has_name:
+        strength = "weak"
+        reason   = "partial name match only"
+    else:
+        strength = "none"
+        reason   = "no company name tokens found in evidence"
+
+    return {
+        "has_company_name":              _has_name,
+        "has_most_company_tokens":       _most_tokens,
+        "has_location":                  _has_loc,
+        "has_contact_or_registered_office": _has_contact,
+        "has_activity_signal":           _has_activity,
+        "serper_identity_strength":      strength,
+        "serper_identity_reason":        reason,
+    }
+
+
 def _apply_haiku_decision(
     python_result: dict,
     haiku_result: dict,
     mode: str,
+    raw_evidence: list[dict] | None = None,
 ) -> dict:
     """
     Merge Python result and Haiku result into final_* fields.
@@ -2244,25 +2373,77 @@ def _apply_haiku_decision(
     haiku_domain = str(haiku_result.get("haiku_domain", "") or "")
     haiku_conf   = haiku_result.get("haiku_confidence", "")
 
+    # Build set of domains present in evidence for replace validation
+    _evidence_domains: set[str] = set()
+    if raw_evidence:
+        for _e in raw_evidence:
+            _d = _e.get("domain", "")
+            if _d:
+                _evidence_domains.add(_d.lower())
+
     if decision == "accept":
         return {
             "final_selected_domain": python_domain,
             "final_decision_source": "haiku_accept",
             "final_confidence":      haiku_conf or python_conf,
         }
+
     if decision == "replace" and haiku_domain:
+        _hd_norm = haiku_domain.lower().lstrip("www.").split("/")[0]
+        _in_evidence = (
+            _hd_norm in _evidence_domains
+            or haiku_domain.lower() in _evidence_domains
+            or any(haiku_domain.lower() in d or d in haiku_domain.lower() for d in _evidence_domains)
+        )
+        if not _in_evidence:
+            # Haiku suggested a domain not in evidence — ignore replace
+            return {
+                "final_selected_domain": python_domain,
+                "final_decision_source": "haiku_invalid_replace_ignored",
+                "final_confidence":      python_conf,
+                "manual_review_needed":  True,
+            }
+        _review = haiku_conf != "High"
         return {
             "final_selected_domain": haiku_domain,
             "final_decision_source": "haiku_replace",
             "final_confidence":      haiku_conf or "Medium",
+            "manual_review_needed":  _review,
         }
-    if decision == "reject":
+
+    if decision == "needs_firecrawl":
         return {
-            "final_selected_domain": "",
-            "final_decision_source": "haiku_reject",
-            "final_confidence":      "None",
+            "final_selected_domain": python_domain,
+            "final_decision_source": "haiku_needs_firecrawl",
+            "final_confidence":      python_conf,
         }
-    # uncertain / skipped / error — keep python result
+
+    if decision == "reject":
+        _py_conf_low = python_conf.lower() in ("low", "none", "")
+        if _py_conf_low:
+            return {
+                "final_selected_domain": "",
+                "final_decision_source": "haiku_reject",
+                "final_confidence":      "None",
+                "manual_review_needed":  True,
+            }
+        # Python confidence is Medium or High — protect the domain
+        return {
+            "final_selected_domain": python_domain,
+            "final_decision_source": "haiku_reject_protected",
+            "final_confidence":      python_conf,
+            "manual_review_needed":  True,
+        }
+
+    if decision == "uncertain":
+        return {
+            "final_selected_domain": python_domain,
+            "final_decision_source": "haiku_uncertain",
+            "final_confidence":      python_conf,
+            "manual_review_needed":  True,
+        }
+
+    # skipped / error / unknown — keep python result
     source = "haiku_skipped" if decision == "skipped_no_serper_evidence" else "haiku_uncertain"
     return {
         "final_selected_domain": python_domain,
@@ -3919,6 +4100,67 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
         if _is_high_risk and cur_conf_py == "high":
             _updates["final_confidence"] = "Medium"
             _updates["manual_review_needed"] = True
+
+        # ── Part 8: Haiku timeout fallback ────────────────────────────────────
+        # When Firecrawl timed out on an exact candidate_url with a meaningful path,
+        # and Serper evidence is medium or strong, accept the candidate domain.
+        _cand_url_hint = str(result.get("candidate_url", "") or "")
+        _cand_type_r   = str(result.get("candidate_type", "") or "")
+        _haiku_dec_r   = str(result.get("haiku_decision", "") or "")
+        _haiku_cand_u  = str(result.get("haiku_candidate_url", "") or "")
+        try:
+            _hint_path = urlparse(_cand_url_hint).path if _cand_url_hint else ""
+        except Exception:
+            _hint_path = ""
+        _hint_meaningful = bool(_hint_path and len(_hint_path.strip("/").split("/")) >= 2)
+        _eligible_type = _cand_type_r in ("group_site_subsidiary_page", "deep_page")
+        if (
+            _hint_meaningful
+            and _eligible_type
+            and decision in ("uncertain", "fetch_failed", "")
+            and _final_dom
+        ):
+            # Compute Serper identity strength using all evidence for this domain
+            _company_nm  = str(result.get("cleaned_company_name", "") or "")
+            _city_r      = str(result.get("city", "") or "")
+            _prov_r      = str(result.get("province", "") or "")
+            # Find the best evidence row for the candidate URL
+            _best_hint_ev: dict = {}
+            for _chk_e in (result.get("_raw_ev_ref") or []):
+                if _chk_e.get("candidate_url", "") == _cand_url_hint or _chk_e.get("url", "") == _cand_url_hint:
+                    _best_hint_ev = _chk_e
+                    break
+            # Fallback: build a synthetic evidence row from result fields
+            if not _best_hint_ev:
+                _best_hint_ev = {
+                    "title":   result.get("serper_top_result_title", ""),
+                    "snippet": "",
+                    "url":     _cand_url_hint,
+                }
+            _id_ev = _serper_exact_page_identity_evidence(
+                _company_nm, _city_r, _prov_r, _best_hint_ev
+            )
+            _id_strength = _id_ev.get("serper_identity_strength", "none")
+
+            if _id_strength in ("medium", "strong"):
+                # Haiku confirmed this candidate if decision was accept/needs_firecrawl
+                _haiku_confirmed = _haiku_dec_r in ("accept", "needs_firecrawl")
+                _timeout_src = (
+                    "haiku_timeout_fallback"
+                    if _haiku_confirmed
+                    else "serper_exact_page_timeout_fallback"
+                )
+                _ev_url_fb = _haiku_cand_u or _cand_url_hint
+                _updates.update({
+                    "final_selected_domain":          _root_domain(_final_dom) or _final_dom,
+                    "final_decision_source":          _timeout_src,
+                    "final_confidence":               "Medium",
+                    "manual_review_needed":           _id_strength != "strong",
+                    "verifier_evidence_url":          _ev_url_fb,
+                    "firecrawl_evidence_url":         _ev_url_fb,
+                    "canonical_domain_verification_status": "firecrawl_timeout_serper_or_haiku_confirmed",
+                })
+
     return _updates
 
 
@@ -4374,6 +4616,11 @@ _OUTPUT_COLS = [
     # v10 candidate metadata
     "candidate_url",
     "candidate_type",
+    "candidate_path",
+    "candidate_source",
+    # v11 haiku extended fields
+    "haiku_candidate_url",
+    "haiku_recommended_action",
 ]
 
 
@@ -4499,7 +4746,7 @@ def process_dataframe(
         res.update({
             "haiku_used": False, "haiku_decision": "", "haiku_domain": "",
             "haiku_confidence": "", "haiku_reason": "", "haiku_risk_flags": "",
-            "haiku_error": "",
+            "haiku_error": "", "haiku_candidate_url": "", "haiku_recommended_action": "",
         })
 
         # Determine if Haiku should run for this row
@@ -4527,8 +4774,53 @@ def process_dataframe(
         else:
             haiku_res = {"haiku_used": False}
 
-        final_fields = _apply_haiku_decision(res, haiku_res, haiku_mode)
+        final_fields = _apply_haiku_decision(res, haiku_res, haiku_mode, raw_evidence=raw_ev)
         res.update(final_fields)
+
+        # ── Populate candidate metadata from best evidence row ───────────────
+        _final_sel_dom = str(res.get("final_selected_domain") or res.get("validated_domain") or "")
+        _best_ev_row: dict = {}
+        _best_ev_score: float = -1.0
+        for _ev in raw_ev:
+            _ev_dom = _ev.get("domain", "")
+            if _ev_dom and _ev_dom == _final_sel_dom:
+                try:
+                    _ev_sc = float(_ev.get("score", -1))
+                except (TypeError, ValueError):
+                    _ev_sc = -1.0
+                if _ev_sc > _best_ev_score:
+                    _best_ev_score = _ev_sc
+                    _best_ev_row = _ev
+        if not _best_ev_row:
+            # Fallback: any evidence row for this domain
+            _best_ev_row = next(
+                (_ev for _ev in raw_ev if _ev.get("domain", "") == _final_sel_dom), {}
+            )
+        _cand_url_out  = _best_ev_row.get("candidate_url", "") or ""
+        _cand_type_out = _best_ev_row.get("candidate_type", "") or ""
+        if _cand_url_out and not _cand_type_out:
+            _t = _best_ev_row.get("title", "")
+            _s = _best_ev_row.get("snippet", "")
+            _cand_type_out = _classify_candidate_type(_cand_url_out, _final_sel_dom, _t, _s)
+        try:
+            _cand_path_out = urlparse(_cand_url_out).path if _cand_url_out else ""
+        except Exception:
+            _cand_path_out = ""
+        _cand_src_out = _best_ev_row.get("candidate_source", "serper_result") if _best_ev_row else ""
+        res["candidate_url"]    = _cand_url_out
+        res["candidate_type"]   = _cand_type_out
+        res["candidate_path"]   = _cand_path_out
+        res["candidate_source"] = _cand_src_out
+
+        # ── Haiku-controlled Firecrawl forcing (Part 6) ───────────────────────
+        # Stored on res so _should_verify can read it; also used directly below
+        _haiku_rec_action = str(res.get("haiku_recommended_action", "") or "")
+        _haiku_dec_final  = str(res.get("haiku_decision", "") or "")
+        _haiku_force_fc   = (
+            _haiku_rec_action in ("firecrawl_exact_url", "firecrawl_root")
+            or _haiku_dec_final == "needs_firecrawl"
+        )
+        res["_haiku_force_firecrawl"] = _haiku_force_fc
 
         # ── Default Jina verifier fields ─────────────────────────────────────
         _jina_defaults = {
@@ -4588,6 +4880,10 @@ def process_dataframe(
             _should_run_v, _verify_reason = _should_verify(
                 res, _name_variants_v, raw_ev, verifier_mode, debug_mode
             )
+            # Haiku may force Firecrawl even when _should_verify would skip
+            if res.pop("_haiku_force_firecrawl", False) and not _should_run_v:
+                _should_run_v   = True
+                _verify_reason  = ("haiku_requested_firecrawl_exact_url; " + _verify_reason).strip("; ")
             res["verification_needed"] = _should_run_v
             res["verification_reason"] = _verify_reason
             if _should_run_v:
@@ -4690,6 +4986,15 @@ def process_dataframe(
                     if is_sel and _sc > _best_sel_score:
                         _best_sel_score = _sc
                         _best_sel_idx = len(new_debug)
+                    _e_url  = e.get("url", "")
+                    _e_dom  = e.get("domain", "")
+                    _e_curl = e.get("candidate_url", "") or _e_url
+                    _e_ctyp = e.get("candidate_type", "") or _classify_candidate_type(
+                        _e_curl, _e_dom, e.get("title", ""), e.get("snippet", ""))
+                    try:
+                        _e_cpath = urlparse(_e_curl).path if _e_curl else ""
+                    except Exception:
+                        _e_cpath = ""
                     new_debug.append({
                         "company_name":          name,
                         "row_number":            global_i + 1,
@@ -4697,8 +5002,12 @@ def process_dataframe(
                         "result_rank":           query_counters[q] if e.get("url") else "",
                         "title":                 e.get("title", ""),
                         "snippet":               e.get("snippet", ""),
-                        "url":                   e.get("url", ""),
-                        "extracted_domain":      e.get("domain", ""),
+                        "url":                   _e_url,
+                        "extracted_domain":      _e_dom,
+                        "candidate_url":         _e_curl,
+                        "candidate_type":        _e_ctyp,
+                        "candidate_source":      e.get("candidate_source", "serper_result"),
+                        "candidate_path":        _e_cpath,
                         "score":                 e.get("score", ""),
                         "used":                  e.get("used", ""),
                         "skip_reason":           e.get("skip_reason", ""),
@@ -4711,6 +5020,8 @@ def process_dataframe(
                         "final_python_domain":   _final_py,
                         "haiku_mode":            haiku_mode,
                         "haiku_decision":        _haiku_dec,
+                        "haiku_candidate_url":   res.get("haiku_candidate_url", ""),
+                        "haiku_recommended_action": res.get("haiku_recommended_action", ""),
                         "final_selected_domain": _final_sel,
                         "selected_candidate":    is_sel,
                         "selected_best_candidate": False,  # back-filled below
@@ -5348,11 +5659,13 @@ def build_excel(
         _debug_cols = [
             "company_name", "row_number", "search_query", "result_rank",
             "title", "snippet", "url", "extracted_domain",
+            "candidate_url", "candidate_type", "candidate_source", "candidate_path",
             "score", "used", "selected_candidate", "selected_best_candidate",
             "skip_reason", "rejection_category",
             "brand_overlap", "full_overlap", "location_match", "email_match",
             "official_signal", "final_python_domain",
-            "haiku_mode", "haiku_decision", "final_selected_domain",
+            "haiku_mode", "haiku_decision", "haiku_candidate_url", "haiku_recommended_action",
+            "final_selected_domain",
         ]
         if debug_rows:
             debug_df = pd.DataFrame(debug_rows)
@@ -5413,12 +5726,14 @@ def build_excel(
         ws_jina = wb.create_sheet("Website Verification Debug")
         _verif_debug_cols = [
             "company_name", "candidate_domain",
+            "candidate_url", "candidate_type", "candidate_source", "candidate_path",
             "original_candidate_url", "page_url",
             "page_type", "redirect_final_url", "redirect_final_domain",
             "canonical_domain_used", "fetch_status", "chars_fetched", "elapsed_secs",
             "source_type", "wrong_entity_type_signal", "wrong_location_signal",
             "evidence_strength", "negative_source_type",
             "verifier_decision", "verifier_reason", "replace_allowed",
+            "haiku_decision", "haiku_confidence",
         ]
         if jina_debug_rows:
             jd_df = pd.DataFrame(jina_debug_rows)
@@ -5736,6 +6051,16 @@ def _build_run_meta(
         ),
         "no_confident_match_count":  no_match,
         "manual_review_count":       review,
+        # v11 Haiku extended counters
+        "haiku_needs_firecrawl":     int(decisions.eq("needs_firecrawl").sum()),
+        "firecrawl_forced_by_haiku": int(
+            enriched_df.get("verification_reason", pd.Series(dtype=str)).astype(str)
+            .str.contains("haiku_requested_firecrawl", na=False).sum()
+        ),
+        "timeout_fallback_applied":  int(
+            enriched_df.get("final_decision_source", pd.Series(dtype=str)).astype(str)
+            .str.contains("timeout_fallback", na=False).sum()
+        ),
     }
 
 
