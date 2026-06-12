@@ -375,7 +375,14 @@ _FC_SPEED_DEFAULTS  = {
 # Negative source-type patterns that block replacement
 _NEG_SOURCE_RES: dict[str, re.Pattern] = {
     "news_media":       re.compile(
-        r"\b(giornale|notizie|news|article|blog|press|media|redazione|editoriale|testata)\b", re.I),
+        # Only flag pages that are clearly third-party editorial/journalism —
+        # NOT company websites that happen to have a news/press section.
+        # Require terms that imply the PAGE ITSELF is a news outlet, not just
+        # that the company publishes updates.
+        r"\b(testata\s+giornalistica|giornale\s+online|quotidiano|settimanale|mensile|"
+        r"rivista\s+di\s+settore|redazione\s+di|notizie\s+di\s+cronaca|ultime\s+notizie|"
+        r"breaking\s+news|newsroom|press\s+release\s+wire|comunicato\s+stampa\s+agenzia)\b",
+        re.I),
     "directory":        re.compile(
         r"\b(fatturato|bilancio|visura|scheda\s+azienda|scheda\s+impresa|"
         r"company\s+profile|business\s+profile|registro\s+imprese|dati\s+aziendali)\b", re.I),
@@ -2334,14 +2341,21 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
 def _detect_neg_source(text: str) -> str:
     """
     Return the first matching negative-source-type key, or empty string if none.
-    Only matches when the page is primarily that source type (pattern density check).
+    Only matches when the page is clearly that source type.
+
+    news_media requires 3+ matches because many company websites contain a news
+    or press section with words like "comunicato stampa", "aggiornamenti", etc.
+    Other types require 2+ matches.
     """
     if not text:
         return ""
     tl = text.lower()
+    # news_media is the most likely to false-positive on company sites → stricter threshold
+    _thresholds = {"news_media": 3}
     for src_type, pat in _NEG_SOURCE_RES.items():
         hits = pat.findall(tl)
-        if len(hits) >= 2:  # require at least 2 matches to avoid false positives
+        threshold = _thresholds.get(src_type, 2)
+        if len(hits) >= threshold:
             return src_type
     return ""
 
@@ -2525,6 +2539,7 @@ def _fc_verify_candidates(
     max_pages: int = 3,
     page_timeout: int = 15,
     fc_speed_mode: str = _FC_SPEED_FAST,
+    python_confidence: str = "",  # "High"/"Medium"/"Low"/"None" from Python scoring
     progress_update_fn=None,  # optional callback(candidate_i, total_cands, page_i, total_pages, domain)
     # live-counter dict — caller passes {} and reads back keys after the call
     live_counters: dict | None = None,
@@ -2730,40 +2745,92 @@ def _fc_verify_candidates(
 
     # Determine final decision
     cur_dr = domain_results.get(current_domain, {})
+    _is_high_conf_python = python_confidence.strip().lower() == "high"
 
-    if cur_dr.get("negative_source_type") and not cur_dr.get("replace_allowed"):
-        # Current domain is a blocked negative source — reject or replace with better
-        if best_alt:
+    # Hard negative sources — directories, databases, government portals, marketplaces —
+    # are always considered reliable enough to reject/replace regardless of Python confidence.
+    _HARD_NEG_SOURCES = {"directory", "government", "marketplace", "job_board"}
+
+    cur_neg = cur_dr.get("negative_source_type", "")
+    _cur_neg_is_hard = cur_neg in _HARD_NEG_SOURCES
+
+    if cur_neg and not cur_dr.get("replace_allowed"):
+        if _is_high_conf_python and not _cur_neg_is_hard:
+            # Soft negative source (news_media, foundation, event, association, dealer) on a
+            # High-confidence Python domain — do NOT reject or blank the domain.
+            # Flag it as uncertain and let the human review if needed.
+            fc_out.update(
+                firecrawl_verified_domain=current_domain,
+                firecrawl_decision="uncertain",
+                firecrawl_confidence="Low",
+                firecrawl_reason=(
+                    f"Possible {cur_neg} signal on page — but Python confidence is High; "
+                    "keeping domain; manual review recommended"
+                ),
+                firecrawl_evidence_strength=cur_dr.get("evidence_strength", "weak"),
+                firecrawl_negative_source_type=cur_neg,
+            )
+        elif best_alt:
+            # Current domain is a hard negative source (or non-High confidence) — replace
             alt_dr = domain_results[best_alt]
             fc_out.update(
                 firecrawl_verified_domain=best_alt,
                 firecrawl_decision="replace",
                 firecrawl_confidence="High" if best_alt_str >= 3 else "Medium",
-                firecrawl_reason=f"Current domain blocked ({cur_dr['negative_source_type']}); {best_alt}: {alt_dr['reason']}",
+                firecrawl_reason=f"Current domain is {cur_neg}; {best_alt}: {alt_dr['reason']}",
                 firecrawl_evidence_strength=alt_dr["evidence_strength"],
                 firecrawl_negative_source_type="",
             )
         else:
-            fc_out.update(
-                firecrawl_verified_domain="",
-                firecrawl_decision="reject",
-                firecrawl_confidence="None",
-                firecrawl_reason=f"Current domain is {cur_dr['negative_source_type']}; no strong alternative found",
-                firecrawl_evidence_strength="none",
-                firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
-            )
+            if _is_high_conf_python:
+                # No strong alternative and High Python confidence — flag, don't blank
+                fc_out.update(
+                    firecrawl_verified_domain=current_domain,
+                    firecrawl_decision="uncertain",
+                    firecrawl_confidence="Low",
+                    firecrawl_reason=(
+                        f"Current domain shows {cur_neg} signals; no verified alternative found; "
+                        "Python confidence High — keeping domain"
+                    ),
+                    firecrawl_evidence_strength="weak",
+                    firecrawl_negative_source_type=cur_neg,
+                )
+            else:
+                fc_out.update(
+                    firecrawl_verified_domain="",
+                    firecrawl_decision="reject",
+                    firecrawl_confidence="None",
+                    firecrawl_reason=f"Current domain is {cur_neg}; no strong alternative found",
+                    firecrawl_evidence_strength="none",
+                    firecrawl_negative_source_type=cur_neg,
+                )
 
     elif best_alt and best_alt_str > current_str and best_alt_str >= 3:
-        # A different domain has strong evidence and current domain is weaker
+        # A different domain has strong evidence and current domain is weaker.
+        # For High-confidence Python rows only replace if the alternative is very strong (IVA match
+        # or legal name match) — otherwise just flag uncertain.
         alt_dr = domain_results[best_alt]
-        fc_out.update(
-            firecrawl_verified_domain=best_alt,
-            firecrawl_decision="replace",
-            firecrawl_confidence="High",
-            firecrawl_reason=f"Stronger evidence on {best_alt}: {alt_dr['reason']}",
-            firecrawl_evidence_strength=alt_dr["evidence_strength"],
-            firecrawl_negative_source_type="",
-        )
+        if _is_high_conf_python and alt_dr.get("evidence_strength") != "strong":
+            fc_out.update(
+                firecrawl_verified_domain=current_domain,
+                firecrawl_decision="uncertain",
+                firecrawl_confidence="Low",
+                firecrawl_reason=(
+                    f"Alternative {best_alt} has stronger evidence but Python confidence is High — "
+                    "not replacing without hard identity proof"
+                ),
+                firecrawl_evidence_strength=cur_dr.get("evidence_strength", "none"),
+                firecrawl_negative_source_type=cur_neg,
+            )
+        else:
+            fc_out.update(
+                firecrawl_verified_domain=best_alt,
+                firecrawl_decision="replace",
+                firecrawl_confidence="High",
+                firecrawl_reason=f"Stronger evidence on {best_alt}: {alt_dr['reason']}",
+                firecrawl_evidence_strength=alt_dr["evidence_strength"],
+                firecrawl_negative_source_type="",
+            )
 
     elif cur_dr.get("replace_allowed") or cur_dr.get("evidence_strength", "none") in ("strong", "medium"):
         # Current domain confirmed (or soft-confirmed)
@@ -2775,7 +2842,7 @@ def _fc_verify_candidates(
             firecrawl_confidence=conf,
             firecrawl_reason=cur_dr.get("reason", "Firecrawl confirms Python selection"),
             firecrawl_evidence_strength=strength,
-            firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
+            firecrawl_negative_source_type=cur_neg,
         )
 
     elif cur_dr.get("evidence_strength", "none") == "weak":
@@ -2785,7 +2852,7 @@ def _fc_verify_candidates(
             firecrawl_confidence="Low",
             firecrawl_reason="Only weak/soft evidence found — keeping Python selection but flagging",
             firecrawl_evidence_strength="weak",
-            firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
+            firecrawl_negative_source_type=cur_neg,
         )
 
     else:
@@ -2905,6 +2972,10 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     """
     Apply the unified verifier result on top of final_* fields.
     Replacement is only allowed when verifier_replace_allowed is True.
+
+    Protection rule: for High-confidence Python rows a verifier "reject" decision
+    is downgraded to "uncertain" — the domain is kept and manual_review_needed is
+    set True, but final_selected_domain is never blanked.
     Returns a dict of fields to merge into result.
     """
     if not verif_res.get("verifier_used"):
@@ -2914,6 +2985,8 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     sel_domain  = str(verif_res.get("verifier_selected_domain", "") or "")
     replace_ok  = verif_res.get("verifier_replace_allowed", False)
     confidence  = verif_res.get("verifier_confidence", "")
+    cur_conf_py = (result.get("final_confidence") or "").strip().lower()
+    _py_high    = cur_conf_py == "high"
 
     if decision == "replace" and replace_ok and sel_domain:
         return {
@@ -2923,6 +2996,12 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
             "manual_review_needed":  False,
         }
     if decision == "reject":
+        if _py_high:
+            # Do not blank a High-confidence domain — flag for review instead
+            return {
+                "final_decision_source": "verifier_flag_high_conf",
+                "manual_review_needed":  True,
+            }
         return {
             "final_selected_domain": "",
             "final_decision_source": "verifier_reject",
@@ -2931,8 +3010,7 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
         }
     if decision == "confirm":
         updates: dict = {"final_decision_source": "verifier_confirm"}
-        cur_conf = (result.get("final_confidence") or "").lower()
-        if confidence == "High" and cur_conf in ("medium", "low", "none", ""):
+        if confidence == "High" and cur_conf_py in ("medium", "low", "none", ""):
             updates["final_confidence"] = "High"
         return updates
     # uncertain / fetch_failed / no_candidates
@@ -2955,6 +3033,7 @@ def _run_website_verifier(
     max_pages: int = 3,
     page_timeout: int = 15,
     fc_speed_mode: str = _FC_SPEED_FAST,
+    python_confidence: str = "",
     live_counters: dict | None = None,
     progress_update_fn=None,
 ) -> tuple[dict, list[dict]]:
@@ -3007,6 +3086,7 @@ def _run_website_verifier(
                 name_variants, cands, current_domain, fc_key,
                 max_pages=max_pages, page_timeout=page_timeout,
                 fc_speed_mode=fc_speed_mode,
+                python_confidence=python_confidence,
                 live_counters=live_counters,
                 progress_update_fn=progress_update_fn,
             )
@@ -3531,6 +3611,7 @@ def process_dataframe(
                         max_pages=max_pages_per_cand,
                         page_timeout=page_timeout,
                         fc_speed_mode=fc_speed_mode,
+                        python_confidence=str(res.get("final_confidence") or res.get("domain_confidence") or ""),
                         live_counters=_live_fc_counters,
                     )
                     res.update(_verif_res)
