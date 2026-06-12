@@ -4905,8 +4905,10 @@ def main():
     if checkpoints:
         n_cp = len(checkpoints)
         with st.expander(f"📂 Previous runs available ({n_cp})", expanded=False):
-            for cp_meta in checkpoints[:8]:
+            for idx, cp_meta in enumerate(checkpoints[:8]):
                 run_id_cp  = cp_meta.get("run_id", "?")
+                folder_cp  = cp_meta.get("_folder", "") or run_id_cp
+                key_suffix = f"{idx}_{folder_cp}"
                 row_idx    = cp_meta.get("row_idx", 0)
                 total      = cp_meta.get("total_rows", "?")
                 ts         = str(cp_meta.get("timestamp", "?"))[:19]
@@ -4922,7 +4924,7 @@ def main():
                 c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
                 c1.markdown(label_str)
 
-                if c2.button("Resume", key=f"resume_{run_id_cp}", use_container_width=True):
+                if c2.button("Resume", key=f"resume_{key_suffix}", use_container_width=True):
                     cp_data = _load_checkpoint(run_id_cp)
                     if cp_data and cp_data.get("input_df") is not None:
                         st.session_state["reg_resume_data"] = cp_data
@@ -4939,12 +4941,12 @@ def main():
                     data=partial_xl,
                     file_name=f"partial_{run_id_cp[:8]}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{run_id_cp}",
+                    key=f"dl_{key_suffix}",
                     use_container_width=True,
                 ):
                     pass  # button handles download
 
-                if c4.button("Delete", key=f"del_{run_id_cp}", use_container_width=True):
+                if c4.button("Delete", key=f"del_{key_suffix}", use_container_width=True):
                     _delete_checkpoint(run_id_cp)
                     st.rerun()
 
