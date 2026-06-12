@@ -524,7 +524,13 @@ EMPLOYEE_RANGE_RESOLVER_FIELDS = [
     "employee_range_source",
     "employee_range_confidence",
     "employee_range_notes",
+    "employee_range_for_scoring",
+    "employee_range_for_scoring_source",
 ]
+
+# Used when no real employee range can be resolved — scoring-continuity only.
+# Never written to lusha_employee_range.
+DEFAULT_EMPLOYEE_RANGE_FOR_SCORING = "51 - 200"
 
 # ── Canonical size bands (must match commercial_fit_scoring.SIZE_BAND_LOOKUP) ─
 _SIZE_BANDS_ORDERED = [
@@ -699,6 +705,83 @@ def resolve_employee_range(row: dict, company_name: str = "") -> dict:
     result["employee_range_confidence"] = "Low"
     result["employee_range_notes"]     = note
     return result
+
+
+def resolve_employee_range_from_serper(
+    company_name: str, domain: str, serper_key: str
+) -> dict:
+    """
+    Fallback: run a few Serper queries to find employee count evidence.
+    Uses _call_serper + _parse_employee_number / _num_to_size_band.
+    Does NOT call Claude or any LLM.
+
+    Returns the same shape as resolve_employee_range:
+      employee_range_resolved, employee_range_source,
+      employee_range_confidence, employee_range_notes.
+    """
+    _empty = {
+        "employee_range_resolved":   "",
+        "employee_range_source":     "missing",
+        "employee_range_confidence": "None",
+        "employee_range_notes":      "",
+    }
+    if not company_name or not serper_key:
+        return _empty
+
+    cn = company_name.strip()
+    queries = [
+        f'"{cn}" employees',
+        f'"{cn}" "number of employees"',
+        f'"{cn}" dipendenti',
+        f'site:linkedin.com/company "{cn}" employees',
+    ]
+    if domain and domain.strip():
+        queries.append(
+            f'site:{domain.strip()} employees OR dipendenti OR workforce OR "team of"'
+        )
+
+    # Confidence heuristic: LinkedIn company page or own domain → High; others → Medium
+    _STRONG_DOMAINS = ("linkedin.com", )
+
+    best_n:    float | None = None
+    best_text: str          = ""
+    best_conf: str          = "None"
+
+    for q in queries:
+        try:
+            hits, _status, _raw, _err = _call_serper(q, serper_key, timeout=10)
+        except Exception:
+            continue
+        if not hits:
+            continue
+        for hit in hits:
+            snippet = (hit.get("snippet") or "") + " " + (hit.get("title") or "")
+            n, matched = _parse_employee_number(snippet)
+            if n is not None and n > 0:
+                hit_domain = hit.get("link", "")
+                is_strong  = any(sd in hit_domain for sd in _STRONG_DOMAINS)
+                if domain and domain.strip() in hit_domain:
+                    is_strong = True
+                conf = "High" if is_strong else "Medium"
+                # Prefer High over Medium; among same level prefer larger sample
+                if best_n is None or (conf == "High" and best_conf != "High"):
+                    best_n    = n
+                    best_text = matched
+                    best_conf = conf
+        if best_conf == "High":
+            break  # good enough — stop querying
+
+    if best_n is None:
+        return _empty
+
+    band = _num_to_size_band(best_n)
+    return {
+        "employee_range_resolved":   band,
+        "employee_range_source":     "serper_employee_search",
+        "employee_range_confidence": best_conf,
+        "employee_range_notes":      f"Serper search found: \"{best_text}\"",
+    }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Extreme Light Mode (ELM) — zero-token, no API key, keyword-only extraction
@@ -4862,7 +4945,19 @@ def _xl_write_opportunity_input(
         ("country",         ["lusha_api_country", "Company Country", "company_hq_country"]),
         ("city",            ["lusha_api_city", "Company City"]),
         ("industry",        ["lusha_api_industry", "Company Main Industry"]),
-        ("employee_range",  ["lusha_api_employee_range", "Company Number of Employees"]),
+        ("employee_range",  [
+            "employee_range_for_scoring",     # scoring default if nothing else
+            "employee_range_resolved",        # High/Medium resolver output
+            "lusha_employee_range",           # back-filled or original Lusha field
+            "lusha_api_employee_range",       # live Lusha API (when available)
+            "Company Number of Employees",    # raw input column
+            "employee_range",                 # generic fallback
+            "company_size",
+        ]),
+        ("employee_range_source",              ["employee_range_source"]),
+        ("employee_range_confidence",          ["employee_range_confidence"]),
+        ("employee_range_notes",               ["employee_range_notes"]),
+        ("employee_range_for_scoring_source",  ["employee_range_for_scoring_source"]),
         # ── Commercial scoring ────────────────────────────────────────────────
         ("commercial_fit_score", ["final_commercial_fit_score"]),
         ("commercial_tier",      ["commercial_tier"]),
@@ -5666,25 +5761,59 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
         df_out[col] = enriched_df[col].values if col in enriched_df.columns else ""
 
     # ── Employee range resolver — runs before scoring ─────────────────────────
-    # Populates employee_range_resolved, employee_range_source, etc.
-    # Then back-fills lusha_employee_range only when empty so the scoring
-    # module picks up the resolved value.
-    _er_records = df_out.to_dict("records")
-    _er_results = []
-    for _rec in _er_records:
-        _cname = str(_rec.get("lusha_company_name") or _rec.get("company_name") or "")
-        _er = resolve_employee_range(_rec, company_name=_cname)
-        _er_results.append(_er)
-    for col in EMPLOYEE_RANGE_RESOLVER_FIELDS:
-        df_out[col] = [r.get(col, "") for r in _er_results]
-    # Back-fill lusha_employee_range with resolved value only when currently empty
+    # Priority: existing fields → text parsing → Serper fallback → scoring default.
+    # Only High/Medium confidence results are back-filled into lusha_employee_range.
+    # The scoring default (51-200) is written only to employee_range_for_scoring,
+    # never to lusha_employee_range.
     def _is_blank_val(v) -> bool:
         return v is None or str(v).strip() in ("", "nan", "None", "N/A", "-")
-    _resolved_vals = df_out["employee_range_resolved"].tolist()
-    _existing_lusha = df_out.get("lusha_employee_range",
-                                  pd.Series([""] * len(df_out))).tolist()
+
+    _serper_key_for_er: str = st.session_state.get("_serper_key", "") or ""
+    _er_records  = df_out.to_dict("records")
+    _er_results: list[dict] = []
+    for _rec in _er_records:
+        _cname  = str(_rec.get("lusha_company_name") or _rec.get("company_name") or "")
+        _domain = str(_rec.get("canonical_company_domain") or _rec.get("domain") or "")
+        _er = resolve_employee_range(_rec, company_name=_cname)
+
+        # Serper fallback when local resolution produced nothing or only Low confidence
+        if _er["employee_range_confidence"] in ("None", "Low") and _serper_key_for_er:
+            _er_s = resolve_employee_range_from_serper(_cname, _domain, _serper_key_for_er)
+            if _er_s.get("employee_range_resolved"):
+                _er = _er_s
+
+        # Populate employee_range_for_scoring and its source
+        if _er.get("employee_range_resolved") and _er.get("employee_range_confidence") in ("High", "Medium"):
+            _er["employee_range_for_scoring"]        = _er["employee_range_resolved"]
+            _er["employee_range_for_scoring_source"] = _er["employee_range_source"]
+        else:
+            # Scoring-only default — not a found fact
+            _er["employee_range_for_scoring"]        = DEFAULT_EMPLOYEE_RANGE_FOR_SCORING
+            _er["employee_range_for_scoring_source"] = "default_commercial_minimum_assumption"
+            if not _er.get("employee_range_notes"):
+                _er["employee_range_notes"] = (
+                    "No employee count found; default commercial minimum range used for scoring only."
+                )
+            if _er["employee_range_confidence"] in ("None",):
+                _er["employee_range_confidence"] = "Low"
+
+        _er_results.append(_er)
+
+    for col in EMPLOYEE_RANGE_RESOLVER_FIELDS:
+        df_out[col] = [r.get(col, "") for r in _er_results]
+
+    # Back-fill lusha_employee_range with High/Medium resolved values only
+    _resolved_vals  = [r.get("employee_range_resolved", "") for r in _er_results]
+    _resolved_confs = [r.get("employee_range_confidence", "None") for r in _er_results]
+    if "lusha_employee_range" not in df_out.columns:
+        df_out["lusha_employee_range"] = ""
+    _existing_lusha = df_out["lusha_employee_range"].tolist()
     df_out["lusha_employee_range"] = [
-        _resolved_vals[i] if _is_blank_val(_existing_lusha[i]) else _existing_lusha[i]
+        _resolved_vals[i]
+        if (_is_blank_val(_existing_lusha[i])
+            and _resolved_vals[i]
+            and _resolved_confs[i] in ("High", "Medium"))
+        else _existing_lusha[i]
         for i in range(len(df_out))
     ]
 
@@ -5699,6 +5828,99 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
         debug_records=debug_records,
     )
     st.rerun()
+
+
+def _smoke_test_employee_range_resolver() -> None:
+    """
+    Offline smoke test for the employee range resolver pipeline.
+    Run with:
+        python -c "import enrich_clients_claude as e; e._smoke_test_employee_range_resolver()"
+    """
+    PASS = "\033[92m✓\033[0m"
+    FAIL = "\033[91m✗\033[0m"
+    failures: list[str] = []
+
+    def chk(label: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            print(f"  {PASS}  {label}")
+        else:
+            failures.append(label)
+            print(f"  {FAIL}  {label}" + (f"  [{detail}]" if detail else ""))
+
+    print("\n=== Employee range resolver smoke test ===\n")
+
+    # ── Row 1: explicit employee count in icp_evidence ────────────────────────
+    print("Case 1: explicit count in icp_evidence")
+    row1 = {
+        "company_name":           "Example Company",
+        "lusha_api_employee_range": "",
+        "lusha_employee_range":   "",
+        "employee_range":         "",
+        "company_size":           "",
+        "Company Number of Employees": "",
+        "icp_evidence": "The company has 500 employees and operates internationally.",
+    }
+    r1 = resolve_employee_range(row1, company_name="Example Company")
+    chk("employee_range_resolved = '201 - 500'",
+        r1["employee_range_resolved"] == "201 - 500",
+        r1["employee_range_resolved"])
+    chk("confidence is High or Medium",
+        r1["employee_range_confidence"] in ("High", "Medium"),
+        r1["employee_range_confidence"])
+
+    # Simulate the for_scoring / backfill logic
+    er_for_scoring1 = r1["employee_range_resolved"] if r1["employee_range_confidence"] in ("High", "Medium") else DEFAULT_EMPLOYEE_RANGE_FOR_SCORING
+    chk("employee_range_for_scoring = resolved value",
+        er_for_scoring1 == "201 - 500",
+        er_for_scoring1)
+
+    existing_lusha1 = ""
+    def _is_blank_val(v):
+        return v is None or str(v).strip() in ("", "nan", "None", "N/A", "-")
+    backfilled1 = r1["employee_range_resolved"] if (
+        _is_blank_val(existing_lusha1)
+        and r1["employee_range_resolved"]
+        and r1["employee_range_confidence"] in ("High", "Medium")
+    ) else existing_lusha1
+    chk("lusha_employee_range backfilled",
+        backfilled1 == "201 - 500",
+        backfilled1)
+
+    # ── Row 2: no employee evidence at all ────────────────────────────────────
+    print("\nCase 2: no employee evidence")
+    row2 = {
+        "company_name":           "Unknown Corp",
+        "lusha_api_employee_range": "",
+        "lusha_employee_range":   "",
+        "employee_range":         "",
+        "icp_evidence":           "They sell widgets and have an office in Milan.",
+    }
+    r2 = resolve_employee_range(row2, company_name="Unknown Corp")
+    chk("employee_range_resolved is blank",
+        r2["employee_range_resolved"] == "",
+        r2["employee_range_resolved"])
+
+    er_for_scoring2 = r2["employee_range_resolved"] if r2["employee_range_confidence"] in ("High", "Medium") else DEFAULT_EMPLOYEE_RANGE_FOR_SCORING
+    chk("employee_range_for_scoring = default '51 - 200'",
+        er_for_scoring2 == DEFAULT_EMPLOYEE_RANGE_FOR_SCORING,
+        er_for_scoring2)
+
+    existing_lusha2 = ""
+    backfilled2 = r2["employee_range_resolved"] if (
+        _is_blank_val(existing_lusha2)
+        and r2["employee_range_resolved"]
+        and r2["employee_range_confidence"] in ("High", "Medium")
+    ) else existing_lusha2
+    chk("lusha_employee_range NOT backfilled from default",
+        backfilled2 == "",
+        repr(backfilled2))
+
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} check(s) — {failures}")
+    else:
+        print("All checks passed.")
+    print()
 
 
 def _validate_type1_type2_pipeline() -> None:
