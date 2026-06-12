@@ -359,6 +359,19 @@ _VM_UNCERTAIN = "Uncertain candidates only"
 _VM_ALL_DEBUG = "All selected candidates in debug mode"
 _VM_OPTIONS   = [_VM_UNCERTAIN, _VM_ALL_DEBUG]
 
+# Firecrawl speed mode constants
+_FC_SPEED_FAST      = "Fast"       # homepage only, 1 candidate, 1 page, 6s timeout
+_FC_SPEED_BALANCED  = "Balanced"   # homepage + about/contact if weak, 1 cand, 2 pages, 8s
+_FC_SPEED_THOROUGH  = "Thorough"   # homepage + about + contact, configurable
+_FC_SPEED_OPTIONS   = [_FC_SPEED_FAST, _FC_SPEED_BALANCED, _FC_SPEED_THOROUGH]
+
+# Per-speed-mode defaults: (max_cands, max_pages, timeout_secs)
+_FC_SPEED_DEFAULTS  = {
+    _FC_SPEED_FAST:     (1, 1, 6),
+    _FC_SPEED_BALANCED: (1, 2, 8),
+    _FC_SPEED_THOROUGH: (3, 3, 15),
+}
+
 # Negative source-type patterns that block replacement
 _NEG_SOURCE_RES: dict[str, re.Pattern] = {
     "news_media":       re.compile(
@@ -2511,14 +2524,22 @@ def _fc_verify_candidates(
     fc_key: str,
     max_pages: int = 3,
     page_timeout: int = 15,
+    fc_speed_mode: str = _FC_SPEED_FAST,
     progress_update_fn=None,  # optional callback(candidate_i, total_cands, page_i, total_pages, domain)
+    # live-counter dict — caller passes {} and reads back keys after the call
+    live_counters: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """
     Verify candidate domains via Firecrawl scrape.
     Returns (fc_result_dict, verif_debug_rows).
 
-    Replacement rule: a candidate may only replace the Python-selected domain when
-    evidence_strength == "strong" AND no negative_source_type.
+    max_pages counts ATTEMPTED requests (not only successes) — the per-candidate
+    request budget stops after max_pages attempts regardless of outcome.
+
+    Early-stop rules:
+    - After homepage: if evidence_strength is "strong" → skip about/contact.
+    - After homepage: if negative_source_type is set → skip remaining pages for this candidate.
+    - In Balanced mode: skip about/contact when homepage already gives medium+ evidence.
     """
     fc_out = {
         "firecrawl_used":               True,
@@ -2534,6 +2555,13 @@ def _fc_verify_candidates(
     }
     debug_rows: list[dict] = []
 
+    if live_counters is None:
+        live_counters = {}
+    live_counters.setdefault("fc_requests_attempted", 0)
+    live_counters.setdefault("fc_pages_successful", 0)
+    live_counters.setdefault("fc_timeouts", 0)
+    live_counters.setdefault("fc_total_secs", 0.0)
+
     if not candidates or not fc_key:
         fc_out.update(
             firecrawl_used=bool(fc_key),
@@ -2542,17 +2570,24 @@ def _fc_verify_candidates(
         )
         return fc_out, debug_rows
 
-    # Page slots to attempt per candidate (try Italian first, then English fallback)
-    _PAGE_SLOTS = [
+    # Page slots available per mode
+    _ALL_SLOTS = [
         ("homepage",  [""]),
         ("about",     ["/chi-siamo", "/about", "/about-us"]),
         ("contact",   ["/contatti", "/contact", "/contacts"]),
     ]
+    if fc_speed_mode == _FC_SPEED_FAST:
+        _active_slots = _ALL_SLOTS[:1]   # homepage only
+    elif fc_speed_mode == _FC_SPEED_BALANCED:
+        _active_slots = _ALL_SLOTS[:2]   # homepage + about (contact dropped; balanced decides below)
+    else:
+        _active_slots = _ALL_SLOTS       # all three slots
 
     domain_results: dict[str, dict] = {}  # domain -> aggregated result
     all_statuses: list[str] = []
     total_pages_fetched = 0
     fc_errors: list[str] = []
+    import time as _time_mod
 
     for ci, domain in enumerate(candidates):
         if not domain:
@@ -2560,24 +2595,50 @@ def _fc_verify_candidates(
 
         pages_evidence: list[dict] = []
         neg_src_domain = ""
-        pages_attempted = 0
+        requests_attempted = 0  # budget: counts every FC request attempt
 
-        for slot_name, slug_candidates in _PAGE_SLOTS:
-            if pages_attempted >= max_pages:
+        for slot_name, slug_candidates in _active_slots:
+            if requests_attempted >= max_pages:
                 break
 
-            # Try slugs in order for this slot; stop at first success or 404
+            # Early-stop after homepage: strong evidence or confirmed negative source
+            if slot_name != "homepage" and pages_evidence:
+                _interim_str, _, _ = _compute_evidence_strength(pages_evidence, neg_src_domain)
+                if _interim_str == "strong":
+                    break  # no need to fetch more pages
+                if neg_src_domain:
+                    break  # negative source confirmed — stop fetching this candidate
+
+                # Balanced: skip about/contact when homepage gives medium evidence
+                if fc_speed_mode == _FC_SPEED_BALANCED and _interim_str == "medium":
+                    break
+
+            # Try slugs in order for this slot; stop at first success or hard failure
             for slug in slug_candidates:
+                if requests_attempted >= max_pages:
+                    break
+
                 url = f"https://{domain}{slug}"
                 if progress_update_fn:
-                    progress_update_fn(ci, len(candidates), pages_attempted, max_pages, domain)
+                    progress_update_fn(ci, len(candidates), requests_attempted, max_pages, domain)
 
+                _t0 = _time_mod.time()
                 text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout)
+                _elapsed = _time_mod.time() - _t0
+
+                requests_attempted += 1
+                live_counters["fc_requests_attempted"] += 1
+                live_counters["fc_total_secs"] += _elapsed
                 all_statuses.append(status)
+
+                if status == "timeout":
+                    live_counters["fc_timeouts"] += 1
+                    fc_errors.append(f"{domain}{slug}:timeout")
+                    break  # don't try more slugs in this slot on timeout
 
                 if status == "ok" and text:
                     total_pages_fetched += 1
-                    pages_attempted += 1
+                    live_counters["fc_pages_successful"] += 1
                     ev = _extract_fc_evidence(
                         text, domain, company_name, city, province,
                         email_domain, input_partita_iva, name_variants,
@@ -2594,6 +2655,7 @@ def _fc_verify_candidates(
                         "page_type":            slot_name,
                         "fetch_status":         status,
                         "chars_fetched":        len(text),
+                        "elapsed_secs":         round(_elapsed, 2),
                         "extracted_legal_name": "yes" if ev.get("legal_name_match") else "",
                         "extracted_company_name": "",
                         "extracted_address":    "",
@@ -2611,14 +2673,12 @@ def _fc_verify_candidates(
                     })
                     break  # slot satisfied; move to next slot
                 elif status == "404":
-                    # Try next slug in this slot
-                    continue
-                elif status in ("timeout",) or status.startswith("error:"):
+                    continue  # try next slug in this slot
+                elif status.startswith("error:"):
                     fc_errors.append(f"{domain}{slug}:{status}")
-                    break  # don't try more slugs in this slot on timeout/error
+                    break  # hard error — don't try more slugs
                 else:
-                    # Other HTTP error — try next slug
-                    continue
+                    continue  # other HTTP error — try next slug
 
         # Score this domain
         strength, replace_ok, reason = _compute_evidence_strength(pages_evidence, neg_src_domain)
@@ -2866,6 +2926,8 @@ def _run_website_verifier(
     max_cands: int = 3,
     max_pages: int = 3,
     page_timeout: int = 15,
+    fc_speed_mode: str = _FC_SPEED_FAST,
+    live_counters: dict | None = None,
     progress_update_fn=None,
 ) -> tuple[dict, list[dict]]:
     """
@@ -2916,6 +2978,8 @@ def _run_website_verifier(
                 company_name, city, province, email_domain, input_partita_iva,
                 name_variants, cands, current_domain, fc_key,
                 max_pages=max_pages, page_timeout=page_timeout,
+                fc_speed_mode=fc_speed_mode,
+                live_counters=live_counters,
                 progress_update_fn=progress_update_fn,
             )
             _verif_defaults.update(fc_res)
@@ -3272,6 +3336,7 @@ def process_dataframe(
     max_cands_per_company: int = 3,
     max_pages_per_cand: int = 3,
     page_timeout: int = 15,
+    fc_speed_mode: str = _FC_SPEED_FAST,
     # Debug
     debug_mode: bool = False,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
@@ -3287,6 +3352,12 @@ def process_dataframe(
     new_jina_debug: list[dict] = []
     n = len(df)
     process_dataframe._jina_debug = new_jina_debug  # type: ignore[attr-defined]
+    _live_fc_counters: dict = {
+        "fc_requests_attempted": 0,
+        "fc_pages_successful": 0,
+        "fc_timeouts": 0,
+        "fc_total_secs": 0.0,
+    }
 
     company_col  = cols.get("company") or ""
     website_col  = cols.get("website") or ""
@@ -3426,6 +3497,8 @@ def process_dataframe(
                         max_cands=max_cands_per_company,
                         max_pages=max_pages_per_cand,
                         page_timeout=page_timeout,
+                        fc_speed_mode=fc_speed_mode,
+                        live_counters=_live_fc_counters,
                     )
                     res.update(_verif_res)
                     _verif_upd = _apply_verifier_decision(res, _verif_res)
@@ -4575,18 +4648,42 @@ def main():
             "All selected candidates in debug mode: verify every row when debug mode is ON."
         ),
     )
-    verifier_max_candidates = int(st.sidebar.number_input(
-        "Max candidates per company", min_value=1, max_value=10, value=3, step=1,
-        key="reg_verifier_max_cands",
-    ))
-    verifier_max_pages = int(st.sidebar.number_input(
-        "Max pages per candidate", min_value=1, max_value=6, value=3, step=1,
-        key="reg_verifier_max_pages",
-    ))
-    verifier_page_timeout = int(st.sidebar.number_input(
-        "Page timeout (seconds)", min_value=5, max_value=60, value=15, step=5,
-        key="reg_verifier_page_timeout",
-    ))
+    verifier_speed_mode = st.sidebar.selectbox(
+        "Firecrawl speed mode",
+        options=_FC_SPEED_OPTIONS,
+        index=_FC_SPEED_OPTIONS.index(_FC_SPEED_FAST),
+        key="reg_verifier_speed_mode",
+        help=(
+            "Fast: homepage only — 1 candidate, 1 page, 6 s timeout.  \n"
+            "Balanced: homepage + about/contact only when homepage is weak — 1 candidate, 2 pages, 8 s.  \n"
+            "Thorough: homepage + about + contact — configurable below."
+        ),
+    ) if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) else _FC_SPEED_FAST
+
+    # Default max_cands / max_pages / timeout from speed mode; allow override in Thorough
+    _spd_defaults = _FC_SPEED_DEFAULTS.get(verifier_speed_mode, _FC_SPEED_DEFAULTS[_FC_SPEED_FAST])
+    if verifier_speed_mode == _FC_SPEED_THOROUGH and verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
+        verifier_max_candidates = int(st.sidebar.number_input(
+            "Max candidates per company", min_value=1, max_value=10, value=_spd_defaults[0], step=1,
+            key="reg_verifier_max_cands",
+        ))
+        verifier_max_pages = int(st.sidebar.number_input(
+            "Max pages per candidate (request budget)", min_value=1, max_value=6, value=_spd_defaults[1], step=1,
+            key="reg_verifier_max_pages",
+        ))
+        verifier_page_timeout = int(st.sidebar.number_input(
+            "Page timeout (seconds)", min_value=5, max_value=60, value=_spd_defaults[2], step=5,
+            key="reg_verifier_page_timeout",
+        ))
+    else:
+        verifier_max_candidates = _spd_defaults[0]
+        verifier_max_pages      = _spd_defaults[1]
+        verifier_page_timeout   = _spd_defaults[2]
+        if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA):
+            st.sidebar.caption(
+                f"Speed defaults: {verifier_max_candidates} cand · "
+                f"{verifier_max_pages} page(s)/cand · {verifier_page_timeout}s timeout"
+            )
 
     # ── API keys ──────────────────────────────────────────────────────────────
     # Jina API key (optional — Jina Reader works without a key at lower rate limits)
@@ -4853,6 +4950,7 @@ def main():
                 max_cands_per_company=verifier_max_candidates,
                 max_pages_per_cand=verifier_max_pages,
                 page_timeout=verifier_page_timeout,
+                fc_speed_mode=verifier_speed_mode,
                 debug_mode=debug_mode,
             )
 
@@ -5082,6 +5180,7 @@ def main():
             max_cands_per_company=verifier_max_candidates,
             max_pages_per_cand=verifier_max_pages,
             page_timeout=verifier_page_timeout,
+            fc_speed_mode=verifier_speed_mode,
             debug_mode=debug_mode,
         )
 
@@ -5137,6 +5236,41 @@ def main():
     _summary_metrics(enriched_df, stored_cols)
     st.markdown("")
     _show_results(enriched_df, stored_cols)
+
+    # ── Firecrawl live counters (shown when verifier ran) ─────────────────────
+    if "firecrawl_pages_fetched" in enriched_df.columns:
+        _fc_pages_total = int(pd.to_numeric(
+            enriched_df["firecrawl_pages_fetched"], errors="coerce").fillna(0).sum())
+        _fc_rows_used = int(
+            enriched_df.get("firecrawl_used", pd.Series(dtype=str)).astype(str)
+            .str.lower().isin(["true", "1"]).sum()
+        )
+        if _fc_rows_used > 0:
+            with st.expander("Firecrawl request stats", expanded=False):
+                _fc_confirmed = int(
+                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+                    .astype(str).eq("confirm").sum()
+                )
+                _fc_replaced = int(
+                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+                    .astype(str).eq("replace").sum()
+                )
+                _fc_rejected = int(
+                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+                    .astype(str).eq("reject").sum()
+                )
+                _fc_uncertain = int(
+                    enriched_df.get("firecrawl_decision", pd.Series(dtype=str))
+                    .astype(str).eq("uncertain").sum()
+                )
+                st.markdown(
+                    f"**Rows verified:** {_fc_rows_used}  \n"
+                    f"**Pages fetched (successful):** {_fc_pages_total}  \n"
+                    f"**Avg pages/row:** {round(_fc_pages_total / _fc_rows_used, 1) if _fc_rows_used else 0}  \n"
+                    f"**Decisions:** confirm={_fc_confirmed} · replace={_fc_replaced} · "
+                    f"reject={_fc_rejected} · uncertain={_fc_uncertain}"
+                )
+
     _show_run_info_block(
         run_label=_out_label, run_id=active_run_id,
         batch_n=int(st.session_state.get("reg_run_meta", {}).get("processed_rows", "?")),
