@@ -4057,7 +4057,7 @@ def build_excel(
         and enriched_df["jina_verifier_used"].astype(str).str.lower().isin(["true", "1"]).any()
     )
     if jina_ran or jina_debug_rows:
-        ws_jina = wb.create_sheet("Jina Verification Debug")
+        ws_jina = wb.create_sheet("Website Verification Debug")
         _jina_debug_cols = [
             "company_name", "candidate_domain", "candidate_url", "page_slug",
             "fetch_status", "chars_fetched",
@@ -4250,6 +4250,8 @@ def _build_run_meta(
     serper_key_present: bool,
     anthropic_key_present: bool,
     jina_mode: str = _JINA_MODE_UNCERTAIN,
+    verifier_provider: str = _VP_OFF,
+    verifier_mode: str = _VM_UNCERTAIN,
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -4300,6 +4302,29 @@ def _build_run_meta(
         "jina_replaced":             int(jina_decisions.eq("replace").sum()),
         "jina_rejected":             int(jina_decisions.eq("reject").sum()),
         "jina_uncertain":            int(jina_decisions.isin(["uncertain", "insufficient_evidence"]).sum()),
+        "website_verifier_provider": verifier_provider,
+        "verification_mode":         verifier_mode,
+        "rows_verified_by_website_verifier": int(
+            enriched_df.get("verifier_used", pd.Series(dtype=str)).astype(str)
+            .str.lower().isin(["true", "1"]).sum()
+        ),
+        "firecrawl_confirmed":       int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("confirm").sum()
+        ),
+        "firecrawl_replaced":        int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("replace").sum()
+        ),
+        "firecrawl_rejected":        int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("reject").sum()
+        ),
+        "firecrawl_uncertain":       int(
+            enriched_df.get("firecrawl_decision", pd.Series(dtype=str)).astype(str).eq("uncertain").sum()
+        ),
+        "firecrawl_pages_fetched_total": int(
+            pd.to_numeric(
+                enriched_df.get("firecrawl_pages_fetched", pd.Series(dtype=int)), errors="coerce"
+            ).fillna(0).sum()
+        ),
         "no_confident_match_count":  no_match,
         "manual_review_count":       review,
     }
@@ -4413,7 +4438,7 @@ def _download_section(
         sheet_n += 1
     if jina_ran or jina_debug_rows:
         sheet_list += (
-            f"  \n{sheet_n}. **Jina Verification Debug** — one row per company/candidate/page fetched by Jina"
+            f"  \n{sheet_n}. **Website Verification Debug** — one row per company/candidate/page fetched by verifier"
         )
         sheet_n += 1
     sheet_list += f"  \n{sheet_n}. **Validation Diagnostics** — coverage, confidence, divergence counts  \n"
@@ -4822,6 +4847,12 @@ def main():
                 haiku_max_rows=int(haiku_max_rows),
                 jina_mode=jina_mode,
                 jina_api_key=jina_api_key,
+                verifier_provider=verifier_provider,
+                verifier_mode=verifier_mode,
+                fc_key=_fc_key,
+                max_cands_per_company=verifier_max_candidates,
+                max_pages_per_cand=verifier_max_pages,
+                page_timeout=verifier_page_timeout,
                 debug_mode=debug_mode,
             )
 
@@ -4840,6 +4871,8 @@ def main():
                 serper_key_present=bool(serper_key),
                 anthropic_key_present=bool(anthropic_key),
                 jina_mode=jina_mode,
+                verifier_provider=verifier_provider,
+                verifier_mode=verifier_mode,
             )
 
             st.session_state["reg_enriched"]    = enriched_df
@@ -5043,6 +5076,12 @@ def main():
             haiku_max_rows=int(haiku_max_rows),
             jina_mode=jina_mode,
             jina_api_key=jina_api_key,
+            verifier_provider=verifier_provider,
+            verifier_mode=verifier_mode,
+            fc_key=_fc_key,
+            max_cands_per_company=verifier_max_candidates,
+            max_pages_per_cand=verifier_max_pages,
+            page_timeout=verifier_page_timeout,
             debug_mode=debug_mode,
         )
 
@@ -5061,6 +5100,8 @@ def main():
             serper_key_present=bool(serper_key),
             anthropic_key_present=bool(anthropic_key),
             jina_mode=jina_mode,
+            verifier_provider=verifier_provider,
+            verifier_mode=verifier_mode,
         )
 
         # Mark complete in checkpoint
