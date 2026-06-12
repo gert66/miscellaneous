@@ -2267,6 +2267,728 @@ def _apply_jina_decision(result: dict, jina_result: dict) -> dict:
 
 
 # =============================================================================
+# FIRECRAWL WEBSITE VERIFIER
+# =============================================================================
+
+
+def _fc_load_key() -> str | None:
+    """Load Firecrawl API key from st.secrets, then os.getenv. Never logs or displays it."""
+    try:
+        k = st.secrets.get("FIRECRAWL_API_KEY") or st.secrets.get("firecrawl_api_key")
+        if k:
+            return k
+    except Exception:
+        pass
+    return os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key") or None
+
+
+def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict]:
+    """
+    Scrape a single URL via Firecrawl v1 scrape endpoint.
+    Returns (markdown_text, fetch_status, metadata_dict).
+    Results cached by URL for the lifetime of the Streamlit session.
+    """
+    if url in _FC_CACHE:
+        return _FC_CACHE[url]
+
+    text, status, meta = "", "not_attempted", {}
+    try:
+        resp = requests.post(
+            _FC_API_URL,
+            headers={"Authorization": f"Bearer {fc_key}", "Content-Type": "application/json"},
+            json={"url": url, "formats": ["markdown"]},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            page_data = body.get("data") or {}
+            text  = (page_data.get("markdown") or "")[:_FC_MAX_CHARS]
+            meta  = page_data.get("metadata") or {}
+            status = "ok"
+        elif resp.status_code == 404:
+            status = "404"
+        else:
+            status = f"http_{resp.status_code}"
+    except requests.Timeout:
+        status = "timeout"
+    except Exception as exc:
+        status = f"error:{str(exc)[:80]}"
+
+    _FC_CACHE[url] = (text, status, meta)
+    return text, status, meta
+
+
+def _detect_neg_source(text: str) -> str:
+    """
+    Return the first matching negative-source-type key, or empty string if none.
+    Only matches when the page is primarily that source type (pattern density check).
+    """
+    if not text:
+        return ""
+    tl = text.lower()
+    for src_type, pat in _NEG_SOURCE_RES.items():
+        hits = pat.findall(tl)
+        if len(hits) >= 2:  # require at least 2 matches to avoid false positives
+            return src_type
+    return ""
+
+
+def _extract_fc_evidence(
+    text: str,
+    domain: str,
+    company_name: str,
+    city: str,
+    province: str,
+    input_email_domain: str,
+    input_partita_iva: str,
+    name_variants: dict,
+) -> dict:
+    """
+    Extract identity evidence from Firecrawl-scraped page text.
+    Returns evidence dict used to compute evidence_strength.
+    """
+    if not text:
+        return {
+            "legal_name_match": False, "partita_iva_match": False,
+            "city_match": False, "province_match": False,
+            "email_domain_match": False, "brand_strong": False,
+            "brand_token": False, "official_signal": False,
+            "italian_language": False, "extracted_iva": "",
+            "extracted_email": "", "extracted_phone": "",
+            "negative_source_type": "",
+        }
+
+    tl = text.lower()
+    brand_lower   = re.sub(r"[^\w\s]", "", (name_variants.get("brand") or company_name).lower())
+    brand_nodot   = re.sub(r"[^\w\s]", "", (name_variants.get("brand_nodot") or brand_lower).lower())
+    name_lower    = re.sub(r"[^\w\s]", "", company_name.lower())
+    name_stripped = re.sub(r"[^\w\s]", "", strip_legal(company_name).lower())
+
+    # Legal/company name match — require most tokens to appear in the page
+    name_toks = [t for t in re.split(r"\s+", name_stripped) if len(t) >= 3]
+    legal_name_match = False
+    if name_toks:
+        matched = sum(1 for t in name_toks if t in tl)
+        legal_name_match = (matched >= max(2, len(name_toks) * 0.75))
+
+    # Partita IVA match
+    _pi_re = re.compile(r"\b(\d{11})\b")
+    extracted_ivas = _pi_re.findall(text)
+    partita_iva_match = bool(
+        input_partita_iva and any(v == input_partita_iva.strip() for v in extracted_ivas)
+    )
+    extracted_iva = extracted_ivas[0] if extracted_ivas else ""
+
+    # City / province match
+    city_match     = bool(city     and len(city)     >= 3 and city.lower()     in tl)
+    province_match = bool(province and len(province) >= 2 and province.lower() in tl)
+
+    # Email domain match (the scraped page contains an email ending with @candidate_domain)
+    _em_re = re.compile(r"[\w.\-]+@([\w.\-]+\.[a-z]{2,6})", re.I)
+    page_email_domains = [m.lower() for m in _em_re.findall(text)]
+    email_domain_match = bool(
+        domain and any(ed == domain or ed.endswith("." + domain) for ed in page_email_domains)
+    )
+    extracted_email = next(
+        (f for f in re.findall(r"[\w.\-]+@[\w.\-]+\.[a-z]{2,6}", text, re.I)
+         if domain in f.lower()), ""
+    ) or (re.findall(r"[\w.\-]+@[\w.\-]+\.[a-z]{2,6}", text, re.I) or [""])[0]
+
+    # Brand token presence
+    brand_token  = bool(brand_lower in tl or brand_nodot in tl)
+    brand_strong = bool(
+        brand_lower and (
+            len(brand_lower) >= 5 and brand_lower in tl
+            or brand_nodot and len(brand_nodot) >= 5 and brand_nodot in tl
+        )
+    )
+
+    # Official-site signal
+    official_signal = bool(re.search(
+        r"\b(sito\s+ufficiale|official\s+(website|site)|benvenuti\s+sul\s+sito|"
+        r"chi\s+siamo|about\s+us|la\s+nostra\s+azienda|our\s+company)\b", tl
+    ))
+
+    # Italian language signal
+    italian_language = bool(re.search(
+        r"\b(azienda|prodotti|servizi|contatti|via\s+[a-z]|piazza|corso\s+[a-z]|"
+        r"srl|spa|snc|sas|p\.iva|partita\s+iva)\b", tl
+    ))
+
+    # Phone
+    _ph_re = re.compile(r"(?:tel\.?|telefono|phone)[:\s]*([\+0][\d\s\-\(\).]{7,20})", re.I)
+    ph_m = _ph_re.search(text)
+    extracted_phone = ph_m.group(1).strip() if ph_m else ""
+
+    # Negative source type
+    negative_source_type = _detect_neg_source(text)
+
+    return {
+        "legal_name_match":    legal_name_match,
+        "partita_iva_match":   partita_iva_match,
+        "city_match":          city_match,
+        "province_match":      province_match,
+        "email_domain_match":  email_domain_match,
+        "brand_strong":        brand_strong,
+        "brand_token":         brand_token,
+        "official_signal":     official_signal,
+        "italian_language":    italian_language,
+        "extracted_iva":       extracted_iva,
+        "extracted_email":     extracted_email,
+        "extracted_phone":     extracted_phone,
+        "negative_source_type": negative_source_type,
+    }
+
+
+def _compute_evidence_strength(
+    pages_evidence: list[dict],
+    negative_source_type: str,
+) -> tuple[str, bool, str]:
+    """
+    Aggregate per-page evidence into an overall evidence_strength and replace_allowed flag.
+
+    Returns (evidence_strength, replace_allowed, reason).
+
+    evidence_strength levels:
+      "none"   — nothing meaningful found
+      "weak"   — soft signals only (Italian language, brand token, official keyword)
+      "medium" — partial identity (city+brand, email domain match, address context)
+      "strong" — hard identity (legal name match, VAT match, or city+brand+email together)
+
+    replace_allowed is True ONLY when evidence_strength == "strong" AND no negative_source_type.
+    False positives are worse than missing domains — be conservative.
+    """
+    if negative_source_type:
+        return "none", False, f"Blocked by negative source type: {negative_source_type}"
+
+    # Aggregate flags across all pages
+    legal_name   = any(e.get("legal_name_match")   for e in pages_evidence)
+    iva_match    = any(e.get("partita_iva_match")   for e in pages_evidence)
+    city_match   = any(e.get("city_match")          for e in pages_evidence)
+    prov_match   = any(e.get("province_match")      for e in pages_evidence)
+    email_match  = any(e.get("email_domain_match")  for e in pages_evidence)
+    brand_strong = any(e.get("brand_strong")        for e in pages_evidence)
+    brand_token  = any(e.get("brand_token")         for e in pages_evidence)
+    official     = any(e.get("official_signal")     for e in pages_evidence)
+    italian      = any(e.get("italian_language")    for e in pages_evidence)
+
+    # Hard evidence combinations → strong
+    if legal_name and brand_strong:
+        return "strong", True, "Legal name + brand confirmed on site"
+    if iva_match:
+        return "strong", True, "Partita IVA matched on site"
+    if email_match and brand_strong and (city_match or prov_match or official):
+        return "strong", True, "Email domain + brand + location/official signal"
+    if city_match and prov_match and brand_strong and official:
+        return "strong", True, "City + province + brand + official signal"
+    if legal_name:
+        return "strong", True, "Legal company name matched on site"
+
+    # Partial identity → medium (confirms but does NOT allow replacement alone)
+    if email_match and brand_strong:
+        return "medium", False, "Email domain + brand (no location corroboration)"
+    if (city_match or prov_match) and brand_strong:
+        return "medium", False, "City/province + brand (no email or VAT)"
+    if email_match and brand_token:
+        return "medium", False, "Email domain found + brand token"
+
+    # Soft signals only → weak
+    if brand_token or official or italian:
+        return "weak", False, "Soft signals only (brand token, Italian language, official keyword)"
+
+    return "none", False, "No meaningful identity evidence found"
+
+
+def _fc_verify_candidates(
+    company_name: str,
+    city: str,
+    province: str,
+    email_domain: str,
+    input_partita_iva: str,
+    name_variants: dict,
+    candidates: list[str],
+    current_domain: str,
+    fc_key: str,
+    max_pages: int = 3,
+    page_timeout: int = 15,
+    progress_update_fn=None,  # optional callback(candidate_i, total_cands, page_i, total_pages, domain)
+) -> tuple[dict, list[dict]]:
+    """
+    Verify candidate domains via Firecrawl scrape.
+    Returns (fc_result_dict, verif_debug_rows).
+
+    Replacement rule: a candidate may only replace the Python-selected domain when
+    evidence_strength == "strong" AND no negative_source_type.
+    """
+    fc_out = {
+        "firecrawl_used":               True,
+        "firecrawl_verified_domain":    "",
+        "firecrawl_decision":           "uncertain",
+        "firecrawl_confidence":         "Low",
+        "firecrawl_reason":             "",
+        "firecrawl_evidence_strength":  "none",
+        "firecrawl_negative_source_type": "",
+        "firecrawl_pages_fetched":      0,
+        "firecrawl_fetch_status":       "",
+        "firecrawl_error":              "",
+    }
+    debug_rows: list[dict] = []
+
+    if not candidates or not fc_key:
+        fc_out.update(
+            firecrawl_used=bool(fc_key),
+            firecrawl_decision="no_candidates" if not candidates else "no_key",
+            firecrawl_reason="No candidates to verify" if not candidates else "No Firecrawl key",
+        )
+        return fc_out, debug_rows
+
+    # Page slots to attempt per candidate (try Italian first, then English fallback)
+    _PAGE_SLOTS = [
+        ("homepage",  [""]),
+        ("about",     ["/chi-siamo", "/about", "/about-us"]),
+        ("contact",   ["/contatti", "/contact", "/contacts"]),
+    ]
+
+    domain_results: dict[str, dict] = {}  # domain -> aggregated result
+    all_statuses: list[str] = []
+    total_pages_fetched = 0
+    fc_errors: list[str] = []
+
+    for ci, domain in enumerate(candidates):
+        if not domain:
+            continue
+
+        pages_evidence: list[dict] = []
+        neg_src_domain = ""
+        pages_attempted = 0
+
+        for slot_name, slug_candidates in _PAGE_SLOTS:
+            if pages_attempted >= max_pages:
+                break
+
+            # Try slugs in order for this slot; stop at first success or 404
+            for slug in slug_candidates:
+                url = f"https://{domain}{slug}"
+                if progress_update_fn:
+                    progress_update_fn(ci, len(candidates), pages_attempted, max_pages, domain)
+
+                text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout)
+                all_statuses.append(status)
+
+                if status == "ok" and text:
+                    total_pages_fetched += 1
+                    pages_attempted += 1
+                    ev = _extract_fc_evidence(
+                        text, domain, company_name, city, province,
+                        email_domain, input_partita_iva, name_variants,
+                    )
+                    if ev.get("negative_source_type") and not neg_src_domain:
+                        neg_src_domain = ev["negative_source_type"]
+                    pages_evidence.append(ev)
+
+                    debug_rows.append({
+                        "company_name":         company_name,
+                        "candidate_domain":     domain,
+                        "provider_used":        "firecrawl",
+                        "page_url":             url,
+                        "page_type":            slot_name,
+                        "fetch_status":         status,
+                        "chars_fetched":        len(text),
+                        "extracted_legal_name": "yes" if ev.get("legal_name_match") else "",
+                        "extracted_company_name": "",
+                        "extracted_address":    "",
+                        "extracted_city":       city if ev.get("city_match") else "",
+                        "extracted_phone":      ev.get("extracted_phone", ""),
+                        "extracted_email":      ev.get("extracted_email", ""),
+                        "extracted_partita_iva": ev.get("extracted_iva", ""),
+                        "source_type":          ev.get("negative_source_type", "") or "company",
+                        "evidence_strength":    "",   # filled after domain scoring
+                        "negative_source_type": ev.get("negative_source_type", ""),
+                        "verifier_score":       "",
+                        "verifier_decision":    "",
+                        "verifier_reason":      "",
+                        "replace_allowed":      "",
+                    })
+                    break  # slot satisfied; move to next slot
+                elif status == "404":
+                    # Try next slug in this slot
+                    continue
+                elif status in ("timeout",) or status.startswith("error:"):
+                    fc_errors.append(f"{domain}{slug}:{status}")
+                    break  # don't try more slugs in this slot on timeout/error
+                else:
+                    # Other HTTP error — try next slug
+                    continue
+
+        # Score this domain
+        strength, replace_ok, reason = _compute_evidence_strength(pages_evidence, neg_src_domain)
+
+        domain_results[domain] = {
+            "pages_evidence":      pages_evidence,
+            "evidence_strength":   strength,
+            "replace_allowed":     replace_ok,
+            "reason":              reason,
+            "negative_source_type": neg_src_domain,
+        }
+
+        # Back-fill debug rows for this domain
+        for row in debug_rows:
+            if row["candidate_domain"] == domain and row["evidence_strength"] == "":
+                row["evidence_strength"]   = strength
+                row["verifier_decision"]   = "replace" if replace_ok and domain != current_domain else "confirm" if replace_ok else "uncertain"
+                row["verifier_reason"]     = reason
+                row["replace_allowed"]     = replace_ok
+
+    fc_out["firecrawl_pages_fetched"] = total_pages_fetched
+    fc_out["firecrawl_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
+    if fc_errors:
+        fc_out["firecrawl_error"] = "; ".join(fc_errors[:5])
+
+    if not domain_results:
+        fc_out.update(firecrawl_decision="fetch_failed", firecrawl_confidence="None",
+                      firecrawl_reason="No pages fetched for any candidate")
+        return fc_out, debug_rows
+
+    # Decision: find the best candidate
+    # Priority: strong evidence > medium > weak > none
+    # Among same strength: prefer current_domain (avoid false replacements)
+    _STRENGTH_ORDER = {"strong": 3, "medium": 2, "weak": 1, "none": 0}
+
+    current_res   = domain_results.get(current_domain, {})
+    current_str   = _STRENGTH_ORDER.get(current_res.get("evidence_strength", "none"), 0)
+    current_neg   = current_res.get("negative_source_type", "")
+
+    # Find best alternative (replace_allowed=True and stronger than current)
+    best_alt: str | None = None
+    best_alt_str = 0
+    for dom, dr in domain_results.items():
+        if dom == current_domain:
+            continue
+        if dr.get("replace_allowed") and _STRENGTH_ORDER.get(dr["evidence_strength"], 0) > best_alt_str:
+            best_alt     = dom
+            best_alt_str = _STRENGTH_ORDER[dr["evidence_strength"]]
+
+    # Determine final decision
+    cur_dr = domain_results.get(current_domain, {})
+
+    if cur_dr.get("negative_source_type") and not cur_dr.get("replace_allowed"):
+        # Current domain is a blocked negative source — reject or replace with better
+        if best_alt:
+            alt_dr = domain_results[best_alt]
+            fc_out.update(
+                firecrawl_verified_domain=best_alt,
+                firecrawl_decision="replace",
+                firecrawl_confidence="High" if best_alt_str >= 3 else "Medium",
+                firecrawl_reason=f"Current domain blocked ({cur_dr['negative_source_type']}); {best_alt}: {alt_dr['reason']}",
+                firecrawl_evidence_strength=alt_dr["evidence_strength"],
+                firecrawl_negative_source_type="",
+            )
+        else:
+            fc_out.update(
+                firecrawl_verified_domain="",
+                firecrawl_decision="reject",
+                firecrawl_confidence="None",
+                firecrawl_reason=f"Current domain is {cur_dr['negative_source_type']}; no strong alternative found",
+                firecrawl_evidence_strength="none",
+                firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
+            )
+
+    elif best_alt and best_alt_str > current_str and best_alt_str >= 3:
+        # A different domain has strong evidence and current domain is weaker
+        alt_dr = domain_results[best_alt]
+        fc_out.update(
+            firecrawl_verified_domain=best_alt,
+            firecrawl_decision="replace",
+            firecrawl_confidence="High",
+            firecrawl_reason=f"Stronger evidence on {best_alt}: {alt_dr['reason']}",
+            firecrawl_evidence_strength=alt_dr["evidence_strength"],
+            firecrawl_negative_source_type="",
+        )
+
+    elif cur_dr.get("replace_allowed") or cur_dr.get("evidence_strength", "none") in ("strong", "medium"):
+        # Current domain confirmed (or soft-confirmed)
+        strength = cur_dr.get("evidence_strength", "none")
+        conf = {"strong": "High", "medium": "Medium", "weak": "Low", "none": "Low"}.get(strength, "Low")
+        fc_out.update(
+            firecrawl_verified_domain=current_domain,
+            firecrawl_decision="confirm",
+            firecrawl_confidence=conf,
+            firecrawl_reason=cur_dr.get("reason", "Firecrawl confirms Python selection"),
+            firecrawl_evidence_strength=strength,
+            firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
+        )
+
+    elif cur_dr.get("evidence_strength", "none") == "weak":
+        fc_out.update(
+            firecrawl_verified_domain=current_domain,
+            firecrawl_decision="uncertain",
+            firecrawl_confidence="Low",
+            firecrawl_reason="Only weak/soft evidence found — keeping Python selection but flagging",
+            firecrawl_evidence_strength="weak",
+            firecrawl_negative_source_type=cur_dr.get("negative_source_type", ""),
+        )
+
+    else:
+        fc_out.update(
+            firecrawl_verified_domain=current_domain,
+            firecrawl_decision="uncertain",
+            firecrawl_confidence="Low",
+            firecrawl_reason="Insufficient identity evidence across all candidates",
+            firecrawl_evidence_strength="none",
+        )
+
+    return fc_out, debug_rows
+
+
+# ---------------------------------------------------------------------------
+# Unified verifier layer
+# ---------------------------------------------------------------------------
+
+
+def _should_verify(
+    result: dict,
+    name_variants: dict,
+    raw_ev: list[dict],
+    verifier_mode: str,
+    debug_mode: bool = False,
+) -> tuple[bool, str]:
+    """
+    Decide whether to run the website verifier for this row.
+    Returns (should_run, trigger_reason).
+    """
+    if verifier_mode == _VM_ALL_DEBUG and debug_mode:
+        return True, "all_debug_mode"
+
+    reasons: list[str] = []
+
+    conf   = str(result.get("final_confidence") or result.get("domain_confidence") or "").strip().lower()
+    manual = str(result.get("manual_review_needed", "")).lower() in ("true", "1", "yes")
+    final_dom = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
+
+    if conf in ("medium", "low", "none", ""):
+        reasons.append(f"confidence={conf or 'empty'}")
+    if manual:
+        reasons.append("manual_review_needed")
+
+    # Top-2 candidate score delta < 0.25
+    scored: dict[str, float] = {}
+    for e in raw_ev:
+        if not e.get("used"):
+            continue
+        dom = e.get("domain", "")
+        try:
+            sc = float(e.get("score", 0))
+        except (TypeError, ValueError):
+            sc = 0.0
+        if dom and sc > scored.get(dom, -1.0):
+            scored[dom] = sc
+    if len(scored) >= 2:
+        top2 = sorted(scored.values(), reverse=True)[:2]
+        if top2[0] - top2[1] < 0.25:
+            reasons.append("close_scores")
+
+    # site:.it query used
+    if str(result.get("search_query_used", "") or "").lower().startswith("site:.it"):
+        reasons.append("site_it_query")
+
+    # No location or email match for selected domain
+    sel = final_dom.lower()
+    if sel and result.get("domain_source") not in (SRC_ORIGINAL, SRC_EMAIL, SRC_SERPER_EMAIL):
+        has_loc   = any(e.get("domain", "").lower() == sel and e.get("location_match") for e in raw_ev)
+        has_email = any(e.get("domain", "").lower() == sel and e.get("email_match")    for e in raw_ev)
+        if not has_loc and not has_email:
+            reasons.append("no_location_or_email_evidence")
+
+    # Brand single-word, short, generic, or famous
+    brand       = (name_variants.get("brand") or "").strip()
+    brand_clean = re.sub(r"[^\w]", "", brand.lower())
+    if brand_clean and (len(brand_clean) <= 5 or brand_clean in _JINA_FAMOUS_BRANDS or _brand_is_ambiguous(brand)):
+        reasons.append("ambiguous_brand")
+
+    # Risky domain pattern
+    if final_dom and _JINA_RISKY_DOMAIN_RE.search(final_dom):
+        reasons.append("risky_domain_pattern")
+
+    should_run = bool(reasons)
+    return should_run, "; ".join(reasons) if reasons else ""
+
+
+def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
+    """
+    Apply the unified verifier result on top of final_* fields.
+    Replacement is only allowed when verifier_replace_allowed is True.
+    Returns a dict of fields to merge into result.
+    """
+    if not verif_res.get("verifier_used"):
+        return {}
+
+    decision    = verif_res.get("verifier_decision", "")
+    sel_domain  = str(verif_res.get("verifier_selected_domain", "") or "")
+    replace_ok  = verif_res.get("verifier_replace_allowed", False)
+    confidence  = verif_res.get("verifier_confidence", "")
+
+    if decision == "replace" and replace_ok and sel_domain:
+        return {
+            "final_selected_domain": sel_domain,
+            "final_decision_source": "verifier_replace",
+            "final_confidence":      confidence or "Medium",
+            "manual_review_needed":  False,
+        }
+    if decision == "reject":
+        return {
+            "final_selected_domain": "",
+            "final_decision_source": "verifier_reject",
+            "final_confidence":      "None",
+            "manual_review_needed":  True,
+        }
+    if decision == "confirm":
+        updates: dict = {"final_decision_source": "verifier_confirm"}
+        cur_conf = (result.get("final_confidence") or "").lower()
+        if confidence == "High" and cur_conf in ("medium", "low", "none", ""):
+            updates["final_confidence"] = "High"
+        return updates
+    # uncertain / fetch_failed / no_candidates
+    return {"final_decision_source": f"verifier_{decision or 'uncertain'}"}
+
+
+def _run_website_verifier(
+    company_name: str,
+    city: str,
+    province: str,
+    email_domain: str,
+    input_partita_iva: str,
+    name_variants: dict,
+    candidates: list[str],
+    current_domain: str,
+    verifier_provider: str,
+    jina_api_key: str | None,
+    fc_key: str | None,
+    max_cands: int = 3,
+    max_pages: int = 3,
+    page_timeout: int = 15,
+    progress_update_fn=None,
+) -> tuple[dict, list[dict]]:
+    """
+    Route verification to Firecrawl, Jina, or both based on verifier_provider.
+    Returns (unified_verifier_result_dict, verif_debug_rows).
+
+    The returned dict contains both provider-specific columns (firecrawl_*, jina_verifier_*)
+    and unified verifier_* columns.
+    """
+    cands = [c for c in candidates[:max_cands] if c]
+    if not cands:
+        cands = [current_domain] if current_domain else []
+
+    _verif_defaults = {
+        "verifier_provider_used":       verifier_provider,
+        "verifier_used":                False,
+        "verifier_decision":            "skipped",
+        "verifier_confidence":          "",
+        "verifier_selected_domain":     current_domain,
+        "verifier_replace_allowed":     False,
+        "verifier_reason":              "",
+        "verifier_evidence_strength":   "none",
+        "verifier_negative_source_type": "",
+        "verifier_pages_fetched":       0,
+        "verifier_fetch_status":        "",
+        "verifier_error":               "",
+        # Provider-specific defaults
+        "firecrawl_used":               False,
+        "firecrawl_verified_domain":    "",
+        "firecrawl_decision":           "",
+        "firecrawl_confidence":         "",
+        "firecrawl_reason":             "",
+        "firecrawl_evidence_strength":  "",
+        "firecrawl_negative_source_type": "",
+        "firecrawl_pages_fetched":      0,
+        "firecrawl_fetch_status":       "",
+        "firecrawl_error":              "",
+    }
+
+    all_debug: list[dict] = []
+    fc_res: dict = {}
+    jina_res: dict = {}
+
+    # ── Firecrawl ────────────────────────────────────────────────────────────
+    if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) and fc_key:
+        try:
+            fc_res, fc_debug = _fc_verify_candidates(
+                company_name, city, province, email_domain, input_partita_iva,
+                name_variants, cands, current_domain, fc_key,
+                max_pages=max_pages, page_timeout=page_timeout,
+                progress_update_fn=progress_update_fn,
+            )
+            _verif_defaults.update(fc_res)
+            all_debug.extend(fc_debug)
+        except Exception as exc:
+            _verif_defaults["firecrawl_error"] = str(exc)[:200]
+
+    # ── Jina (standalone or fallback) ────────────────────────────────────────
+    _jina_needed = (
+        verifier_provider == _VP_JINA
+        or (verifier_provider == _VP_FC_JINA and
+            _verif_defaults.get("firecrawl_decision") in ("uncertain", "fetch_failed", ""))
+    )
+    if _jina_needed and jina_api_key:
+        try:
+            jina_res, jina_debug = _jina_verify_candidates(
+                company_name, city, province, email_domain,
+                name_variants, cands, current_domain, jina_api_key,
+            )
+            _verif_defaults.update({
+                k: v for k, v in jina_res.items()
+                if k.startswith("jina_")
+            })
+            all_debug.extend(jina_debug)
+        except Exception as exc:
+            _verif_defaults["jina_fetch_status"] = f"jina_exception:{str(exc)[:120]}"
+
+    # ── Build unified verifier_* fields from the winning provider ────────────
+    _verif_defaults["verifier_used"] = True
+
+    # Prefer Firecrawl result if available and actionable
+    if fc_res.get("firecrawl_decision") in ("confirm", "replace", "reject"):
+        src = "firecrawl"
+        _verif_defaults.update(
+            verifier_decision=fc_res["firecrawl_decision"],
+            verifier_confidence=fc_res.get("firecrawl_confidence", ""),
+            verifier_selected_domain=fc_res.get("firecrawl_verified_domain", current_domain) or current_domain,
+            verifier_replace_allowed=(fc_res["firecrawl_decision"] == "replace"),
+            verifier_reason=fc_res.get("firecrawl_reason", ""),
+            verifier_evidence_strength=fc_res.get("firecrawl_evidence_strength", "none"),
+            verifier_negative_source_type=fc_res.get("firecrawl_negative_source_type", ""),
+            verifier_pages_fetched=fc_res.get("firecrawl_pages_fetched", 0),
+            verifier_fetch_status=fc_res.get("firecrawl_fetch_status", ""),
+            verifier_error=fc_res.get("firecrawl_error", ""),
+        )
+    elif jina_res.get("jina_verifier_decision") in ("confirm", "replace", "reject"):
+        src = "jina"
+        jd = jina_res.get("jina_verifier_decision", "")
+        jv = jina_res.get("jina_verified_domain", current_domain) or current_domain
+        jr = (jd == "replace") and bool(jv)
+        _verif_defaults.update(
+            verifier_decision=jd,
+            verifier_confidence=jina_res.get("jina_verifier_confidence", ""),
+            verifier_selected_domain=jv,
+            verifier_replace_allowed=jr,
+            verifier_reason=jina_res.get("jina_verifier_reason", ""),
+            verifier_evidence_strength="weak",
+            verifier_pages_fetched=jina_res.get("jina_pages_fetched", 0),
+            verifier_fetch_status=jina_res.get("jina_fetch_status", ""),
+        )
+    else:
+        _verif_defaults.update(
+            verifier_decision="uncertain",
+            verifier_confidence="Low",
+            verifier_selected_domain=current_domain,
+            verifier_replace_allowed=False,
+            verifier_reason="No provider returned actionable evidence",
+        )
+
+    return _verif_defaults, all_debug
+
+
+# =============================================================================
 # AUTOSAVE / RESUME
 # =============================================================================
 
