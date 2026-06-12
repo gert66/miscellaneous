@@ -31,8 +31,52 @@ from urllib.parse import quote
 import anthropic
 import pandas as pd
 import requests
-import streamlit as st
-import streamlit.components.v1 as components
+st = None          # lazy — populated by get_streamlit() in UI mode only
+components = None  # lazy — populated by get_streamlit() in UI mode only
+
+
+def get_streamlit():
+    global st, components
+    if st is None:
+        import streamlit as _st
+        import streamlit.components.v1 as _components
+        st = _st
+        components = _components
+    return st, components
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI / Streamlit mode detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CLI_FLAGS = {
+    "--input", "--dry-run-paths", "--output-dir", "--project-root",
+    "--max-rows", "--debug", "--anthropic-key", "--serper-key",
+}
+
+
+def cli_args_present() -> bool:
+    """Return True when any known CLI flag is present in sys.argv."""
+    for arg in sys.argv[1:]:
+        if arg in _CLI_FLAGS:
+            return True
+        if any(arg.startswith(flag + "=") for flag in _CLI_FLAGS):
+            return True
+    return False
+
+
+def running_under_streamlit() -> bool:
+    """Return True when executed via `streamlit run`."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def is_cli_mode() -> bool:
+    """Return True when running in CLI mode (not via Streamlit)."""
+    return cli_args_present() or not running_under_streamlit()
+
+
 from bs4 import BeautifulSoup
 
 try:
@@ -991,10 +1035,13 @@ def write_debug_log(company_name: str, content: str, prefix: str = "step2_prompt
 
 def append_debug_log(message: str) -> None:
     """Append a timestamped message to the in-session debug log."""
+    if is_cli_mode():
+        return
+    _st, _ = get_streamlit()
     stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{stamp}] {message}\n"
-    current = st.session_state.get("_step2_debug_log", "")
-    st.session_state["_step2_debug_log"] = current + entry
+    current = _st.session_state.get("_step2_debug_log", "")
+    _st.session_state["_step2_debug_log"] = current + entry
 
 
 def format_step2_debug_content(
@@ -1835,13 +1882,16 @@ def _jina_get_with_retry(url: str, company_hint: str = "") -> str:
         try:
             return _jina_get(url, company_hint)
         except JinaRateLimitRetry as exc:
-            # Track retry count for the live counter
-            st.session_state["_jina_retry_count"] = (
-                st.session_state.get("_jina_retry_count", 0) + 1
-            )
-            st.session_state["_last_retry_msg"] = (
-                f"⏳ Rate limit — waiting {exc.wait}s for {company_hint or url}…"
-            )
+            if is_cli_mode():
+                print(f"[enricher] Jina rate limit — waiting {exc.wait}s for {company_hint or url}", flush=True)
+            else:
+                _st, _ = get_streamlit()
+                _st.session_state["_jina_retry_count"] = (
+                    _st.session_state.get("_jina_retry_count", 0) + 1
+                )
+                _st.session_state["_last_retry_msg"] = (
+                    f"⏳ Rate limit — waiting {exc.wait}s for {company_hint or url}…"
+                )
             time.sleep(wait)
     # Final attempt — let HTTPError propagate
     return _jina_get(url, company_hint)
@@ -4248,14 +4298,12 @@ def get_model_code(model_name: str) -> str:
 
 
 def build_run_tag() -> str:
-    """
-    Return a filename-safe tag for the current run, including provider code,
-    model code, and 'lusha' suffix when Lusha API enrichment is enabled.
-    Safe to call from both the processing loop and the results section.
-    """
-    prov  = st.session_state.get("_step2_provider",   STEP2_PROVIDER_SERPER)
-    model = st.session_state.get("_model_step2",       MODEL_STEP2)
-    lusha = st.session_state.get("_enable_lusha_api",  False)
+    if is_cli_mode():
+        return "sg_hq"
+    _st, _ = get_streamlit()
+    prov  = _st.session_state.get("_step2_provider",   STEP2_PROVIDER_SERPER)
+    model = _st.session_state.get("_model_step2",       MODEL_STEP2)
+    lusha = _st.session_state.get("_enable_lusha_api",  False)
     tag   = f"{get_provider_code(prov)}_{get_model_code(model)}"
     if lusha:
         tag = f"{tag}_lusha"
@@ -5728,12 +5776,18 @@ def autosave_already_done(df_saved: pd.DataFrame, name_col: str, domain_col: str
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ss(key, default=None):
-    return st.session_state.get(key, default)
+    if is_cli_mode():
+        return default
+    _st, _ = get_streamlit()
+    return _st.session_state.get(key, default)
 
 
 def ss_set(**kwargs):
+    if is_cli_mode():
+        return
+    _st, _ = get_streamlit()
     for k, v in kwargs.items():
-        st.session_state[k] = v
+        _st.session_state[k] = v
 
 
 def reset_processing(clear_autosave: bool = False):
