@@ -6246,7 +6246,7 @@ def main():
     haiku_mode = st.sidebar.selectbox(
         "Haiku review mode",
         options=_HAIKU_MODES,
-        index=0,
+        index=_HAIKU_MODES.index(_HAIKU_MODE_UNCERTAIN),
         help=(
             "Python only: use existing scoring only (no Haiku calls, no cost).  \n"
             "Uncertain rows: call Haiku only for rows where Python is not confident.  \n"
@@ -6290,7 +6290,7 @@ def main():
     eligibility_filter_mode = st.sidebar.selectbox(
         "Eligibility filter mode",
         options=_PF_MODES,
-        index=0,
+        index=_PF_MODES.index(_PF_MODE_MAYBE),
         key="reg_eligibility_filter_mode",
         help=(
             "Commercial only: process SPA, SRL, SNC, SAS, etc. Skip associations, schools, "
