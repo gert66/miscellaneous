@@ -534,7 +534,9 @@ _NEG_SOURCE_RES: dict[str, re.Pattern] = {
         r"liceo\s+statale|scuola\s+media\s+statale|scuola\s+primaria|"
         r"ministero\s+dell.istruzione|ministero\s+dell.istruzione\s+e\s+del\s+merito|"
         r"scuola\s+in\s+chiaro|ptof\b|piano\s+triennale\s+dell.offerta\s+formativa|"
-        r"\bdocenti?\b.*\bstudenti?\b|\bstudenti?\b.*\bdocenti?\b)\b",
+        r"\bdocenti?\b.*\bstudenti?\b|\bstudenti?\b.*\bdocenti?\b|"
+        r"ptof|piano\s+triennale|registro\s+elettronico|docenti|studenti|"
+        r"scuola\s+in\s+chiaro|ministero\s+dell.istruzione|miur|ministero\s+istruzione)\b",
         re.I),
     "university":       re.compile(
         r"\b(universit[àa]\s+degli\s+studi|universit[àa]\s+di|dipartimento\s+di|"
@@ -1184,6 +1186,16 @@ def _score_candidate(
     # 8. .it TLD bonus (official company domain for Italian businesses)
     if domain.endswith(".it"):
         score += 0.15
+
+    # 9. Hard penalties for non-commercial domain signals
+    if _EDU_IT_RE.search(domain):
+        score -= 0.6   # public school TLD — almost never correct for SPA/SRL
+    elif re.search(r"\b(forum|foro|archive|archivio)\b", domain, re.I):
+        score -= 0.3
+    elif re.search(r"\b(associazione|fondazione|onlus|odv|aps)\b", domain, re.I):
+        score -= 0.3
+    if score < 0:
+        score = 0.0
 
     return round(score, 4)
 
@@ -2583,6 +2595,7 @@ def _extract_fc_evidence(
             "city_match": False, "province_match": False,
             "email_domain_match": False, "brand_strong": False,
             "brand_token": False, "official_signal": False,
+            "group_italy_mention": False,
             "italian_language": False, "extracted_iva": "",
             "extracted_email": "", "extracted_phone": "",
             "negative_source_type": "",
@@ -2639,6 +2652,13 @@ def _extract_fc_evidence(
         r"chi\s+siamo|about\s+us|la\s+nostra\s+azienda|our\s+company)\b", tl
     ))
 
+    # Group corporate site with Italian operations mention
+    group_italy_mention = bool(re.search(
+        r"\b(italia|italy|italian|sede\s+italiana|operazioni\s+in\s+italia|"
+        r"filiale\s+italiana|stabilimento|plant\s+in\s+italy|cementificio|cemento|cement"
+        r"|subsidiary|sussidiar|gruppo\s+\w+|group\s+\w+|holding)\b", tl
+    ))
+
     # Italian language signal
     italian_language = bool(re.search(
         r"\b(azienda|prodotti|servizi|contatti|via\s+[a-z]|piazza|corso\s+[a-z]|"
@@ -2656,16 +2676,19 @@ def _extract_fc_evidence(
     # Wrong entity type: the detected source type is non-commercial and hard
     wrong_entity_type_signal = negative_source_type in _HARD_NEG_SOURCES
 
-    # Wrong location: a specific Italian city is prominently mentioned on the page
-    # that does NOT match the register city/province — only flag when city is known
+    # Wrong location: a different Italian city appears on the page that contradicts the register
     wrong_location_signal = False
-    if city and len(city) >= 3:
-        # If city appears → location matches, so no conflict
-        if not city_match and not province_match:
-            # Look for any Italian city-like mention that contradicts register
-            # We treat the absence of our city as a weak wrong-location signal
-            # only when combined with wrong_entity_type
-            wrong_location_signal = wrong_entity_type_signal
+    if city and len(city) >= 3 and not city_match and not province_match:
+        _it_city_re = re.compile(
+            r"\b(milano|roma|torino|napoli|bologna|firenze|venezia|palermo|genova|"
+            r"bari|catania|verona|messina|padova|trieste|brescia|taranto|prato|"
+            r"modena|perugia|livorno|ravenna|cagliari|foggia|rimini|salerno|ferrara|"
+            r"sassari|latina|monza|bergamo|forl[ìi]|trento|vicenza|terni|novara|"
+            r"piacenza|ancona|udine|cesena|lecce|pesaro|alessandria|"
+            r"casale\s+monferrato)\b", re.I
+        )
+        if _it_city_re.search(tl) or wrong_entity_type_signal:
+            wrong_location_signal = True
 
     return {
         "legal_name_match":         legal_name_match,
@@ -2676,6 +2699,7 @@ def _extract_fc_evidence(
         "brand_strong":             brand_strong,
         "brand_token":              brand_token,
         "official_signal":          official_signal,
+        "group_italy_mention":      group_italy_mention,
         "italian_language":         italian_language,
         "extracted_iva":            extracted_iva,
         "extracted_email":          extracted_email,
@@ -2708,15 +2732,20 @@ def _compute_evidence_strength(
         return "none", False, f"Blocked by negative source type: {negative_source_type}"
 
     # Aggregate flags across all pages
-    legal_name   = any(e.get("legal_name_match")   for e in pages_evidence)
-    iva_match    = any(e.get("partita_iva_match")   for e in pages_evidence)
-    city_match   = any(e.get("city_match")          for e in pages_evidence)
-    prov_match   = any(e.get("province_match")      for e in pages_evidence)
-    email_match  = any(e.get("email_domain_match")  for e in pages_evidence)
-    brand_strong = any(e.get("brand_strong")        for e in pages_evidence)
-    brand_token  = any(e.get("brand_token")         for e in pages_evidence)
-    official     = any(e.get("official_signal")     for e in pages_evidence)
-    italian      = any(e.get("italian_language")    for e in pages_evidence)
+    legal_name        = any(e.get("legal_name_match")     for e in pages_evidence)
+    iva_match         = any(e.get("partita_iva_match")     for e in pages_evidence)
+    city_match        = any(e.get("city_match")            for e in pages_evidence)
+    prov_match        = any(e.get("province_match")        for e in pages_evidence)
+    email_match       = any(e.get("email_domain_match")    for e in pages_evidence)
+    brand_strong      = any(e.get("brand_strong")          for e in pages_evidence)
+    brand_token       = any(e.get("brand_token")           for e in pages_evidence)
+    official          = any(e.get("official_signal")       for e in pages_evidence)
+    group_italy       = any(e.get("group_italy_mention")   for e in pages_evidence)
+    italian           = any(e.get("italian_language")      for e in pages_evidence)
+
+    # Group corporate site with Italian operations → strong when brand + location match
+    if group_italy and brand_strong and (city_match or prov_match):
+        return "strong", True, "Group site with Italian operations + brand + city/province match"
 
     # Hard evidence combinations → strong
     if legal_name and brand_strong:
@@ -2787,6 +2816,7 @@ def _fc_verify_candidates(
         "firecrawl_pages_fetched":      0,
         "firecrawl_fetch_status":       "",
         "firecrawl_error":              "",
+        "firecrawl_evidence_url":       "",
     }
     debug_rows: list[dict] = []
 
@@ -2997,6 +3027,7 @@ def _fc_verify_candidates(
 
     fc_out["firecrawl_pages_fetched"] = total_pages_fetched
     fc_out["firecrawl_fetch_status"]  = "; ".join(dict.fromkeys(all_statuses))[:200]
+    fc_out["firecrawl_evidence_url"]  = _best_evidence_url
     if fc_errors:
         fc_out["firecrawl_error"] = "; ".join(fc_errors[:5])
 
@@ -3287,6 +3318,15 @@ def _should_verify(
     return should_run, "; ".join(reasons) if reasons else ""
 
 
+def _root_domain(url_or_domain: str) -> str:
+    """Extract bare root domain from a URL or domain string (strips scheme, path, www.)."""
+    s = (url_or_domain or "").strip().lower()
+    s = re.sub(r"^https?://", "", s)
+    s = re.sub(r"/.*$", "", s)   # strip path
+    s = re.sub(r"^www\.", "", s)
+    return s
+
+
 def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     """
     Apply the unified verifier result on top of final_* fields.
@@ -3309,10 +3349,11 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
 
     if decision == "replace" and replace_ok and sel_domain:
         return {
-            "final_selected_domain": sel_domain,
+            "final_selected_domain": _root_domain(sel_domain) or sel_domain,
             "final_decision_source": "verifier_replace",
             "final_confidence":      confidence or "Medium",
             "manual_review_needed":  False,
+            "verifier_evidence_url": verif_res.get("verifier_evidence_url", ""),
         }
     if decision == "reject":
         if _py_high:
@@ -3355,6 +3396,7 @@ def _run_website_verifier(
     python_confidence: str = "",
     live_counters: dict | None = None,
     progress_update_fn=None,
+    fc_location: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """
     Route verification to Firecrawl, Jina, or both based on verifier_provider.
@@ -3391,6 +3433,8 @@ def _run_website_verifier(
         "firecrawl_pages_fetched":      0,
         "firecrawl_fetch_status":       "",
         "firecrawl_error":              "",
+        "firecrawl_evidence_url":       "",
+        "verifier_evidence_url":        "",
     }
 
     all_debug: list[dict] = []
@@ -3408,6 +3452,7 @@ def _run_website_verifier(
                 python_confidence=python_confidence,
                 live_counters=live_counters,
                 progress_update_fn=progress_update_fn,
+                fc_location=fc_location,
             )
             _verif_defaults.update(fc_res)
             all_debug.extend(fc_debug)
@@ -3451,6 +3496,7 @@ def _run_website_verifier(
             verifier_pages_fetched=fc_res.get("firecrawl_pages_fetched", 0),
             verifier_fetch_status=fc_res.get("firecrawl_fetch_status", ""),
             verifier_error=fc_res.get("firecrawl_error", ""),
+            verifier_evidence_url=fc_res.get("firecrawl_evidence_url", ""),
         )
     elif jina_res.get("jina_verifier_decision") in ("confirm", "replace", "reject"):
         src = "jina"
@@ -3741,6 +3787,9 @@ _OUTPUT_COLS = [
     "wrong_location_signal",
     "firecrawl_redirect_final_url",
     "firecrawl_redirect_final_domain",
+    # v8 evidence URL fields
+    "verifier_evidence_url",
+    "firecrawl_evidence_url",
     # v8 organization eligibility pre-filter columns
     "organization_type",
     "myngle_target_eligibility",
@@ -3779,6 +3828,7 @@ def process_dataframe(
     max_pages_per_cand: int = 3,
     page_timeout: int = 15,
     fc_speed_mode: str = _FC_SPEED_FAST,
+    fc_location: dict | None = None,
     # Organization eligibility pre-filter
     eligibility_filter_mode: str = _PF_MODE_COMMERCIAL,
     # Debug
@@ -3930,6 +3980,8 @@ def process_dataframe(
             "firecrawl_negative_source_type": "",
             "firecrawl_pages_fetched": 0, "firecrawl_fetch_status": "",
             "firecrawl_error": "",
+            "firecrawl_evidence_url": "",
+            "verifier_evidence_url": "",
             # v7 redirect / wrong entity
             "original_candidate_domain": "",
             "redirect_final_url": "",
@@ -3990,6 +4042,7 @@ def process_dataframe(
                         fc_speed_mode=fc_speed_mode,
                         python_confidence=str(res.get("final_confidence") or res.get("domain_confidence") or ""),
                         live_counters=_live_fc_counters,
+                        fc_location=fc_location,
                     )
                     res.update(_verif_res)
                     _verif_upd = _apply_verifier_decision(res, _verif_res)
@@ -4259,6 +4312,10 @@ def _build_best_guess_df(
             "firecrawl_reason":           str(r.get("firecrawl_reason", "") or ""),
             "firecrawl_pages_fetched":    r.get("firecrawl_pages_fetched", 0),
             "firecrawl_fetch_status":     str(r.get("firecrawl_fetch_status", "") or ""),
+            "verifier_evidence_url":      str(r.get("verifier_evidence_url", "") or ""),
+            "firecrawl_evidence_url":     str(r.get("firecrawl_evidence_url", "") or ""),
+            "organization_type":          str(r.get("organization_type", "") or ""),
+            "myngle_target_eligibility":  str(r.get("myngle_target_eligibility", "") or ""),
         })
     return pd.DataFrame(rows)
 
@@ -4650,6 +4707,8 @@ def build_excel(
         "original_candidate_domain", "redirect_final_domain", "redirect_final_url",
         "wrong_entity_type_signal", "wrong_location_signal",
         "firecrawl_decision", "firecrawl_reason", "firecrawl_fetch_status",
+        "verifier_evidence_url", "firecrawl_evidence_url",
+        "organization_type", "myngle_target_eligibility",
         "top_3_candidate_domains", "serper_top_result_title", "serper_top_result_url",
     ]
     ws_mrq = wb.create_sheet("Manual Review Queue")
@@ -5298,6 +5357,20 @@ def main():
                 f"{verifier_max_pages} page(s)/cand · {verifier_page_timeout}s timeout"
             )
 
+    fc_location_label = st.sidebar.selectbox(
+        "Firecrawl location",
+        options=_FC_LOC_OPTIONS,
+        index=0,
+        key="reg_fc_location",
+        help=(
+            "Italy: sends scrape requests as if from Italy (country=IT, languages=[it,en]). "
+            "Recommended for Italian Business Register exports.  \n"
+            "United States: US infrastructure.  \n"
+            "Default Firecrawl: no location override."
+        ),
+    ) if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) else _FC_LOC_ITALY
+    fc_location_payload = _FC_LOC_PAYLOADS.get(fc_location_label, _FC_LOC_PAYLOADS[_FC_LOC_ITALY])
+
     # ── API keys ──────────────────────────────────────────────────────────────
     # Jina API key (optional — Jina Reader works without a key at lower rate limits)
     jina_api_key: str | None = None
@@ -5566,6 +5639,7 @@ def main():
                 max_pages_per_cand=verifier_max_pages,
                 page_timeout=verifier_page_timeout,
                 fc_speed_mode=verifier_speed_mode,
+                fc_location=fc_location_payload,
                 eligibility_filter_mode=eligibility_filter_mode,
                 debug_mode=debug_mode,
             )
@@ -5867,6 +5941,7 @@ def main():
             max_pages_per_cand=verifier_max_pages,
             page_timeout=verifier_page_timeout,
             fc_speed_mode=verifier_speed_mode,
+            fc_location=fc_location_payload,
             eligibility_filter_mode=eligibility_filter_mode,
             debug_mode=debug_mode,
         )
