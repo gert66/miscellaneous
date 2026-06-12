@@ -2922,6 +2922,8 @@ def _fc_verify_candidates(
     # redirects to a different root domain, insert that as the primary candidate
     # (it becomes the first domain Firecrawl actually scrapes).
     _redirect_info: dict[str, dict] = {}   # original domain -> redirect result
+    # Maps redirect_final_domain -> full redirect URL (for Fix 2: scrape that URL first)
+    _domain_hint_url: dict[str, str] = {}
     _expanded_candidates: list[str] = []
     _suspicious_re = re.compile(r"\b(forum|fan|club|community|archive|directory)\b", re.I)
     for _cdom in candidates:
@@ -2929,13 +2931,18 @@ def _fc_verify_candidates(
             continue
         _rr = _resolve_redirect(_cdom)
         _redirect_info[_cdom] = _rr
-        _redir_final = _rr.get("redirect_final_domain", "")
-        if _redir_final and _redir_final not in _expanded_candidates:
-            # Prioritise the redirect destination when original looks suspicious
-            if _suspicious_re.search(_cdom):
-                _expanded_candidates.insert(0, _redir_final)
-            else:
-                _expanded_candidates.append(_redir_final)
+        _redir_final  = _rr.get("redirect_final_domain", "")
+        _redir_url    = _rr.get("redirect_final_url", "")
+        if _redir_final:
+            # Remember the exact redirect URL so Firecrawl scrapes it first
+            if _redir_url and _redir_final not in _domain_hint_url:
+                _domain_hint_url[_redir_final] = _redir_url
+            if _redir_final not in _expanded_candidates:
+                # Prioritise the redirect destination when original looks suspicious
+                if _suspicious_re.search(_cdom):
+                    _expanded_candidates.insert(0, _redir_final)
+                else:
+                    _expanded_candidates.append(_redir_final)
         if _cdom not in _expanded_candidates:
             _expanded_candidates.append(_cdom)
     # Deduplicate preserving order
@@ -2955,12 +2962,22 @@ def _fc_verify_candidates(
         neg_src_domain = ""
         requests_attempted = 0  # budget: counts every FC request attempt
 
-        for slot_name, slug_candidates in _active_slots:
+        # Build per-domain slot list: prepend the known redirect URL if we have one
+        # (e.g. ferrari.com with hint https://www.ferrari.com/en-NL/auto/car-range)
+        _hint_url = _domain_hint_url.get(domain, "")
+        if _hint_url:
+            # Extract the path from the hint URL to use as a specific slug
+            _hint_path = re.sub(r"^https?://[^/]+", "", _hint_url) or ""
+            _dom_slots = [("redirect_hint", [_hint_path, ""])] + list(_active_slots)
+        else:
+            _dom_slots = list(_active_slots)
+
+        for slot_name, slug_candidates in _dom_slots:
             if requests_attempted >= max_pages:
                 break
 
-            # Early-stop after homepage: strong evidence or confirmed negative source
-            if slot_name != "homepage" and pages_evidence:
+            # Early-stop after homepage/redirect_hint: strong evidence or confirmed negative source
+            if slot_name not in ("homepage", "redirect_hint") and pages_evidence:
                 _interim_str, _, _ = _compute_evidence_strength(pages_evidence, neg_src_domain)
                 if _interim_str == "strong":
                     break  # no need to fetch more pages
@@ -2976,7 +2993,11 @@ def _fc_verify_candidates(
                 if requests_attempted >= max_pages:
                     break
 
-                url = f"https://{domain}{slug}"
+                # For redirect_hint slot, use the full hint URL when slug matches hint path
+                if slot_name == "redirect_hint" and _hint_url and slug == _hint_path:
+                    url = _hint_url
+                else:
+                    url = f"https://{domain}{slug}"
                 if progress_update_fn:
                     progress_update_fn(ci, len(candidates), requests_attempted, max_pages, domain)
 
@@ -3456,31 +3477,76 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     cur_conf_py = (result.get("final_confidence") or "").strip().lower()
     _py_high    = cur_conf_py == "high"
 
-    # ── Timeout-on-high-risk protection ──────────────────────────────────────
-    # If Firecrawl timed out and the row has high-risk signals, force manual review.
+    # Shared context
     _fc_status   = str(verif_res.get("firecrawl_fetch_status", "") or "")
     _had_timeout = "timeout" in _fc_status
     _verify_rsn  = str(result.get("verification_reason", "") or "")
     _final_dom   = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
+    _redir_dom   = str(verif_res.get("redirect_final_domain", "") or result.get("redirect_final_domain", "") or "")
+    _redir_url   = str(verif_res.get("redirect_final_url", "")   or result.get("redirect_final_url", "")   or "")
     _brand_clean = re.sub(r"[^\w]", "", (result.get("cleaned_company_name") or "").lower().split()[0] if result.get("cleaned_company_name") else "")
-
-    _is_high_risk_timeout = _had_timeout and (
-        "famous_brand"        in _verify_rsn
-        or "close_scores"     in _verify_rsn
-        or "risky_domain"     in _verify_rsn
-        or _JINA_RISKY_DOMAIN_RE.search(_final_dom or "")
-        or _brand_clean in _JINA_FAMOUS_BRANDS
+    _suspicious_orig = bool(_JINA_RISKY_DOMAIN_RE.search(_final_dom or ""))
+    _is_famous   = _brand_clean in _JINA_FAMOUS_BRANDS
+    _is_high_risk = (
+        "famous_brand"    in _verify_rsn
+        or "close_scores" in _verify_rsn
+        or "risky_domain" in _verify_rsn
+        or _suspicious_orig
+        or _is_famous
     )
-    if _is_high_risk_timeout and decision not in ("confirm", "replace"):
+
+    # ── Fix 1: Canonical redirect → use redirect domain even on timeout ───────
+    # When original candidate is suspicious AND a clean redirect domain exists
+    # with strong brand overlap, use the redirect domain as final even if
+    # Firecrawl could not confirm (timeout).  Mark manual_review_needed = True.
+    if (
+        _redir_dom
+        and _suspicious_orig
+        and decision not in ("confirm", "replace")
+        and not is_generic(_redir_dom)
+        and not _EDU_IT_RE.search(_redir_dom)
+        and not _GOV_IT_RE.search(_redir_dom)
+    ):
+        # Brand-domain overlap check on redirect domain
+        _name_variants_check = result.get("_name_variants", {})
+        _redir_brand_ov = brand_overlap_variants(_name_variants_check, _redir_dom) if _name_variants_check else 0.0
+        # Fallback: check if brand token appears in redirect domain
+        if not _name_variants_check and _brand_clean and len(_brand_clean) >= 4:
+            _redir_brand_ov = 1.0 if _brand_clean in _redir_dom.replace("-", "").replace(".", "") else 0.0
+        if _redir_brand_ov >= 0.5 or (_brand_clean and len(_brand_clean) >= 4 and _brand_clean in _redir_dom):
+            _cv_status = "firecrawl_timeout" if _had_timeout else "unverified"
+            return {
+                "final_selected_domain":          _root_domain(_redir_dom),
+                "final_decision_source":          "redirect_canonical_unverified",
+                "final_confidence":               "Medium",
+                "manual_review_needed":           True,
+                "verifier_reason":                (
+                    f"Suspicious candidate ({_final_dom}) redirected to clean canonical domain "
+                    f"({_redir_dom}), but Firecrawl did not fully confirm "
+                    f"({'timeout' if _had_timeout else 'uncertain'}). Manual review required."
+                ),
+                "canonical_domain_verification_status": _cv_status,
+                "redirect_checked":               True,
+                "redirect_final_domain":          _redir_dom,
+                "redirect_final_url":             _redir_url,
+                "original_candidate_domain":      _final_dom,
+            }
+
+    # ── Fix 2: High-risk timeout that is NOT a suspicious-redirect case ───────
+    # Downgrade confidence and force manual review but keep the current domain.
+    if _is_high_risk and _had_timeout and decision not in ("confirm", "replace"):
         _timeout_note = (
             "Firecrawl timeout on high-risk row; selected domain may be a redirect/forum. "
             "Manual review required."
         )
+        _conf_downgrade = "Low" if _is_famous else "Medium"
         return {
             "final_decision_source": "verifier_timeout_high_risk",
+            "final_confidence":      _conf_downgrade,
             "manual_review_needed":  True,
             "verifier_reason":       _timeout_note,
             "firecrawl_reason":      _timeout_note,
+            "canonical_domain_verification_status": "firecrawl_timeout",
         }
 
     if decision == "replace" and replace_ok and sel_domain:
@@ -3490,32 +3556,44 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
             "final_confidence":      confidence or "Medium",
             "manual_review_needed":  False,
             "verifier_evidence_url": verif_res.get("verifier_evidence_url", ""),
+            "canonical_domain_verification_status": "verified",
         }
     if decision == "reject":
         if _py_high:
-            # Do not blank a High-confidence domain — flag for review instead
             return {
                 "final_decision_source": "verifier_flag_high_conf",
                 "manual_review_needed":  True,
+                "canonical_domain_verification_status": "rejected_high_conf_protected",
             }
         return {
             "final_selected_domain": "",
             "final_decision_source": "verifier_reject",
             "final_confidence":      "None",
             "manual_review_needed":  True,
+            "canonical_domain_verification_status": "rejected",
         }
     if decision == "confirm":
-        updates: dict = {"final_decision_source": "verifier_confirm"}
+        updates: dict = {
+            "final_decision_source": "verifier_confirm",
+            "canonical_domain_verification_status": "confirmed",
+        }
         if confidence == "High" and cur_conf_py in ("medium", "low", "none", ""):
             updates["final_confidence"] = "High"
         return updates
     # uncertain / fetch_failed / no_candidates
-    _updates: dict = {"final_decision_source": f"verifier_{decision or 'uncertain'}"}
+    _updates: dict = {
+        "final_decision_source": f"verifier_{decision or 'uncertain'}",
+        "canonical_domain_verification_status": f"verifier_{decision or 'uncertain'}",
+    }
     if _had_timeout:
         _updates["verifier_reason"] = (
             str(verif_res.get("verifier_reason", "") or "")
             or "Firecrawl timed out; could not verify selected domain."
         )
+        # Fix 3: downgrade confidence on timeout even for non-famous brands
+        if _is_high_risk and cur_conf_py == "high":
+            _updates["final_confidence"] = "Medium"
+            _updates["manual_review_needed"] = True
     return _updates
 
 
@@ -3950,6 +4028,10 @@ _OUTPUT_COLS = [
     # v8 evidence URL fields
     "verifier_evidence_url",
     "firecrawl_evidence_url",
+    # v9 redirect resolution status
+    "redirect_checked",
+    "redirect_resolution_status",
+    "canonical_domain_verification_status",
     # v8 organization eligibility pre-filter columns
     "organization_type",
     "myngle_target_eligibility",
@@ -4142,6 +4224,9 @@ def process_dataframe(
             "firecrawl_error": "",
             "firecrawl_evidence_url": "",
             "verifier_evidence_url": "",
+            "redirect_checked": False,
+            "redirect_resolution_status": "",
+            "canonical_domain_verification_status": "",
             # v7 redirect / wrong entity
             "original_candidate_domain": "",
             "redirect_final_url": "",
@@ -4205,7 +4290,9 @@ def process_dataframe(
                         fc_location=fc_location,
                     )
                     res.update(_verif_res)
+                    res["_name_variants"] = _name_variants_v  # temp: used in _apply_verifier_decision
                     _verif_upd = _apply_verifier_decision(res, _verif_res)
+                    res.pop("_name_variants", None)
                     if _verif_upd:
                         res.update(_verif_upd)
                 except Exception as _vex:
