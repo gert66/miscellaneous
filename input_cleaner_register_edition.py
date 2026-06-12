@@ -330,6 +330,34 @@ _JINA_RISKY_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RISKY_MARKERS = [
+    "forum", "foro", "fan", "fans", "club", "community",
+    "archive", "archivio", "wiki", "museum",
+    "dealer", "reseller", "shop", "store",
+    "directory", "profile",
+]
+
+
+def _domain_has_risky_marker(domain: str) -> tuple[bool, str]:
+    """
+    Return (is_risky, reason) for a domain name.
+    Detects risky markers even when glued to a brand (e.g. ferrariforum.it).
+    Use this instead of _JINA_RISKY_DOMAIN_RE when checking domain strings.
+    """
+    d = (domain or "").lower()
+    base = d.split(".")[0]                      # e.g. "ferrariforum"
+    compact = re.sub(r"[^a-z0-9]", "", base)   # e.g. "ferrariforum"
+    parts = re.split(r"[-._]", d)              # e.g. ["ferrariforum", "it"]
+
+    for m in _RISKY_MARKERS:
+        if m in parts:                          # exact token match
+            return True, f"contains risky marker: {m}"
+        if m in compact:                        # glued pattern (ferrariforum)
+            return True, f"contains risky marker: {m}"
+
+    return False, ""
+
+
 # Famous / generic single-word brands that need extra Jina verification
 _JINA_FAMOUS_BRANDS: frozenset = frozenset({
     "ferrari", "lamborghini", "fiat", "alfa", "romeo", "lancia", "ducati",
@@ -2133,7 +2161,7 @@ def _jina_should_run(
         return True
 
     # Trigger 7: selected domain contains risky patterns
-    if final_dom and _JINA_RISKY_DOMAIN_RE.search(final_dom):
+    if final_dom and _domain_has_risky_marker(final_dom)[0]:
         return True
 
     return False
@@ -3402,7 +3430,7 @@ def _should_verify(
     _strong_overlap = bov >= 0.60
     _clear_winner   = score_delta >= 0.25
     _not_famous     = brand_clean not in _JINA_FAMOUS_BRANDS
-    _not_risky      = not _JINA_RISKY_DOMAIN_RE.search(final_dom) if final_dom else True
+    _not_risky      = not _domain_has_risky_marker(final_dom)[0] if final_dom else True
 
     if _is_high_conf and _domain_ok and _strong_overlap and _clear_winner and _not_famous and _not_risky:
         return False, f"skipped: high confidence + strong brand-domain overlap ({round(bov, 2)}) + clear score winner"
@@ -3441,7 +3469,7 @@ def _should_verify(
             reasons.append("famous_brand")
 
     # Risky domain pattern — always a trigger
-    if final_dom and _JINA_RISKY_DOMAIN_RE.search(final_dom):
+    if final_dom and _domain_has_risky_marker(final_dom)[0]:
         reasons.append("risky_domain_pattern")
 
     should_run = bool(reasons)
@@ -3485,7 +3513,7 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     _redir_dom   = str(verif_res.get("redirect_final_domain", "") or result.get("redirect_final_domain", "") or "")
     _redir_url   = str(verif_res.get("redirect_final_url", "")   or result.get("redirect_final_url", "")   or "")
     _brand_clean = re.sub(r"[^\w]", "", (result.get("cleaned_company_name") or "").lower().split()[0] if result.get("cleaned_company_name") else "")
-    _suspicious_orig = bool(_JINA_RISKY_DOMAIN_RE.search(_final_dom or ""))
+    _suspicious_orig, _risky_reason = _domain_has_risky_marker(_final_dom or "")
     _is_famous   = _brand_clean in _JINA_FAMOUS_BRANDS
     _is_high_risk = (
         "famous_brand"    in _verify_rsn
@@ -3525,11 +3553,14 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
                     f"({_redir_dom}), but Firecrawl did not fully confirm "
                     f"({'timeout' if _had_timeout else 'uncertain'}). Manual review required."
                 ),
-                "canonical_domain_verification_status": _cv_status,
-                "redirect_checked":               True,
-                "redirect_final_domain":          _redir_dom,
-                "redirect_final_url":             _redir_url,
-                "original_candidate_domain":      _final_dom,
+                "canonical_domain_verification_status":  _cv_status,
+                "redirect_checked":                      True,
+                "redirect_final_domain":                 _redir_dom,
+                "redirect_final_url":                    _redir_url,
+                "original_candidate_domain":             _final_dom,
+                "original_domain_risky_marker":          True,
+                "risky_marker_reason":                   _risky_reason,
+                "redirect_canonical_override_applied":   True,
             }
 
     # ── Fix 2: High-risk timeout that is NOT a suspicious-redirect case ───────
@@ -4032,6 +4063,9 @@ _OUTPUT_COLS = [
     "redirect_checked",
     "redirect_resolution_status",
     "canonical_domain_verification_status",
+    "original_domain_risky_marker",
+    "risky_marker_reason",
+    "redirect_canonical_override_applied",
     # v8 organization eligibility pre-filter columns
     "organization_type",
     "myngle_target_eligibility",
@@ -4227,6 +4261,9 @@ def process_dataframe(
             "redirect_checked": False,
             "redirect_resolution_status": "",
             "canonical_domain_verification_status": "",
+            "original_domain_risky_marker": False,
+            "risky_marker_reason": "",
+            "redirect_canonical_override_applied": False,
             # v7 redirect / wrong entity
             "original_candidate_domain": "",
             "redirect_final_url": "",
