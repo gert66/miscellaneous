@@ -3139,6 +3139,7 @@ def _fc_verify_candidates(
     # live-counter dict — caller passes {} and reads back keys after the call
     live_counters: dict | None = None,
     fc_location: dict | None = None,
+    candidate_hints: dict | None = None,  # domain -> best candidate_url from Serper evidence
 ) -> tuple[dict, list[dict]]:
     """
     Verify candidate domains via Firecrawl scrape.
@@ -3208,8 +3209,19 @@ def _fc_verify_candidates(
     # redirects to a different root domain, insert that as the primary candidate
     # (it becomes the first domain Firecrawl actually scrapes).
     _redirect_info: dict[str, dict] = {}   # original domain -> redirect result
-    # Maps redirect_final_domain -> full redirect URL (for Fix 2: scrape that URL first)
+    # Maps domain -> full URL to scrape first (redirect URL or Serper candidate_url)
+    # Seeded from candidate_hints (Serper evidence URLs for group/subsidiary pages)
     _domain_hint_url: dict[str, str] = {}
+    # Tracks slot type label: "candidate_url_hint" (from Serper) vs "redirect_hint"
+    _domain_hint_type: dict[str, str] = {}
+    if candidate_hints:
+        for _ch_dom, _ch_url in (candidate_hints or {}).items():
+            if _ch_dom and _ch_url:
+                _ch_path = re.sub(r"^https?://[^/]+", "", _ch_url) or ""
+                # Only use as a hint when there's a meaningful path (not just root)
+                if _ch_path and _ch_path != "/" and len(_ch_path) > 1:
+                    _domain_hint_url[_ch_dom] = _ch_url
+                    _domain_hint_type[_ch_dom] = "candidate_url_hint"
     _expanded_candidates: list[str] = []
     _suspicious_re = re.compile(r"\b(forum|fan|club|community|archive|directory)\b", re.I)
     for _cdom in candidates:
@@ -3223,6 +3235,7 @@ def _fc_verify_candidates(
             # Remember the exact redirect URL so Firecrawl scrapes it first
             if _redir_url and _redir_final not in _domain_hint_url:
                 _domain_hint_url[_redir_final] = _redir_url
+                _domain_hint_type[_redir_final] = "redirect_hint"
             if _redir_final not in _expanded_candidates:
                 # Prioritise the redirect destination when original looks suspicious
                 if _suspicious_re.search(_cdom):
@@ -3248,13 +3261,15 @@ def _fc_verify_candidates(
         neg_src_domain = ""
         requests_attempted = 0  # budget: counts every FC request attempt
 
-        # Build per-domain slot list: prepend the known redirect URL if we have one
-        # (e.g. ferrari.com with hint https://www.ferrari.com/en-NL/auto/car-range)
-        _hint_url = _domain_hint_url.get(domain, "")
+        # Build per-domain slot list: prepend the known hint URL if we have one.
+        # Hint may come from a redirect destination (redirect_hint) or directly from
+        # the Serper candidate_url stored in evidence (candidate_url_hint).
+        _hint_url  = _domain_hint_url.get(domain, "")
+        _hint_type = _domain_hint_type.get(domain, "redirect_hint")
         if _hint_url:
             # Extract the path from the hint URL to use as a specific slug
             _hint_path = re.sub(r"^https?://[^/]+", "", _hint_url) or ""
-            _dom_slots = [("redirect_hint", [_hint_path, ""])] + list(_active_slots)
+            _dom_slots = [(_hint_type, [_hint_path, ""])] + list(_active_slots)
         else:
             _dom_slots = list(_active_slots)
 
@@ -3262,8 +3277,8 @@ def _fc_verify_candidates(
             if requests_attempted >= max_pages:
                 break
 
-            # Early-stop after homepage/redirect_hint: strong evidence or confirmed negative source
-            if slot_name not in ("homepage", "redirect_hint") and pages_evidence:
+            # Early-stop after homepage/hint slots: strong evidence or confirmed negative source
+            if slot_name not in ("homepage", "redirect_hint", "candidate_url_hint") and pages_evidence:
                 _interim_str, _, _ = _compute_evidence_strength(pages_evidence, neg_src_domain)
                 if _interim_str == "strong":
                     break  # no need to fetch more pages
@@ -3279,8 +3294,8 @@ def _fc_verify_candidates(
                 if requests_attempted >= max_pages:
                     break
 
-                # For redirect_hint slot, use the full hint URL when slug matches hint path
-                if slot_name == "redirect_hint" and _hint_url and slug == _hint_path:
+                # For hint slots (redirect or candidate_url), use the full hint URL
+                if slot_name in ("redirect_hint", "candidate_url_hint") and _hint_url and slug == _hint_path:
                     url = _hint_url
                 else:
                     url = f"https://{domain}{slug}"
@@ -3778,15 +3793,6 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
     cur_conf_py = (result.get("final_confidence") or "").strip().lower()
     _py_high    = cur_conf_py == "high"
 
-    # Handle group_subsidiary_page candidate type
-    _raw_ev = result.get("_raw_evidence", [])
-    _final_dom_check = str(result.get("final_selected_domain") or result.get("validated_domain") or "")
-    for _ev in _raw_ev:
-        if (_ev.get("candidate_type") == "group_site_subsidiary_page"
-                and _ev.get("domain", "").lower() == _final_dom_check.lower()):
-            result["final_decision_source"] = result.get("final_decision_source") or "group_subsidiary_page"
-            break
-
     # Shared context
     _fc_status   = str(verif_res.get("firecrawl_fetch_status", "") or "")
     _had_timeout = "timeout" in _fc_status
@@ -3886,9 +3892,15 @@ def _apply_verifier_decision(result: dict, verif_res: dict) -> dict:
             "canonical_domain_verification_status": "rejected",
         }
     if decision == "confirm":
+        # If the evidence came from a deep subsidiary page, mark as group_subsidiary_page
+        _ev_url   = str(verif_res.get("firecrawl_evidence_url", "") or verif_res.get("verifier_evidence_url", "") or "")
+        _ev_path  = re.sub(r"^https?://[^/]+", "", _ev_url) if _ev_url else ""
+        _ev_deep  = bool(_ev_path and _ev_path.strip("/") and len(_ev_path.strip("/").split("/")) >= 2)
+        _dec_src  = "group_subsidiary_page" if _ev_deep else "verifier_confirm"
         updates: dict = {
-            "final_decision_source": "verifier_confirm",
+            "final_decision_source": _dec_src,
             "canonical_domain_verification_status": "confirmed",
+            "verifier_evidence_url": _ev_url,
         }
         if confidence == "High" and cur_conf_py in ("medium", "low", "none", ""):
             updates["final_confidence"] = "High"
@@ -3930,6 +3942,7 @@ def _run_website_verifier(
     live_counters: dict | None = None,
     progress_update_fn=None,
     fc_location: dict | None = None,
+    candidate_hints: dict | None = None,  # domain -> best candidate_url from Serper
 ) -> tuple[dict, list[dict]]:
     """
     Route verification to Firecrawl, Jina, or both based on verifier_provider.
@@ -3997,6 +4010,7 @@ def _run_website_verifier(
                     live_counters=live_counters,
                     progress_update_fn=progress_update_fn,
                     fc_location=fc_location,
+                    candidate_hints=candidate_hints,
                 )
                 _verif_defaults.update(fc_res)
                 all_debug.extend(fc_debug)
@@ -4577,8 +4591,9 @@ def process_dataframe(
             res["verification_needed"] = _should_run_v
             res["verification_reason"] = _verify_reason
             if _should_run_v:
-                # Collect top scored candidates
+                # Collect top scored candidates + best candidate_url per domain
                 _cand_scores: dict[str, float] = {}
+                _cand_urls:   dict[str, str]   = {}  # domain -> best candidate_url
                 for _e in raw_ev:
                     if not _e.get("used"):
                         continue
@@ -4589,6 +4604,9 @@ def process_dataframe(
                         _s = 0.0
                     if _d and _s > _cand_scores.get(_d, -1.0):
                         _cand_scores[_d] = _s
+                        _curl = _e.get("candidate_url", "")
+                        if _curl:
+                            _cand_urls[_d] = _curl
                 _sorted_cands = sorted(_cand_scores.items(), key=lambda x: x[1], reverse=True)
                 _v_cands = [d for d, _ in _sorted_cands[:max_cands_per_company]]
                 if _cur_dom and _cur_dom not in _v_cands:
@@ -4614,6 +4632,7 @@ def process_dataframe(
                         python_confidence=str(res.get("final_confidence") or res.get("domain_confidence") or ""),
                         live_counters=_live_fc_counters,
                         fc_location=fc_location,
+                        candidate_hints=_cand_urls,
                     )
                     res.update(_verif_res)
                     res["_name_variants"] = _name_variants_v  # temp: used in _apply_verifier_decision
