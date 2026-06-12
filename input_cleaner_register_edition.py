@@ -347,6 +347,126 @@ _FC_API_URL   = "https://api.firecrawl.dev/v1/scrape"
 _FC_MAX_CHARS = 5000  # chars to keep per scraped page
 _FC_CACHE: dict[str, tuple[str, str, dict]] = {}  # url -> (text, status, meta)
 
+# =============================================================================
+# ORGANIZATION ELIGIBILITY PRE-FILTER
+# =============================================================================
+
+_ELI_KEEP    = "KEEP"
+_ELI_MAYBE   = "MAYBE"
+_ELI_EXCLUDE = "EXCLUDE"
+
+_PF_SEND    = "send_to_website_discovery"
+_PF_SKIP    = "skip_website_discovery"
+_PF_LATER   = "optional_later_review"
+
+_PF_MODE_COMMERCIAL = "Commercial only"
+_PF_MODE_MAYBE      = "Commercial + Maybe"
+_PF_MODE_ALL        = "All rows"
+_PF_MODES           = [_PF_MODE_COMMERCIAL, _PF_MODE_MAYBE, _PF_MODE_ALL]
+
+# Legal forms → KEEP (commercial companies)
+_KEEP_FORMS_RE = re.compile(
+    r"\b(s\.?\s*p\.?\s*a\.?|spa|societ[àa]\s+per\s+azioni"
+    r"|s\.?\s*r\.?\s*l\.?\s*s?\.?|srl[s]?|societ[àa]\s+a\s+responsabilit[àa]\s+limitata"
+    r"|s\.?\s*a\.?\s*p\.?\s*a\.?"
+    r"|s\.?\s*n\.?\s*c\.?|snc|societ[àa]\s+in\s+nome\s+collettivo"
+    r"|s\.?\s*a\.?\s*s\.?|sas|societ[àa]\s+in\s+accomandita\s+semplice)\b",
+    re.I,
+)
+
+# Legal forms / keywords → MAYBE
+_MAYBE_FORMS_RE = re.compile(
+    r"\b(cooperativa|societ[àa]\s+cooperativa|coop\.?"
+    r"|consorzio|societ[àa]\s+consortile"
+    r"|societ[àa]\s+agricola|societ[àa]\s+semplice\s+agricola|ss\s+agricola"
+    r"|azienda\s+speciale)\b",
+    re.I,
+)
+
+# Keywords → EXCLUDE (non-commercial or public bodies)
+_EXCLUDE_FORMS_RE = re.compile(
+    r"\b(associazione|fondazione|ets|onlus|odv|aps"
+    r"|comitato\b|caritas|parrocchia|diocesi|congregazione"
+    r"|universit[àa]|politecnico"
+    r"|scuola\b|istituto\s+statale|istituto\s+tecnico|istituto\s+comprensivo"
+    r"|comune\s+di|comune\b|regione\b|provincia\s+di|ministero"
+    r"|asl\b|ausl\b|ats\b|asp\b"
+    r"|azienda\s+sanitaria|azienda\s+ospedaliera|ospedale|irccs"
+    r"|ente\s+ecclesiastico)\b",
+    re.I,
+)
+
+# Public/health override signals that downgrade even legal commercial forms
+_PUBLIC_OVERRIDE_RE = re.compile(
+    r"\b(sanitaservice|asl\s+\w+|ausl\s+\w+|ats\s+\w+|asp\s+\w+"
+    r"|azienda\s+sanitaria|azienda\s+ospedaliera|ospedale\s+\w+"
+    r"|irccs|ente\s+pubblico|ente\s+locale|partecipata\s+pubblica"
+    r"|in\s+house\s+provid|societ[àa]\s+in\s+house)\b",
+    re.I,
+)
+
+
+def classify_organization(company_name: str) -> tuple[str, str, str, str]:
+    """
+    Classify a company name for mYngle eligibility.
+    Returns (organization_type, myngle_target_eligibility, pre_filter_decision, pre_filter_reason).
+    """
+    n = (company_name or "").strip()
+    nl = n.lower()
+
+    has_keep    = bool(_KEEP_FORMS_RE.search(n))
+    has_maybe   = bool(_MAYBE_FORMS_RE.search(n))
+    has_exclude = bool(_EXCLUDE_FORMS_RE.search(n))
+    has_public  = bool(_PUBLIC_OVERRIDE_RE.search(n))
+
+    # Determine organization type label
+    if _EXCLUDE_FORMS_RE.search(n):
+        # Find the first matching exclude term
+        _em = _EXCLUDE_FORMS_RE.search(n)
+        _et = _em.group(0).strip().lower() if _em else "non_commercial"
+        if any(t in nl for t in ("asl", "ausl", "ats", "asp", "sanitaria", "ospedaliera", "irccs", "ospedale")):
+            org_type = "public_health"
+        elif any(t in nl for t in ("universit", "politecnico")):
+            org_type = "university_education"
+        elif any(t in nl for t in ("scuola", "istituto statale", "istituto tecnico", "istituto comprensivo")):
+            org_type = "public_school"
+        elif any(t in nl for t in ("associazione", "odv", "aps", "onlus", "ets")):
+            org_type = "nonprofit_association"
+        elif any(t in nl for t in ("fondazione",)):
+            org_type = "foundation"
+        elif any(t in nl for t in ("comune", "regione", "provincia", "ministero")):
+            org_type = "government_body"
+        elif any(t in nl for t in ("parrocchia", "diocesi", "congregazione", "caritas", "ente ecclesiastico")):
+            org_type = "religious_body"
+        else:
+            org_type = "non_commercial"
+    elif has_public and has_keep:
+        org_type = "public_health_or_public_owned"
+    elif has_maybe:
+        org_type = "cooperative_or_consortium"
+    elif has_keep:
+        org_type = "commercial_company"
+    else:
+        org_type = "unknown"
+
+    # Eligibility decision
+    if has_exclude:
+        return org_type, _ELI_EXCLUDE, _PF_SKIP, f"Non-commercial entity: {org_type}"
+
+    if has_public and has_keep:
+        # Commercial legal form but public-body name signals
+        return org_type, _ELI_MAYBE, _PF_LATER, "Commercial form but public/healthcare name signals"
+
+    if has_keep:
+        return org_type, _ELI_KEEP, _PF_SEND, "Commercial legal form"
+
+    if has_maybe:
+        return org_type, _ELI_MAYBE, _PF_LATER, "Cooperative/consortium — lower priority"
+
+    # No recognizable legal form
+    return "unknown", _ELI_MAYBE, _PF_LATER, "No recognized legal form — unknown organization type"
+
+
 # Unified website verifier provider options
 _VP_OFF       = "Off"
 _VP_JINA      = "Jina"
@@ -3597,6 +3717,11 @@ _OUTPUT_COLS = [
     "wrong_location_signal",
     "firecrawl_redirect_final_url",
     "firecrawl_redirect_final_domain",
+    # v8 organization eligibility pre-filter columns
+    "organization_type",
+    "myngle_target_eligibility",
+    "pre_filter_decision",
+    "pre_filter_reason",
 ]
 
 
@@ -3630,6 +3755,8 @@ def process_dataframe(
     max_pages_per_cand: int = 3,
     page_timeout: int = 15,
     fc_speed_mode: str = _FC_SPEED_FAST,
+    # Organization eligibility pre-filter
+    eligibility_filter_mode: str = _PF_MODE_COMMERCIAL,
     # Debug
     debug_mode: bool = False,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
@@ -3678,9 +3805,42 @@ def process_dataframe(
         province = _sv(province_col)
         postcode = _sv(postcode_col)
 
+        # ── Organization eligibility pre-filter ──────────────────────────────
+        org_type, eligibility, pf_decision, pf_reason = classify_organization(name)
+        _pf_skip = (
+            (eligibility == _ELI_EXCLUDE and eligibility_filter_mode in (_PF_MODE_COMMERCIAL, _PF_MODE_MAYBE))
+            or (eligibility == _ELI_MAYBE and eligibility_filter_mode == _PF_MODE_COMMERCIAL)
+        )
+        if _pf_skip:
+            res = {
+                "organization_type": org_type,
+                "myngle_target_eligibility": eligibility,
+                "pre_filter_decision": _PF_SKIP,
+                "pre_filter_reason": pf_reason,
+                "cleaned_company_name": name,
+                "normalized_input_website": website,
+                "email_domain": "",
+                "final_selected_domain": "",
+                "final_decision_source": "pre_filter_skip",
+                "final_confidence": "",
+                "manual_review_needed": False,
+                "domain_confidence": "",
+                "domain_action": "skip",
+                "domain_reason": pf_reason,
+            }
+            new_results.append(res)
+            new_evidence.append({})
+            if progress_cb:
+                progress_cb(global_i + 1, n)
+            continue
+
         res, raw_ev = validate_register_row(
             name, website, email, city, province, postcode, serper_key, max_queries
         )
+        res["organization_type"] = org_type
+        res["myngle_target_eligibility"] = eligibility
+        res["pre_filter_decision"] = pf_decision
+        res["pre_filter_reason"] = pf_reason
 
         # Default Haiku fields (Python-only values)
         res.update({
@@ -4523,6 +4683,58 @@ def build_excel(
     ws_val.column_dimensions["B"].width = 14
     ws_val.freeze_panes = "A2"
 
+    # ── Organization eligibility pre-filter sheets ───────────────────────────
+    _pf_col = "myngle_target_eligibility"
+    _pf_key_cols = [
+        "organization_type", "myngle_target_eligibility",
+        "pre_filter_decision", "pre_filter_reason",
+        "cleaned_company_name", "normalized_input_website",
+        "email_domain", "domain_action", "final_selected_domain",
+        "final_confidence", "final_decision_source",
+    ]
+
+    def _make_pf_sheet(ws, df_subset):
+        if df_subset.empty:
+            ws.cell(row=1, column=1, value="No rows in this category.")
+            return
+        out_cols = [c for c in _pf_key_cols if c in df_subset.columns]
+        _write_sheet(ws, df_subset[out_cols])
+
+    _keep_mask  = enriched_df.get(_pf_col, pd.Series("", index=enriched_df.index)).astype(str) == _ELI_KEEP
+    _maybe_mask = enriched_df.get(_pf_col, pd.Series("", index=enriched_df.index)).astype(str) == _ELI_MAYBE
+    _excl_mask  = enriched_df.get(_pf_col, pd.Series("", index=enriched_df.index)).astype(str) == _ELI_EXCLUDE
+
+    ws_comm = wb.create_sheet("Commercial Input")
+    _make_pf_sheet(ws_comm, enriched_df[_keep_mask])
+
+    ws_maybe_sheet = wb.create_sheet("Maybe Review")
+    _make_pf_sheet(ws_maybe_sheet, enriched_df[_maybe_mask])
+
+    ws_excl = wb.create_sheet("Excluded Organizations")
+    _make_pf_sheet(ws_excl, enriched_df[_excl_mask])
+
+    # Pre-filter Summary
+    ws_pfs = wb.create_sheet("Pre-filter Summary")
+    _pf_rows = []
+    if _pf_col in enriched_df.columns and "organization_type" in enriched_df.columns:
+        for (ot, eli, dec), grp in enriched_df.groupby(
+            ["organization_type", "myngle_target_eligibility", "pre_filter_decision"],
+            dropna=False,
+        ):
+            reasons = enriched_df.loc[grp.index, "pre_filter_reason"].value_counts()
+            top_reason = reasons.index[0] if len(reasons) else ""
+            _pf_rows.append({
+                "organization_type": ot,
+                "eligibility": eli,
+                "pre_filter_decision": dec,
+                "count": len(grp),
+                "most_common_reason": top_reason,
+            })
+    if _pf_rows:
+        _write_sheet(ws_pfs, pd.DataFrame(_pf_rows))
+    else:
+        ws_pfs.cell(row=1, column=1, value="Pre-filter columns not present in output.")
+
     # Run Summary — always last
     ws_summary = wb.create_sheet("Run Summary")
     if run_meta:
@@ -4987,6 +5199,21 @@ def main():
         haiku_max_rows = 0
 
     st.sidebar.markdown("---")
+    st.sidebar.subheader("Organization Eligibility Filter")
+    eligibility_filter_mode = st.sidebar.selectbox(
+        "Eligibility filter mode",
+        options=_PF_MODES,
+        index=0,
+        key="reg_eligibility_filter_mode",
+        help=(
+            "Commercial only: process SPA, SRL, SNC, SAS, etc. Skip associations, schools, "
+            "public bodies, cooperatives.  \n"
+            "Commercial + Maybe: also process cooperatives, consortia, agricultural companies.  \n"
+            "All rows: no pre-filtering — process every row regardless of legal form."
+        ),
+    )
+
+    st.sidebar.markdown("---")
     st.sidebar.subheader("Website Verifier")
     verifier_provider = st.sidebar.selectbox(
         "Website verifier provider",
@@ -5315,6 +5542,7 @@ def main():
                 max_pages_per_cand=verifier_max_pages,
                 page_timeout=verifier_page_timeout,
                 fc_speed_mode=verifier_speed_mode,
+                eligibility_filter_mode=eligibility_filter_mode,
                 debug_mode=debug_mode,
             )
 
@@ -5615,6 +5843,7 @@ def main():
             max_pages_per_cand=verifier_max_pages,
             page_timeout=verifier_page_timeout,
             fc_speed_mode=verifier_speed_mode,
+            eligibility_filter_mode=eligibility_filter_mode,
             debug_mode=debug_mode,
         )
 
