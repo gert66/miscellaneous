@@ -3313,95 +3313,17 @@ def run_lusha_api_enrichment(
     raw_url: str,
     api_key: str,
 ) -> tuple:
-    """
-    Call the real Lusha Company API and return:
-    (lusha_fields_dict, raw_json_dict, status, error_message)
-
-    Status values:
-      "ok"             — HTTP 200 AND at least one useful company field was mapped
-      "empty_response" — HTTP 200 but no useful company data found in the response
-      "not_found"      — Lusha returned 404 (no company match)
-      "auth_error"     — 401 invalid key
-      "rate_limit"     — 429 quota exceeded
-      "timeout"        — request timed out
-      "http_{N}"       — other HTTP error
-      "parse_error"    — response body was not valid JSON
-      "no_key"         — API key not provided
-      "no_input"       — neither domain nor company name available
-      "cached"         — result served from local file cache
-    """
-    _empty = {f: "" for f in LUSHA_API_FIELDS + ["lusha_api_raw_keys"]}
-
-    api_key = (api_key or "").strip()
-    if not api_key:
-        return _empty, {}, "no_key", "Lusha API key not provided"
-
-    domain = clean_domain(raw_url)
-    cache_key = f"lusha_api_{domain or safe_filename(company_name or 'unknown')}"
-    cached = load_cache(cache_key)
-    if cached is not None:
-        cached_status = cached.get("status", "")
-        # Avoid returning "ok" for a previously-cached empty response
-        if cached_status == "not_found":
-            return _empty, cached.get("raw", {}), "not_found", "Lusha API: company not found (cached)"
-        fields = _map_lusha_api_fields(cached.get("raw", {}), raw_url)
-        effective_status = "cached" if _lusha_has_useful_data(fields) else "empty_response"
-        return fields, cached.get("raw", {}), effective_status, ""
-
-    # ── Build request ─────────────────────────────────────────────────────────
-    params: dict = {}
-    if domain:
-        params["domain"] = domain
-    elif company_name:
-        params["name"] = company_name
-    else:
-        return _empty, {}, "no_input", "No domain or company name available"
-
-    try:
-        resp = requests.get(
-            _LUSHA_API_BASE,
-            headers={"api_key": api_key, "Accept": "application/json"},
-            params=params,
-            timeout=_LUSHA_TIMEOUT,
-        )
-
-        if resp.status_code == 404:
-            save_cache(cache_key, {"raw": {}, "status": "not_found"})
-            return _empty, {}, "not_found", "Lusha API: company not found (404)"
-
-        if resp.status_code == 401:
-            return _empty, {}, "auth_error", "Lusha API: invalid or missing API key (401)"
-
-        if resp.status_code == 429:
-            return _empty, {}, "rate_limit", "Lusha API: rate limit exceeded (429)"
-
-        resp.raise_for_status()
-
-        raw = resp.json()
-        fields = _map_lusha_api_fields(raw, raw_url)
-
-        if _lusha_has_useful_data(fields):
-            status = "ok"
-            error  = ""
-        else:
-            status = "empty_response"
-            error  = (
-                f"Lusha returned HTTP 200 but no useful company fields were mapped. "
-                f"Response keys: {fields.get('lusha_api_raw_keys', '(unknown)')}"
-            )
-
-        save_cache(cache_key, {"raw": raw, "status": status})
-        return fields, raw, status, error
-
-    except requests.Timeout:
-        return _empty, {}, "timeout", f"Lusha API timed out after {_LUSHA_TIMEOUT}s"
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else 0
-        return _empty, {}, f"http_{code}", f"Lusha API HTTP {code}: {str(e)[:120]}"
-    except (json.JSONDecodeError, ValueError) as e:
-        return _empty, {}, "parse_error", f"Lusha API invalid JSON: {str(e)[:120]}"
-    except Exception as e:
-        return _empty, {}, "error", f"Lusha API error: {type(e).__name__}: {str(e)[:120]}"
+    """Live Lusha API enrichment is disabled in Layer 1. Moved to Buyer Contact Finder (Layer 2.5)."""
+    disabled_meta = {
+        "lusha_api_status":           "disabled_in_layer_1",
+        "lusha_api_error":            "Live Lusha API disabled in Layer 1. Use Buyer Contact Finder for contact enrichment.",
+        "lusha_api_match_confidence": "",
+        "lusha_api_needs_review":     False,
+        "lusha_api_match_notes":      "",
+        "lusha_api_raw_keys":         "",
+    }
+    empty_fields = {f: "" for f in LUSHA_API_FIELDS}
+    return {**empty_fields, **disabled_meta}, {}, "disabled_in_layer_1", ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3658,9 +3580,10 @@ def enrich_one_row(
     # 8-second pause between companies to stay under the token/min rate limit
     time.sleep(8)
 
-    # ── Optional: Lusha API enrichment ────────────────────────────────────────
+    # ── Lusha live API disabled in Layer 1 — see Buyer Contact Finder (Layer 2.5) ──
     _lusha_raw_json = {}
-    if enable_lusha_api and lusha_api_key:
+    # Lusha live API is disabled in Layer 1 — moved to Buyer Contact Finder (Layer 2.5)
+    if False and enable_lusha_api and lusha_api_key:   # kept for reference only
         la_fields, _lusha_raw_json, la_status, la_err = run_lusha_api_enrichment(
             company_name, url, lusha_api_key,
         )
@@ -3669,9 +3592,17 @@ def enrich_one_row(
         row["lusha_api_error"]  = la_err
         review_meta = flag_lusha_api_review(la_fields, company_name, url)
         row.update(review_meta)
-    elif enable_lusha_api and not lusha_api_key:
-        row["lusha_api_status"] = "no_key"
-        row["lusha_api_error"]  = "Lusha API key not provided"
+    else:
+        la_fields = {f: "" for f in LUSHA_API_FIELDS}
+        la_fields.update({
+            "lusha_api_status":           "disabled_in_layer_1",
+            "lusha_api_error":            "",
+            "lusha_api_match_confidence": "",
+            "lusha_api_needs_review":     False,
+            "lusha_api_match_notes":      "Lusha/Lucia live enrichment moved to Buyer Contact Finder (Layer 2.5).",
+            "lusha_api_raw_keys":         "",
+        })
+        row.update(la_fields)
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
     if run_step1_enrichment:
@@ -4222,6 +4153,16 @@ def _xl_write_scoring_settings(ws) -> None:
 
     ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 20
+
+    r += 1
+    ws.cell(row=r, column=1, value="Layer 1 Notes").font = bold
+    r += 1
+    ws.cell(row=r, column=1, value="lusha_layer1_note").font = norm
+    ws.cell(row=r, column=2, value=(
+        "Lusha/Lucia live enrichment is disabled in Layer 1. "
+        "Company size is resolved from input data, uploaded metadata, website/Jina evidence, "
+        "or public snippets only. Contact enrichment belongs to Buyer Contact Finder (Layer 2.5)."
+    )).font = norm
 
 
 # Human-readable labels for model signal field names.
@@ -5851,7 +5792,7 @@ _elm_mode  = False
 debug_mode = False
 delay_sec  = 1.0
 ss_set(
-    _enable_lusha_api          = bool(lusha_api_key),
+    _enable_lusha_api          = False,  # Lusha live API disabled in Layer 1
     _run_step1_enrichment      = not ss("_has_lusha_input", False),
     _run_step2_enrichment      = True,
     _extract_model_signals     = True,
@@ -5881,10 +5822,11 @@ with st.sidebar:
         st.success("✓ Serper API key loaded")
     else:
         st.error("⚠ Serper API key missing — required for Step 2 search")
-    if lusha_api_key:
-        st.success("✓ Lusha API key loaded")
-    else:
-        st.caption("ⓘ Lusha API key not set")
+    st.sidebar.info(
+        "**Lusha/Lucia live enrichment** is disabled in this layer. "
+        "Contact enrichment runs in **Buyer Contact Finder (Layer 2.5)** "
+        "after company selection, to preserve credits."
+    )
 
     st.divider()
 
@@ -6142,9 +6084,8 @@ if (
     and not _is_preview_mode
 ):
     blocking.append("SERPER_API_KEY is missing from .streamlit/secrets.toml")
-_active_lusha_api = ss("_enable_lusha_api", False)
-if _active_lusha_api and not lusha_api_key:
-    blocking.append("LUSHA_API_KEY is missing from .streamlit/secrets.toml")
+_active_lusha_api = False  # Lusha live API disabled in Layer 1
+# (no blocking check needed — Lusha live API is disabled in Layer 1)
 if _app_mode == "Batch Upload" and uploaded is None:
     blocking.append("Upload a file to start.")
 if _app_mode == "Single Company" and (_sc_df is None or _sc_df.empty):
@@ -6314,7 +6255,7 @@ if start_btn and not blocking and not currently_processing:
         _serper_key=serper_key,
         _step2_dry_run=ss("_step2_dry_run", False),
         _zero_cost_preview=ss("_zero_cost_preview", False),
-        _enable_lusha_api=ss("_enable_lusha_api", False),
+        _enable_lusha_api=False,  # Lusha live API disabled in Layer 1
         _lusha_api_key=lusha_api_key,
         _extract_model_signals=ss("_extract_model_signals", True),
         _include_signal_evidence=ss("_include_signal_evidence", True),
@@ -6593,7 +6534,7 @@ if ss("processing", False):
         # sidebar setting — company data is already pre-mapped from the CSV.
         _row_input_type = str(input_row.get("input_type", "")).strip()
         _is_lucia_row   = (_row_input_type == "pre_enriched_lucia_export")
-        _effective_lusha_api = _enable_lusha_api_run and not _is_lucia_row
+        _effective_lusha_api = False  # Lusha live API disabled in Layer 1
 
         # ── Resume: skip rows already in autosave ─────────────────────────────
         if _resume_mode and autosave_already_done(
