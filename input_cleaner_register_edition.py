@@ -676,8 +676,13 @@ _EDU_IT_RE = re.compile(r"\.edu\.it$", re.I)
 _GOV_IT_RE = re.compile(r"\.(gov|governo|istruzione|giustizia|interno|esteri)\.it$", re.I)
 
 # Hard negative source types — always block even for High-confidence Python domains
-_HARD_NEG_SOURCES = frozenset({"directory", "government", "marketplace", "job_board",
-                                "public_school", "university"})
+_HARD_NEG_SOURCES = frozenset({
+    "directory", "government", "marketplace", "job_board",
+    "public_school", "university",
+    # v12 — URL/domain-identified hard negatives
+    "business_directory", "marketplace_product_page", "pdf_list",
+    "document_hosting", "third_party_client_reference",
+})
 
 _HAIKU_MODES          = [_HAIKU_MODE_PYTHON, _HAIKU_MODE_UNCERTAIN, _HAIKU_MODE_ALL]
 
@@ -3226,6 +3231,121 @@ def _detect_neg_source(text: str, domain: str = "") -> str:
     return ""
 
 
+_BUSINESS_DIR_DOMAINS = frozenset({
+    "creditsafe.com", "infobel.com", "paginegialle.it", "tuttitalia.it",
+    "dnb.com", "kompass.com", "europages.it", "europages.com",
+    "registroimprese.it", "atoka.io", "offertedilavoro.it",
+})
+_DOCUMENT_HOSTING_DOMAINS = frozenset({
+    "yumpu.com", "issuu.com", "scribd.com", "slideshare.net",
+    "calameo.com", "docplayer.it", "docplayer.net",
+})
+_PRODUCT_PATH_RE = re.compile(
+    r"/(product|products|shop|catalog|catalogue|catalogo|cart|checkout|"
+    r"negozio|articolo|article|item|sku)/",
+    re.I,
+)
+_PDF_URL_RE = re.compile(r"\.pdf(\?|#|$)", re.I)
+
+
+def _detect_neg_source_url(url: str, candidate_domain: str = "") -> str:
+    """
+    Detect hard negative source type purely from the URL.
+    Returns a string key or empty string.
+    """
+    if not url:
+        return ""
+    try:
+        _parsed = urlparse(url)
+        _url_domain = _parsed.netloc.lower().lstrip("www.")
+        _path = (_parsed.path or "").lower()
+    except Exception:
+        _url_domain = ""
+        _path = url.lower()
+
+    # PDF hosted elsewhere (not on the candidate's own domain)
+    if _PDF_URL_RE.search(_path) or _path.endswith(".pdf"):
+        if candidate_domain and _url_domain and _url_domain != candidate_domain.lstrip("www."):
+            return "pdf_list"
+        if not candidate_domain:
+            return "pdf_list"
+    # /wp-content/uploads/ PDF on any domain (typically blog/client reference)
+    if "/wp-content/uploads/" in _path and _PDF_URL_RE.search(_path):
+        return "pdf_list"
+
+    # Known business directory domains
+    if _url_domain in _BUSINESS_DIR_DOMAINS:
+        return "business_directory"
+    for _bd in _BUSINESS_DIR_DOMAINS:
+        if _url_domain.endswith("." + _bd):
+            return "business_directory"
+
+    # Document hosting
+    if _url_domain in _DOCUMENT_HOSTING_DOMAINS:
+        return "document_hosting"
+
+    # Product / marketplace path pattern
+    if _PRODUCT_PATH_RE.search(_path):
+        if not candidate_domain or _url_domain != candidate_domain.lstrip("www."):
+            return "marketplace_product_page"
+
+    # Known marketplace / e-commerce aggregators (also caught by text detector
+    # but url check is faster and fires even with no page text)
+    _MARKETPLACE_DOMAINS = frozenset({
+        "gosupps.com", "amazon.it", "amazon.com", "ebay.it", "ebay.com",
+        "aliexpress.com", "etsy.com",
+    })
+    if _url_domain in _MARKETPLACE_DOMAINS:
+        return "marketplace_product_page"
+
+    return ""
+
+
+def _detect_neg_source(text: str, domain: str = "", url: str = "") -> str:
+    """
+    Return the first matching negative-source-type key, or empty string if none.
+    Checks URL first (fast), then domain TLD, then page text patterns.
+
+    Thresholds:
+    - news_media: 3+ matches (company websites often have news sections)
+    - public_school / university: 1+ match (very distinctive vocabulary)
+    - others: 2+ matches
+
+    Also checks domain TLD: .edu.it → public_school, .gov.it etc. → government.
+    """
+    # URL-based check (highest confidence, no text needed)
+    if url:
+        _url_neg = _detect_neg_source_url(url, domain)
+        if _url_neg:
+            return _url_neg
+
+    if not text and not domain:
+        return ""
+
+    # Domain-level hard signals (checked before text)
+    if domain:
+        if _EDU_IT_RE.search(domain.lower()):
+            return "public_school"
+        if _GOV_IT_RE.search(domain.lower()):
+            return "government"
+
+    if not text:
+        return ""
+    tl = text.lower()
+
+    _thresholds = {
+        "news_media": 3,
+        "public_school": 1,   # very specific vocabulary, 1 match is enough
+        "university": 1,
+    }
+    for src_type, pat in _NEG_SOURCE_RES.items():
+        hits = pat.findall(tl)
+        threshold = _thresholds.get(src_type, 2)
+        if len(hits) >= threshold:
+            return src_type
+    return ""
+
+
 def _extract_fc_evidence(
     text: str,
     domain: str,
@@ -3235,6 +3355,7 @@ def _extract_fc_evidence(
     input_email_domain: str,
     input_partita_iva: str,
     name_variants: dict,
+    source_url: str = "",
 ) -> dict:
     """
     Extract identity evidence from Firecrawl-scraped page text.
@@ -3321,8 +3442,8 @@ def _extract_fc_evidence(
     ph_m = _ph_re.search(text)
     extracted_phone = ph_m.group(1).strip() if ph_m else ""
 
-    # Negative source type (pass domain for TLD-level checks)
-    negative_source_type = _detect_neg_source(text, domain)
+    # Negative source type (check URL first, then domain TLD, then text)
+    negative_source_type = _detect_neg_source(text, domain, source_url)
 
     # Wrong entity type: the detected source type is non-commercial and hard
     wrong_entity_type_signal = negative_source_type in _HARD_NEG_SOURCES
@@ -3636,6 +3757,7 @@ def _fc_verify_candidates(
                     _ev_partial = _extract_fc_evidence(
                         text, domain, company_name, city, province,
                         email_domain, input_partita_iva, name_variants,
+                        source_url=url,
                     )
                     if _ev_partial.get("negative_source_type") and not neg_src_domain:
                         neg_src_domain = _ev_partial["negative_source_type"]
@@ -3652,6 +3774,8 @@ def _fc_verify_candidates(
                 _redirect_domain = meta.get("redirect_domain", "")
                 _canonical_domain_used = _redirect_domain or domain
 
+                _url_neg_src = _detect_neg_source_url(url, domain)
+                _neg_src_for_row = _ev_partial.get("negative_source_type", "") or _url_neg_src
                 debug_rows.append({
                     "company_name":             company_name,
                     "candidate_domain":         domain,
@@ -3664,11 +3788,12 @@ def _fc_verify_candidates(
                     "fetch_status":             status,
                     "chars_fetched":            len(text),
                     "elapsed_secs":             round(_elapsed, 2),
-                    "source_type":              _ev_partial.get("negative_source_type", "") or ("company" if status == "ok" else ""),
+                    "source_type":              _neg_src_for_row or ("company" if status == "ok" else ""),
                     "wrong_entity_type_signal": _ev_partial.get("wrong_entity_type_signal", False),
                     "wrong_location_signal":    _ev_partial.get("wrong_location_signal", False),
                     "evidence_strength":        "",   # filled after domain scoring
-                    "negative_source_type":     _ev_partial.get("negative_source_type", ""),
+                    "negative_source_type":     _neg_src_for_row,
+                    "third_party_evidence_flag": bool(_url_neg_src or _neg_src_for_row),
                     "verifier_decision":        "",
                     "verifier_reason":          "",
                     "replace_allowed":          "",
@@ -3694,6 +3819,7 @@ def _fc_verify_candidates(
                         _redir_ev = _extract_fc_evidence(
                             text, _redirect_domain, company_name, city, province,
                             email_domain, input_partita_iva, name_variants,
+                            source_url=_redirect_url or url,
                         )
                         ev["redirect_domain"]       = _redirect_domain
                         ev["redirect_ev"]           = _redir_ev
@@ -4128,6 +4254,39 @@ def _apply_final_safety_guard(result: dict) -> dict:
             "pre_safety_manual_review_needed":   result.get("manual_review_needed", ""),
             "pre_safety_final_decision_source":  result.get("final_decision_source", ""),
         }
+
+    # ── Rule 0: blank domain — ALWAYS the first check ────────────────────────
+    final_dom = str(result.get("final_selected_domain", "") or "").strip()
+    if not final_dom:
+        if conf in ("high", "medium") or not manual:
+            updates = _snapshot()
+            updates["final_confidence"]      = "None"
+            updates["manual_review_needed"]  = True
+            updates["final_decision_source"] = "blank_domain_safety_guard"
+            updates["safety_guard_applied"]  = True
+            updates["safety_guard_reason"]   = "final_selected_domain_blank"
+            return updates
+
+    # ── Rule 6 (evidence URL check) — before verifier-confirm early return ───
+    _ev_url = str(result.get("verifier_evidence_url", "") or
+                  result.get("firecrawl_evidence_url", "") or "")
+    if _ev_url and verif_dec == "confirm" and verif_ev_str in ("medium", "strong"):
+        _ev_neg = _detect_neg_source_url(_ev_url, str(result.get("final_selected_domain", "") or ""))
+        if _ev_neg in _HARD_NEG_SOURCES:
+            updates = _snapshot()
+            updates["safety_guard_applied"] = True
+            if haiku_dec == "reject":
+                updates["final_selected_domain"] = ""
+                updates["final_confidence"]      = "None"
+                updates["manual_review_needed"]  = True
+                updates["final_decision_source"] = "haiku_reject_third_party_verifier_guard"
+                updates["safety_guard_reason"]   = "haiku_reject_and_verifier_source_not_official"
+            else:
+                updates["final_confidence"]      = "Low"
+                updates["manual_review_needed"]  = True
+                updates["final_decision_source"] = "third_party_evidence_safety_guard"
+                updates["safety_guard_reason"]   = f"verifier_evidence_url_hard_negative:{_ev_neg}"
+            return updates
 
     # Rule 5 / 6: verifier confirmed or replaced with good evidence — do not downgrade
     if _verif_confirmed or (_verif_replaced and not wrong_loc and not wrong_entity):
@@ -6033,6 +6192,7 @@ def build_excel(
             "verifier_decision", "verifier_reason", "replace_allowed",
             "haiku_decision", "haiku_confidence",
             "firecrawl_key_index_used", "firecrawl_key_failover_count", "firecrawl_key_statuses",
+            "third_party_evidence_flag",
         ]
         if jina_debug_rows:
             jd_df = pd.DataFrame(jina_debug_rows)
