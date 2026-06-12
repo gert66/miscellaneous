@@ -485,6 +485,18 @@ _FC_SPEED_BALANCED  = "Balanced"   # homepage + about/contact if weak, 1 cand, 2
 _FC_SPEED_THOROUGH  = "Thorough"   # homepage + about + contact, configurable
 _FC_SPEED_OPTIONS   = [_FC_SPEED_FAST, _FC_SPEED_BALANCED, _FC_SPEED_THOROUGH]
 
+# Firecrawl location constants
+_FC_LOC_ITALY   = "Italy (default)"
+_FC_LOC_USA     = "United States"
+_FC_LOC_DEFAULT = "Default Firecrawl"
+_FC_LOC_OPTIONS = [_FC_LOC_ITALY, _FC_LOC_USA, _FC_LOC_DEFAULT]
+
+_FC_LOC_PAYLOADS = {
+    _FC_LOC_ITALY:   {"country": "IT", "languages": ["it", "en"]},
+    _FC_LOC_USA:     {"country": "US", "languages": ["en"]},
+    _FC_LOC_DEFAULT: {},
+}
+
 # Per-speed-mode defaults: (max_cands, max_pages, timeout_secs)
 _FC_SPEED_DEFAULTS  = {
     _FC_SPEED_FAST:     (1, 1, 6),
@@ -2448,7 +2460,7 @@ def _fc_load_key() -> str | None:
     return os.getenv("FIRECRAWL_API_KEY") or os.getenv("firecrawl_api_key") or None
 
 
-def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict]:
+def _fc_scrape(url: str, fc_key: str, timeout: int = 15, fc_location: dict | None = None) -> tuple[str, str, dict]:
     """
     Scrape a single URL via Firecrawl v1 scrape endpoint.
     Returns (markdown_text, fetch_status, metadata_dict).
@@ -2456,17 +2468,21 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
       - redirect_url: final URL after any redirects (from Firecrawl sourceURL/url metadata)
       - redirect_domain: extracted domain of redirect_url if different from original
       - canonical_url: og:url or canonical link if present
-    Results cached by URL for the lifetime of the Streamlit session.
+    Results cached by (URL, location) for the lifetime of the Streamlit session.
     """
-    if url in _FC_CACHE:
-        return _FC_CACHE[url]
+    _cache_key = (url, frozenset((fc_location or {}).items()))
+    if _cache_key in _FC_CACHE:
+        return _FC_CACHE[_cache_key]
 
     text, status, meta = "", "not_attempted", {}
     try:
+        _payload: dict = {"url": url, "formats": ["markdown"]}
+        if fc_location:
+            _payload["location"] = fc_location
         resp = requests.post(
             _FC_API_URL,
             headers={"Authorization": f"Bearer {fc_key}", "Content-Type": "application/json"},
-            json={"url": url, "formats": ["markdown"]},
+            json=_payload,
             timeout=timeout,
         )
         if resp.status_code == 200:
@@ -2505,7 +2521,7 @@ def _fc_scrape(url: str, fc_key: str, timeout: int = 15) -> tuple[str, str, dict
     except Exception as exc:
         status = f"error:{str(exc)[:80]}"
 
-    _FC_CACHE[url] = (text, status, meta)
+    _FC_CACHE[_cache_key] = (text, status, meta)
     return text, status, meta
 
 
@@ -2746,6 +2762,7 @@ def _fc_verify_candidates(
     progress_update_fn=None,  # optional callback(candidate_i, total_cands, page_i, total_pages, domain)
     # live-counter dict — caller passes {} and reads back keys after the call
     live_counters: dict | None = None,
+    fc_location: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """
     Verify candidate domains via Firecrawl scrape.
@@ -2805,6 +2822,7 @@ def _fc_verify_candidates(
     all_statuses: list[str] = []
     total_pages_fetched = 0
     fc_errors: list[str] = []
+    _best_evidence_url: str = ""
     import time as _time_mod
 
     for ci, domain in enumerate(candidates):
@@ -2841,7 +2859,7 @@ def _fc_verify_candidates(
                     progress_update_fn(ci, len(candidates), requests_attempted, max_pages, domain)
 
                 _t0 = _time_mod.time()
-                text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout)
+                text, status, meta = _fc_scrape(url, fc_key, timeout=page_timeout, fc_location=fc_location)
                 _elapsed = _time_mod.time() - _t0
 
                 requests_attempted += 1
@@ -2864,6 +2882,12 @@ def _fc_verify_candidates(
                     if ev.get("negative_source_type") and not neg_src_domain:
                         neg_src_domain = ev["negative_source_type"]
                     pages_evidence.append(ev)
+
+                    # Track best evidence URL for firecrawl_evidence_url
+                    if _best_evidence_url == "" and status == "ok":
+                        _interim_str, _, _ = _compute_evidence_strength(pages_evidence, neg_src_domain)
+                        if _interim_str in ("medium", "strong"):
+                            _best_evidence_url = url
 
                     _redirect_url    = meta.get("final_url", "") or meta.get("redirect_url", "")
                     _redirect_domain = meta.get("redirect_domain", "")
