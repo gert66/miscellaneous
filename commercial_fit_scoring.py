@@ -121,11 +121,11 @@ SIZE_WEIGHT:  float = COMPANY_SIZE_WEIGHT
 _LEGACY_MODEL_WEIGHT: float = 0.75
 _LEGACY_SIZE_WEIGHT:  float = 0.25
 
-#: Tier thresholds — inclusive lower bounds, checked in descending order.
+#: Tier thresholds — recalibrated for 90/10 blend (top 15% / 35% / 70% of score distribution).
 TIER_THRESHOLDS: list[tuple[float, str]] = [
-    (8.66, "🥇 Hot"),
-    (7.19, "🥈 Warm"),
-    (4.23, "🥉 Cool"),
+    (9.34, "🥇 Hot"),
+    (8.28, "🥈 Warm"),
+    (4.26, "🥉 Cool"),
     (0.0,  "❄️ Pass"),
 ]
 
@@ -151,8 +151,8 @@ COMMERCIAL_COMPLEXITY_FIELDS: list[str] = [
     "competitor_signal_strength_score",
 ]
 
-HIGH_VALUE_MIN_SCORE: float = 7.19   # Hot or Warm
-WEAK_MAX_SCORE:       float = 4.23   # below Cool
+HIGH_VALUE_MIN_SCORE: float = 8.28   # Hot or Warm (recalibrated for 90/10 blend)
+WEAK_MAX_SCORE:       float = 4.26   # below Cool  (recalibrated for 90/10 blend)
 DATA_QUALITY_MEDIUM_MISSING: int = 2
 DATA_QUALITY_LOW_MISSING:    int = 5
 TOP_DRIVER_THRESHOLD:   float = 0.15
@@ -768,12 +768,12 @@ if __name__ == "__main__":
     _section("Smoke Test 10: Tier boundary values")
 
     for score_val, expected_tier in [
-        (9.0,  "🥇 Hot"),
-        (8.66, "🥇 Hot"),
-        (8.0,  "🥈 Warm"),
-        (7.19, "🥈 Warm"),
-        (5.0,  "🥉 Cool"),
-        (4.23, "🥉 Cool"),
+        (9.5,  "🥇 Hot"),
+        (9.34, "🥇 Hot"),
+        (9.0,  "🥈 Warm"),
+        (8.28, "🥈 Warm"),
+        (6.0,  "🥉 Cool"),
+        (4.26, "🥉 Cool"),
         (2.0,  "❄️ Pass"),
     ]:
         row_t = {f: 0 for f in LEAN_COEFFICIENTS}
