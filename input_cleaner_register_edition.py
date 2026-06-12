@@ -4357,6 +4357,9 @@ _OUTPUT_COLS = [
     "professional_site_score",
     "professional_site_level",
     "professional_site_signals",
+    # v10 candidate metadata
+    "candidate_url",
+    "candidate_type",
 ]
 
 
