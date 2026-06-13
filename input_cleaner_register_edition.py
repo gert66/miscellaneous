@@ -179,9 +179,20 @@ _LEGAL_TOKENS = re.compile(
     r"\b(s\.?r\.?l\.?|s\.?p\.?a\.?|s\.?a\.?s?|snc|s\.?n\.?c\.?|"
     r"s\.?a\.?p\.?a?\.?|ltd|limited|b\.?v\.?|n\.?v\.?|gmbh|ag|"
     r"llc|inc|corp|plc|holding|holdings|group|co|company|pty|"
-    r"se|pte|bhd|sarl|eurl|scs|cv|impresa|ditta|studio)\b\.?",
+    r"se|pte|bhd|sarl|eurl|scs|cv|impresa|ditta|studio|"
+    r"kg|k\.g\.|ohg|o\.h\.g\.|ug|kgaa|k\.g\.a\.a\.|gbr|g\.b\.r\.|ek|e\.k\.|partg)\b\.?",
     re.IGNORECASE,
 )
+
+# Tokens that are purely legal suffixes and must never be used as the brand name
+_BRAND_LEGAL_REJECT_TOKENS: frozenset = frozenset({
+    # Italian
+    "srl", "spa", "sas", "snc", "srls", "sapa",
+    # German
+    "gmbh", "ag", "kg", "ohg", "ug", "se", "kgaa", "gbr", "ek", "partg",
+    # International
+    "ltd", "llc", "inc", "corp", "plc", "bv", "nv", "co",
+})
 
 # Italian descriptor words that are NOT part of the brand name
 _ITALIAN_DESCRIPTORS = re.compile(
@@ -703,18 +714,26 @@ _FC_SPEED_THOROUGH  = "Thorough"   # homepage + about + contact, configurable
 _FC_SPEED_OPTIONS   = [_FC_SPEED_FAST, _FC_SPEED_BALANCED, _FC_SPEED_THOROUGH]
 
 # Firecrawl location constants
-_FC_LOC_ITALY   = "Italy (default)"
+_FC_LOC_AUTO    = "Auto from detected country"
+_FC_LOC_ITALY   = "Italy"
 _FC_LOC_GERMANY = "Germany"
 _FC_LOC_USA     = "United States"
 _FC_LOC_DEFAULT = "Default Firecrawl"
-_FC_LOC_OPTIONS = [_FC_LOC_ITALY, _FC_LOC_GERMANY, _FC_LOC_USA, _FC_LOC_DEFAULT]
+_FC_LOC_OPTIONS = [_FC_LOC_AUTO, _FC_LOC_ITALY, _FC_LOC_GERMANY, _FC_LOC_USA, _FC_LOC_DEFAULT]
 
 _FC_LOC_PAYLOADS = {
+    _FC_LOC_AUTO:    None,  # resolved at runtime from detected country
     _FC_LOC_ITALY:   {"country": "IT", "languages": ["it", "en"]},
     _FC_LOC_GERMANY: {"country": "DE", "languages": ["de", "en"]},
     _FC_LOC_USA:     {"country": "US", "languages": ["en"]},
     _FC_LOC_DEFAULT: {},
 }
+
+def _fc_loc_payload_for_country(country_code: str) -> dict:
+    """Return the Firecrawl location payload for the given country code."""
+    if country_code == "DE":
+        return {"country": "DE", "languages": ["de", "en"]}
+    return {"country": "IT", "languages": ["it", "en"]}
 
 # =============================================================================
 # COUNTRY CONFIG
@@ -1429,7 +1448,12 @@ def extract_name_variants(name: str) -> dict:
         ]
 
     if not raw_toks:
-        brand = no_desc or no_legal or full
+        # Strip trailing punctuation/operators from fallback (e.g. "Global &" → "Global")
+        _fb = no_desc or no_legal or full
+        brand = re.sub(r"[\s&,./\\-]+$", "", _fb).strip()
+        brand = re.sub(r"^[\s&,./\\-]+", "", brand).strip()
+        if not brand:
+            brand = full
     elif len(raw_toks) == 1:
         brand = raw_toks[0]
     elif len(raw_toks) == 2:
@@ -1467,6 +1491,18 @@ def extract_name_variants(name: str) -> dict:
     if "TECNOLOGIE" in _nolegal_upper:
         _tech_variant = re.sub(r"\bTECNOLOGIE\b", "TECHNOLOGIES", no_legal, flags=re.I)
         descriptor_variants.append(("technologies_variant", _tech_variant.strip()))
+
+    # Safety: if the resulting brand is purely a legal suffix (e.g. "KG", "AG"),
+    # fall back to no_legal or full so we never search with a generic legal token.
+    _brand_lower = re.sub(r"[^a-z0-9]", "", brand.lower())
+    if _brand_lower in _BRAND_LEGAL_REJECT_TOKENS:
+        # Use the cleaned name without descriptors, fall back to no_legal, then full
+        brand = no_desc.strip() or no_legal.strip() or full
+        # If that also reduces to a legal token, use full
+        if re.sub(r"[^a-z0-9]", "", brand.lower()) in _BRAND_LEGAL_REJECT_TOKENS:
+            brand = full
+        brand_is_acronym = _is_acronym(brand)
+        brand_nodot = _acronym_nodot(brand) if brand_is_acronym else brand
 
     return {
         "full":               full,
@@ -1570,6 +1606,22 @@ def is_generic(domain: str, country_config: "CountryConfig | None" = None) -> bo
         for base in country_config.directory_blacklist_bases:
             if dl == base or dl.endswith("." + base):
                 return True
+    return False
+
+
+def is_discovery_blocked(domain: str) -> bool:
+    """
+    Return True if the domain must never become an official company domain
+    (music stores, streaming, social media, marketplaces, encyclopedias).
+    These may remain in Raw Search Evidence as rejected evidence but must not
+    be validated, recommended, or sent to Firecrawl.
+    """
+    if not domain:
+        return False
+    dl = domain.lower()
+    for blocked in _DISCOVERY_BLOCKED_DOMAINS:
+        if dl == blocked or dl.endswith("." + blocked):
+            return True
     return False
 
 
@@ -2106,6 +2158,20 @@ def search_official_domain_register(
                 })
                 rejection_notes.append(f"{domain}: blacklisted")
                 rejection_counts["directory"] += 1
+                continue
+
+            # Hard-block media, streaming, social, marketplace domains — they can
+            # never be an official company domain regardless of snippet content.
+            if is_discovery_blocked(domain):
+                evidence.append({
+                    "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
+                    "domain": domain, "used": False,
+                    "skip_reason": "media/streaming/social domain blocked", "score": 0,
+                    "rejection_category": "media_blocked",
+                })
+                rejection_notes.append(f"{domain}: media/streaming blocked")
+                rejection_counts["media_blocked"] = rejection_counts.get("media_blocked", 0) + 1
                 continue
 
             # Category check — reject government, religious, directory, academic
@@ -3564,7 +3630,7 @@ def _score_professional_site(text: str, domain: str) -> dict:
         score += 1
         signals.append("rich_footer")
 
-    level = "none" if score < 3 else "weak" if score < 5 else "medium" if score < 8 else "strong"
+    level = "none" if score == 0 else "weak" if score <= 2 else "medium" if score <= 4 else "strong"
 
     return {
         "professional_site_score": score,
@@ -6234,6 +6300,25 @@ _SIZE_INFERENCE_BLOCKED_DOMAINS: frozenset = frozenset({
     "play.google.com", "apps.apple.com", "podcasts.apple.com",
 })
 
+# Hard-blocked domains for official-domain discovery — music, media, streaming,
+# app stores, marketplaces. These must never become python_validated_domain or
+# be sent to Firecrawl. Separate from _SIZE_INFERENCE_BLOCKED_DOMAINS to allow
+# fine-tuned control of each gate.
+_DISCOVERY_BLOCKED_DOMAINS: frozenset = frozenset({
+    "music.apple.com", "apps.apple.com", "podcasts.apple.com", "apple.com",
+    "spotify.com", "youtube.com", "soundcloud.com", "deezer.com",
+    "tidal.com", "bandcamp.com", "iheart.com", "iheartradio.com",
+    "last.fm", "tunein.com", "pandora.com", "audiomack.com", "napster.com",
+    "amazon.com", "amazon.de", "amazon.it", "amazon.co.uk", "amazon.fr",
+    "amazon.es", "amazon.com.au",
+    "ebay.com", "ebay.de", "ebay.it",
+    "play.google.com", "store.google.com",
+    "facebook.com", "instagram.com", "twitter.com", "x.com", "tiktok.com",
+    "linkedin.com", "xing.com", "reddit.com",
+    "wikipedia.org", "wikidata.org", "wikimedia.org",
+    "genius.com", "azlyrics.com", "lyrics.com", "musixmatch.com",
+})
+
 
 def _is_allowed_size_source(
     evidence_url: str,
@@ -6396,7 +6481,9 @@ def _infer_company_size(
                 )
                 fc_pages_for_size += 1
                 if live_counters is not None:
-                    live_counters["fc_requests_attempted"] = live_counters.get("fc_requests_attempted", 0) + 1
+                    # si_* sub-counters track size-inference FC separately from DV
+                    live_counters["si_requests_attempted"] = live_counters.get("si_requests_attempted", 0) + 1
+                    live_counters["requests_attempted"] = live_counters.get("requests_attempted", 0) + 1
                 page_text = _md or ""
                 if page_text:
                     _fc_texts.append(page_text)   # FC-only list (always from official domain)
@@ -6404,11 +6491,13 @@ def _infer_company_size(
                     if not _fc_evidence_url:
                         _fc_evidence_url = fc_url  # FC URLs are always from validated domain
                     if live_counters is not None:
-                        live_counters["fc_pages_successful"] = live_counters.get("fc_pages_successful", 0) + 1
+                        live_counters["si_pages_successful"] = live_counters.get("si_pages_successful", 0) + 1
+                        live_counters["pages_successful"] = live_counters.get("pages_successful", 0) + 1
             except Exception:
                 fc_pages_for_size += 1  # count attempt
                 if live_counters is not None:
-                    live_counters["fc_requests_attempted"] = live_counters.get("fc_requests_attempted", 0) + 1
+                    live_counters["si_requests_attempted"] = live_counters.get("si_requests_attempted", 0) + 1
+                    live_counters["requests_attempted"] = live_counters.get("requests_attempted", 0) + 1
 
         result["firecrawl_used_for_size_inference"] = fc_pages_for_size > 0
         if _fc_evidence_url:
@@ -6860,7 +6949,7 @@ def process_dataframe(
             try:
                 _s = int(_pro_score)
                 res["professional_site_level"] = (
-                    "strong" if _s >= 8 else "medium" if _s >= 5 else "weak" if _s >= 3 else "none"
+                    "strong" if _s >= 5 else "medium" if _s >= 3 else "weak" if _s >= 1 else "none"
                 )
             except (ValueError, TypeError):
                 res["professional_site_level"] = "none"
@@ -8114,41 +8203,57 @@ def _build_fc_usage_fields(
     _avg_pages_dv_row    = round(dv_pages      / fc_rows, 2) if fc_rows else 0.0
     _avg_pages_si_row    = round(si_new        / si_rows, 2) if si_rows else 0.0
 
+    # Total requests from health (includes both DV and SI since _infer_company_size now updates it)
+    total_att  = att if att > 0 else total_new_pages
+    total_succ = succ if att > 0 else total_new_pages
+
+    # DV requests ≈ DV pages (each page is one Firecrawl API call)
+    dv_att  = dv_pages   # pages fetched = API calls for domain verification
+    dv_succ = dv_pages   # all fetched pages count as successful
+    # SI requests from health si_* sub-counters (or fall back to column)
+    si_att  = fc_health.get("si_requests_attempted", si_new)
+    si_succ = fc_health.get("si_pages_successful",   si_new)
+
     fields: dict = {
+        # ── Canonical purpose-split fields (the authoritative numbers) ─────────
+        "firecrawl_domain_verification_requests_attempted":  dv_att,
+        "firecrawl_domain_verification_pages_successful":    dv_succ,
+        "firecrawl_domain_verification_estimated_credits":   dv_succ,
+        "firecrawl_size_inference_requests_attempted":       si_att,
+        "firecrawl_size_inference_pages_successful_new":     si_succ,
+        "firecrawl_size_inference_pages_reused":             si_reused,
+        "firecrawl_size_inference_estimated_credits":        si_succ,
         # ── Canonical totals ───────────────────────────────────────────────────
-        "firecrawl_total_pages_successful_new":       total_new_pages,
-        "firecrawl_total_estimated_credits":          total_credits,
-        "firecrawl_credit_estimation_method":         credit_method,
-        # kept for backward compat with existing callers
-        "firecrawl_pages_fetched_total":              dv_pages,
-        "firecrawl_estimated_credits_used":           total_credits,
-        # ── Runtime health (request-level) ────────────────────────────────────
-        "firecrawl_requests_attempted":               att if att > 0 else total_new_pages,
-        "firecrawl_pages_successful":                 succ if att > 0 else total_new_pages,
-        "firecrawl_requests_failed":                  failed if att > 0 else 0,
-        "firecrawl_timeouts":                         timeouts,
-        "firecrawl_exceptions":                       excepts,
-        "firecrawl_key_failovers_total":              failovers,
-        "firecrawl_keys_loaded":                      firecrawl_keys_loaded,
-        # ── Row-level counts (distinct from page counts) ──────────────────────
-        "firecrawl_rows_attempted":                   fc_rows,
-        "firecrawl_rows_with_successful_page":        int(fc_dec.isin(["confirm","replace","replace_domain"]).sum()),
-        "firecrawl_rows_confirmed":                   int(fc_dec.eq("confirm").sum()),
-        "firecrawl_rows_uncertain":                   int(fc_dec.eq("uncertain").sum()),
-        "firecrawl_rows_failed":                      int(fc_dec.isin(["failed", "error", "no_fetch"]).sum()),
-        # ── Purpose split ──────────────────────────────────────────────────────
-        "firecrawl_domain_verification_pages":        dv_pages,
-        "firecrawl_domain_verification_estimated_credits": dv_pages,
-        "firecrawl_size_inference_pages_new":         si_new,
-        "firecrawl_size_inference_reused_pages":      si_reused,
-        "firecrawl_size_inference_total_pages_available": si_new + si_reused,
-        "firecrawl_size_inference_estimated_credits": si_new,
-        "firecrawl_size_inference_rows":              si_rows,
+        "firecrawl_total_requests_attempted":                dv_att + si_att,
+        "firecrawl_total_pages_successful_new":              total_new_pages,
+        "firecrawl_total_estimated_credits":                 total_credits,
+        "firecrawl_credit_estimation_method":                credit_method,
+        # ── Row-level counts (rows, not pages) ────────────────────────────────
+        "firecrawl_rows_attempted":                          fc_rows,
+        "firecrawl_rows_with_successful_page":               int(fc_dec.isin(["confirm","replace","replace_domain"]).sum()),
+        "firecrawl_rows_confirmed":                          int(fc_dec.eq("confirm").sum()),
+        "firecrawl_rows_uncertain":                          int(fc_dec.eq("uncertain").sum()),
+        "firecrawl_rows_failed":                             int(fc_dec.isin(["failed", "error", "no_fetch"]).sum()),
+        "firecrawl_size_inference_rows":                     si_rows,
+        # ── Runtime health (for debugging) ────────────────────────────────────
+        "firecrawl_runtime_requests_attempted":              total_att,
+        "firecrawl_runtime_pages_successful":                total_succ,
+        "firecrawl_runtime_requests_failed":                 failed if att > 0 else 0,
+        "firecrawl_timeouts":                                timeouts,
+        "firecrawl_exceptions":                              excepts,
+        "firecrawl_key_failovers_total":                     failovers,
+        "firecrawl_keys_loaded":                             firecrawl_keys_loaded,
         # ── Averages ───────────────────────────────────────────────────────────
-        "firecrawl_avg_pages_per_processed_row":      _avg_pages_processed,
-        "firecrawl_avg_pages_per_firecrawl_used_row": _avg_pages_fc_row,
-        "firecrawl_avg_pages_per_domain_verification_row": _avg_pages_dv_row,
-        "firecrawl_avg_pages_per_size_inference_row": _avg_pages_si_row,
+        "firecrawl_avg_pages_per_processed_row":             _avg_pages_processed,
+        "firecrawl_avg_pages_per_firecrawl_used_row":        _avg_pages_fc_row,
+        "firecrawl_avg_pages_per_domain_verification_row":   _avg_pages_dv_row,
+        "firecrawl_avg_pages_per_size_inference_row":        _avg_pages_si_row,
+        # ── Legacy aliases (backward compat) ──────────────────────────────────
+        "firecrawl_domain_verification_pages":               dv_pages,
+        "firecrawl_size_inference_pages_new":                si_new,
+        "firecrawl_size_inference_reused_pages":             si_reused,
+        "firecrawl_estimated_credits_used":                  total_credits,
+        "firecrawl_pages_fetched_total":                     dv_pages,
     }
     # Per-key usage (key labels only — no actual key values)
     for _klabel in sorted(_per_key.keys()):
@@ -8341,6 +8446,12 @@ def _build_run_meta(
     firecrawl_keys_loaded: int = 0,
     fc_health: dict | None = None,
     serper_queries_total: int = 0,
+    detected_country: str = "",
+    country_detection_source: str = "",
+    firecrawl_location_mode: str = "",
+    firecrawl_location_used: str = "",
+    firecrawl_location_country: str = "",
+    firecrawl_location_languages: str = "",
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -8451,6 +8562,13 @@ def _build_run_meta(
             enriched_df.get("size_inference_enabled", pd.Series(dtype=str))
             .astype(str).str.lower().isin(["true","1"]).sum()
         ),
+        # ── Detected country and Firecrawl location ───────────────────────────
+        "detected_country":             detected_country,
+        "country_detection_source":     country_detection_source,
+        "firecrawl_location_mode":      firecrawl_location_mode,
+        "firecrawl_location_used":      firecrawl_location_used,
+        "firecrawl_location_country":   firecrawl_location_country,
+        "firecrawl_location_languages": firecrawl_location_languages,
         # ── Firecrawl credit / usage counters (from runtime health) ──────────
         **(_build_fc_usage_fields(enriched_df, firecrawl_keys_loaded, fc_health or {})),
     }
@@ -9044,19 +9162,25 @@ def cli_batch_run() -> None:
     run_label    = _make_run_label(args.haiku_mode, batch_n, args.max_queries, args.debug, ts=ts)
     run_filename = _make_filename(run_label, file_hash)
 
-    print(f"[cleaner] Input:      {input_path}")
-    print(f"[cleaner] Country:    {cfg.country_name} ({cfg.country_code})")
-    print(f"[cleaner] Rows:       {batch_n} / {len(df)}")
-    print(f"[cleaner] Output:     {pl_paths['output_xlsx']}")
-    print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
-    print(f"[cleaner] Haiku mode: {args.haiku_mode}")
-    print(f"[cleaner] Verifier:   {args.verifier}")
+    import time as _time_mod
+    _cli_started_at = _time_mod.time()
+    _fc_loc_country_str = _fc_loc_payload.get("country", "auto") if _fc_loc_payload else "auto"
+    _fc_loc_langs_str   = ", ".join(_fc_loc_payload.get("languages", [])) if _fc_loc_payload else ""
+    _infer_size_str     = "enabled" if getattr(args, "infer_size", False) else "disabled"
+
+    print(f"[cleaner] Input:            {input_path}", flush=True)
+    print(f"[cleaner] Country:          {cfg.country_name} ({cfg.country_code})", flush=True)
+    print(f"[cleaner] Rows:             {batch_n} / {len(df)}", flush=True)
+    print(f"[cleaner] Output dir:       {pl_paths['output_xlsx']}", flush=True)
+    print(f"[cleaner] Verifier:         {args.verifier}", flush=True)
+    print(f"[cleaner] Firecrawl loc:    country={_fc_loc_country_str} languages=[{_fc_loc_langs_str}]", flush=True)
+    print(f"[cleaner] Haiku mode:       {args.haiku_mode}", flush=True)
+    print(f"[cleaner] Size inference:   {_infer_size_str}", flush=True)
+    print(f"[cleaner] Started:          {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
     # ── Column-map debug output ───────────────────────────────────────────────
-    _col_summary = ", ".join(
-        f"{role}={col}" for role, col in cols.items() if col
-    )
-    print(f"[cleaner] Column map: {_col_summary}")
+    _col_summary = ", ".join(f"{role}={col}" for role, col in cols.items() if col)
+    print(f"[cleaner] Column map:       {_col_summary}", flush=True)
     _name_col = cols.get("company") or ""
     _first_names: list[str] = []
     if _name_col and _name_col in run_df.columns:
@@ -9065,7 +9189,7 @@ def cli_batch_run() -> None:
             .replace("", None).dropna()
             .head(5).tolist()
         )
-    print(f"[cleaner] First company names: {_first_names}")
+    print(f"[cleaner] First names:      {_first_names}", flush=True)
 
     # ── Hard guardrail: abort if company column is missing or all blank ──────
     if not _name_col:
@@ -9099,11 +9223,28 @@ def cli_batch_run() -> None:
         )
         sys.exit(3)
 
-    def _cli_progress(i, total):
-        pct = round(i / total * 100) if total else 0
-        print(f"\r[cleaner] {i}/{total} ({pct}%)   ", end="", flush=True)
-
     _cli_fc_health: dict = _make_fc_health()
+    # Current-name box: updated before each row's progress callback via index lookup
+    _name_col_for_cb = cols.get("company") or ""
+
+    def _cli_progress(i, total):
+        # Look up the company name for the row just completed (0-indexed row = i-1)
+        _cur = ""
+        if _name_col_for_cb and _name_col_for_cb in run_df.columns and i > 0:
+            try:
+                _cur = str(run_df[_name_col_for_cb].iloc[i - 1] or "").strip()
+            except (IndexError, KeyError):
+                _cur = ""
+        _counters = {
+            **_cli_fc_health,
+            "serper_queries": getattr(process_dataframe, "_last_serper_count", 0),
+        }
+        _print_cli_progress(
+            "[cleaner]", i, total, _cli_started_at,
+            current_name=_cur,
+            counters=_counters,
+        )
+
     enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
         run_df, cols, serper_key or None, args.max_queries,
         progress_cb=_cli_progress,
@@ -9130,6 +9271,7 @@ def cli_batch_run() -> None:
     )
     print()  # newline after progress
 
+    _fc_loc_pl = _fc_loc_payload or {}
     run_meta = _build_run_meta(
         enriched_df=enriched_df,
         input_filename=input_path.name,
@@ -9146,6 +9288,12 @@ def cli_batch_run() -> None:
         firecrawl_keys_loaded=len(fc_keys_cli),
         fc_health=_cli_fc_health,
         serper_queries_total=getattr(process_dataframe, "_last_serper_count", 0),
+        detected_country=country_code,
+        country_detection_source="cli_arg" if args.country.upper() in COUNTRY_CONFIGS else "auto",
+        firecrawl_location_mode="cli_auto",
+        firecrawl_location_used=cfg.country_name,
+        firecrawl_location_country=_fc_loc_pl.get("country", ""),
+        firecrawl_location_languages=", ".join(_fc_loc_pl.get("languages", [])),
     )
 
     # Build fc_audit dict for the Firecrawl Audit sheet
@@ -9215,9 +9363,34 @@ def cli_batch_run() -> None:
         "notes":                 "",
     }
     _append_run_log_csv(Path(pl_paths["run_log_csv"]), _pl_log_row)
-    print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
-    print(f"\n{_fc_usage_console_summary(run_meta)}")
-    print(f"[cleaner] Done.")
+    import time as _time_mod2
+    _elapsed_total = _time_mod2.time() - _cli_started_at
+
+    print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}", flush=True)
+    print(f"\n{_fc_usage_console_summary(run_meta)}", flush=True)
+
+    # ── End-of-run summary ────────────────────────────────────────────────────
+    _rows_with_domain = int(
+        enriched_df.get("final_selected_domain", pd.Series(dtype=str))
+        .astype(str).str.strip().replace("", pd.NA).notna().sum()
+    )
+    _rows_failed = _cli_fc_health.get("exceptions", 0)
+    print(f"\n[cleaner] Summary:", flush=True)
+    print(f"  rows_processed:                    {batch_n}", flush=True)
+    print(f"  rows_with_final_domain:            {_rows_with_domain}", flush=True)
+    print(f"  rows_failed:                       {_rows_failed}", flush=True)
+    print(f"  serper_queries_total:              {getattr(process_dataframe, '_last_serper_count', 0)}", flush=True)
+    print(f"  haiku_calls_total:                 {run_meta.get('rows_reviewed_by_haiku', 0)}", flush=True)
+    _tot_att  = run_meta.get("firecrawl_total_requests_attempted", 0)
+    _tot_succ = run_meta.get("firecrawl_total_pages_successful_new", 0)
+    _tot_cred = run_meta.get("firecrawl_total_estimated_credits", 0)
+    print(f"  firecrawl_total_requests_attempted:{_tot_att}", flush=True)
+    print(f"  firecrawl_total_pages_successful:  {_tot_succ}", flush=True)
+    print(f"  firecrawl_total_estimated_credits: {_tot_cred}", flush=True)
+    print(f"  elapsed:                           {_format_duration(_elapsed_total)}", flush=True)
+    print(f"  output_file:                       {out_path}", flush=True)
+
+    print(f"\n[cleaner] Done.", flush=True)
     if args.infer_size and "employee_size_band" in enriched_df.columns:
         _band_counts = enriched_df["employee_size_band"].value_counts().to_dict()
         _hrm_vals = pd.to_numeric(enriched_df.get("hrm_likelihood_score", pd.Series(dtype=float)), errors="coerce")
@@ -9250,6 +9423,74 @@ def _archive_autosave_dir() -> None:
         dst = src.parent / f"autosave_archive_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
         src.rename(dst)
     _AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _format_duration(seconds) -> str:
+    """Format a duration in seconds to MM:SS or HH:MM:SS. Safe against None/NaN."""
+    try:
+        s = float(seconds)
+        if s != s or s < 0:  # NaN or negative
+            return "??:??"
+        s = int(s)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+    except (TypeError, ValueError):
+        return "??:??"
+
+
+def _print_cli_progress(
+    prefix: str,
+    i: int,
+    total: int,
+    started_at: float,
+    current_name: str = "",
+    counters: dict | None = None,
+    every: int = 10,
+) -> None:
+    """
+    Print a CLI progress line if this row warrants one.
+    Prints: first row, last row, every row when total<=5, every 5 when total<=100,
+    every `every` rows otherwise.
+    """
+    import time as _time
+    if total <= 5 or i == 1 or i == total:
+        do_print = True
+    elif total <= 100:
+        do_print = (i % 5 == 0)
+    else:
+        do_print = (i % every == 0)
+    if not do_print:
+        return
+
+    elapsed = _time.time() - started_at
+    pct = i / total * 100 if total else 0.0
+    if i > 0 and elapsed > 0:
+        eta = elapsed / i * (total - i)
+    else:
+        eta = 0.0
+
+    name_part = (current_name[:57] + "...") if len(current_name) > 60 else current_name
+    c = counters or {}
+    serper_n  = c.get("serper_queries", 0)
+    fc_att    = c.get("requests_attempted", 0)
+    fc_succ   = c.get("pages_successful", 0)
+    haiku_n   = c.get("haiku_calls", 0)
+    errors_n  = c.get("errors", 0)
+    skipped_n = c.get("skipped", 0)
+
+    line = (
+        f"{prefix} {i}/{total} ({pct:.1f}%) | "
+        f"elapsed {_format_duration(elapsed)} | ETA {_format_duration(eta)} | "
+        f"current: {name_part} | "
+        f"Serper: {serper_n} | FC: {fc_att}req/{fc_succ}ok | "
+        f"Haiku: {haiku_n} | errors: {errors_n}"
+    )
+    if skipped_n:
+        line += f" | skipped: {skipped_n}"
+    print(line, flush=True)
 
 
 def main():
@@ -9447,26 +9688,23 @@ def main():
                 f"{verifier_max_pages} page(s)/cand · {verifier_page_timeout}s timeout"
             )
 
-    # Default Firecrawl location driven by selected country (user can override)
-    _fc_loc_country_default = (
-        _FC_LOC_GERMANY if _sidebar_country_code == "DE"
-        else _FC_LOC_ITALY  # IT or auto → Italy default
-    )
-    _fc_loc_default_idx = _FC_LOC_OPTIONS.index(_fc_loc_country_default)
+    # Firecrawl location mode — default is "Auto from detected country"
     fc_location_label = st.sidebar.selectbox(
         "Firecrawl location",
         options=_FC_LOC_OPTIONS,
-        index=_fc_loc_default_idx,
+        index=0,  # Auto from detected country is always index 0
         key="reg_fc_location",
         help=(
+            "Auto from detected country: uses Germany location for DE files, Italy for IT files.  \n"
             "Italy: sends scrape requests as if from Italy (country=IT, languages=[it,en]).  \n"
             "Germany: sends scrape requests as if from Germany (country=DE, languages=[de,en]).  \n"
             "United States: US infrastructure.  \n"
-            "Default Firecrawl: no location override.  \n"
-            "Default is auto-set from the selected country pipeline above."
+            "Default Firecrawl: no location override."
         ),
-    ) if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) else _fc_loc_country_default
-    fc_location_payload = _FC_LOC_PAYLOADS.get(fc_location_label, _FC_LOC_PAYLOADS[_FC_LOC_ITALY])
+    ) if verifier_provider in (_VP_FIRECRAWL, _VP_FC_JINA) else _FC_LOC_AUTO
+    # fc_location_payload is resolved after country detection (below, when file is uploaded)
+    # For sidebar-only state (no file yet), default to auto
+    _fc_location_mode = fc_location_label  # store the mode label for later resolution
 
     # ── API keys ──────────────────────────────────────────────────────────────
     # Jina API key (optional — Jina Reader works without a key at lower rate limits)
@@ -9996,20 +10234,28 @@ def main():
         _country_source = "auto"
     _country_cfg = COUNTRY_CONFIGS.get(_resolved_country, IT_CONFIG)
 
-    # Bug fix: if country was auto-detected (not manually set), override FC location payload
-    # to match the resolved country — sidebar default was computed before the file was uploaded
-    if _country_source == "auto":
-        _auto_fc_loc = _FC_LOC_GERMANY if _resolved_country == "DE" else _FC_LOC_ITALY
-        fc_location_payload = _FC_LOC_PAYLOADS.get(_auto_fc_loc, _FC_LOC_PAYLOADS[_FC_LOC_ITALY])
+    # Resolve FC location payload from the mode label + detected country
+    if _fc_location_mode == _FC_LOC_AUTO:
+        fc_location_payload = _fc_loc_payload_for_country(_resolved_country)
+        _fc_location_used_label = f"Auto → {_country_cfg.country_name}"
+    else:
+        fc_location_payload = _FC_LOC_PAYLOADS.get(_fc_location_mode) or _fc_loc_payload_for_country(_resolved_country)
+        _fc_location_used_label = _fc_location_mode
 
     _country_flag = {"IT": "🇮🇹", "DE": "🇩🇪"}.get(_resolved_country, "🌍")
     st.title(f"{_country_flag} Input Cleaner · Register Edition")
 
     _country_label = _country_cfg.country_name
     if _country_source == "manual":
-        st.info(f"Country selected manually: **{_country_label} ({_resolved_country})**")
+        st.info(
+            f"Country selected manually: **{_country_label} ({_resolved_country})**  \n"
+            f"Firecrawl location: **{_fc_location_used_label}**"
+        )
     else:
-        st.info(f"Detected country: **{_country_label} ({_resolved_country})**")
+        st.info(
+            f"Detected country: **{_country_label} ({_resolved_country})**  \n"
+            f"Firecrawl location: **{_fc_location_used_label}**"
+        )
 
     st.success(f"✅ Loaded **{len(df)} companies**, {len(df.columns)} columns from `{uploaded.name}`")
 
