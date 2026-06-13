@@ -951,6 +951,136 @@ def detect_columns_generic(df: "pd.DataFrame", config: "CountryConfig") -> dict:
     return col_map
 
 
+def normalize_register_columns_for_cleaner(
+    df: "pd.DataFrame",
+    cfg: "CountryConfig",
+) -> "tuple[pd.DataFrame, dict]":
+    """
+    Return a (copy_of_df, mapping_report) where canonical columns used by
+    process_dataframe are guaranteed to exist.
+
+    Canonical columns added (never overwrite if already present and non-blank):
+        company_name, website, email, city, province, postcode, phone,
+        country_code, country_name, legal_form, registered_address
+
+    The mapping_report dict records which source column was chosen for each role.
+    Original columns are always preserved.
+    """
+    out = df.copy()
+    report: dict = {}
+
+    cols_avail = set(df.columns)
+
+    def _coalesce(*candidates) -> tuple[str, str]:
+        """Return (source_col_name, value_from_first_non_blank_col)."""
+        for c in candidates:
+            if c and c in cols_avail:
+                return c, None  # lazy — actual values resolved per-row
+        return "", ""
+
+    def _add_canonical(canonical: str, *candidates: str) -> None:
+        """Add `canonical` column by picking first non-blank candidate column."""
+        # If already present and at least one non-blank value → keep it
+        if canonical in cols_avail:
+            non_blank = out[canonical].astype(str).str.strip().ne("").any()
+            if non_blank:
+                report[canonical] = canonical  # identity
+                return
+        # Find first candidate that exists and has at least one non-blank value
+        for c in candidates:
+            if c and c in cols_avail:
+                has_data = out[c].astype(str).str.strip().ne("").any()
+                if has_data:
+                    out[canonical] = out[c].astype(str).str.strip()
+                    report[canonical] = c
+                    return
+        # All blank — still add the column (empty) from first existing candidate
+        for c in candidates:
+            if c and c in cols_avail:
+                out[canonical] = out[c].astype(str).str.strip()
+                report[canonical] = f"{c} (blank)"
+                return
+        # Column doesn't exist at all
+        out[canonical] = ""
+        report[canonical] = "(not found)"
+
+    if cfg.country_code == "DE":
+        _add_canonical("company_name",
+            "company_name_clean", "company_name_raw", "Company Name", "company_name", "name")
+        _add_canonical("website",
+            "website", "Website", "domain", "url", "homepage",
+            "canonical_company_url", "validated_domain")
+        _add_canonical("email",
+            "email", "Email", "email_address", "contact_email", "kontakt_email")
+        _add_canonical("city",
+            "city_or_registered_office", "registered_office", "city", "ort", "City")
+        _add_canonical("province",
+            "federal_state", "bundesland", "state", "province")
+        _add_canonical("postcode",
+            "postcode", "postal_code", "plz", "Postal Code")
+        _add_canonical("phone",
+            "phone", "phone_number", "telefon", "tel", "Phone number")
+        _add_canonical("legal_form",
+            "legal_form_detected", "legal_form", "rechtsform")
+        _add_canonical("registered_address",
+            "registered_address", "address", "anschrift")
+        out["country_code"] = "DE"
+        out["country_name"] = "Germany"
+        report["country_code"] = "constant"
+        report["country_name"] = "constant"
+    else:  # IT
+        _add_canonical("company_name",
+            "Company Name", "company_name", "company_name_clean",
+            "ragione sociale", "denominazione")
+        _add_canonical("website",
+            "Website", "website", "domain", "url")
+        _add_canonical("email",
+            "Email address", "email", "email_address")
+        _add_canonical("city",
+            "City", "city", "comune")
+        _add_canonical("province",
+            "National statistical institute Province", "Province", "province", "provincia")
+        _add_canonical("postcode",
+            "Postal Code", "postal_code", "postcode", "cap")
+        _add_canonical("phone",
+            "Phone number", "phone", "telefono")
+        _add_canonical("legal_form",
+            "legal_form_detected", "legal_form", "forma giuridica")
+        _add_canonical("registered_address",
+            "registered_address", "address", "indirizzo")
+        out["country_code"] = "IT"
+        out["country_name"] = "Italy"
+        report["country_code"] = "constant"
+        report["country_name"] = "constant"
+
+    return out, report
+
+
+def _cols_from_normalized(run_df: "pd.DataFrame", cfg: "CountryConfig") -> dict:
+    """
+    Build a cols dict that always points to canonical column names.
+    Falls back to detect_columns_generic if a canonical column is entirely blank.
+    """
+    canonical_map = {
+        "company":  "company_name",
+        "website":  "website",
+        "email":    "email",
+        "city":     "city",
+        "province": "province",
+        "postcode": "postcode",
+        "phone":    "phone",
+    }
+    cols: dict = {}
+    fallback = detect_columns_generic(run_df, cfg)
+    for role, canon in canonical_map.items():
+        if canon in run_df.columns:
+            has_data = run_df[canon].astype(str).str.strip().ne("").any()
+            cols[role] = canon if has_data else fallback.get(role)
+        else:
+            cols[role] = fallback.get(role)
+    return cols
+
+
 def _is_de_negative_domain(domain: str) -> tuple[bool, str]:
     """
     Return (True, reason) when domain contains a German public/non-commercial token
@@ -8647,7 +8777,58 @@ def _smoke_test_country_config() -> None:
     assert _de_full_cols["city"]     == "city_or_registered_office", f"DE full: city={_de_full_cols['city']}"
     assert _de_full_cols["province"] == "federal_state",             f"DE full: province={_de_full_cols['province']}"
 
-    print("[SMOKE TEST] _smoke_test_country_config: all 11 cases passed.", flush=True)
+    # ── 12. normalize_register_columns_for_cleaner: Germany ──────────────────
+    _de_norm_in = _pd.DataFrame([{
+        "company_name_clean": "Mustermann GmbH",
+        "company_name_raw":   "Mustermann GmbH i.G.",
+        "city_or_registered_office": "Berlin",
+        "federal_state": "Berlin",
+        "registered_address": "Unter den Linden 1",
+        "legal_form_detected": "GmbH",
+    }])
+    _de_norm_out, _de_norm_rep = normalize_register_columns_for_cleaner(_de_norm_in, DE_CONFIG)
+    assert _de_norm_out["company_name"].iloc[0] == "Mustermann GmbH", \
+        f"DE norm company_name: {_de_norm_out['company_name'].iloc[0]}"
+    assert _de_norm_out["city"].iloc[0] == "Berlin", \
+        f"DE norm city: {_de_norm_out['city'].iloc[0]}"
+    assert _de_norm_out["province"].iloc[0] == "Berlin", \
+        f"DE norm province: {_de_norm_out['province'].iloc[0]}"
+    assert _de_norm_out["country_code"].iloc[0] == "DE", \
+        f"DE norm country_code: {_de_norm_out['country_code'].iloc[0]}"
+    # Original columns must still be present
+    assert "company_name_clean" in _de_norm_out.columns, "DE norm: original column missing"
+
+    # _cols_from_normalized must point to canonical columns
+    _de_canon_cols = _cols_from_normalized(_de_norm_out, DE_CONFIG)
+    assert _de_canon_cols["company"] == "company_name", \
+        f"DE canonical company col: {_de_canon_cols['company']}"
+    assert _de_canon_cols["city"] == "city", \
+        f"DE canonical city col: {_de_canon_cols['city']}"
+
+    # ── 13. normalize_register_columns_for_cleaner: Italy ────────────────────
+    _it_norm_in = _pd.DataFrame([{
+        "Company Name": "ACME SRL",
+        "Website": "acme.it",
+        "Email address": "info@acme.it",
+        "City": "Milano",
+        "National statistical institute Province": "MI",
+        "Postal Code": "20100",
+    }])
+    _it_norm_out, _it_norm_rep = normalize_register_columns_for_cleaner(_it_norm_in, IT_CONFIG)
+    assert _it_norm_out["company_name"].iloc[0] == "ACME SRL", \
+        f"IT norm company_name: {_it_norm_out['company_name'].iloc[0]}"
+    assert _it_norm_out["city"].iloc[0] == "Milano", \
+        f"IT norm city: {_it_norm_out['city'].iloc[0]}"
+    assert _it_norm_out["province"].iloc[0] == "MI", \
+        f"IT norm province: {_it_norm_out['province'].iloc[0]}"
+    assert _it_norm_out["country_code"].iloc[0] == "IT", \
+        f"IT norm country_code: {_it_norm_out['country_code'].iloc[0]}"
+
+    # ── 14. detect_country_from_path: bare filenames (spot-check) ────────────
+    assert detect_country_from_path("Germany_1_R0001_0500.xlsx") == "DE"
+    assert detect_country_from_path("Italy100_1_R0001_0500.xlsx") == "IT"
+
+    print("[SMOKE TEST] _smoke_test_country_config: all 14 cases passed.", flush=True)
 
 
 def _smoke_test_size_inference() -> None:
@@ -8849,10 +9030,16 @@ def cli_batch_run() -> None:
     batch_n = len(df) if args.max_rows <= 0 else min(args.max_rows, len(df))
     run_df  = df.head(batch_n).copy()
 
-    # ── Country resolution + column detection ────────────────────────────────
+    # ── Country resolution ───────────────────────────────────────────────────
     country_code = resolve_country(args.country, str(input_path), run_df)
     cfg          = COUNTRY_CONFIGS.get(country_code, IT_CONFIG)
-    cols         = detect_columns_generic(run_df, cfg)
+
+    # ── Normalize to canonical columns ───────────────────────────────────────
+    run_df, _norm_report = normalize_register_columns_for_cleaner(run_df, cfg)
+    cols = _cols_from_normalized(run_df, cfg)
+
+    # Firecrawl location follows resolved country (never silently default to Italy)
+    _fc_loc_payload = cfg.firecrawl_location or {"country": "IT", "languages": ["it", "en"]}
 
     run_label    = _make_run_label(args.haiku_mode, batch_n, args.max_queries, args.debug, ts=ts)
     run_filename = _make_filename(run_label, file_hash)
@@ -8864,6 +9051,53 @@ def cli_batch_run() -> None:
     print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
     print(f"[cleaner] Haiku mode: {args.haiku_mode}")
     print(f"[cleaner] Verifier:   {args.verifier}")
+
+    # ── Column-map debug output ───────────────────────────────────────────────
+    _col_summary = ", ".join(
+        f"{role}={col}" for role, col in cols.items() if col
+    )
+    print(f"[cleaner] Column map: {_col_summary}")
+    _name_col = cols.get("company") or ""
+    _first_names: list[str] = []
+    if _name_col and _name_col in run_df.columns:
+        _first_names = (
+            run_df[_name_col].astype(str).str.strip()
+            .replace("", None).dropna()
+            .head(5).tolist()
+        )
+    print(f"[cleaner] First company names: {_first_names}")
+
+    # ── Hard guardrail: abort if company column is missing or all blank ──────
+    if not _name_col:
+        print(
+            f"\nERROR: Could not find a company-name column.\n"
+            f"  Resolved country: {cfg.country_name} ({cfg.country_code})\n"
+            f"  Available columns: {list(run_df.columns)}\n"
+            f"  Normalization report: {_norm_report}\n"
+            f"  Hint: pass --country DE or --country IT to force the country.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    _sample_rows = min(5, len(run_df))
+    _sample_names = run_df[_name_col].astype(str).str.strip().head(_sample_rows).tolist()
+    if all(n == "" for n in _sample_names):
+        print(
+            f"\nERROR: company-name column '{_name_col}' is blank in the first "
+            f"{_sample_rows} rows.\n"
+            f"  Resolved country: {cfg.country_name} ({cfg.country_code})\n"
+            f"  Available columns: {list(run_df.columns)}\n"
+            f"  Normalization report: {_norm_report}\n"
+            f"  First 5 raw values from likely source columns:\n"
+            + "\n".join(
+                f"    [{c}]: {run_df[c].head(5).tolist()}"
+                for c in ["company_name_clean", "company_name_raw",
+                           "Company Name", "company_name"]
+                if c in run_df.columns
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(3)
 
     def _cli_progress(i, total):
         pct = round(i / total * 100) if total else 0
@@ -8887,6 +9121,7 @@ def cli_batch_run() -> None:
         verifier_provider=args.verifier,
         verifier_mode=_VM_UNCERTAIN,
         fc_key=fc_key_arg,
+        fc_location=_fc_loc_payload,
         eligibility_filter_mode=_PF_MODE_MAYBE,
         debug_mode=args.debug,
         fc_fail_fast=_fc_fail_fast,
@@ -9562,7 +9797,8 @@ def main():
         else:
             _resume_country = resolve_country("auto", uploaded.name, df)
         _resume_cfg = COUNTRY_CONFIGS.get(_resume_country, IT_CONFIG)
-        cols = detect_columns_generic(df, _resume_cfg)
+        df, _ = normalize_register_columns_for_cleaner(df, _resume_cfg)
+        cols = _cols_from_normalized(df, _resume_cfg)
         # Apply saved column mapping (overrides detection when columns are preserved)
         for role, col_name in saved_cols.items():
             if col_name and col_name in df.columns:
@@ -9798,8 +10034,9 @@ def main():
             st.rerun()
         return
 
-    # ── Column detection ──────────────────────────────────────────────────────
-    cols = detect_columns_generic(df, _country_cfg)
+    # ── Normalize to canonical columns ────────────────────────────────────────
+    df, _st_norm_report = normalize_register_columns_for_cleaner(df, _country_cfg)
+    cols = _cols_from_normalized(df, _country_cfg)
 
     with st.expander("Column mapping (auto-detected)", expanded=False):
         col_options = ["(none)"] + list(df.columns)
