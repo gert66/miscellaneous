@@ -8504,6 +8504,30 @@ def cli_batch_run() -> None:
         print(f"[size inference] FC pages used for size inference: {int(_fc_size_total)}")
 
 
+# ── Streamlit autosave / download helpers ─────────────────────────────────────
+
+def _prepared_download_key(suffix: str) -> str:
+    """Stable session_state key for a lazily-prepared checkpoint download."""
+    return f"_cp_dl_{suffix}"
+
+
+def _clear_prepared_checkpoint_downloads() -> None:
+    """Remove all prepared checkpoint download bytes from session_state."""
+    to_remove = [k for k in st.session_state if k.startswith("_cp_dl_")]
+    for k in to_remove:
+        del st.session_state[k]
+
+
+def _archive_autosave_dir() -> None:
+    """Rename autosave/ to autosave_archive_YYYYMMDD_HHMMSS; recreate empty autosave/."""
+    from datetime import datetime as _dt
+    src = _AUTOSAVE_DIR
+    if src.exists():
+        dst = src.parent / f"autosave_archive_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+        src.rename(dst)
+    _AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def main():
     st.title("🇮🇹 Input Cleaner · Register Edition")
     st.caption(
@@ -8864,55 +8888,79 @@ def main():
         "**Resume previous run** to continue without reprocessing completed rows."
     )
 
-    # ── Previous-run panel (shown even without a file uploaded) ──────────────
+    # ── Previous-run panel (lazy — only rendered when checkbox is checked) ────
     checkpoints = _list_checkpoints()
     if checkpoints:
         n_cp = len(checkpoints)
-        with st.expander(f"📂 Previous runs available ({n_cp})", expanded=False):
-            for idx, cp_meta in enumerate(checkpoints[:8]):
-                run_id_cp  = cp_meta.get("run_id", "?")
-                folder_cp  = cp_meta.get("_folder", "") or run_id_cp
-                key_suffix = f"{idx}_{folder_cp}"
-                row_idx    = cp_meta.get("row_idx", 0)
-                total      = cp_meta.get("total_rows", "?")
-                ts         = str(cp_meta.get("timestamp", "?"))[:19]
-                complete   = cp_meta.get("complete", False)
-                pct        = f"{row_idx / total * 100:.0f}%" if isinstance(total, int) and total else "?"
-                run_label_cp = cp_meta.get("run_label", "") or cp_meta.get("_folder", run_id_cp[:8])
-                label_str  = (
-                    f"{'✅ Complete' if complete else '⏸ Partial'} · "
-                    f"**{row_idx}/{total}** rows ({pct}) · saved {ts}  \n"
-                    f"`{run_label_cp}`"
-                )
+        st.sidebar.markdown(f"📂 Previous runs available: **{n_cp}**")
+        if st.sidebar.button("🗄 Archive all previous runs", key="reg_archive_autosave",
+                             help="Renames autosave/ to autosave_archive_YYYYMMDD_HHMMSS. Nothing is deleted."):
+            _archive_autosave_dir()
+            _clear_prepared_checkpoint_downloads()
+            st.rerun()
+        show_prev = st.sidebar.checkbox("Show previous runs", value=False, key="reg_show_prev_runs")
+    else:
+        show_prev = False
 
-                c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
-                c1.markdown(label_str)
+    if show_prev and checkpoints:
+        st.markdown("### 📂 Previous runs")
+        for idx, cp_meta in enumerate(checkpoints[:8]):
+            run_id_cp  = cp_meta.get("run_id", "?")
+            folder_cp  = cp_meta.get("_folder", "") or run_id_cp
+            key_suffix = f"{idx}_{folder_cp}"
+            row_idx    = cp_meta.get("row_idx", 0)
+            total      = cp_meta.get("total_rows", "?")
+            ts         = str(cp_meta.get("timestamp", "?"))[:19]
+            complete   = cp_meta.get("complete", False)
+            pct        = f"{row_idx / total * 100:.0f}%" if isinstance(total, int) and total else "?"
+            run_label_cp = cp_meta.get("run_label", "") or cp_meta.get("_folder", run_id_cp[:8])
+            label_str  = (
+                f"{'✅ Complete' if complete else '⏸ Partial'} · "
+                f"**{row_idx}/{total}** rows ({pct}) · saved {ts}  \n"
+                f"`{run_label_cp}`"
+            )
 
-                if c2.button("Resume", key=f"resume_{key_suffix}", use_container_width=True):
-                    cp_data = _load_checkpoint(run_id_cp)
-                    if cp_data and cp_data.get("input_df") is not None:
-                        st.session_state["reg_resume_data"] = cp_data
-                        st.session_state["reg_run_id"]      = run_id_cp
-                        st.rerun()
-                    else:
-                        st.error("Could not load checkpoint (input snapshot missing). Re-upload the file.")
+            c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
+            c1.markdown(label_str)
 
-                # Download partial Excel directly from checkpoint
-                saved_cols = cp_meta.get("cols", {})
-                partial_xl = _checkpoint_excel_bytes(run_id_cp, saved_cols)
-                if partial_xl and c3.download_button(
-                    "Download",
-                    data=partial_xl,
-                    file_name=f"partial_{run_id_cp[:8]}.xlsx",
+            if c2.button("Resume", key=f"resume_{key_suffix}", use_container_width=True):
+                cp_data = _load_checkpoint(run_id_cp)
+                if cp_data and cp_data.get("input_df") is not None:
+                    st.session_state["reg_resume_data"] = cp_data
+                    st.session_state["reg_run_id"]      = run_id_cp
+                    st.rerun()
+                else:
+                    st.error("Could not load checkpoint (input snapshot missing). Re-upload the file.")
+
+            # Lazy download: only build Excel when user clicks "Prepare download"
+            saved_cols = cp_meta.get("cols", {})
+            dl_key = _prepared_download_key(key_suffix)
+            prepared = st.session_state.get(dl_key)
+            if prepared:
+                c3.download_button(
+                    "⬇ Download",
+                    data=prepared["bytes"],
+                    file_name=prepared["filename"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"dl_{key_suffix}",
                     use_container_width=True,
-                ):
-                    pass  # button handles download
+                )
+            else:
+                if c3.button("Prepare download", key=f"prep_{key_suffix}", use_container_width=True):
+                    xl = _checkpoint_excel_bytes(run_id_cp, saved_cols)
+                    if xl:
+                        st.session_state[dl_key] = {
+                            "bytes": xl,
+                            "filename": f"partial_{run_id_cp[:8]}.xlsx",
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Could not build Excel from checkpoint.")
 
-                if c4.button("Delete", key=f"del_{key_suffix}", use_container_width=True):
-                    _delete_checkpoint(run_id_cp)
-                    st.rerun()
+            if c4.button("Delete", key=f"del_{key_suffix}", use_container_width=True):
+                _delete_checkpoint(run_id_cp)
+                st.session_state.pop(dl_key, None)
+                st.rerun()
 
     # ── Handle resume-from-checkpoint (no upload needed if snapshot present) ─
     resume_data = st.session_state.get("reg_resume_data")
@@ -8946,16 +8994,29 @@ def main():
             st.rerun()
 
         if uploaded is None:
-            # Offer download of partial results from checkpoint while user locates file
-            partial_xl = _checkpoint_excel_bytes(run_id, saved_cols)
-            if partial_xl:
+            # Lazy download: only build Excel when user clicks the prepare button
+            _resume_dl_key = _prepared_download_key(f"resume_{run_id[:8]}")
+            _resume_prepared = st.session_state.get(_resume_dl_key)
+            if _resume_prepared:
                 st.download_button(
                     f"⬇ Download partial results ({resume_from} rows so far)",
-                    data=partial_xl,
-                    file_name=f"partial_{run_id[:8]}.xlsx",
+                    data=_resume_prepared["bytes"],
+                    file_name=_resume_prepared["filename"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+            else:
+                if st.button("Prepare partial download", key=f"prep_resume_{run_id[:8]}",
+                             use_container_width=True):
+                    _xl = _checkpoint_excel_bytes(run_id, saved_cols)
+                    if _xl:
+                        st.session_state[_resume_dl_key] = {
+                            "bytes": _xl,
+                            "filename": f"partial_{run_id[:8]}.xlsx",
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Could not build partial Excel from checkpoint.")
             return
 
         raw_bytes  = uploaded.read()
@@ -9078,17 +9139,30 @@ def main():
                 run_label=_resume_label,
             )
 
-        # Show partial download while waiting for user to click Continue
+        # Show partial download while waiting for user to click Continue (lazy)
         else:
-            partial_xl = _checkpoint_excel_bytes(run_id, cols)
-            if partial_xl:
+            _cont_dl_key = _prepared_download_key(f"continue_{run_id[:8]}")
+            _cont_prepared = st.session_state.get(_cont_dl_key)
+            if _cont_prepared:
                 st.download_button(
                     f"⬇ Download partial results ({resume_from} rows so far)",
-                    data=partial_xl,
-                    file_name=f"partial_{run_id[:8]}.xlsx",
+                    data=_cont_prepared["bytes"],
+                    file_name=_cont_prepared["filename"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+            else:
+                if st.button("Prepare partial download", key=f"prep_continue_{run_id[:8]}",
+                             use_container_width=True):
+                    _xl = _checkpoint_excel_bytes(run_id, cols)
+                    if _xl:
+                        st.session_state[_cont_dl_key] = {
+                            "bytes": _xl,
+                            "filename": f"partial_{run_id[:8]}.xlsx",
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Could not build partial Excel from checkpoint.")
 
         # Fall through to results section if enriched_df is available
         enriched_df = st.session_state.get("reg_enriched")
