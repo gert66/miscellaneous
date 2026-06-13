@@ -194,6 +194,18 @@ _BRAND_LEGAL_REJECT_TOKENS: frozenset = frozenset({
     "ltd", "llc", "inc", "corp", "plc", "bv", "nv", "co",
 })
 
+# Generic single-word tokens that must never be used as a standalone brand for
+# German companies. If the extracted brand reduces to one of these, the candidate
+# requires the exact legal company name (or a very close variant) in title/snippet
+# before it can be accepted — preventing false positives like "Global" → geglobalsales.com.
+_DE_GENERIC_BRAND_TOKENS: frozenset = frozenset({
+    "global", "holding", "holdings", "group", "international", "investments",
+    "investment", "media", "entertainment", "management", "services", "service",
+    "solutions", "solution", "technologies", "technology", "systems", "system",
+    "consulting", "sales", "trading", "industries", "industrial", "capital",
+    "partners", "enterprise", "enterprises", "logistics", "digital",
+})
+
 # Italian descriptor words that are NOT part of the brand name
 _ITALIAN_DESCRIPTORS = re.compile(
     r"\b(societ[aà]|societa|aziend[ae]|azienda|impres[ae]|impresa|"
@@ -1504,6 +1516,15 @@ def extract_name_variants(name: str) -> dict:
         brand_is_acronym = _is_acronym(brand)
         brand_nodot = _acronym_nodot(brand) if brand_is_acronym else brand
 
+    # Brand-is-generic guard for German names: a single generic token like "Global"
+    # must never be treated as a distinctive brand signal.
+    _brand_stripped = re.sub(r"[^a-z]", "", brand.lower())
+    brand_is_de_generic = (
+        bool(_brand_stripped)
+        and " " not in brand.strip()
+        and _brand_stripped in _DE_GENERIC_BRAND_TOKENS
+    )
+
     return {
         "full":               full,
         "no_legal":           no_legal,
@@ -1516,6 +1537,7 @@ def extract_name_variants(name: str) -> dict:
         "siglabile_compact":  siglabile_variants[1] if len(siglabile_variants) > 1 else "",
         "first_token_brand":  first_token_brand,
         "descriptor_variants": descriptor_variants,
+        "brand_is_de_generic": brand_is_de_generic,
     }
 
 
@@ -1623,6 +1645,23 @@ def is_discovery_blocked(domain: str) -> bool:
         if dl == blocked or dl.endswith("." + blocked):
             return True
     return False
+
+
+# URL shortener domains — must never become validated/recommended/final domain,
+# must never be sent to Firecrawl, must never be used in size inference.
+_URL_SHORTENER_DOMAINS: frozenset = frozenset({
+    "t.co", "bit.ly", "bitly.com", "tinyurl.com", "ow.ly", "buff.ly",
+    "shorturl.at", "rebrand.ly", "cutt.ly", "lnkd.in", "linktr.ee",
+    "goo.gl", "is.gd", "s.id", "trib.al",
+})
+
+
+def is_url_shortener(domain: str) -> bool:
+    """Return True if the domain is a known URL shortener service."""
+    if not domain:
+        return False
+    dl = domain.lower()
+    return any(dl == blocked or dl.endswith("." + blocked) for blocked in _URL_SHORTENER_DOMAINS)
 
 
 def is_pec_or_personal_email(email_domain: str) -> bool:
@@ -2160,6 +2199,19 @@ def search_official_domain_register(
                 rejection_counts["directory"] += 1
                 continue
 
+            # Hard-block URL shorteners — they must never become a company domain.
+            if is_url_shortener(domain):
+                evidence.append({
+                    "query": query, "title": title[:80], "url": url,
+                    "snippet": snippet[:200],
+                    "domain": domain, "used": False,
+                    "skip_reason": "url_shortener_blocked", "score": 0,
+                    "rejection_category": "rejected_shortener",
+                })
+                rejection_notes.append(f"{domain}: url shortener blocked")
+                rejection_counts["rejected_shortener"] = rejection_counts.get("rejected_shortener", 0) + 1
+                continue
+
             # Hard-block media, streaming, social, marketplace domains — they can
             # never be an official company domain regardless of snippet content.
             if is_discovery_blocked(domain):
@@ -2241,6 +2293,8 @@ def search_official_domain_register(
             for _su in _snippet_urls:
                 _su_domain = _extract_domain(_su)
                 if (_su_domain and not is_generic(_su_domain)
+                        and not is_url_shortener(_su_domain)
+                        and not is_discovery_blocked(_su_domain)
                         and not classify_domain(_su_domain, title, snippet)):
                     _su_score = _score_candidate(
                         _su_domain, rank, title, snippet,
@@ -2276,6 +2330,53 @@ def search_official_domain_register(
             evidence, query_used, "", [],
             rejection_counts,
         )
+
+    # ── Generic DE brand guard ────────────────────────────────────────────────
+    # If the brand is a single generic token (e.g. "Global"), require the full
+    # legal company name or no_legal variant to appear in title+snippet evidence
+    # before accepting any candidate domain.
+    if name_variants.get("brand_is_de_generic"):
+        _full_lower   = name_variants.get("full", "").lower()
+        _nolegal_lower = name_variants.get("no_legal", "").lower()
+        _brand_name   = name_variants.get("brand", "")
+        _filtered_cands: dict[str, float] = {}
+        for _dom, _sc in candidates.items():
+            _dom_evs = [e for e in evidence if e.get("domain") == _dom and e.get("used")]
+            _name_found = False
+            for _ev in _dom_evs:
+                _ct = (_ev.get("title", "") + " " + _ev.get("snippet", "")).lower()
+                if ((_full_lower and _full_lower in _ct)
+                        or (_nolegal_lower and len(_nolegal_lower) >= 5 and _nolegal_lower in _ct)):
+                    _name_found = True
+                    break
+            if _name_found:
+                _filtered_cands[_dom] = _sc
+            else:
+                # Demote: mark evidence rows as rejected
+                for _ev in evidence:
+                    if _ev.get("domain") == _dom and _ev.get("used"):
+                        _ev["used"] = False
+                        _ev["skip_reason"] = (
+                            f"generic_de_brand_no_exact_name_match "
+                            f"(brand='{_brand_name}' is generic; need full company name in evidence)"
+                        )
+                        _ev["rejection_category"] = "generic_brand_rejected"
+                rejection_notes.append(
+                    f"{_dom}: rejected (generic DE brand '{_brand_name}', "
+                    f"full company name not found in evidence)"
+                )
+                rejection_counts["generic_brand_rejected"] = (
+                    rejection_counts.get("generic_brand_rejected", 0) + 1
+                )
+        candidates = _filtered_cands
+        if not candidates:
+            return (
+                "", 0.0,
+                f"Generic DE brand '{_brand_name}': no candidate with exact company name in evidence. "
+                + "; ".join(rejection_notes[:4]),
+                evidence, query_used, "", [],
+                rejection_counts,
+            )
 
     # Sort by score — compare all candidates, pick best
     sorted_cands = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
@@ -2435,6 +2536,9 @@ def validate_register_row(
     email_is_pec = is_pec_or_personal_email(email_domain)
 
     norm_website = best_website_domain(raw_website)
+    # Hard guard: URL shorteners must never become validated_domain
+    if is_url_shortener(norm_website):
+        norm_website = ""
     name_variants = extract_name_variants(name)
 
     result = {
@@ -4511,6 +4615,9 @@ def _fc_verify_candidates(
     if candidate_hints:
         for _ch_dom, _ch_url in (candidate_hints or {}).items():
             if _ch_dom and _ch_url:
+                # Never send shorteners or discovery-blocked domains to Firecrawl
+                if is_url_shortener(_ch_dom) or is_discovery_blocked(_ch_dom):
+                    continue
                 _ch_path = re.sub(r"^https?://[^/]+", "", _ch_url) or ""
                 # Only use as a hint when there's a meaningful path (not just root)
                 if _ch_path and _ch_path != "/" and len(_ch_path) > 1:
@@ -4520,6 +4627,9 @@ def _fc_verify_candidates(
     _suspicious_re = re.compile(r"\b(forum|fan|club|community|archive|directory)\b", re.I)
     for _cdom in candidates:
         if not _cdom:
+            continue
+        # Skip shorteners and blocked domains entirely — never send to Firecrawl
+        if is_url_shortener(_cdom) or is_discovery_blocked(_cdom):
             continue
         _rr = _resolve_redirect(_cdom)
         _redirect_info[_cdom] = _rr
@@ -6344,6 +6454,9 @@ def _is_allowed_size_source(
         or validated_domain.endswith("." + ev_domain)
     ):
         return True
+    # Hard-reject URL shorteners
+    if is_url_shortener(ev_domain):
+        return False
     # Hard-reject blocked domains and their subdomains
     for blocked in _SIZE_INFERENCE_BLOCKED_DOMAINS:
         if ev_domain == blocked or ev_domain.endswith("." + blocked):
@@ -8946,7 +9059,52 @@ def _smoke_test_country_config() -> None:
     assert detect_country_from_path("Germany_1_R0001_0500.xlsx") == "DE"
     assert detect_country_from_path("Italy100_1_R0001_0500.xlsx") == "IT"
 
-    print("[SMOKE TEST] _smoke_test_country_config: all 14 cases passed.", flush=True)
+    # ── 15. Generic German brand: brand_is_de_generic flag ───────────────────
+    _gh_variants = extract_name_variants("Global Holding GmbH & Co. KG")
+    assert _gh_variants.get("brand_is_de_generic"), (
+        f"'Global Holding GmbH & Co. KG' must set brand_is_de_generic=True; "
+        f"brand='{_gh_variants.get('brand')}'"
+    )
+    # Verify that a real distinctive brand does NOT set the flag
+    _real_variants = extract_name_variants("Mustermann GmbH")
+    assert not _real_variants.get("brand_is_de_generic"), (
+        f"'Mustermann GmbH' must NOT set brand_is_de_generic; brand='{_real_variants.get('brand')}'"
+    )
+    # Single-token company with non-generic brand
+    _acme_variants = extract_name_variants("Acme GmbH")
+    assert not _acme_variants.get("brand_is_de_generic"), (
+        f"'Acme GmbH' must NOT set brand_is_de_generic; brand='{_acme_variants.get('brand')}'"
+    )
+
+    # ── 16. URL shorteners: is_url_shortener detects all required domains ─────
+    for _short in ["t.co", "bit.ly", "bitly.com", "tinyurl.com", "lnkd.in", "linktr.ee", "goo.gl"]:
+        assert is_url_shortener(_short), f"'{_short}' must be detected as url shortener"
+    assert not is_url_shortener("acme-gmbh.de"), "acme-gmbh.de must NOT be a shortener"
+    assert not is_url_shortener("linkedin.com"),  "linkedin.com must NOT be a shortener"
+
+    # t.co must be blocked from validated_domain via norm_website guard
+    _tco_norm = best_website_domain("https://t.co/somelink")
+    _tco_blocked = is_url_shortener(_tco_norm) if _tco_norm else True
+    assert _tco_blocked, f"t.co must be blocked as url shortener; norm='{_tco_norm}'"
+
+    # ── 17. Firecrawl country default: DE_CONFIG.firecrawl_location ──────────
+    assert DE_CONFIG.firecrawl_location.get("country") == "DE", \
+        f"DE_CONFIG.firecrawl_location must have country=DE: {DE_CONFIG.firecrawl_location}"
+    assert "de" in DE_CONFIG.firecrawl_location.get("languages", []), \
+        f"DE_CONFIG.firecrawl_location must include 'de': {DE_CONFIG.firecrawl_location}"
+    assert IT_CONFIG.firecrawl_location.get("country") == "IT", \
+        f"IT_CONFIG.firecrawl_location must have country=IT: {IT_CONFIG.firecrawl_location}"
+
+    # ── 18. CLI country resolution drives Firecrawl location ─────────────────
+    # resolve_country("auto", "Germany_1_R0001_0500.xlsx", empty_df) → DE
+    _de_country = resolve_country("auto", "Germany_1_R0001_0500.xlsx", _pd.DataFrame())
+    _de_cfg = COUNTRY_CONFIGS.get(_de_country, IT_CONFIG)
+    assert _de_cfg.firecrawl_location.get("country") == "DE", (
+        f"German filename auto-detected as {_de_country} must use DE FC location, "
+        f"got {_de_cfg.firecrawl_location}"
+    )
+
+    print("[SMOKE TEST] _smoke_test_country_config: all 18 cases passed.", flush=True)
 
 
 def _smoke_test_size_inference() -> None:
