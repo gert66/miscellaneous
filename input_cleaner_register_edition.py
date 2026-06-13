@@ -3173,6 +3173,20 @@ def _make_fc_health() -> dict:
     }
 
 
+def _safe_extract_http_status(status_value) -> int:
+    """Extract the first HTTP status code from a Firecrawl status string.
+
+    Handles clean values ("http_500") and combined values ("http_500; ok",
+    "http_429; http_200").  Returns 0 when no three-digit code is found.
+    Never raises.
+    """
+    import re as _re
+    if not status_value:
+        return 0
+    m = _re.search(r"http_(\d{3})", str(status_value).lower())
+    return int(m.group(1)) if m else 0
+
+
 def _fc_health_update(
     health: dict,
     fetch_status: str,
@@ -3205,7 +3219,7 @@ def _fc_health_update(
     else:
         # HTTP error or other non-ok, non-timeout status
         if _fc_is_key_failure(
-            int(_st.replace("http_", "")) if _st.startswith("http_") else 0,
+            _safe_extract_http_status(_st),
             _st,
         ):
             health["quota_or_billing_errors"] = health.get("quota_or_billing_errors", 0) + 1
@@ -7364,7 +7378,18 @@ def _smoke_test_firecrawl_health() -> None:
     _fc_health_update(h7, "ok", "", 0, fc_was_used=False)
     assert h7["requests_attempted"] == 0, "Case 7 fail"
 
-    print("[SMOKE TEST] _smoke_test_firecrawl_health: all 7 cases passed.", flush=True)
+    # Case 8: _safe_extract_http_status handles combined / malformed status strings
+    assert _safe_extract_http_status("http_500")          == 500,  "Case 8a fail"
+    assert _safe_extract_http_status("http_500; ok")      == 500,  "Case 8b fail"
+    assert _safe_extract_http_status("http_429; http_200") == 429, "Case 8c fail"
+    assert _safe_extract_http_status("ok")                == 0,    "Case 8d fail"
+    assert _safe_extract_http_status(None)                == 0,    "Case 8e fail"
+    # Verify that a combined status no longer crashes _fc_health_update
+    h8 = _make_fc_health()
+    _fc_health_update(h8, "http_500; ok", "", 0, fc_was_used=True)
+    assert h8["requests_attempted"] == 1, "Case 8f fail"
+
+    print("[SMOKE TEST] _smoke_test_firecrawl_health: all 8 cases passed.", flush=True)
 
 
 def cli_batch_run() -> None:
