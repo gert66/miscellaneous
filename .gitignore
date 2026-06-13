@@ -14,6 +14,8 @@ venv/
 # German pipeline — data files (never commit)
 Germany/handelsregister.db
 Germany/01_seed/
+Germany/00_raw/
+Germany/_archive/
 
 # Data file types
 *.xlsx
