@@ -6052,15 +6052,14 @@ def _infer_company_size(
             if fc_pages_for_size >= size_fc_budget:
                 break
             try:
-                fc_result = _fetch_one_page_firecrawl(
+                _md, _status, _meta = _fc_scrape(
                     fc_url,
                     fc_key_list,
-                    speed_mode=fc_speed_mode,
-                    location=fc_location,
                     timeout=page_timeout,
+                    fc_location=fc_location,
                 )
                 fc_pages_for_size += 1
-                page_text = fc_result.get("markdown") or fc_result.get("text") or ""
+                page_text = _md or ""
                 if page_text:
                     text_corpus.append(page_text)
                     if not evidence_url:
@@ -6150,6 +6149,8 @@ def process_dataframe(
     debug_mode: bool = False,
     # Country config
     country_config: "CountryConfig | None" = None,
+    # Optional size inference
+    infer_size: bool = False,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
     """
     Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
@@ -6445,6 +6446,36 @@ def process_dataframe(
         _safety_upd = _apply_final_safety_guard(res)
         if _safety_upd:
             res.update(_safety_upd)
+
+        # ── Optional size inference ───────────────────────────────────────────
+        if infer_size and country_config is not None:
+            _fc_pages_used_dv = int(res.get("firecrawl_pages_fetched") or 0)
+            _existing_texts: list[str] = []
+            _ev_url = str(res.get("firecrawl_evidence_url") or res.get("verifier_evidence_url") or "")
+            # Reuse any FC-fetched content stored in res
+            for _fk in ("firecrawl_reason", "verifier_reason"):
+                _ft = str(res.get(_fk) or "")
+                if _ft:
+                    _existing_texts.append(_ft)
+            _size_result = _infer_company_size(
+                domain=str(res.get("validated_domain") or res.get("final_selected_domain") or ""),
+                company_name=name,
+                serper_key=serper_key,
+                fc_keys=fc_key,
+                country_config=country_config,
+                fc_location=fc_location,
+                max_size_serper_queries=2,
+                max_size_fc_pages=2,
+                fc_pages_already_used=_fc_pages_used_dv,
+                max_total_fc_pages=3,
+                existing_texts=_existing_texts,
+                existing_evidence_url=_ev_url,
+                fc_speed_mode=fc_speed_mode,
+                page_timeout=page_timeout,
+            )
+            res.update(_size_result)
+        elif not infer_size:
+            res["size_inference_enabled"] = False
 
         new_results.append(res)
 
@@ -8242,6 +8273,8 @@ def cli_batch_run() -> None:
                         help="Disable the runtime Firecrawl fail-fast safety check")
     parser.add_argument("--country", default="auto", choices=["auto", "IT", "DE"],
                         help="Country pipeline: auto (default), IT (Italy), DE (Germany)")
+    parser.add_argument("--infer-size", action="store_true",
+                        help="Infer company size and HR signals using Serper + Firecrawl evidence")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -8369,6 +8402,7 @@ def cli_batch_run() -> None:
         debug_mode=args.debug,
         fc_fail_fast=_fc_fail_fast,
         country_config=cfg,
+        infer_size=args.infer_size,
     )
     print()  # newline after progress
 
@@ -8460,6 +8494,14 @@ def cli_batch_run() -> None:
     if args.verifier in (_VP_FIRECRAWL, _VP_FC_JINA):
         print(f"\n{_fc_usage_console_summary(run_meta)}")
     print(f"[cleaner] Done.")
+    if args.infer_size and "employee_size_band" in enriched_df.columns:
+        _band_counts = enriched_df["employee_size_band"].value_counts().to_dict()
+        _hrm_vals = pd.to_numeric(enriched_df.get("hrm_likelihood_score", pd.Series(dtype=float)), errors="coerce")
+        _hrm_avg = _hrm_vals.mean()
+        _fc_size_total = pd.to_numeric(enriched_df.get("firecrawl_pages_used_for_size", pd.Series(dtype=float)), errors="coerce").sum()
+        print(f"\n[size inference] Employee size band distribution: {_band_counts}")
+        print(f"[size inference] HRM likelihood avg: {_hrm_avg:.1f}")
+        print(f"[size inference] FC pages used for size inference: {int(_fc_size_total)}")
 
 
 def main():
@@ -8777,6 +8819,16 @@ def main():
         )
 
     st.sidebar.markdown("---")
+    infer_size = st.sidebar.checkbox(
+        "Infer company size and HR signals",
+        value=False,
+        help=(
+            "Uses Serper snippets and up to 2 Firecrawl pages per company to estimate "
+            "employee count and HRM signal strength. Uses extra credits."
+        ),
+    )
+
+    st.sidebar.markdown("---")
     st.sidebar.subheader("Pipeline output (optional)")
     st.sidebar.caption(
         "When enabled, the cleaned Excel is automatically written to the standard "
@@ -8982,6 +9034,7 @@ def main():
                 fc_location=fc_location_payload,
                 eligibility_filter_mode=eligibility_filter_mode,
                 debug_mode=debug_mode,
+                infer_size=infer_size,
             )
 
             progress_bar.progress(1.0)
@@ -9287,6 +9340,7 @@ def main():
             fc_location=fc_location_payload,
             eligibility_filter_mode=eligibility_filter_mode,
             debug_mode=debug_mode,
+            infer_size=infer_size,
         )
 
         progress_bar.progress(1.0)
