@@ -429,15 +429,15 @@ def main() -> None:
 
     df_out = pd.concat([non_excluded, excluded], ignore_index=True)
 
-    # --- Write main outputs ---
+    # --- Write main outputs (backward-compatible) ---
     csv_path  = OUTPUT_DIR / "germany_step1_seed_filtered.csv"
     xlsx_path = OUTPUT_DIR / "germany_step1_seed_filtered.xlsx"
 
     df_out.to_csv(csv_path, index=False, encoding="utf-8-sig")
     df_out.to_excel(xlsx_path, index=False, engine="openpyxl")
 
-    print(f"Main CSV  : {csv_path}")
-    print(f"Main XLSX : {xlsx_path}")
+    print(f"Legacy CSV  : {csv_path}")
+    print(f"Legacy XLSX : {xlsx_path}")
 
     # --- Counts file ---
     counts = (
@@ -448,7 +448,7 @@ def main() -> None:
     )
     counts_path = OUTPUT_DIR / "germany_step1_counts.csv"
     counts.to_csv(counts_path, index=False, encoding="utf-8-sig")
-    print(f"Counts CSV: {counts_path}")
+    print(f"Counts CSV  : {counts_path}")
 
     # --- Review sample ---
     random.seed(42)
@@ -463,13 +463,72 @@ def main() -> None:
         review = pd.concat(sample_frames, ignore_index=True)
         review_path = OUTPUT_DIR / "germany_step1_review_sample.xlsx"
         review.to_excel(review_path, index=False, engine="openpyxl")
-        print(f"Review XLSX: {review_path}")
+        print(f"Review XLSX : {review_path}")
 
-    # --- Terminal summary ---
+    # -----------------------------------------------------------------------
+    # Labelled split files
+    # -----------------------------------------------------------------------
+
+    def _write(df: pd.DataFrame, stem: str, with_csv: bool = True) -> Path:
+        p_xlsx = OUTPUT_DIR / f"{stem}.xlsx"
+        df.to_excel(p_xlsx, index=False, engine="openpyxl")
+        if with_csv:
+            p_csv = OUTPUT_DIR / f"{stem}.csv"
+            df.to_csv(p_csv, index=False, encoding="utf-8-sig")
+        return p_xlsx
+
+    # 1. Full working set
+    all_path = _write(df_out, "germany_step1_all_working_set")
+    print(f"All working : {all_path}")
+
+    # 2. PRE_KEEP — full, sorted by score desc
+    df_keep = (
+        df_out[df_out["pre_label"] == "PRE_KEEP"]
+        .sort_values("pre_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    keep_path = _write(df_keep, "germany_step1_PRE_KEEP_for_serper")
+    print(f"PRE_KEEP    : {keep_path}")
+
+    # 3. PRE_KEEP top-500 pilot
+    pilot_path = _write(
+        df_keep.head(500),
+        "germany_step1_PRE_KEEP_top500_pilot",
+    )
+    print(f"Pilot 500   : {pilot_path}")
+
+    # 4. PRE_MAYBE reserve — sorted by score desc, XLSX + CSV
+    df_maybe = (
+        df_out[df_out["pre_label"] == "PRE_MAYBE"]
+        .sort_values("pre_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    maybe_path = _write(df_maybe, "germany_step1_PRE_MAYBE_reserve")
+    print(f"PRE_MAYBE   : {maybe_path}")
+
+    # 5. PRE_EXCLUDE audit — XLSX only (can be large)
+    df_excl = df_out[df_out["pre_label"] == "PRE_EXCLUDE"].reset_index(drop=True)
+    excl_path = _write(df_excl, "germany_step1_PRE_EXCLUDE_audit", with_csv=False)
+    print(f"PRE_EXCLUDE : {excl_path}")
+
+    # -----------------------------------------------------------------------
+    # Terminal summary
+    # -----------------------------------------------------------------------
     label_counts = df_out["pre_label"].value_counts()
-    print("\n--- Label counts ---")
-    for label, cnt in label_counts.items():
-        print(f"  {label}: {cnt:,}")
+    n_keep    = label_counts.get("PRE_KEEP", 0)
+    n_maybe   = label_counts.get("PRE_MAYBE", 0)
+    n_unknown = label_counts.get("PRE_UNKNOWN", 0)
+    n_excl    = label_counts.get("PRE_EXCLUDE", 0)
+
+    print("\n" + "=" * 60)
+    print(f"  Total rows in working set : {len(df_out):,}")
+    print(f"  PRE_KEEP                  : {n_keep:,}")
+    print(f"  PRE_MAYBE                 : {n_maybe:,}")
+    print(f"  PRE_UNKNOWN               : {n_unknown:,}")
+    print(f"  PRE_EXCLUDE               : {n_excl:,}")
+    print(f"\n  Serper first batch        : {keep_path}")
+    print(f"  Serper pilot (top 500)    : {pilot_path}")
+    print("=" * 60)
 
     print("\n--- Top legal forms by label ---")
     for label in ["PRE_KEEP", "PRE_MAYBE", "PRE_UNKNOWN", "PRE_EXCLUDE"]:
