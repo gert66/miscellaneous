@@ -560,9 +560,26 @@ DOMAIN_VALIDATION_FIELDS = [
     "needs_domain_review",
 ]
 
+# ICP override fields — populated per-row (search + classify) then finalised
+# by apply_competitor_icp_override() after scoring.
+ICP_OVERRIDE_FIELDS: list[str] = [
+    "base_commercial_fit_score",
+    "competitor_customer_signal",
+    "competitor_provider_detected",
+    "competitor_signal_strength",
+    "competitor_signal_type",
+    "competitor_evidence",
+    "competitor_evidence_url",
+    "icp_override_applied",
+    "icp_override_reason",
+    "competitive_switch_opportunity",
+    "sales_action_hint",
+]
+
 ALL_ENRICHMENT_FIELDS = (
     LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS
     + META_FIELDS + DOMAIN_VALIDATION_FIELDS + MODEL_SIGNAL_FIELDS
+    + ICP_OVERRIDE_FIELDS
 )
 
 # Employee range resolver output fields (populated before scoring)
@@ -3069,6 +3086,274 @@ _CAT3_PROVIDERS: frozenset = frozenset({
 # mYngle must never appear in any competitor/provider signal field.
 _MYNGLE_VARIANTS: frozenset = frozenset({"myngle", "mYngle"})
 
+# ── mYngle competitor list ─────────────────────────────────────────────────────
+# Edit this list to add/remove competitors. Used for override detection only.
+MYNGLE_COMPETITOR_KEYWORDS: list[str] = [
+    "Speexx", "goFLUENT", "Berlitz", "Babbel for Business",
+    "Busuu for Business", "EF Corporate", "EF Education First",
+    "Learnship", "Learnlight", "Preply Business",
+    "Rosetta Stone", "Wall Street English", "Linguarama",
+    "Cegos", "Altissia", "Gymglish", "Voxy", "Lingoda",
+]
+
+# Subset used in the targeted Serper competitor-customer search query
+_COMPETITOR_SEARCH_SUBSET: list[str] = [
+    "Speexx", "goFLUENT", "Berlitz", "Babbel for Business",
+    "Learnship", "Learnlight", "Preply Business",
+]
+
+# URL fragments that strongly suggest a case study or customer page
+_COMPETITOR_CUSTOMER_URL_SIGNALS: tuple[str, ...] = (
+    "case-study", "case_study", "customer-story", "customer_story",
+    "success-story", "success_story", "client-story", "testimonial",
+    "case-studies", "customer-stories", "references", "klanten",
+    "kunden", "kundenstimmen", "clientes",
+)
+
+# Snippet phrases that strongly indicate the company is a customer/user
+_COMPETITOR_CUSTOMER_SNIPPET_HIGH: tuple[str, ...] = (
+    "selected", "chose", "deployed", "implemented",
+    "is using", "uses", "has chosen", "has selected",
+    "language training partner", "official language provider",
+    "language learning platform", "training platform", "e-learning partner",
+    "powered by", "in partnership with", "as their", "as its",
+)
+
+# Phrases indicating a medium-confidence connection
+_COMPETITOR_CUSTOMER_SNIPPET_MEDIUM: tuple[str, ...] = (
+    "access to", "benefit", "offers", "employees can",
+    "learning benefit", "corporate benefit", "provided by",
+    "as part of", "included in", "onboarding", "academy",
+)
+
+
+def _build_competitor_customer_empty() -> dict:
+    """Return a zeroed-out ICP override fields dict."""
+    return {
+        "competitor_customer_signal":  "",
+        "competitor_provider_detected": "",
+        "competitor_signal_strength":  "",
+        "competitor_signal_type":      "",
+        "competitor_evidence":         "",
+        "competitor_evidence_url":     "",
+    }
+
+
+def _run_competitor_customer_search(
+    company_name: str,
+    domain: str,
+    serper_key: str,
+) -> dict:
+    """Run a targeted Serper search to find competitor-customer evidence.
+
+    Returns a dict with keys 'hits' (list of result dicts) and 'query_used'.
+    Never logs or returns API key values.
+    """
+    competitors_q = " OR ".join(f'"{c}"' for c in _COMPETITOR_SEARCH_SUBSET)
+    # Prefer a site-scoped query when domain is known; fall back to company name
+    if domain and "." in domain:
+        clean_domain = domain.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+        query = f'site:{clean_domain} ({competitors_q})'
+    else:
+        query = f'"{company_name}" ({competitors_q})'
+
+    hits, _status, _raw, _err = _call_serper(query, serper_key, timeout=12)
+    return {"hits": hits or [], "query_used": query, "error": _err or ""}
+
+
+def _detect_competitor_in_text(text: str) -> str:
+    """Return the first competitor name found in text (case-insensitive), or ''."""
+    text_lc = text.lower()
+    for comp in MYNGLE_COMPETITOR_KEYWORDS:
+        if comp.lower() in text_lc:
+            return comp
+    return ""
+
+
+def _classify_competitor_customer_evidence(
+    hits: list,
+    company_name: str,
+    existing_icp_signal: str = "",
+    existing_evidence: str = "",
+) -> dict:
+    """Classify competitor-customer evidence from search hits and existing signals.
+
+    Returns a dict with competitor_customer_signal, competitor_provider_detected,
+    competitor_signal_strength, competitor_signal_type, competitor_evidence,
+    competitor_evidence_url.
+
+    High confidence  → signal=Yes, strength=High
+    Medium confidence → signal=Unclear, strength=Medium
+    Low / no signal   → signal=No, strength=Low or blank
+    """
+    result = _build_competitor_customer_empty()
+    company_lc = company_name.lower()
+
+    # ── Walk each search hit ──────────────────────────────────────────────────
+    best_strength  = ""   # "High" > "Medium" > "Low"
+    best_type      = ""
+    best_evidence  = ""
+    best_url       = ""
+    best_provider  = ""
+
+    strength_rank  = {"High": 3, "Medium": 2, "Low": 1, "": 0}
+
+    for hit in hits:
+        title   = str(hit.get("title", ""))
+        snippet = str(hit.get("snippet", ""))
+        url     = str(hit.get("link", ""))
+        text    = (title + " " + snippet).lower()
+
+        provider = _detect_competitor_in_text(text)
+        if not provider:
+            continue  # no competitor name found — skip this result
+
+        # ── Determine signal type and strength ───────────────────────────────
+        url_lc   = url.lower()
+        strength = "Low"
+        sig_type = "search_snippet_only"
+
+        # High-confidence URL patterns (case study, customer story, etc.)
+        if any(frag in url_lc for frag in _COMPETITOR_CUSTOMER_URL_SIGNALS):
+            strength = "High"
+            sig_type = "case_study" if "case" in url_lc else "customer_story"
+
+        # High-confidence snippet phrases combined with company name in text
+        elif company_lc in text and any(ph in text for ph in _COMPETITOR_CUSTOMER_SNIPPET_HIGH):
+            strength = "High"
+            # Classify by URL context
+            if "tender" in url_lc or "procurement" in url_lc or "contract" in url_lc:
+                sig_type = "procurement_or_tender"
+            elif "job" in url_lc or "career" in url_lc or "vacature" in url_lc:
+                sig_type = "job_posting_or_benefits"
+            elif "supplier" in url_lc or "vendor" in url_lc:
+                sig_type = "supplier_or_vendor_page"
+            elif "academy" in url_lc or "training" in url_lc or "learning" in url_lc:
+                sig_type = "training_platform_reference"
+            else:
+                sig_type = "company_website_mention"
+
+        # Medium-confidence: company name in text with medium phrases
+        elif company_lc in text and any(ph in text for ph in _COMPETITOR_CUSTOMER_SNIPPET_MEDIUM):
+            strength = "Medium"
+            sig_type = "search_snippet_only"
+
+        # Low: competitor found but no company-name match or weak context
+        else:
+            # Only count if company name appears anywhere in the hit
+            if company_lc not in text:
+                continue  # competitor mention with no company connection — skip
+            strength = "Low"
+            sig_type = "search_snippet_only"
+
+        # Keep the highest-confidence hit
+        if strength_rank[strength] > strength_rank[best_strength]:
+            best_strength = strength
+            best_type     = sig_type
+            best_evidence = f"{title}: {snippet}"[:300]
+            best_url      = url
+            best_provider = provider
+
+    # ── Fall back to existing ICP signal fields ───────────────────────────────
+    if not best_provider and existing_icp_signal and existing_icp_signal.strip():
+        first_provider = existing_icp_signal.split(",")[0].strip()
+        if first_provider:
+            best_provider = first_provider
+            best_strength = "Medium"
+            best_type     = "search_snippet_only"
+            best_evidence = (existing_evidence or "")[:300]
+            best_url      = ""
+
+    # ── Build output ──────────────────────────────────────────────────────────
+    if not best_provider:
+        result["competitor_customer_signal"] = "No"
+        return result
+
+    if best_strength == "High":
+        result["competitor_customer_signal"] = "Yes"
+    elif best_strength == "Medium":
+        result["competitor_customer_signal"] = "Unclear"
+    else:
+        result["competitor_customer_signal"] = "No"
+
+    result["competitor_provider_detected"] = best_provider
+    result["competitor_signal_strength"]   = best_strength
+    result["competitor_signal_type"]       = best_type
+    result["competitor_evidence"]          = best_evidence.strip()
+    result["competitor_evidence_url"]      = best_url
+    return result
+
+
+def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Post-scoring override layer for confirmed competitor-customer evidence.
+
+    Must be called AFTER apply_results_compatible_scoring().
+    Adds / updates all ICP_OVERRIDE_FIELDS columns.
+    Never destroys the original score — it is saved to base_commercial_fit_score.
+    """
+    import pandas as _pd
+
+    df = df.copy()
+
+    # Initialise base_commercial_fit_score from the current final score (numeric)
+    if "final_commercial_fit_score" in df.columns:
+        df["base_commercial_fit_score"] = (
+            _pd.to_numeric(df["final_commercial_fit_score"], errors="coerce")
+        )
+    else:
+        df["base_commercial_fit_score"] = _pd.NA
+
+    # Ensure all remaining override columns exist with blank defaults
+    for col in ICP_OVERRIDE_FIELDS:
+        if col == "base_commercial_fit_score":
+            continue
+        if col not in df.columns:
+            df[col] = ""
+
+    for idx, row in df.iterrows():
+
+        signal   = str(row.get("competitor_customer_signal", "") or "").strip()
+        strength = str(row.get("competitor_signal_strength", "") or "").strip()
+        provider = str(row.get("competitor_provider_detected", "") or "").strip()
+
+        if signal == "Yes" and strength == "High" and provider:
+            # ── High-confidence override ──────────────────────────────────────
+            df.at[idx, "final_commercial_fit_score"] = 10.0
+            if "commercial_tier" in df.columns:
+                df.at[idx, "commercial_tier"] = "🥇 Hot"
+            df.at[idx, "icp_override_applied"]      = "Yes"
+            df.at[idx, "icp_override_reason"]       = (
+                f"Explicit competitor customer evidence: company appears connected to "
+                f"{provider} as language training provider"
+            )
+            df.at[idx, "competitive_switch_opportunity"] = "Strong"
+            df.at[idx, "sales_action_hint"]         = "ATTACK: already buys language training category"
+            # Append override note to scoring_notes if that column exists
+            if "scoring_notes" in df.columns:
+                existing_note = str(df.at[idx, "scoring_notes"] or "")
+                override_note = (
+                    f"Competitive switch signal: Strong. Explicit evidence suggests the company "
+                    f"already uses or works with {provider}. ICP override applied because the "
+                    f"company already buys the language training category."
+                )
+                df.at[idx, "scoring_notes"] = (existing_note + " | " + override_note).lstrip(" | ")
+
+        elif signal == "Unclear" and strength == "Medium":
+            # ── Medium-confidence — no override, flag for investigation ──────
+            df.at[idx, "icp_override_applied"]          = "No"
+            df.at[idx, "icp_override_reason"]           = ""
+            df.at[idx, "competitive_switch_opportunity"] = "Possible"
+            df.at[idx, "sales_action_hint"]             = "Investigate current language training provider"
+
+        else:
+            # ── No override ───────────────────────────────────────────────────
+            df.at[idx, "icp_override_applied"]          = "No"
+            df.at[idx, "icp_override_reason"]           = ""
+            df.at[idx, "competitive_switch_opportunity"] = "No clear signal"
+            df.at[idx, "sales_action_hint"]             = ""
+
+    return df
+
 
 def _sanitize_provider_list(raw_value: str, allowed: frozenset) -> str:
     """Return only items from raw_value (comma-separated) whose lowercase name
@@ -4034,6 +4319,36 @@ def enrich_one_row(
     else:
         # Fill defaults when signal extraction is disabled or dry-run
         row.update(_build_model_signal_empty())
+
+    # ── Step 4 — Competitor customer search ──────────────────────────────────
+    # Runs a targeted Serper query to find evidence that the company is already
+    # a customer/user of a direct mYngle competitor.  Only runs when a Serper
+    # key is available and not in dry-run mode.
+    _comp_fields = _build_competitor_customer_empty()
+    if serper_key and not dry_run:
+        try:
+            _cc_result = _run_competitor_customer_search(company_name, url, serper_key)
+            _comp_fields = _classify_competitor_customer_evidence(
+                hits=_cc_result.get("hits", []),
+                company_name=company_name,
+                existing_icp_signal=row.get("icp_competitor_signal", ""),
+                existing_evidence=row.get("competitor_signal_strength_evidence", ""),
+            )
+        except Exception as _cc_exc:
+            _comp_fields["competitor_evidence"] = (
+                f"Step 4 search error: {type(_cc_exc).__name__}: {str(_cc_exc)[:120]}"
+            )
+    else:
+        # No serper key or dry-run — still check existing ICP signal fields
+        _existing_sig = row.get("icp_competitor_signal", "")
+        if _existing_sig and _existing_sig.strip():
+            _comp_fields = _classify_competitor_customer_evidence(
+                hits=[],
+                company_name=company_name,
+                existing_icp_signal=_existing_sig,
+                existing_evidence=row.get("competitor_signal_strength_evidence", ""),
+            )
+    row.update(_comp_fields)
 
     # Debug record
     dbg = {
@@ -5895,6 +6210,10 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
             df_out = apply_results_compatible_scoring(df_out)
         except Exception:
             pass
+        try:
+            df_out = apply_competitor_icp_override(df_out)
+        except Exception:
+            pass
     ss_set(
         processing=False, stop_requested=False,
         enrichment_done=True, df_enriched=df_out,
@@ -6336,6 +6655,11 @@ def run_cli() -> None:
         df_out = apply_results_compatible_scoring(df_out)
     except Exception as _score_exc:
         print(f"[enricher] Scoring skipped: {_score_exc}", flush=True)
+
+    try:
+        df_out = apply_competitor_icp_override(df_out)
+    except Exception as _ov_exc:
+        print(f"[enricher] ICP override skipped: {_ov_exc}", flush=True)
 
     # ── Write output ──────────────────────────────────────────────────────────
     stamp    = ts()

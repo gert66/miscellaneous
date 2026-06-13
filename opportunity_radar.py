@@ -22,393 +22,52 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 import pandas as pd
 import requests
-import streamlit as st
+import sys
+
+st = None          # lazy — populated by _get_st() in UI mode only
+
+def _get_st():
+    global st
+    if st is None:
+        import streamlit as _st
+        st = _st
+    return st
+
+
+_CLI_FLAGS = {
+    "--input", "--dry-run-paths", "--project-root",
+    "--serper-key", "--anthropic-key", "--max-rows", "--debug", "--force-fresh",
+}
+
+
+def cli_args_present() -> bool:
+    for arg in sys.argv[1:]:
+        if arg in _CLI_FLAGS:
+            return True
+        if any(arg.startswith(f + "=") for f in _CLI_FLAGS):
+            return True
+    return False
+
+
+def running_under_streamlit() -> bool:
+    if "streamlit" not in sys.modules:
+        return False
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def is_cli_mode() -> bool:
+    return cli_args_present() or not running_under_streamlit()
+
 
 try:
     import anthropic as _anthropic_mod
     _ANTHROPIC_AVAILABLE = True
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
-
-# =============================================================================
-# PAGE CONFIG
-# =============================================================================
-
-st.set_page_config(
-    page_title="mYngle · Opportunity Radar",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# =============================================================================
-# HEADER  (logo + title — mirrors lead prioritizer layout exactly)
-# =============================================================================
-
-_logo_path = pathlib.Path(__file__).parent / "mingle_local_final_fixed.png"
-_logo_src  = (
-    f"data:image/png;base64,{base64.b64encode(_logo_path.read_bytes()).decode()}"
-    if _logo_path.exists() else ""
-)
-_img_tag = (
-    f'<img src="{_logo_src}" class="brand-logo" alt="mYngle" />'
-    if _logo_src else ""
-)
-
-st.markdown(
-    f"""
-    <style>
-    .block-container {{
-        max-width: 880px;
-        padding-top: 2.2rem;
-        padding-bottom: 3rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
-    }}
-
-    div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
-        overflow: visible !important;
-        margin-bottom: 1.0rem;
-    }}
-
-    .brand-header {{
-        display: grid;
-        grid-template-columns: 43% 57%;
-        align-items: center;
-        min-height: 140px;
-        padding-top: 10px;
-        padding-bottom: 6px;
-        overflow: visible !important;
-    }}
-
-    .brand-title-block {{
-        display: flex;
-        align-items: center;
-        justify-content: flex-start;
-        overflow: visible !important;
-    }}
-
-    .brand-title {{
-        font-size: 42px;
-        font-weight: 700;
-        color: #0B1F3A;
-        line-height: 1.1;
-        white-space: nowrap;
-        margin: 0;
-        padding: 0;
-    }}
-
-    .brand-logo-block {{
-        display: flex;
-        justify-content: flex-end;
-        align-items: center;
-        padding: 0;
-        line-height: 0;
-        overflow: visible !important;
-    }}
-
-    .brand-logo {{
-        width: 430px;
-        max-width: 100%;
-        height: auto;
-        display: block;
-        object-fit: contain;
-        object-position: center center;
-        overflow: visible !important;
-    }}
-    </style>
-
-    <div class="brand-header">
-      <div class="brand-title-block">
-        <span class="brand-title">Opportunity Radar</span>
-      </div>
-      <div class="brand-logo-block">
-        {_img_tag}
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
-CLAUDE_MODEL    = "claude-haiku-4-5-20251001"
-SERPER_URL      = "https://google.serper.dev/search"
-RADAR_CACHE_DIR = pathlib.Path("radar_cache")
-
-# Bump this string whenever the prompt or interpretation logic changes.
-# It is included in cache keys so old Claude outputs are never reused after a prompt update.
-CACHE_VERSION = "v3_myngle_20260608"
-
-# 5 query groups — one Serper call each
-QUERY_GROUPS = [
-    (
-        "Annual Report / Financial",
-        '"{name}" annual report fiscal year results revenue 2024 2025',
-    ),
-    (
-        "International Hiring / Growth",
-        '"{name}" hiring international careers jobs "new office" global expansion 2024 2025',
-    ),
-    (
-        "Language / Communication / L&D",
-        '"{name}" "language training" OR "business English" OR "communication training" '
-        'OR "learning and development" OR "talent development" OR training academy HR',
-    ),
-    (
-        "Sales / Customer Success Expansion",
-        '"{name}" "sales team" OR "customer success" OR "account management" '
-        'OR "sales enablement" OR "client-facing" international expansion',
-    ),
-    (
-        "M&A / Funding / Integration",
-        '"{name}" acquisition OR merger OR integration OR funding OR investment OR "private equity"',
-    ),
-]
-
-ALLOWED_TRIGGER_TYPES = [
-    "International hiring",
-    "Client-facing team expansion",
-    "Sales / customer success growth",
-    "New market or office expansion",
-    "Multilingual workforce growth",
-    "M&A / integration",
-    "Funding / growth investment",
-    "HR / L&D hiring",
-    "Onboarding pressure",
-    "Foreign HQ / group communication",
-    "Employer branding / retention",
-    "Annual planning / budget window",
-    "No clear trigger",
-    "Other",
-]
-
-ALLOWED_ROUTES = [
-    "L&D / Talent Development",
-    "HR / People",
-    "International HR",
-    "Sales Enablement",
-    "Customer Success",
-    "People Operations",
-    "Operations",
-    "Procurement",
-    "Unknown",
-]
-
-ALLOWED_RECOMMENDATIONS = [
-    "Call now",
-    "Call this month",
-    "Call before budget cycle",
-    "Monitor",
-    "Manual research needed",
-    "Low priority",
-    "Internal / exclude",
-]
-
-# JSON schema Claude must return
-_CLAUDE_SCHEMA = """{
-  "trigger_found": true/false,
-  "trigger_type": "<one of the allowed trigger types>",
-  "trigger_date": "<date or empty string>",
-  "trigger_score": <0-3>,
-  "trigger_evidence": "<1-3 sentence summary of evidence>",
-  "annual_report_found": true/false,
-  "annual_report_url": "<url or empty>",
-  "annual_report_date": "<date or empty>",
-  "fiscal_year_pattern": "<Calendar year | Non-calendar fiscal year | Unknown>",
-  "likely_buying_window": "<e.g. Q1 2026 or empty>",
-  "buying_window_score": <0-3>,
-  "buying_window_confidence": "<High | Medium | Low | Unknown>",
-  "buying_window_reason": "<brief explanation>",
-  "hiring_signal_score": <0-3>,
-  "international_hiring_signal": <0-3>,
-  "lnd_hr_hiring_signal": <0-3>,
-  "sales_cs_hiring_signal": <0-3>,
-  "onboarding_pressure_signal": <0-3>,
-  "preferred_buyer_route": "<one of the allowed routes>",
-  "backup_buyer_route": "<one of the allowed routes or empty>",
-  "suggested_title_searches": "<comma-separated titles to search for>",
-  "suggested_opener": "<1-2 sentence caller opener referencing a specific signal>",
-  "why_now": "<1-2 sentence reason this company is worth calling now>",
-  "evidence_sources": "<comma-separated URLs that support the conclusions>",
-  "evidence_quality": "<Strong | Medium | Weak | Insufficient>",
-  "confidence_level": "<High | Medium | Low | Unknown>",
-  "manual_review_needed": true/false,
-  "manual_review_reason": "<reason or empty>"
-}"""
-
-_EMPTY_CLAUDE_RESULT: dict = {
-    "trigger_found": False,
-    "trigger_type": "None",
-    "trigger_date": "",
-    "trigger_score": 0,
-    "trigger_evidence": "",
-    "annual_report_found": False,
-    "annual_report_url": "",
-    "annual_report_date": "",
-    "fiscal_year_pattern": "Unknown",
-    "likely_buying_window": "",
-    "buying_window_score": 0,
-    "buying_window_confidence": "Unknown",
-    "buying_window_reason": "",
-    "hiring_signal_score": 0,
-    "international_hiring_signal": 0,
-    "lnd_hr_hiring_signal": 0,
-    "sales_cs_hiring_signal": 0,
-    "onboarding_pressure_signal": 0,
-    "preferred_buyer_route": "Unknown",
-    "backup_buyer_route": "",
-    "suggested_title_searches": "",
-    "suggested_opener": "",
-    "why_now": "",
-    "evidence_sources": "",
-    "evidence_quality": "Insufficient",
-    "confidence_level": "Unknown",
-    "manual_review_needed": True,
-    "manual_review_reason": "No search results available",
-}
-
-# =============================================================================
-# SESSION STATE HELPERS
-# =============================================================================
-
-def ss(key: str, default=None):
-    return st.session_state.get(key, default)
-
-
-def ss_set(**kwargs):
-    for k, v in kwargs.items():
-        st.session_state[k] = v
-
-
-def reset():
-    ss_set(
-        _or_file_key="__none__",
-        _or_df_raw=None,
-        _or_file_name=None,
-        _or_file_error=None,
-        _or_name_col=None,
-        _or_domain_col=None,
-        _or_country_col=None,
-        _or_score_col=None,
-        _or_tier_col=None,
-        _or_icp_col=None,
-        _or_n_companies=0,
-        _or_input_type=None,   # "enriched_export" | "simple_company_list"
-        _or_processing=False,
-        _or_done=False,
-        _or_process_index=0,
-        _or_company_list=None,
-        _or_results=None,
-        _or_raw_sources=None,
-        _or_excel_bytes=None,
-        _or_stop=False,
-        _or_force_refresh=False,
-        _or_scan_start_time=None,
-        _or_autosave=True,
-        _or_checkpoint_n=10,
-        _or_last_checkpoint_path=None,
-        _or_last_checkpoint_count=None,
-        _or_final_autosave_path=None,
-        _or_input_bytes=None,
-    )
-
-
-# =============================================================================
-# COLUMN DETECTION
-# =============================================================================
-
-_NAME_CANDIDATES = [
-    "company_name", "company name", "canonical_company_name",
-    "company", "name", "organisation", "organization",
-]
-_DOMAIN_CANDIDATES = [
-    "validated_domain",          # preferred: set by Lead Prioritizer domain validation
-    "canonical_company_url", "canonical_company_domain",
-    "company_domain", "company_url", "domain",
-    "company website", "company domain",
-    "website", "url", "company url", "homepage",
-]
-_COUNTRY_CANDIDATES = [
-    "country", "company_country", "company country",
-    "hq country", "hq_country", "company_hq_country",
-]
-_SCORE_CANDIDATES = [
-    "final_commercial_fit_score", "commercial_fit_score", "score",
-]
-_TIER_CANDIDATES = [
-    "commercial_tier", "tier",
-]
-_ICP_CANDIDATES = [
-    "icp_evidence", "icp evidence", "why_relevant", "why_is_this_company_relevant",
-    "buying_signals", "icp_buying_signals", "purchasing_signals", "icp_signals",
-]
-
-# Columns whose presence signals an enriched export
-_ENRICHED_SIGNAL_COLS = {
-    "final_commercial_fit_score", "commercial_fit_score", "commercial_tier",
-    "icp_evidence", "icp_buying_signals", "icp_lead_score", "icp_why_relevant",
-    "icp_likely_training_interest", "icp_potential_buyer_function",
-    "sig_intl_footprint_score", "sig_rapid_growth_score", "enrichment_status",
-    "top_positive_signals", "top_score_drivers",
-}
-
-
-# Layer 1 fields carried through from Lead Prioritizer enriched export
-_L1_IDENTITY_FIELDS = [
-    "lead_id", "company_key", "input_company_name", "normalized_company_name",
-    "city", "industry", "employee_range",
-]
-_L1_DOMAIN_FIELDS = [
-    "input_domain", "validated_domain", "domain_used_for_enrichment",
-    "domain_match_confidence", "possible_domain_mismatch", "suggested_domain",
-    "domain_check_reason", "domain_source", "needs_domain_review",
-]
-_L1_COMMERCIAL_FIELDS = [
-    "model_probability", "lean_model_prob", "icp_lead_score",
-    "icp_buying_signals", "icp_evidence", "icp_why_relevant",
-    "icp_likely_training_interest", "icp_potential_buyer_function",
-    "top_positive_signals", "gaps_missing_signals",
-    "scoring_notes", "needs_manual_review", "match_notes",
-]
-_L1_SIGNAL_SCORE_FIELDS = [
-    "sig_intl_footprint_score", "sig_foreign_hq_score", "sig_explicit_lnd_score",
-    "sig_multicultural_score", "sig_employer_branding_score", "sig_rapid_growth_score",
-    "sig_merger_acq_score", "sig_lnd_onboarding_score",
-    "ti_language_english_score", "ti_onboarding_score", "ti_leadership_score",
-    "ti_broader_professional_score", "ti_team_collab_score", "ti_intercultural_score",
-    "ti_negotiation_sales_score",
-]
-_L1_EVIDENCE_FIELDS = [
-    "sig_intl_footprint_evidence", "sig_foreign_hq_evidence", "sig_explicit_lnd_evidence",
-    "sig_multicultural_evidence", "sig_employer_branding_evidence", "sig_rapid_growth_evidence",
-    "sig_merger_acq_evidence", "sig_lnd_onboarding_evidence",
-    "ti_language_english_evidence", "ti_onboarding_evidence", "ti_leadership_evidence",
-    "ti_intercultural_evidence", "ti_negotiation_sales_evidence",
-]
-
-# Row colors for Caller Prep Input (same palette as Lead Prioritizer)
-_CPI_TIER_FILLS: dict = {
-    "🥇 Hot":  "D6E4F7",
-    "🥈 Warm": "D9EAD3",
-    "🥉 Cool": "FCE5CD",
-    "❄️ Pass": "F4CCCC",
-    "Hot":     "D6E4F7",
-    "Warm":    "D9EAD3",
-    "Cool":    "FCE5CD",
-    "Pass":    "F4CCCC",
-    "Low":     "F2F2F2",
-}
-_CPI_REC_FILLS: dict = {
-    "Call now":                 "D6E4F7",
-    "Call this month":          "D9EAD3",
-    "Call before budget cycle": "FCE5CD",
-    "Manual research needed":   "FFF2CC",
-    "Low priority":             "F2F2F2",
-    "Internal / exclude":       "F4CCCC",
-}
 
 
 def _detect_col(df: pd.DataFrame, candidates: list) -> str | None:
@@ -1103,6 +762,107 @@ def _sanitize_claude_result(cr: dict) -> dict:
             sanitized[f] = _sanitize_text(sanitized[f])
     return sanitized
 
+ALLOWED_TRIGGER_TYPES = [
+    "International hiring",
+    "Client-facing team expansion",
+    "Sales / customer success growth",
+    "New market or office expansion",
+    "Multilingual workforce growth",
+    "M&A / integration",
+    "Funding / growth investment",
+    "HR / L&D hiring",
+    "Onboarding pressure",
+    "Foreign HQ / group communication",
+    "Employer branding / retention",
+    "Annual planning / budget window",
+    "No clear trigger",
+    "Other",
+]
+
+ALLOWED_ROUTES = [
+    "L&D / Talent Development",
+    "HR / People",
+    "International HR",
+    "Sales Enablement",
+    "Customer Success",
+    "People Operations",
+    "Operations",
+    "Procurement",
+    "Unknown",
+]
+
+ALLOWED_RECOMMENDATIONS = [
+    "Call now",
+    "Call this month",
+    "Call before budget cycle",
+    "Monitor",
+    "Manual research needed",
+    "Low priority",
+    "Internal / exclude",
+]
+
+# JSON schema Claude must return
+_CLAUDE_SCHEMA = """{
+  "trigger_found": true/false,
+  "trigger_type": "<one of the allowed trigger types>",
+  "trigger_date": "<date or empty string>",
+  "trigger_score": <0-3>,
+  "trigger_evidence": "<1-3 sentence summary of evidence>",
+  "annual_report_found": true/false,
+  "annual_report_url": "<url or empty>",
+  "annual_report_date": "<date or empty>",
+  "fiscal_year_pattern": "<Calendar year | Non-calendar fiscal year | Unknown>",
+  "likely_buying_window": "<e.g. Q1 2026 or empty>",
+  "buying_window_score": <0-3>,
+  "buying_window_confidence": "<High | Medium | Low | Unknown>",
+  "buying_window_reason": "<brief explanation>",
+  "hiring_signal_score": <0-3>,
+  "international_hiring_signal": <0-3>,
+  "lnd_hr_hiring_signal": <0-3>,
+  "sales_cs_hiring_signal": <0-3>,
+  "onboarding_pressure_signal": <0-3>,
+  "preferred_buyer_route": "<one of the allowed routes>",
+  "backup_buyer_route": "<one of the allowed routes or empty>",
+  "suggested_title_searches": "<comma-separated titles to search for>",
+  "suggested_opener": "<1-2 sentence caller opener referencing a specific signal>",
+  "why_now": "<1-2 sentence reason this company is worth calling now>",
+  "evidence_sources": "<comma-separated URLs that support the conclusions>",
+  "evidence_quality": "<Strong | Medium | Weak | Insufficient>",
+  "confidence_level": "<High | Medium | Low | Unknown>",
+  "manual_review_needed": true/false,
+  "manual_review_reason": "<reason or empty>"
+}"""
+
+_EMPTY_CLAUDE_RESULT: dict = {
+    "trigger_found": False,
+    "trigger_type": "None",
+    "trigger_date": "",
+    "trigger_score": 0,
+    "trigger_evidence": "",
+    "annual_report_found": False,
+    "annual_report_url": "",
+    "annual_report_date": "",
+    "fiscal_year_pattern": "Unknown",
+    "likely_buying_window": "",
+    "buying_window_score": 0,
+    "buying_window_confidence": "Unknown",
+    "buying_window_reason": "",
+    "hiring_signal_score": 0,
+    "international_hiring_signal": 0,
+    "lnd_hr_hiring_signal": 0,
+    "sales_cs_hiring_signal": 0,
+    "onboarding_pressure_signal": 0,
+    "preferred_buyer_route": "Unknown",
+    "backup_buyer_route": "",
+    "suggested_title_searches": "",
+    "suggested_opener": "",
+    "why_now": "",
+    "evidence_sources": "",
+    "evidence_quality": "Insufficient",
+    "confidence_level": "Unknown",
+    "manual_review_needed": True,
+    "manual_review_reason": "No search results available",
+}
 
 # Fuzzy mapping: substrings in Claude's free-text → canonical trigger type
 _TRIGGER_MAP: list[tuple[str, str]] = [
@@ -2511,453 +2271,967 @@ def _autosave_excel(excel_bytes: bytes, filename: str) -> pathlib.Path:
     p = _unique_path(folder, filename)
     p.write_bytes(excel_bytes)
     return p
-# =============================================================================
 
-_anthropic_key = ""
-_serper_key    = ""
-try:
-    _anthropic_key = (st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
-    _serper_key    = (st.secrets.get("SERPER_API_KEY",    "") or "").strip()
-except Exception:
-    pass
-
-_keys_ok = bool(_anthropic_key and _serper_key and _ANTHROPIC_AVAILABLE)
 
 # =============================================================================
-# STEP 1 — UPLOAD
+# PIPELINE FOLDER HELPERS
 # =============================================================================
 
-st.divider()
-st.subheader("Step 1 · Upload your file")
-st.caption(
-    "Upload a Lead Prioritizer export, an Opportunity Input sheet, "
-    "or a simple company list with company name and website."
-)
-
-uploaded = st.file_uploader(
-    "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
-    type=["xlsx", "xls", "csv"],
-    label_visibility="collapsed",
-)
-
-new_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
-if new_key != ss("_or_file_key", "__none__"):
-    ss_set(
-        _or_file_key      = new_key,
-        _or_df_raw        = None,
-        _or_file_name     = None,
-        _or_file_error    = None,
-        _or_name_col      = None,
-        _or_domain_col    = None,
-        _or_country_col   = None,
-        _or_score_col     = None,
-        _or_tier_col      = None,
-        _or_icp_col       = None,
-        _or_n_companies   = 0,
-        _or_input_type    = None,
-        _or_processing    = False,
-        _or_done          = False,
-        _or_process_index = 0,
-        _or_company_list  = None,
-        _or_results       = None,
-        _or_raw_sources   = None,
-        _or_excel_bytes   = None,
-        _or_stop          = False,
+def _parse_pipeline_filename(input_path: str) -> dict:
+    """
+    Parse cohort/batch_number/row_range from a prioritized xlsx filename.
+    Scans left-to-right for first purely-numeric segment = batch_number.
+    """
+    stem = pathlib.Path(input_path).stem
+    stem = re.sub(
+        r'_(prioritized|cleaned|enriched|opportunity|lead_prioritized)_\d{8}_\d{4}.*$',
+        '', stem, flags=re.IGNORECASE,
     )
-    if uploaded is not None:
+    parts = stem.split("_")
+    batch_number = ""
+    batch_idx    = -1
+    for i, p in enumerate(parts):
+        if re.fullmatch(r'\d+', p):
+            batch_number = p
+            batch_idx    = i
+            break
+    if batch_idx < 0:
+        return {"cohort": stem, "batch_number": "", "row_range": "", "batch_stem": stem, "valid": False}
+    cohort    = "_".join(parts[:batch_idx])
+    row_range = ""
+    for j in range(batch_idx + 1, len(parts) - 1):
+        candidate = parts[j] + "_" + parts[j + 1]
+        if re.fullmatch(r'R\d+_\d+', candidate):
+            row_range = candidate
+            break
+    batch_stem = cohort + "_" + batch_number
+    if row_range:
+        batch_stem = batch_stem + "_" + row_range
+    return {
+        "cohort":       cohort,
+        "batch_number": batch_number,
+        "row_range":    row_range,
+        "batch_stem":   batch_stem,
+        "valid":        bool(cohort and batch_number),
+    }
+
+
+def _resolve_opportunity_paths(
+    input_path: str,
+    project_root: str | None = None,
+    ts: str | None = None,
+) -> dict:
+    """Resolve pipeline output paths for the Opportunity Radar."""
+    if ts is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+    parsed = _parse_pipeline_filename(input_path)
+    cohort = parsed.get("cohort", "unknown")
+    stem   = parsed.get("batch_stem", pathlib.Path(input_path).stem)
+    # Auto-detect project_root by walking up from 02_lead_prioritized/
+    if not project_root:
+        p = pathlib.Path(input_path).resolve()
+        for parent in p.parents:
+            if parent.name.startswith("02_"):
+                project_root = str(parent.parent.parent)
+                break
+        if not project_root:
+            project_root = str(pathlib.Path(input_path).resolve().parent.parent.parent)
+    root       = pathlib.Path(project_root)
+    cohort_dir = root / cohort
+    output_dir = cohort_dir / "03_opportunity_radar"
+    logs_dir   = cohort_dir / "_logs"
+    return {
+        "cohort":       cohort,
+        "batch_stem":   stem,
+        "batch_number": parsed.get("batch_number", ""),
+        "row_range":    parsed.get("row_range", ""),
+        "valid_name":   parsed.get("valid", False),
+        "project_root": str(root),
+        "cohort_dir":   str(cohort_dir),
+        "output_dir":   str(output_dir),
+        "logs_dir":     str(logs_dir),
+        "output_xlsx":  str(output_dir / f"{stem}_opportunity_{ts}.xlsx"),
+        "run_log_csv":  str(logs_dir   / f"{cohort}_opportunity_runlog.csv"),
+        "ts":           ts,
+    }
+
+
+def _load_cli_secrets(
+    cli_anthropic: str | None,
+    cli_serper: str | None,
+) -> tuple[str, str]:
+    """Load API keys: CLI arg → env var → secrets.toml. Never logs key values."""
+    import os as _os
+
+    def _from_toml(name: str) -> str:
         try:
-            fname             = uploaded.name
-            # Capture raw bytes before _load_df_from_upload consumes the file
+            import tomllib
+        except ImportError:
             try:
-                uploaded.seek(0)
-                _raw_bytes = uploaded.read()
-                uploaded.seek(0)
-            except Exception:
-                _raw_bytes = None
-            df_loaded, sheet  = _load_df_from_upload(uploaded)
-            input_type        = _detect_input_type(df_loaded)
-            name_col          = _detect_col(df_loaded, _NAME_CANDIDATES)
-            domain_col        = _detect_col(df_loaded, _DOMAIN_CANDIDATES)
-            country_col       = _detect_col(df_loaded, _COUNTRY_CANDIDATES)
-            score_col         = _detect_col(df_loaded, _SCORE_CANDIDATES)
-            tier_col          = _detect_col(df_loaded, _TIER_CANDIDATES)
-            icp_col           = _detect_col(df_loaded, _ICP_CANDIDATES)
-            n                 = _count_companies(df_loaded, name_col)
-            ss_set(
-                _or_df_raw      = df_loaded,
-                _or_file_name   = fname,
-                _or_name_col    = name_col,
-                _or_domain_col  = domain_col,
-                _or_country_col = country_col,
-                _or_score_col   = score_col,
-                _or_tier_col    = tier_col,
-                _or_icp_col     = icp_col,
-                _or_n_companies = n,
-                _or_input_type  = input_type,
-                _or_input_bytes = _raw_bytes,
-            )
-        except Exception as exc:
-            ss_set(_or_file_error=str(exc))
+                import tomli as tomllib  # type: ignore[no-redef]
+            except ImportError:
+                return ""
+        p = pathlib.Path(__file__).parent / ".streamlit" / "secrets.toml"
+        if not p.exists():
+            return ""
+        try:
+            with open(p, "rb") as f:
+                data = tomllib.load(f)
+            return str(data.get(name, "") or "")
+        except Exception:
+            return ""
 
-if ss("_or_file_error"):
-    st.error(f"Could not read the file: {ss('_or_file_error')}")
-elif ss("_or_df_raw") is not None and not ss("_or_processing", False) and not ss("_or_done", False):
-    n          = ss("_or_n_companies", 0)
-    itype      = ss("_or_input_type", "")
-    itype_label = (
-        "enriched export detected" if itype == "enriched_export"
-        else "simple company list detected"
+    anthropic_key = (
+        cli_anthropic
+        or _os.environ.get("ANTHROPIC_API_KEY", "")
+        or _from_toml("ANTHROPIC_API_KEY")
+        or _from_toml("anthropic_api_key")
+        or ""
     )
-    st.success(
-        f"✓ **{ss('_or_file_name')}** loaded · "
-        f"{n:,} {'company' if n == 1 else 'companies'} ready · "
-        f"{itype_label}"
+    serper_key = (
+        cli_serper
+        or _os.environ.get("SERPER_API_KEY", "")
+        or _from_toml("SERPER_API_KEY")
+        or _from_toml("serper_api_key")
+        or ""
     )
+    return anthropic_key.strip(), serper_key.strip()
+
+
+def _append_opportunity_runlog(csv_path: pathlib.Path, row: dict) -> None:
+    """Append one row to the opportunity run log CSV."""
+    import csv as _csv
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "timestamp", "cohort", "batch_stem", "input_file", "output_file",
+        "mode", "max_rows", "rows_in_input", "rows_processed",
+        "api_calls_attempted", "api_calls_successful", "api_calls_failed",
+        "serper_key_loaded", "anthropic_key_loaded", "status", "error_message",
+    ]
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 # =============================================================================
-# API KEY STATUS
+# CLI ENTRY POINT
 # =============================================================================
 
-if not ss("_or_done", False):
-    if _keys_ok:
-        st.success("🔑 API keys detected: Serper and Claude ready")
-    else:
-        if not _serper_key:
-            st.error(
-                "Missing SERPER_API_KEY. "
-                "Opportunity Radar cannot search for company triggers without it. "
-                "Add it to .streamlit/secrets.toml."
-            )
-        if not _anthropic_key or not _ANTHROPIC_AVAILABLE:
-            st.error(
-                "Missing ANTHROPIC_API_KEY. "
-                "Opportunity Radar cannot interpret evidence without it. "
-                "Add it to .streamlit/secrets.toml."
-            )
+def run_cli() -> None:
+    """Non-Streamlit batch entry point for the Opportunity Radar."""
+    import argparse
 
-# =============================================================================
-# STEP 2 — START / PROCESSING LOOP
-# =============================================================================
-
-_ready      = ss("_or_df_raw") is not None and _keys_ok
-_processing = ss("_or_processing", False)
-_done       = ss("_or_done", False)
-
-if not _done and not _processing:
-    use_cache = st.checkbox(
-        "Use cached results when available",
-        value=ss("_or_force_refresh", False),
-        key="or_force_refresh_cb",
-        help=(
-            f"When checked, previously cached analysis may be reused. "
-            f"When unchecked (default), every company is re-fetched and re-analysed from scratch. "
-            f"Cache version: {CACHE_VERSION}"
-        ),
+    parser = argparse.ArgumentParser(
+        description="mYngle Opportunity Radar — CLI batch mode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ss_set(_or_force_refresh=use_cache)
-    mode_text = (
-        "Scan mode: cached results may be reused"
-        if ss("_or_force_refresh", False)
-        else "Scan mode: fresh search and fresh analysis"
+    parser.add_argument("--input",          required=True,  help="Path to prioritized .xlsx input")
+    parser.add_argument("--project-root",   default=None,   help="Pipeline project root folder")
+    parser.add_argument("--serper-key",     default=None,   help="Serper API key")
+    parser.add_argument("--anthropic-key",  default=None,   help="Anthropic API key")
+    parser.add_argument("--max-rows",       type=int, default=0, help="Process first N rows (0=all)")
+    parser.add_argument("--debug",          action="store_true", help="Enable debug output")
+    parser.add_argument("--dry-run-paths",  action="store_true", help="Print resolved paths and exit")
+    parser.add_argument("--force-fresh",    action="store_true", help="Bypass result cache")
+    args = parser.parse_args()
+
+    input_path = pathlib.Path(args.input).resolve()
+    if not input_path.exists():
+        print(f"ERROR: input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ts           = datetime.now().strftime("%Y%m%d_%H%M")
+    pl           = _resolve_opportunity_paths(str(input_path), args.project_root, ts=ts)
+    anthropic_key, serper_key = _load_cli_secrets(args.anthropic_key, args.serper_key)
+
+    print("[radar] CLI mode detected", flush=True)
+    print(f"[radar] Input:            {input_path}", flush=True)
+    print(f"[radar] Project root:     {pl['project_root']}", flush=True)
+    print(f"[radar] Cohort:           {pl['cohort']}", flush=True)
+    print(f"[radar] Batch stem:       {pl['batch_stem']}", flush=True)
+    print(f"[radar] Output file:      {pl['output_xlsx']}", flush=True)
+    print(f"[radar] Max rows:         {args.max_rows if args.max_rows > 0 else 'all'}", flush=True)
+    print(f"[radar] Debug:            {args.debug}", flush=True)
+    print(f"[radar] Force fresh:      {args.force_fresh}", flush=True)
+    print(f"[radar] Serper key:       {'loaded' if serper_key else 'missing'}", flush=True)
+    print(f"[radar] Anthropic key:    {'loaded' if anthropic_key else 'missing'}", flush=True)
+
+    if args.dry_run_paths:
+        out_dir  = pathlib.Path(pl["output_dir"])
+        logs_dir = pathlib.Path(pl["logs_dir"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[radar] --dry-run-paths results:")
+        print(f"  input exists:         {input_path.exists()}")
+        print(f"  project root exists:  {pathlib.Path(pl['project_root']).exists()}")
+        print(f"  cohort dir exists:    {pathlib.Path(pl['cohort_dir']).exists()}")
+        print(f"  output dir:           {pl['output_dir']}")
+        print(f"  run log:              {pl['run_log_csv']}")
+        print(f"  output dir ready:     True")
+        sys.exit(0)
+
+    # ── Load input ────────────────────────────────────────────────────────────
+    fname = input_path.name.lower()
+    df_in = pd.read_csv(input_path) if fname.endswith(".csv") else pd.read_excel(input_path)
+    if args.max_rows and args.max_rows > 0:
+        df_in = df_in.head(args.max_rows)
+
+    input_type  = _detect_input_type(df_in)
+    name_col    = _detect_col(df_in, _NAME_CANDIDATES)
+    domain_col  = _detect_col(df_in, _DOMAIN_CANDIDATES)
+    score_col   = _detect_col(df_in, _SCORE_CANDIDATES)
+    tier_col    = _detect_col(df_in, _TIER_CANDIDATES)
+    icp_col     = _detect_col(df_in, _ICP_CANDIDATES)
+    country_col = _detect_col(df_in, _COUNTRY_CANDIDATES)
+
+    print(f"[radar] Rows to process:  {len(df_in)}", flush=True)
+    print(f"[radar] Input type:       {input_type}", flush=True)
+    print(f"[radar] Name col:         {name_col}", flush=True)
+    print(f"[radar] Domain col:       {domain_col}", flush=True)
+
+    if not name_col:
+        print("ERROR: could not detect company name column.", file=sys.stderr)
+        sys.exit(1)
+
+    company_list = _build_company_list(
+        df_in, name_col, domain_col, country_col, score_col, tier_col, icp_col,
+        input_type=input_type,
     )
-    st.caption(mode_text)
+    n_total = len(company_list)
 
-    _col_a, _col_b = st.columns([3, 2])
-    with _col_a:
-        autosave_cb = st.checkbox(
-            "Autosave results to Downloads",
-            value=ss("_or_autosave", True),
-            key="or_autosave_cb",
-        )
-        ss_set(_or_autosave=autosave_cb)
-    with _col_b:
-        chk_n_val = st.number_input(
-            "Checkpoint every N companies",
-            min_value=1, max_value=50,
-            value=int(ss("_or_checkpoint_n", 10)),
-            step=1, key="or_checkpoint_n_input",
-        )
-        ss_set(_or_checkpoint_n=int(chk_n_val))
+    # ── Build Anthropic client ────────────────────────────────────────────────
+    client = None
+    if anthropic_key and _ANTHROPIC_AVAILABLE:
+        try:
+            client = _anthropic_mod.Anthropic(api_key=anthropic_key)
+        except Exception as _ce:
+            print(f"[radar] Anthropic client error: {_ce}", flush=True)
 
-    if autosave_cb:
-        st.caption(f"Autosave destination: {_output_folder()}")
+    # ── Process companies ─────────────────────────────────────────────────────
+    results:      list = []
+    raw_sources:  list = []
+    n_api_att = n_api_ok = n_api_fail = 0
+    out_dir   = pathlib.Path(pl["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    partial_path = out_dir / f"{pl['batch_stem']}_opportunity_PARTIAL_{ts}.xlsx"
+    error_msg = ""
 
-    start_btn = st.button(
-        "▶ Start radar scan",
-        type="primary",
-        use_container_width=True,
-        disabled=not _ready,
-        key="or_start_btn",
-    )
+    try:
+        for i, company in enumerate(company_list, 1):
+            print(f"\r[radar] {i}/{n_total} — {str(company.get('name', ''))[:40]:<40}",
+                  end="", flush=True)
+            name   = company.get("name", "")
+            domain = company.get("domain", "")
 
-    if start_btn and _ready:
-        df_raw = ss("_or_df_raw")
-        company_list = _build_company_list(
-            df_raw,
-            ss("_or_name_col"),
-            ss("_or_domain_col"),
-            ss("_or_country_col"),
-            ss("_or_score_col"),
-            ss("_or_tier_col"),
-            ss("_or_icp_col"),
-            ss("_or_input_type", "simple_company_list"),
-        )
-        ss_set(
-            _or_processing     = True,
-            _or_done           = False,
-            _or_process_index  = 0,
-            _or_company_list   = company_list,
-            _or_results        = [],
-            _or_raw_sources    = [],
-            _or_excel_bytes    = None,
-            _or_stop           = False,
-            _or_scan_start_time = time.time(),
-        )
-        st.rerun()
-
-if _processing and not _done:
-    company_list = ss("_or_company_list", [])
-    results      = ss("_or_results", [])
-    raw_sources  = ss("_or_raw_sources", [])
-    idx          = ss("_or_process_index", 0)
-    n_total      = len(company_list)
-
-    # ── Stop button ───────────────────────────────────────────────────────────
-    if st.button("⏹ Stop", key="or_stop_btn"):
-        ss_set(_or_stop=True)
-
-    if ss("_or_stop", False):
-        ss_set(_or_processing=False, _or_done=True)
-        st.rerun()
-
-    # ── Progress display ──────────────────────────────────────────────────────
-    if n_total:
-        frac = idx / n_total if n_total else 0
-        st.progress(frac)
-        st.markdown("**Scanning opportunities…**")
-
-        if idx < n_total:
-            current_name = (
-                company_list[idx].get("company_name")
-                or company_list[idx].get("domain", "")
-            )
-            st.caption(f"Company {idx + 1} of {n_total}: {current_name}")
-
-        scan_start = ss("_or_scan_start_time")
-        if scan_start:
-            elapsed_sec = time.time() - scan_start
-            elapsed_str = time.strftime("%M:%S", time.gmtime(int(elapsed_sec)))
-            st.caption(f"Elapsed: {elapsed_str}")
-            completed = idx  # companies fully processed so far
-            if completed >= 2 and n_total > idx:
-                avg_sec        = elapsed_sec / completed
-                remaining_sec  = (n_total - idx) * avg_sec
-                remaining_str  = time.strftime("%M:%S", time.gmtime(int(remaining_sec)))
-                ready_time     = datetime.now() + timedelta(seconds=remaining_sec)
-                ready_str      = ready_time.strftime("%H:%M")
-                st.caption(f"Estimated remaining: {remaining_str}")
-                st.caption(f"Estimated ready around: {ready_str}")
-            elif idx < n_total:
-                st.caption("Estimating time remaining…")
-
-        # Show latest checkpoint status
-        chk_path = ss("_or_last_checkpoint_path")
-        chk_count = ss("_or_last_checkpoint_count")
-        if chk_path and chk_count:
-            st.caption(
-                f"Latest checkpoint saved after {chk_count} companies: {chk_path}"
-            )
-
-    # ── Process one company ───────────────────────────────────────────────────
-    if idx < n_total:
-        company     = company_list[idx]
-        name        = company.get("company_name", "")
-        domain      = company.get("domain", "")
-        country     = company.get("country", "")
-        fit_score   = company.get("fit_score", "")
-        tier        = company.get("tier", "")
-        icp_ev      = company.get("icp_evidence", "")
-        c_itype     = company.get("input_type", "simple_company_list")
-        c_fit_avail = company.get("commercial_fit_available", False)
-        is_internal = company.get("internal", False)
-
-        enriched_row = company.get("enriched_row", {})
-
-        if is_internal:
-            # Mark without any research
-            record = {
-                "company_name":             name,
-                "domain":                   domain,
-                "country":                  country,
-                "fit_score":                "",
-                "tier":                     "",
-                "input_type":               c_itype,
-                "commercial_fit_available": False,
-                "claude": {
-                    **_EMPTY_CLAUDE_RESULT,
-                    "why_now": "Internal / exclude",
-                    "trigger_evidence": "Internal company — excluded from radar.",
-                },
-                "scores": {
-                    "trigger_score":       0,
-                    "buying_window_score": 0,
-                    "contact_route_score": 0,
-                    "opportunity_score":   0,
-                    "call_recommendation": "Internal / exclude",
-                },
-                "enriched_row": enriched_row,
-            }
-            results.append(record)
-        else:
-            # Check cache — only use if "Use cached results" is checked
-            use_cache = ss("_or_force_refresh", False)
-            cached = _cache_load(name, domain, c_itype) if use_cache else None
-            if cached is not None:
-                # Enforce correct fit data for this input type
-                cached["input_type"]              = c_itype
-                cached["commercial_fit_available"] = c_fit_avail
-                if c_itype == "simple_company_list":
-                    # Strip any enriched fit values that crept into the cache
-                    cached["fit_score"] = ""
-                    cached["tier"]      = ""
-                # Reattach enriched_row (not stored in cache)
-                cached["enriched_row"] = enriched_row
-                # Re-apply window adjustment and recompute scores (in case window aged)
-                adj_claude, fresh_scores = _compute_scores(
-                    cached.get("claude", {}),
-                    cached.get("fit_score", ""),
-                    cached.get("tier", ""),
-                    c_itype,
-                    icp_evidence=icp_ev,
-                    company_name=name,
-                )
-                cached["claude"] = adj_claude
-                cached["scores"] = fresh_scores
+            # Cache check
+            cached = None if args.force_fresh else _cache_load(name, domain, input_type)
+            if cached:
                 results.append(cached)
-                # Restore raw sources stored in cache (if any)
-                raw_sources.extend(cached.get("raw_sources", []))
-            else:
-                # Run Serper searches
-                grouped_results = _run_searches(name or domain, domain, _serper_key)
-                sources         = _collect_raw_sources(name, grouped_results, c_itype)
+                raw_sources.extend(cached.get("_raw_sources", []))
+                continue
 
-                # Call Claude
-                client = _anthropic_mod.Anthropic(api_key=_anthropic_key)
-                raw_claude = _call_claude(
-                    name, domain, country, fit_score, tier, icp_ev,
-                    grouped_results, client,
+            # Serper searches
+            grouped: dict = {}
+            if serper_key:
+                try:
+                    grouped = _run_searches(name, domain, serper_key)
+                    n_api_att += 1
+                    n_api_ok  += 1
+                except Exception as _se:
+                    n_api_att  += 1
+                    n_api_fail += 1
+                    if args.debug:
+                        print(f"\n[radar] Serper error {name}: {_se}", flush=True)
+
+            company_raw_sources = _collect_raw_sources(name, grouped, input_type)
+
+            # Claude analysis
+            claude_result: dict = {}
+            if client:
+                try:
+                    claude_result = _call_claude(
+                        name=name,
+                        domain=domain,
+                        country=company.get("country", ""),
+                        fit_score=str(company.get("fit_score", "") or ""),
+                        tier=str(company.get("tier", "") or ""),
+                        icp_evidence=str(company.get("icp_evidence", "") or ""),
+                        grouped_results=grouped,
+                        client=client,
+                    )
+                    n_api_att += 1
+                    n_api_ok  += 1
+                except Exception as _ce:
+                    n_api_att  += 1
+                    n_api_fail += 1
+                    if args.debug:
+                        print(f"\n[radar] Claude error {name}: {_ce}", flush=True)
+
+            # Scores + fallbacks
+            adj, scores = _compute_scores(
+                claude_result,
+                fit_score_raw  = company.get("fit_score"),
+                tier_raw       = company.get("tier", ""),
+                input_type     = input_type,
+                icp_evidence   = str(company.get("icp_evidence", "") or ""),
+                company_name   = name,
+            )
+            row_out = {
+                **adj,
+                **scores,
+                "company_name": name,
+                "domain":       domain,
+                "country":      company.get("country", ""),
+                "fit_score":    company.get("fit_score", ""),
+                "tier":         company.get("tier", ""),
+                "icp_evidence": company.get("icp_evidence", ""),
+                "input_type":   input_type,
+                "commercial_fit_available": input_type == "enriched_export",
+                "_raw_sources": company_raw_sources,
+            }
+            _cache_save(name, domain, input_type, row_out)
+            results.append(row_out)
+            raw_sources.extend(company_raw_sources)
+
+        print(f"\n[radar] Processing complete — {len(results)}/{n_total}.", flush=True)
+
+    except KeyboardInterrupt:
+        print(f"\n[radar] Interrupted — saving partial output ({len(results)} rows).", flush=True)
+    except Exception as _exc:
+        error_msg = f"{type(_exc).__name__}: {_exc}"
+        print(f"\n[radar] Error: {error_msg}", flush=True)
+
+    # ── Write Excel ───────────────────────────────────────────────────────────
+    out_path = pathlib.Path("")
+    if results:
+        try:
+            xl_bytes = _build_excel_bytes(results, raw_sources)
+            is_partial = len(results) < n_total
+            out_path = partial_path if is_partial else out_dir / f"{pl['batch_stem']}_opportunity_{ts}.xlsx"
+            out_path.write_bytes(xl_bytes)
+            print(f"[radar] Saved: {out_path}", flush=True)
+        except Exception as _we:
+            print(f"[radar] Excel write error: {_we}", flush=True)
+            error_msg = error_msg or str(_we)
+    else:
+        print("[radar] No results — no output written.", flush=True)
+
+    # ── Run log ───────────────────────────────────────────────────────────────
+    _append_opportunity_runlog(
+        pathlib.Path(pl["run_log_csv"]),
+        {
+            "timestamp":           ts,
+            "cohort":              pl["cohort"],
+            "batch_stem":          pl["batch_stem"],
+            "input_file":          str(input_path),
+            "output_file":         str(out_path),
+            "mode":                "cli",
+            "max_rows":            args.max_rows if args.max_rows > 0 else "all",
+            "rows_in_input":       len(df_in),
+            "rows_processed":      len(results),
+            "api_calls_attempted": n_api_att,
+            "api_calls_successful":n_api_ok,
+            "api_calls_failed":    n_api_fail,
+            "serper_key_loaded":   bool(serper_key),
+            "anthropic_key_loaded":bool(anthropic_key),
+            "status":              "complete" if (len(results) == n_total and not error_msg) else "partial",
+            "error_message":       error_msg,
+        },
+    )
+    print(f"[radar] Run log: {pl['run_log_csv']}", flush=True)
+    print("[radar] Done.", flush=True)
+
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+CLAUDE_MODEL    = "claude-haiku-4-5-20251001"
+SERPER_URL      = "https://google.serper.dev/search"
+RADAR_CACHE_DIR = pathlib.Path("radar_cache")
+
+# Bump this string whenever the prompt or interpretation logic changes.
+# It is included in cache keys so old Claude outputs are never reused after a prompt update.
+CACHE_VERSION = "v3_myngle_20260608"
+
+# 5 query groups — one Serper call each
+QUERY_GROUPS = [
+    (
+        "Annual Report / Financial",
+        '"{name}" annual report fiscal year results revenue 2024 2025',
+    ),
+    (
+        "International Hiring / Growth",
+        '"{name}" hiring international careers jobs "new office" global expansion 2024 2025',
+    ),
+    (
+        "Language / Communication / L&D",
+        '"{name}" "language training" OR "business English" OR "communication training" '
+        'OR "learning and development" OR "talent development" OR training academy HR',
+    ),
+    (
+        "Sales / Customer Success Expansion",
+        '"{name}" "sales team" OR "customer success" OR "account management" '
+        'OR "sales enablement" OR "client-facing" international expansion',
+    ),
+    (
+        "M&A / Funding / Integration",
+        '"{name}" acquisition OR merger OR integration OR funding OR investment OR "private equity"',
+    ),
+]
+
+
+def run_streamlit_app() -> None:
+    _st = _get_st()
+
+    # =============================================================================
+    # PAGE CONFIG
+    # =============================================================================
+
+    _st.set_page_config(
+        page_title="mYngle · Opportunity Radar",
+        page_icon="📡",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
+    # =============================================================================
+    # HEADER  (logo + title — mirrors lead prioritizer layout exactly)
+    # =============================================================================
+
+    _logo_path = pathlib.Path(__file__).parent / "mingle_local_final_fixed.png"
+    _logo_src  = (
+        f"data:image/png;base64,{base64.b64encode(_logo_path.read_bytes()).decode()}"
+        if _logo_path.exists() else ""
+    )
+    _img_tag = (
+        f'<img src="{_logo_src}" class="brand-logo" alt="mYngle" />'
+        if _logo_src else ""
+    )
+
+    _st.markdown(
+        f"""
+        <style>
+        .block-container {{
+            max-width: 880px;
+            padding-top: 2.2rem;
+            padding-bottom: 3rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }}
+
+        div[data-testid="stMarkdownContainer"]:has(.brand-header) {{
+            overflow: visible !important;
+            margin-bottom: 1.0rem;
+        }}
+
+        .brand-header {{
+            display: grid;
+            grid-template-columns: 43% 57%;
+            align-items: center;
+            min-height: 140px;
+            padding-top: 10px;
+            padding-bottom: 6px;
+            overflow: visible !important;
+        }}
+
+        .brand-title-block {{
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            overflow: visible !important;
+        }}
+
+        .brand-title {{
+            font-size: 42px;
+            font-weight: 700;
+            color: #0B1F3A;
+            line-height: 1.1;
+            white-space: nowrap;
+            margin: 0;
+            padding: 0;
+        }}
+
+        .brand-logo-block {{
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            padding: 0;
+            line-height: 0;
+            overflow: visible !important;
+        }}
+
+        .brand-logo {{
+            width: 430px;
+            max-width: 100%;
+            height: auto;
+            display: block;
+            object-fit: contain;
+            object-position: center center;
+            overflow: visible !important;
+        }}
+        </style>
+
+        <div class="brand-header">
+          <div class="brand-title-block">
+            <span class="brand-title">Opportunity Radar</span>
+          </div>
+          <div class="brand-logo-block">
+            {_img_tag}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # STEP 1 — UPLOAD
+    # =============================================================================
+
+    _st.divider()
+    _st.subheader("Step 1 · Upload your file")
+    _st.caption(
+        "Upload a Lead Prioritizer export, an Opportunity Input sheet, "
+        "or a simple company list with company name and website."
+    )
+
+    uploaded = _st.file_uploader(
+        "Drag and drop here, or click to browse  (.xlsx · .xls · .csv)",
+        type=["xlsx", "xls", "csv"],
+        label_visibility="collapsed",
+    )
+
+    new_key = f"{uploaded.name}___{uploaded.size}" if uploaded else "__none__"
+    if new_key != ss("_or_file_key", "__none__"):
+        ss_set(
+            _or_file_key      = new_key,
+            _or_df_raw        = None,
+            _or_file_name     = None,
+            _or_file_error    = None,
+            _or_name_col      = None,
+            _or_domain_col    = None,
+            _or_country_col   = None,
+            _or_score_col     = None,
+            _or_tier_col      = None,
+            _or_icp_col       = None,
+            _or_n_companies   = 0,
+            _or_input_type    = None,
+            _or_processing    = False,
+            _or_done          = False,
+            _or_process_index = 0,
+            _or_company_list  = None,
+            _or_results       = None,
+            _or_raw_sources   = None,
+            _or_excel_bytes   = None,
+            _or_stop          = False,
+        )
+        if uploaded is not None:
+            try:
+                fname             = uploaded.name
+                # Capture raw bytes before _load_df_from_upload consumes the file
+                try:
+                    uploaded.seek(0)
+                    _raw_bytes = uploaded.read()
+                    uploaded.seek(0)
+                except Exception:
+                    _raw_bytes = None
+                df_loaded, sheet  = _load_df_from_upload(uploaded)
+                input_type        = _detect_input_type(df_loaded)
+                name_col          = _detect_col(df_loaded, _NAME_CANDIDATES)
+                domain_col        = _detect_col(df_loaded, _DOMAIN_CANDIDATES)
+                country_col       = _detect_col(df_loaded, _COUNTRY_CANDIDATES)
+                score_col         = _detect_col(df_loaded, _SCORE_CANDIDATES)
+                tier_col          = _detect_col(df_loaded, _TIER_CANDIDATES)
+                icp_col           = _detect_col(df_loaded, _ICP_CANDIDATES)
+                n                 = _count_companies(df_loaded, name_col)
+                ss_set(
+                    _or_df_raw      = df_loaded,
+                    _or_file_name   = fname,
+                    _or_name_col    = name_col,
+                    _or_domain_col  = domain_col,
+                    _or_country_col = country_col,
+                    _or_score_col   = score_col,
+                    _or_tier_col    = tier_col,
+                    _or_icp_col     = icp_col,
+                    _or_n_companies = n,
+                    _or_input_type  = input_type,
+                    _or_input_bytes = _raw_bytes,
+                )
+            except Exception as exc:
+                ss_set(_or_file_error=str(exc))
+
+    if ss("_or_file_error"):
+        _st.error(f"Could not read the file: {ss('_or_file_error')}")
+    elif ss("_or_df_raw") is not None and not ss("_or_processing", False) and not ss("_or_done", False):
+        n          = ss("_or_n_companies", 0)
+        itype      = ss("_or_input_type", "")
+        itype_label = (
+            "enriched export detected" if itype == "enriched_export"
+            else "simple company list detected"
+        )
+        _st.success(
+            f"✓ **{ss('_or_file_name')}** loaded · "
+            f"{n:,} {'company' if n == 1 else 'companies'} ready · "
+            f"{itype_label}"
+        )
+
+    # =============================================================================
+    # API KEY STATUS
+    # =============================================================================
+
+    if not ss("_or_done", False):
+        if _keys_ok:
+            _st.success("🔑 API keys detected: Serper and Claude ready")
+        else:
+            if not _serper_key:
+                _st.error(
+                    "Missing SERPER_API_KEY. "
+                    "Opportunity Radar cannot search for company triggers without it. "
+                    "Add it to .streamlit/secrets.toml."
+                )
+            if not _anthropic_key or not _ANTHROPIC_AVAILABLE:
+                _st.error(
+                    "Missing ANTHROPIC_API_KEY. "
+                    "Opportunity Radar cannot interpret evidence without it. "
+                    "Add it to .streamlit/secrets.toml."
                 )
 
-                # Adjust window + compute scores; formula depends on input type
-                adj_claude, scores = _compute_scores(
-                    raw_claude, fit_score, tier, c_itype,
-                    icp_evidence=icp_ev, company_name=name,
+    # =============================================================================
+    # STEP 2 — START / PROCESSING LOOP
+    # =============================================================================
+
+    _ready      = ss("_or_df_raw") is not None and _keys_ok
+    _processing = ss("_or_processing", False)
+    _done       = ss("_or_done", False)
+
+    if not _done and not _processing:
+        use_cache = _st.checkbox(
+            "Use cached results when available",
+            value=ss("_or_force_refresh", False),
+            key="or_force_refresh_cb",
+            help=(
+                f"When checked, previously cached analysis may be reused. "
+                f"When unchecked (default), every company is re-fetched and re-analysed from scratch. "
+                f"Cache version: {CACHE_VERSION}"
+            ),
+        )
+        ss_set(_or_force_refresh=use_cache)
+        mode_text = (
+            "Scan mode: cached results may be reused"
+            if ss("_or_force_refresh", False)
+            else "Scan mode: fresh search and fresh analysis"
+        )
+        _st.caption(mode_text)
+
+        _col_a, _col_b = _st.columns([3, 2])
+        with _col_a:
+            autosave_cb = _st.checkbox(
+                "Autosave results to Downloads",
+                value=ss("_or_autosave", True),
+                key="or_autosave_cb",
+            )
+            ss_set(_or_autosave=autosave_cb)
+        with _col_b:
+            chk_n_val = _st.number_input(
+                "Checkpoint every N companies",
+                min_value=1, max_value=50,
+                value=int(ss("_or_checkpoint_n", 10)),
+                step=1, key="or_checkpoint_n_input",
+            )
+            ss_set(_or_checkpoint_n=int(chk_n_val))
+
+        if autosave_cb:
+            _st.caption(f"Autosave destination: {_output_folder()}")
+
+        start_btn = _st.button(
+            "▶ Start radar scan",
+            type="primary",
+            use_container_width=True,
+            disabled=not _ready,
+            key="or_start_btn",
+        )
+
+        if start_btn and _ready:
+            df_raw = ss("_or_df_raw")
+            company_list = _build_company_list(
+                df_raw,
+                ss("_or_name_col"),
+                ss("_or_domain_col"),
+                ss("_or_country_col"),
+                ss("_or_score_col"),
+                ss("_or_tier_col"),
+                ss("_or_icp_col"),
+                ss("_or_input_type", "simple_company_list"),
+            )
+            ss_set(
+                _or_processing     = True,
+                _or_done           = False,
+                _or_process_index  = 0,
+                _or_company_list   = company_list,
+                _or_results        = [],
+                _or_raw_sources    = [],
+                _or_excel_bytes    = None,
+                _or_stop           = False,
+                _or_scan_start_time = time.time(),
+            )
+            _st.rerun()
+
+    if _processing and not _done:
+        company_list = ss("_or_company_list", [])
+        results      = ss("_or_results", [])
+        raw_sources  = ss("_or_raw_sources", [])
+        idx          = ss("_or_process_index", 0)
+        n_total      = len(company_list)
+
+        # ── Stop button ───────────────────────────────────────────────────────────
+        if _st.button("⏹ Stop", key="or_stop_btn"):
+            ss_set(_or_stop=True)
+
+        if ss("_or_stop", False):
+            ss_set(_or_processing=False, _or_done=True)
+            _st.rerun()
+
+        # ── Progress display ──────────────────────────────────────────────────────
+        if n_total:
+            frac = idx / n_total if n_total else 0
+            _st.progress(frac)
+            _st.markdown("**Scanning opportunities…**")
+
+            if idx < n_total:
+                current_name = (
+                    company_list[idx].get("company_name")
+                    or company_list[idx].get("domain", "")
+                )
+                _st.caption(f"Company {idx + 1} of {n_total}: {current_name}")
+
+            scan_start = ss("_or_scan_start_time")
+            if scan_start:
+                elapsed_sec = time.time() - scan_start
+                elapsed_str = time.strftime("%M:%S", time.gmtime(int(elapsed_sec)))
+                _st.caption(f"Elapsed: {elapsed_str}")
+                completed = idx  # companies fully processed so far
+                if completed >= 2 and n_total > idx:
+                    avg_sec        = elapsed_sec / completed
+                    remaining_sec  = (n_total - idx) * avg_sec
+                    remaining_str  = time.strftime("%M:%S", time.gmtime(int(remaining_sec)))
+                    ready_time     = datetime.now() + timedelta(seconds=remaining_sec)
+                    ready_str      = ready_time.strftime("%H:%M")
+                    _st.caption(f"Estimated remaining: {remaining_str}")
+                    _st.caption(f"Estimated ready around: {ready_str}")
+                elif idx < n_total:
+                    _st.caption("Estimating time remaining…")
+
+            # Show latest checkpoint status
+            chk_path = ss("_or_last_checkpoint_path")
+            chk_count = ss("_or_last_checkpoint_count")
+            if chk_path and chk_count:
+                _st.caption(
+                    f"Latest checkpoint saved after {chk_count} companies: {chk_path}"
                 )
 
-                # For simple lists: never carry commercial fit values
-                out_fit_score = fit_score if c_itype == "enriched_export" else ""
-                out_tier      = tier      if c_itype == "enriched_export" else ""
+        # ── Process one company ───────────────────────────────────────────────────
+        if idx < n_total:
+            company     = company_list[idx]
+            name        = company.get("company_name", "")
+            domain      = company.get("domain", "")
+            country     = company.get("country", "")
+            fit_score   = company.get("fit_score", "")
+            tier        = company.get("tier", "")
+            icp_ev      = company.get("icp_evidence", "")
+            c_itype     = company.get("input_type", "simple_company_list")
+            c_fit_avail = company.get("commercial_fit_available", False)
+            is_internal = company.get("internal", False)
 
+            enriched_row = company.get("enriched_row", {})
+
+            if is_internal:
+                # Mark without any research
                 record = {
                     "company_name":             name,
                     "domain":                   domain,
                     "country":                  country,
-                    "fit_score":                out_fit_score,
-                    "tier":                     out_tier,
+                    "fit_score":                "",
+                    "tier":                     "",
                     "input_type":               c_itype,
-                    "commercial_fit_available": c_fit_avail,
-                    "claude":                   adj_claude,
-                    "scores":                   scores,
-                    "raw_sources":              sources,
-                    "enriched_row":             enriched_row,
+                    "commercial_fit_available": False,
+                    "claude": {
+                        **_EMPTY_CLAUDE_RESULT,
+                        "why_now": "Internal / exclude",
+                        "trigger_evidence": "Internal company — excluded from radar.",
+                    },
+                    "scores": {
+                        "trigger_score":       0,
+                        "buying_window_score": 0,
+                        "contact_route_score": 0,
+                        "opportunity_score":   0,
+                        "call_recommendation": "Internal / exclude",
+                    },
+                    "enriched_row": enriched_row,
                 }
-                _cache_save(name, domain, c_itype, record)
                 results.append(record)
-                raw_sources.extend(sources)
+            else:
+                # Check cache — only use if "Use cached results" is checked
+                use_cache = ss("_or_force_refresh", False)
+                cached = _cache_load(name, domain, c_itype) if use_cache else None
+                if cached is not None:
+                    # Enforce correct fit data for this input type
+                    cached["input_type"]              = c_itype
+                    cached["commercial_fit_available"] = c_fit_avail
+                    if c_itype == "simple_company_list":
+                        # Strip any enriched fit values that crept into the cache
+                        cached["fit_score"] = ""
+                        cached["tier"]      = ""
+                    # Reattach enriched_row (not stored in cache)
+                    cached["enriched_row"] = enriched_row
+                    # Re-apply window adjustment and recompute scores (in case window aged)
+                    adj_claude, fresh_scores = _compute_scores(
+                        cached.get("claude", {}),
+                        cached.get("fit_score", ""),
+                        cached.get("tier", ""),
+                        c_itype,
+                        icp_evidence=icp_ev,
+                        company_name=name,
+                    )
+                    cached["claude"] = adj_claude
+                    cached["scores"] = fresh_scores
+                    results.append(cached)
+                    # Restore raw sources stored in cache (if any)
+                    raw_sources.extend(cached.get("raw_sources", []))
+                else:
+                    # Run Serper searches
+                    grouped_results = _run_searches(name or domain, domain, _serper_key)
+                    sources         = _collect_raw_sources(name, grouped_results, c_itype)
 
-        new_idx = idx + 1
-        ss_set(
-            _or_results       = results,
-            _or_raw_sources   = raw_sources,
-            _or_process_index = new_idx,
+                    # Call Claude
+                    client = _anthropic_mod.Anthropic(api_key=_anthropic_key)
+                    raw_claude = _call_claude(
+                        name, domain, country, fit_score, tier, icp_ev,
+                        grouped_results, client,
+                    )
+
+                    # Adjust window + compute scores; formula depends on input type
+                    adj_claude, scores = _compute_scores(
+                        raw_claude, fit_score, tier, c_itype,
+                        icp_evidence=icp_ev, company_name=name,
+                    )
+
+                    # For simple lists: never carry commercial fit values
+                    out_fit_score = fit_score if c_itype == "enriched_export" else ""
+                    out_tier      = tier      if c_itype == "enriched_export" else ""
+
+                    record = {
+                        "company_name":             name,
+                        "domain":                   domain,
+                        "country":                  country,
+                        "fit_score":                out_fit_score,
+                        "tier":                     out_tier,
+                        "input_type":               c_itype,
+                        "commercial_fit_available": c_fit_avail,
+                        "claude":                   adj_claude,
+                        "scores":                   scores,
+                        "raw_sources":              sources,
+                        "enriched_row":             enriched_row,
+                    }
+                    _cache_save(name, domain, c_itype, record)
+                    results.append(record)
+                    raw_sources.extend(sources)
+
+            new_idx = idx + 1
+            ss_set(
+                _or_results       = results,
+                _or_raw_sources   = raw_sources,
+                _or_process_index = new_idx,
+            )
+
+            # ── Checkpoint autosave ───────────────────────────────────────────────
+            if ss("_or_autosave", True):
+                chk_n = ss("_or_checkpoint_n", 10)
+                if new_idx > 0 and new_idx % chk_n == 0:
+                    try:
+                        chk_bytes = _build_excel_bytes(results, raw_sources,
+                                                       input_bytes=ss("_or_input_bytes"))
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        chk_name = (
+                            f"opportunity_radar_checkpoint_{ts}_after_{new_idx:03d}.xlsx"
+                        )
+                        chk_path = _autosave_excel(chk_bytes, chk_name)
+                        ss_set(
+                            _or_last_checkpoint_path=str(chk_path),
+                            _or_last_checkpoint_count=new_idx,
+                        )
+                    except Exception:
+                        pass  # never block the scan on a save failure
+
+            _st.rerun()
+
+        else:
+            # All companies processed
+            ss_set(_or_processing=False, _or_done=True)
+            _st.rerun()
+
+    # =============================================================================
+    # STEP 3 — RESULTS + DOWNLOAD
+    # =============================================================================
+
+    if _done:
+        results     = ss("_or_results", [])
+        raw_sources = ss("_or_raw_sources", [])
+        processed   = len(results)
+        n           = ss("_or_n_companies", 0)
+
+        scan_start = ss("_or_scan_start_time")
+        avg_note = ""
+        if scan_start and processed > 0:
+            total_sec = time.time() - scan_start
+            avg_sec   = total_sec / processed
+            avg_note  = f" · avg {avg_sec:.0f} s/company"
+
+        _st.success(
+            f"✅ Ready · **{processed:,}** "
+            f"{'company' if processed == 1 else 'companies'} scanned{avg_note}"
         )
 
-        # ── Checkpoint autosave ───────────────────────────────────────────────
-        if ss("_or_autosave", True):
-            chk_n = ss("_or_checkpoint_n", 10)
-            if new_idx > 0 and new_idx % chk_n == 0:
-                try:
-                    chk_bytes = _build_excel_bytes(results, raw_sources,
-                                                   input_bytes=ss("_or_input_bytes"))
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    chk_name = (
-                        f"opportunity_radar_checkpoint_{ts}_after_{new_idx:03d}.xlsx"
-                    )
-                    chk_path = _autosave_excel(chk_bytes, chk_name)
-                    ss_set(
-                        _or_last_checkpoint_path=str(chk_path),
-                        _or_last_checkpoint_count=new_idx,
-                    )
-                except Exception:
-                    pass  # never block the scan on a save failure
+        # Build Excel once, cache bytes in session state
+        if ss("_or_excel_bytes") is None:
+            ss_set(_or_excel_bytes=_build_excel_bytes(results, raw_sources,
+                                                       input_bytes=ss("_or_input_bytes")))
 
-        st.rerun()
+        # Final autosave — runs once per completed scan
+        if ss("_or_autosave", True) and ss("_or_final_autosave_path") is None:
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                final_name = f"opportunity_radar_autosave_{ts}.xlsx"
+                final_path = _autosave_excel(ss("_or_excel_bytes"), final_name)
+                ss_set(_or_final_autosave_path=str(final_path))
+            except Exception:
+                pass  # autosave failure never blocks download
 
+        if ss("_or_final_autosave_path"):
+            _st.caption(f"Final autosave saved: {ss('_or_final_autosave_path')}")
+
+        _st.download_button(
+            label="⬇ Download opportunity radar",
+            data=ss("_or_excel_bytes"),
+            file_name=f"opportunity_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary",
+        )
+
+        _st.divider()
+        if _st.button("↺ Start a new radar scan", use_container_width=True, key="or_restart_btn"):
+            reset()
+            _st.rerun()
+
+
+
+if __name__ == "__main__":
+    if cli_args_present():
+        run_cli()
+    elif running_under_streamlit():
+        run_streamlit_app()
     else:
-        # All companies processed
-        ss_set(_or_processing=False, _or_done=True)
-        st.rerun()
-
-# =============================================================================
-# STEP 3 — RESULTS + DOWNLOAD
-# =============================================================================
-
-if _done:
-    results     = ss("_or_results", [])
-    raw_sources = ss("_or_raw_sources", [])
-    processed   = len(results)
-    n           = ss("_or_n_companies", 0)
-
-    scan_start = ss("_or_scan_start_time")
-    avg_note = ""
-    if scan_start and processed > 0:
-        total_sec = time.time() - scan_start
-        avg_sec   = total_sec / processed
-        avg_note  = f" · avg {avg_sec:.0f} s/company"
-
-    st.success(
-        f"✅ Ready · **{processed:,}** "
-        f"{'company' if processed == 1 else 'companies'} scanned{avg_note}"
-    )
-
-    # Build Excel once, cache bytes in session state
-    if ss("_or_excel_bytes") is None:
-        ss_set(_or_excel_bytes=_build_excel_bytes(results, raw_sources,
-                                                   input_bytes=ss("_or_input_bytes")))
-
-    # Final autosave — runs once per completed scan
-    if ss("_or_autosave", True) and ss("_or_final_autosave_path") is None:
-        try:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            final_name = f"opportunity_radar_autosave_{ts}.xlsx"
-            final_path = _autosave_excel(ss("_or_excel_bytes"), final_name)
-            ss_set(_or_final_autosave_path=str(final_path))
-        except Exception:
-            pass  # autosave failure never blocks download
-
-    if ss("_or_final_autosave_path"):
-        st.caption(f"Final autosave saved: {ss('_or_final_autosave_path')}")
-
-    st.download_button(
-        label="⬇ Download opportunity radar",
-        data=ss("_or_excel_bytes"),
-        file_name=f"opportunity_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
-    )
-
-    st.divider()
-    if st.button("↺ Start a new radar scan", use_container_width=True, key="or_restart_btn"):
-        reset()
-        st.rerun()
+        run_cli()
