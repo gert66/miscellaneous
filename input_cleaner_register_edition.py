@@ -6058,25 +6058,89 @@ def _classify_hrm_signals(
     found_signals: list[str] = []
     career_found = False
 
-    # career_page only counts if URL is from the official domain or explicitly career-related
+    # career_page_found requires BOTH: keyword match AND URL from the official domain
     _evidence_urls_low = [u.lower() for u in (evidence_urls or [])]
-    _career_url_signals = ("karriere", "career", "jobs", "stellenangebote", "ausbildung",
-                           "lavora-con-noi", "posizioni-aperte", "carriere")
-    _career_from_official = (
-        any(official_domain and official_domain in u for u in _evidence_urls_low)
-        or any(sig in u for u in _evidence_urls_low for sig in _career_url_signals)
-    ) if official_domain or _evidence_urls_low else False
+    _career_path_signals = ("karriere", "/career", "/jobs", "stellenangebote", "ausbildung",
+                            "lavora-con-noi", "posizioni-aperte", "/carriere", "/careers")
+    _official_domain_low = (official_domain or "").lower()
+    _career_from_official = False
+    if _official_domain_low and _evidence_urls_low:
+        for _eu in _evidence_urls_low:
+            # URL must be from the official domain
+            _eu_domain = _extract_domain(_eu)
+            _on_official = _eu_domain and (
+                _eu_domain == _official_domain_low
+                or _eu_domain.endswith("." + _official_domain_low)
+                or _official_domain_low.endswith("." + _eu_domain)
+            )
+            if _on_official:
+                # And URL path or domain must signal career/jobs page
+                if any(sig in _eu for sig in _career_path_signals):
+                    _career_from_official = True
+                    break
+                # Or the homepage itself (if on official domain and career keywords in text)
+                _career_from_official = True  # on official domain = at least trusted
+                break
 
     for keywords, pts, label in signals_def:
         if any(kw in combined for kw in keywords):
             score += pts
             found_signals.append(label)
             if label == "career_page":
-                # career_page only sets career_found if URL is domain-anchored
                 career_found = _career_from_official
 
     score = min(score, 10)
     return score, ",".join(found_signals), career_found
+
+
+# Hard-blocked source domains for size inference — media, app stores, music, lyrics sites
+_SIZE_INFERENCE_BLOCKED_DOMAINS: frozenset = frozenset({
+    "music.apple.com", "apple.com", "spotify.com", "youtube.com", "soundcloud.com",
+    "deezer.com", "tidal.com", "bandcamp.com", "genius.com", "azlyrics.com",
+    "lyrics.com", "musixmatch.com", "amazon.com", "amazon.de", "amazon.it",
+    "ebay.com", "ebay.de", "ebay.it", "facebook.com", "instagram.com",
+    "twitter.com", "x.com", "tiktok.com", "linkedin.com", "xing.com",
+    "reddit.com", "wikipedia.org", "wikidata.org",
+    "play.google.com", "apps.apple.com", "podcasts.apple.com",
+})
+
+
+def _is_allowed_size_source(
+    evidence_url: str,
+    company_name: str,
+    validated_domain: str,
+) -> bool:
+    """
+    Return True only if the evidence URL is a safe source for employee-size inference.
+    Rules:
+    - Allow if URL is from the validated company domain.
+    - Hard-reject known unrelated domains (music, media, stores, social).
+    - For any other domain: require company name words in the URL hostname.
+    """
+    if not evidence_url:
+        return False
+    ev_domain = _extract_domain(evidence_url.lower())
+    if not ev_domain:
+        return False
+    # Allow if it is the validated company domain
+    if validated_domain and (
+        ev_domain == validated_domain
+        or ev_domain.endswith("." + validated_domain)
+        or validated_domain.endswith("." + ev_domain)
+    ):
+        return True
+    # Hard-reject blocked domains and their subdomains
+    for blocked in _SIZE_INFERENCE_BLOCKED_DOMAINS:
+        if ev_domain == blocked or ev_domain.endswith("." + blocked):
+            return False
+    # For other domains: require company-name signal in the domain
+    _name_words = [w.lower() for w in (company_name or "").split() if len(w) > 3
+                   and w.lower() not in {"gmbh", "co.", "co", "kg", "und", "the", "and",
+                                         "srl", "spa", "snc", "sas", "etal", "italia"}]
+    if _name_words and any(w in ev_domain for w in _name_words):
+        return True
+    # Unknown domain with no name signal — reject
+    return False
 
 
 def _build_size_serper_queries(domain: str, country_config: "CountryConfig") -> list[str]:
@@ -6126,11 +6190,14 @@ def _infer_company_size(
     stop_reason = ""
 
     # Step 1: mine existing Serper/FC evidence already in corpus
+    # Only use existing_evidence_url if it comes from the validated domain
+    if evidence_url and not _is_allowed_size_source(evidence_url, company_name, domain):
+        evidence_url = ""  # discard unsafe pre-existing evidence URL
     size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
-    if size_info["band"] in (SIZE_100_PLUS_CONFIRMED,) and size_info["confidence"] == "high":
+    if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] == "high":
         stop_reason = "exact_count_from_existing_evidence"
 
-    # Step 2: fetch homepage if no strong signal yet and we have budget
+    # Step 2: Serper snippets — only from validated domain or company-identified pages
     if not stop_reason and serper_key:
         queries = _build_size_serper_queries(domain, country_config)
         gl = country_config.serper_gl
@@ -6144,43 +6211,38 @@ def _infer_company_size(
                 serper_used += 1
                 if _hits:
                     for hit in _hits[:3]:
-                        _hit_domain = _extract_domain(hit.get("link", "") or "")
-                        # Only accept hits from the validated company domain or clearly related pages
-                        _is_official = domain and _hit_domain and (
-                            _hit_domain == domain
-                            or _hit_domain.endswith("." + domain)
-                            or domain.endswith("." + _hit_domain)
-                        )
-                        # For cross-domain hits: only accept if company name appears in snippet/title
-                        _combined = ((hit.get("snippet") or "") + " " + (hit.get("title") or "")).lower()
-                        _name_low = company_name.lower()
-                        _name_words = [w for w in _name_low.split() if len(w) > 3]
-                        _name_in_snippet = any(w in _combined for w in _name_words) if _name_words else False
-                        if not _is_official and not _name_in_snippet:
-                            continue  # skip unrelated result
+                        _link = hit.get("link", "") or ""
+                        # Source-domain safety check
+                        if not _is_allowed_size_source(_link, company_name, domain):
+                            continue
                         snippet = (hit.get("snippet") or "") + " " + (hit.get("title") or "")
                         if snippet.strip():
                             text_corpus.append(snippet)
-                            if not evidence_url and hit.get("link"):
-                                evidence_url = hit["link"]
+                            if not evidence_url:
+                                evidence_url = _link
             except Exception:
                 pass
 
-        # Re-check after Serper evidence — require HIGH confidence from Serper alone
+        # After Serper: require HIGH confidence AND safe evidence URL
         size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
-        if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] == "high":
+        if (size_info["band"] == SIZE_100_PLUS_CONFIRMED
+                and size_info["confidence"] == "high"
+                and _is_allowed_size_source(evidence_url, company_name, domain)):
             stop_reason = "confirmed_from_serper_snippets"
 
-    # Step 3: fetch FC pages (homepage + 1 targeted page) if still no signal
+    # Step 3: FC pages — only from the validated company domain (domain is already validated)
     fc_budget_remaining = max_total_fc_pages - fc_pages_already_used
     size_fc_budget = min(max_size_fc_pages, fc_budget_remaining)
+    _fc_evidence_url = ""  # track FC-specific evidence URL separately
 
     if not stop_reason and size_fc_budget > 0 and fc_keys:
-        fc_urls_to_try = [f"https://{domain}"]
-        # add career page URL guess
         cc = country_config.country_code
         career_path = "/karriere" if cc == "DE" else "/lavora-con-noi"
-        fc_urls_to_try.append(f"https://{domain}{career_path}")
+        # Only fetch from the validated company domain — never from third-party URLs
+        fc_urls_to_try = [
+            f"https://{domain}",
+            f"https://{domain}{career_path}",
+        ]
 
         fc_key_list = fc_keys if isinstance(fc_keys, list) else [fc_keys]
         for fc_url in fc_urls_to_try[:size_fc_budget]:
@@ -6197,13 +6259,16 @@ def _infer_company_size(
                 page_text = _md or ""
                 if page_text:
                     text_corpus.append(page_text)
-                    if not evidence_url:
-                        evidence_url = fc_url
+                    if not _fc_evidence_url:
+                        _fc_evidence_url = fc_url  # FC URLs are always from validated domain
             except Exception:
                 fc_pages_for_size += 1  # count attempt
 
         result["firecrawl_used_for_size_inference"] = fc_pages_for_size > 0
-        # Re-check after FC
+        # Update evidence_url to FC source if FC found something (FC URLs are always trusted)
+        if _fc_evidence_url:
+            evidence_url = _fc_evidence_url
+        # Re-check after FC — FC pages are from official domain, so trust them
         size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
         if size_info["band"] in (SIZE_100_PLUS_CONFIRMED, SIZE_100_PLUS_LIKELY) and size_info["confidence"] != "none":
             stop_reason = "confirmed_from_firecrawl"
@@ -6211,28 +6276,26 @@ def _infer_company_size(
     if not stop_reason:
         stop_reason = "max_pages_reached" if (fc_pages_for_size >= size_fc_budget and size_fc_budget > 0) else "no_evidence_found"
 
-    # HRM signals
+    # Final source-safety check: if evidence_url is not from official domain, reset to SIZE_UNKNOWN
+    if not _is_allowed_size_source(evidence_url, company_name, domain):
+        size_info = {"band": SIZE_UNKNOWN, "confidence": "none", "estimate": "",
+                     "count_min": "", "count_max": "", "evidence_text": ""}
+        evidence_url = ""
+        stop_reason = "unsafe_or_unrelated_source"
+
+    # HRM signals — only score using text from trusted sources (FC pages from official domain)
+    # Use only the FC page text if available; otherwise skip HRM scoring to avoid false signals
+    _hrm_corpus = [_fc_evidence_url] if _fc_evidence_url else []
+    _hrm_texts = text_corpus if _fc_evidence_url else []
     hrm_score, hrm_signals, career_found = _classify_hrm_signals(
-        text_corpus,
+        _hrm_texts,
         country_config.country_code,
         official_domain=domain,
         evidence_urls=[evidence_url] if evidence_url else [],
     )
 
-    # Safety: SIZE_100_PLUS_CONFIRMED from Serper only is allowed only if evidence_url is from the official domain
     band = size_info["band"]
     confidence = size_info["confidence"]
-    if band == SIZE_100_PLUS_CONFIRMED and not result.get("firecrawl_used_for_size_inference"):
-        # Serper-only path: downgrade to LIKELY unless evidence is from official domain
-        _ev_domain = _extract_domain(evidence_url or "")
-        _is_ev_official = domain and _ev_domain and (
-            _ev_domain == domain
-            or _ev_domain.endswith("." + domain)
-            or domain.endswith("." + _ev_domain)
-        )
-        if not _is_ev_official:
-            band = SIZE_100_PLUS_LIKELY
-            confidence = "low"
 
     # Upgrade band based on HRM signals (size unknown but strong HRM signal → likely 100+)
     if band == SIZE_UNKNOWN and hrm_score >= 5:
@@ -6638,11 +6701,21 @@ def process_dataframe(
             res["size_inference_enabled"] = False
 
         # Clean NaN strings from output
-        for _k, _v in res.items():
+        for _k, _v in list(res.items()):
             if isinstance(_v, float) and (_v != _v):  # NaN check
                 res[_k] = ""
             elif isinstance(_v, str) and _v.lower() in ("nan", "none", "null"):
                 res[_k] = ""
+        # Ensure professional_site_level is always set when score exists
+        _pro_score = res.get("professional_site_score")
+        if _pro_score is not None and _pro_score != "" and not res.get("professional_site_level"):
+            try:
+                _s = int(_pro_score)
+                res["professional_site_level"] = (
+                    "strong" if _s >= 8 else "medium" if _s >= 5 else "weak" if _s >= 3 else "none"
+                )
+            except (ValueError, TypeError):
+                res["professional_site_level"] = "none"
 
         new_results.append(res)
 
@@ -7868,36 +7941,46 @@ def _build_fc_usage_fields(
                     _per_key[_klabel]["failures"] += 1
 
     # Purpose-split from per-row df columns (size_inference vs domain_verification)
+    # domain_verification pages = firecrawl_pages_fetched (set by the verifier path)
     dv_pages  = int(pd.to_numeric(enriched_df.get("firecrawl_pages_fetched",
         pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
-    si_pages  = int(pd.to_numeric(enriched_df.get("firecrawl_pages_used_for_size",
+    # size_inference pages = new FC fetches made during size inference
+    si_new    = int(pd.to_numeric(enriched_df.get("firecrawl_pages_used_for_size",
         pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
     si_reused = int(pd.to_numeric(enriched_df.get("firecrawl_size_inference_reused_pages",
         pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
-    si_new    = si_pages  # pages counted in size inference (FC was actually called)
+    # Total new pages = DV + SI new (reused pages cost 0 credits)
+    total_new_pages    = dv_pages + si_new
+    total_credits      = total_new_pages  # 1 credit per new fetched page
     # rows where size inference ran
     si_rows_col = enriched_df.get("firecrawl_used_for_size_inference", pd.Series(dtype=str))
     si_rows = int(si_rows_col.astype(str).str.lower().isin(["true","1"]).sum())
     fc_rows = int(fc_used.sum())
-    # batch_n
     _proc = len(enriched_df)
-    _avg_pages_processed = round(pages_total / _proc, 2) if _proc else 0.0
-    _avg_pages_fc_row    = round(pages_total / fc_rows, 2) if fc_rows else 0.0
-    _avg_pages_dv_row    = round(dv_pages    / fc_rows, 2) if fc_rows else 0.0
-    _avg_pages_si_row    = round(si_pages    / si_rows, 2) if si_rows else 0.0
+    _avg_pages_processed = round(total_credits / _proc, 2) if _proc else 0.0
+    _avg_pages_fc_row    = round(total_credits / fc_rows, 2) if fc_rows else 0.0
+    _avg_pages_dv_row    = round(dv_pages      / fc_rows, 2) if fc_rows else 0.0
+    _avg_pages_si_row    = round(si_new        / si_rows, 2) if si_rows else 0.0
 
     fields: dict = {
-        "firecrawl_pages_fetched_total":              pages_total,
-        "firecrawl_estimated_credits_used":           estimated_credits,
+        # ── Canonical totals ───────────────────────────────────────────────────
+        "firecrawl_total_pages_successful_new":       total_new_pages,
+        "firecrawl_total_estimated_credits":          total_credits,
         "firecrawl_credit_estimation_method":         credit_method,
-        "firecrawl_requests_attempted":               att if att > 0 else pages_total,
-        "firecrawl_requests_successful":              succ if att > 0 else pages_total,
+        # kept for backward compat with existing callers
+        "firecrawl_pages_fetched_total":              dv_pages,
+        "firecrawl_estimated_credits_used":           total_credits,
+        # ── Runtime health (request-level) ────────────────────────────────────
+        "firecrawl_requests_attempted":               att if att > 0 else total_new_pages,
+        "firecrawl_pages_successful":                 succ if att > 0 else total_new_pages,
         "firecrawl_requests_failed":                  failed if att > 0 else 0,
         "firecrawl_timeouts":                         timeouts,
         "firecrawl_exceptions":                       excepts,
         "firecrawl_key_failovers_total":              failovers,
         "firecrawl_keys_loaded":                      firecrawl_keys_loaded,
+        # ── Row-level counts (distinct from page counts) ──────────────────────
         "firecrawl_rows_attempted":                   fc_rows,
+        "firecrawl_rows_with_successful_page":        int(fc_dec.isin(["confirm","replace","replace_domain"]).sum()),
         "firecrawl_rows_confirmed":                   int(fc_dec.eq("confirm").sum()),
         "firecrawl_rows_uncertain":                   int(fc_dec.eq("uncertain").sum()),
         "firecrawl_rows_failed":                      int(fc_dec.isin(["failed", "error", "no_fetch"]).sum()),
@@ -7963,23 +8046,36 @@ def _xl_write_api_usage_summary(ws, run_meta: dict) -> None:
     _sec(ri, 1, "── Firecrawl ──")
     ri += 1
     _fc_fields = [
-        ("firecrawl_pages_fetched_total",     "Pages fetched"),
-        ("firecrawl_estimated_credits_used",  "Estimated credits used"),
-        ("firecrawl_credit_estimation_method","Credit estimation method"),
-        ("firecrawl_requests_attempted",      "Requests attempted"),
-        ("firecrawl_requests_successful",     "Requests successful"),
-        ("firecrawl_requests_failed",         "Requests failed"),
-        ("firecrawl_timeouts",                "Timeouts"),
-        ("firecrawl_exceptions",              "Exceptions"),
-        ("firecrawl_key_failovers_total",     "Key failovers (total)"),
-        ("firecrawl_keys_loaded",             "Keys loaded"),
-        ("firecrawl_rows_attempted",          "Rows attempted"),
-        ("firecrawl_rows_confirmed",          "Rows confirmed"),
-        ("firecrawl_rows_uncertain",          "Rows uncertain"),
-        ("firecrawl_rows_failed",             "Rows failed"),
+        ("firecrawl_total_estimated_credits",                 "Total estimated credits (DV + SI new pages)"),
+        ("firecrawl_credit_estimation_method",                "Credit estimation method"),
+        ("firecrawl_total_pages_successful_new",              "Total new pages fetched (DV + SI)"),
+        ("firecrawl_domain_verification_pages",               "Domain verification pages"),
+        ("firecrawl_domain_verification_estimated_credits",   "Domain verification estimated credits"),
+        ("firecrawl_size_inference_pages_new",                "Size inference pages (new fetches)"),
+        ("firecrawl_size_inference_reused_pages",             "Size inference pages (reused, 0 credits)"),
+        ("firecrawl_size_inference_estimated_credits",        "Size inference estimated credits"),
+        ("firecrawl_size_inference_rows",                     "Rows with size inference FC"),
+        ("firecrawl_avg_pages_per_processed_row",             "Avg pages / processed row"),
+        ("firecrawl_avg_pages_per_firecrawl_used_row",        "Avg pages / FC-used row"),
+        ("firecrawl_avg_pages_per_domain_verification_row",   "Avg pages / domain-verification row"),
+        ("firecrawl_avg_pages_per_size_inference_row",        "Avg pages / size-inference row"),
+        ("firecrawl_requests_attempted",                      "Requests attempted (runtime)"),
+        ("firecrawl_pages_successful",                        "Pages successful (runtime)"),
+        ("firecrawl_requests_failed",                         "Requests failed"),
+        ("firecrawl_timeouts",                                "Timeouts"),
+        ("firecrawl_exceptions",                              "Exceptions"),
+        ("firecrawl_key_failovers_total",                     "Key failovers (total)"),
+        ("firecrawl_keys_loaded",                             "Keys loaded"),
+        ("firecrawl_rows_attempted",                          "Rows attempted"),
+        ("firecrawl_rows_with_successful_page",               "Rows with successful page"),
+        ("firecrawl_rows_confirmed",                          "Rows confirmed (domain verification)"),
+        ("firecrawl_rows_uncertain",                          "Rows uncertain"),
+        ("firecrawl_rows_failed",                             "Rows failed"),
     ]
     for _key, _label in _fc_fields:
         val = run_meta.get(_key, "")
+        if val == "" and _key.startswith("firecrawl_avg"):
+            val = "0.00"
         _row(ri, _label, val)
         ri += 1
 
@@ -8000,30 +8096,40 @@ def _xl_write_api_usage_summary(ws, run_meta: dict) -> None:
     _sec(ri, 1, "── Serper ──")
     ri += 1
     _serper_fields = [
-        ("max_serper_queries",  "Max queries per company (setting)"),
+        ("serper_queries_total",                  "Queries total (actual API calls)"),
+        ("serper_avg_queries_per_processed_row",  "Avg queries / processed row"),
+        ("serper_avg_queries_per_serper_row",     "Avg queries / row where Serper ran"),
+        ("max_serper_queries",                    "Max queries per company (setting)"),
+        ("serper_key_present",                    "Serper key present"),
     ]
     for _key, _label in _serper_fields:
-        _row(ri, _label, run_meta.get(_key, ""))
+        val = run_meta.get(_key, "")
+        if val == "" and "avg" in _key:
+            val = "0.00"
+        _row(ri, _label, val)
         ri += 1
-    _row(ri, "Serper key present", run_meta.get("serper_key_present", ""))
-    ri += 1
 
-    # ── Haiku section ─────────────────────────────────────────────────────────
+    # ── Claude Haiku section ──────────────────────────────────────────────────
     ri += 1
     _sec(ri, 1, "── Claude Haiku ──")
     ri += 1
     _haiku_fields = [
-        ("rows_reviewed_by_haiku", "Rows reviewed by Haiku"),
-        ("haiku_accepted_python",  "Haiku accepted Python decision"),
-        ("haiku_replaced_python",  "Haiku replaced Python decision"),
-        ("haiku_rejected",         "Haiku rejected domain"),
-        ("haiku_uncertain",        "Haiku uncertain"),
-        ("haiku_mode",             "Haiku mode"),
-        ("haiku_model",            "Haiku model"),
-        ("anthropic_key_present",  "Anthropic key present"),
+        ("haiku_calls_total",               "Calls total"),
+        ("haiku_avg_calls_per_processed_row", "Avg calls / processed row"),
+        ("rows_reviewed_by_haiku",          "Rows reviewed by Haiku"),
+        ("haiku_accepted_python",           "Haiku accepted Python decision"),
+        ("haiku_replaced_python",           "Haiku replaced Python decision"),
+        ("haiku_rejected",                  "Haiku rejected domain"),
+        ("haiku_uncertain",                 "Haiku uncertain"),
+        ("haiku_mode",                      "Haiku mode"),
+        ("haiku_model",                     "Haiku model"),
+        ("anthropic_key_present",           "Anthropic key present"),
     ]
     for _key, _label in _haiku_fields:
-        _row(ri, _label, run_meta.get(_key, ""))
+        val = run_meta.get(_key, "")
+        if val == "" and "avg" in _key:
+            val = "0.00"
+        _row(ri, _label, val)
         ri += 1
 
     ws.row_dimensions[1].height = 18
@@ -8180,6 +8286,11 @@ def _build_run_meta(
         # ── Serper usage ──────────────────────────────────────────────────────
         "serper_queries_total":                serper_queries_total,
         "serper_avg_queries_per_processed_row": round(serper_queries_total / batch_n, 2) if batch_n else 0.0,
+        "serper_avg_queries_per_serper_row":   round(
+            serper_queries_total
+            / max(int(enriched_df.get("search_query_used", pd.Series(dtype=str)).astype(str)
+                      .str.strip().replace("", pd.NA).notna().sum()), 1), 2
+        ) if serper_queries_total else 0.0,
         # ── Haiku usage ───────────────────────────────────────────────────────
         "haiku_calls_total":                   n_haiku,
         "haiku_avg_calls_per_processed_row":   round(n_haiku / batch_n, 3) if batch_n else 0.0,
@@ -8519,32 +8630,31 @@ def _smoke_test_country_config() -> None:
 
 def _smoke_test_size_inference() -> None:
     """
-    Regression test: unrelated Apple Music / Headcount snippet must not produce
-    SIZE_100_PLUS_CONFIRMED for 'Global Holding GmbH & Co. KG'.
+    Regression tests for size inference safety.
+    - Apple Music / Headcount false positive must be blocked.
+    - German commercial legal forms must be classified correctly.
+    - Firecrawl total credits = DV pages + SI new pages.
     """
-    # Simulate what the old code did wrong: Serper returned Apple Music snippets
     _bad_snippets = [
         "Apple Music / Headcount / 100 Miles",
         "Headcount 100 songs on Apple Music",
         "Listen to Headcount on music.apple.com",
     ]
-    _bad_url = "https://music.apple.com/headcount"
+    _bad_url = "https://music.apple.com/us/artist/headcount/40703962"
     _domain  = "global-holding.de"
     _company = "Global Holding GmbH & Co. KG"
 
-    # Test regex extraction — should NOT match any of these as employee count
+    # 1. Regex must not extract employee count from Apple Music snippets
     _combined = " ".join(_bad_snippets)
-    result = _extract_employee_size_regex(_combined, "DE")
-    assert result["band"] != SIZE_100_PLUS_CONFIRMED, \
-        f"Apple Music snippets must not produce SIZE_100_PLUS_CONFIRMED: {result}"
+    _re_result = _extract_employee_size_regex(_combined, "DE")
+    assert _re_result["band"] == SIZE_UNKNOWN, \
+        f"Apple Music snippets must produce SIZE_UNKNOWN, got: {_re_result}"
 
-    # Test name-in-snippet filter
-    _name_words = [w for w in _company.lower().split() if len(w) > 3]
-    for snippet in _bad_snippets:
-        _in_snippet = any(w in snippet.lower() for w in _name_words)
-        assert not _in_snippet, f"Company name should NOT appear in Apple Music snippet: {snippet!r}"
+    # 2. Source-domain safety: music.apple.com must be rejected
+    assert not _is_allowed_size_source(_bad_url, _company, _domain), \
+        f"music.apple.com must be rejected by _is_allowed_size_source"
 
-    # Test career_page domain anchor
+    # 3. career_page_found must be False for Apple Music URL
     _, _, career_found = _classify_hrm_signals(
         _bad_snippets,
         country_code="DE",
@@ -8552,9 +8662,36 @@ def _smoke_test_size_inference() -> None:
         evidence_urls=[_bad_url],
     )
     assert not career_found, \
-        f"career_page_found must be False for Apple Music URL (domain={_bad_url!r}, official={_domain!r})"
+        f"career_page_found must be False for Apple Music URL"
 
-    print("[SMOKE TEST] _smoke_test_size_inference: all cases passed.", flush=True)
+    # 4. German commercial legal forms: GmbH & Co. KG → commercial_company / KEEP
+    from input_cleaner_register_edition import classify_organization
+    _org, _eli, _pf, _reason = classify_organization(
+        "Global Holding GmbH & Co. KG",
+        legal_form_hint="GmbH & Co. KG",
+        country_code="DE",
+    )
+    assert _org == "commercial_company", f"GmbH & Co. KG must be commercial_company, got {_org}"
+    assert _eli == _ELI_KEEP, f"GmbH & Co. KG must be KEEP, got {_eli}"
+
+    _org2, _eli2, _, _ = classify_organization("Mustermann AG", legal_form_hint="AG", country_code="DE")
+    assert _org2 == "commercial_company" and _eli2 == _ELI_KEEP, f"AG must be commercial_company/KEEP"
+
+    # 5. Firecrawl total credits = DV + SI new pages
+    import pandas as _pd
+    _test_df = _pd.DataFrame({
+        "firecrawl_pages_fetched":         [2],
+        "firecrawl_pages_used_for_size":   [4],
+        "firecrawl_size_inference_reused_pages": [0],
+        "firecrawl_used":                  ["True"],
+        "firecrawl_used_for_size_inference": ["True"],
+        "firecrawl_decision":              ["confirm"],
+    })
+    _fc_fields = _build_fc_usage_fields(_test_df, 1, {})
+    _total = _fc_fields["firecrawl_total_estimated_credits"]
+    assert _total == 6, f"Total estimated credits must be 6 (2 DV + 4 SI), got {_total}"
+
+    print("[SMOKE TEST] _smoke_test_size_inference: all 5 cases passed.", flush=True)
 
 
 def cli_batch_run() -> None:
