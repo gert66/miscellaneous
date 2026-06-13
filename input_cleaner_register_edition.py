@@ -58,6 +58,16 @@ st.set_page_config(
 
 SERPER_URL      = "https://google.serper.dev/search"
 _AUTOSAVE_DIR   = Path("autosave")
+
+# Module-level Serper call counter (reset per run via _reset_serper_counter())
+_serper_call_count: int = 0
+
+def _reset_serper_counter() -> None:
+    global _serper_call_count
+    _serper_call_count = 0
+
+def _get_serper_count() -> int:
+    return _serper_call_count
 _AUTOSAVE_EVERY = 10   # write checkpoint every N processed rows
 
 # Generic / directory / social / database domains to skip (global + Italian-specific)
@@ -514,6 +524,84 @@ _PUBLIC_OVERRIDE_RE = re.compile(
 )
 
 
+_DE_KEEP_FORMS_RE = re.compile(
+    r"\b(GmbH\s*&\s*Co\.?\s*KG|GmbH\s*&\s*Co\.?\s*KGaA"
+    r"|Gesellschaft\s+mit\s+beschr[äa]nkter\s+Haftung"
+    r"|GmbH|AG|Aktiengesellschaft"
+    r"|KG|OHG|KGaA|SE\b|UG\s*\(?haftungsbeschr[äa]nkt\)?"
+    r"|UG\b|PartG|GbR|Einzelunternehmen|e\.?\s*K\.?)\b",
+    re.I,
+)
+
+_DE_MAYBE_FORMS_RE = re.compile(
+    r"\b(eG\b|Genossenschaft|Genossenschaftsbank"
+    r"|GmbH\s*&\s*Co\.?\s*eG|Kommanditgesellschaft\s+auf\s+Aktien)\b",
+    re.I,
+)
+
+_DE_EXCLUDE_FORMS_RE = re.compile(
+    r"\b(e\.?\s*V\.?\b|Verein|Stiftung|gemeinn[üu]tzig"
+    r"|Stadtwerke|Gemeinde\b|Landkreis\b|Kreisverwaltung"
+    r"|Krankenhaus|Klinikum|Klinik\b|Universit[äa]t\b|Hochschule\b"
+    r"|Schule\b|Gymnasium\b|Realschule\b|Grundschule\b|Berufsschule\b"
+    r"|Kirche\b|Pfarr\w*|Diözese|Bistum|Caritas\b"
+    r"|Bundesamt\b|Bundesanstalt\b|Ministerium\b|Amt\s+f[üu]r|Beh[öo]rde)\b",
+    re.I,
+)
+
+_DE_PUBLIC_OVERRIDE_RE = re.compile(
+    r"\b(Stadt\s+\w+|Stadtwerke\s+\w+|Landratsamt\b|Landkreis\s+\w+"
+    r"|Klinikum\s+\w+|Universit[äa]tsklinikum|Beh[öo]rde\b"
+    r"|GmbH\s+der\s+Stadt|mbH\s+der\s+Gemeinde)\b",
+    re.I,
+)
+
+
+def _classify_organization_de(
+    company_name: str,
+    legal_form_hint: str = "",
+) -> tuple[str, str, str, str]:
+    """Classify German company for mYngle eligibility."""
+    # Prefer legal_form_detected from register; fall back to company name
+    probe = (legal_form_hint or company_name or "").strip()
+    name_probe = (company_name or "").strip()
+
+    has_keep    = bool(_DE_KEEP_FORMS_RE.search(probe) or _DE_KEEP_FORMS_RE.search(name_probe))
+    has_maybe   = bool(_DE_MAYBE_FORMS_RE.search(probe) or _DE_MAYBE_FORMS_RE.search(name_probe))
+    has_exclude = bool(_DE_EXCLUDE_FORMS_RE.search(probe) or _DE_EXCLUDE_FORMS_RE.search(name_probe))
+    has_public  = bool(_DE_PUBLIC_OVERRIDE_RE.search(probe) or _DE_PUBLIC_OVERRIDE_RE.search(name_probe))
+
+    nl = (probe + " " + name_probe).lower()
+
+    if has_exclude:
+        if any(t in nl for t in ("verein", "e.v", "e. v")):
+            org_type = "nonprofit_association"
+        elif any(t in nl for t in ("stiftung",)):
+            org_type = "foundation"
+        elif any(t in nl for t in ("gemeinde", "landkreis", "kreisverwaltung", "stadtwerke", "amt ", "ministerium", "bundesamt", "bundesanstalt")):
+            org_type = "government_body"
+        elif any(t in nl for t in ("klinik", "krankenhaus", "klinikum")):
+            org_type = "public_health"
+        elif any(t in nl for t in ("universit", "hochschule", "schule", "gymnasium", "realschule", "grundschule", "berufsschule")):
+            org_type = "university_education"
+        elif any(t in nl for t in ("kirche", "pfarr", "diöze", "bistum", "caritas")):
+            org_type = "religious_body"
+        else:
+            org_type = "non_commercial"
+        return org_type, _ELI_EXCLUDE, _PF_SKIP, f"Non-commercial entity (DE): {org_type}"
+
+    if has_public and has_keep:
+        return "public_health_or_public_owned", _ELI_MAYBE, _PF_LATER, "Commercial form but public-body name signals (DE)"
+
+    if has_keep:
+        return "commercial_company", _ELI_KEEP, _PF_SEND, "German commercial legal form"
+
+    if has_maybe:
+        return "cooperative_or_consortium", _ELI_MAYBE, _PF_LATER, "German cooperative/eG — lower priority"
+
+    return "unknown", _ELI_MAYBE, _PF_LATER, "No recognized German legal form — unknown organization type"
+
+
 def _normalize_legal_text(s: str) -> str:
     """Strip accents, apostrophes, and non-alphanumeric chars for regex matching."""
     s = (s or "").upper()
@@ -525,11 +613,19 @@ def _normalize_legal_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def classify_organization(company_name: str) -> tuple[str, str, str, str]:
+def classify_organization(
+    company_name: str,
+    legal_form_hint: str = "",
+    country_code: str = "IT",
+) -> tuple[str, str, str, str]:
     """
     Classify a company name for mYngle eligibility.
     Returns (organization_type, myngle_target_eligibility, pre_filter_decision, pre_filter_reason).
     """
+    # ── German fast-path ─────────────────────────────────────────────────────
+    if country_code == "DE":
+        return _classify_organization_de(company_name, legal_form_hint)
+
     n = (company_name or "").strip()
     nl = n.lower()
     n_norm = _normalize_legal_text(n)
@@ -1469,6 +1565,8 @@ def _call_serper(
     gl: str = "it",
     hl: str = "it",
 ) -> tuple:
+    global _serper_call_count
+    _serper_call_count += 1
     try:
         resp = requests.post(
             SERPER_URL,
@@ -5848,8 +5946,8 @@ def _extract_employee_size_regex(text: str, country_code: str = "IT") -> dict:
         (r"Team\s+(?:von|mit)\s+(\d[\d\.,]*)\s*(?:Personen|Mitarbeiter|Menschen)?", "de_team"),
         # "150 employees" (English on DE sites)
         (r"(\d[\d\.,]*)\s+employees?", "de_en_empl"),
-        # "Headcount: 300"
-        (r"[Hh]eadcount[:\s]+(\d[\d\.,]*)", "de_headcount"),
+        # "Headcount: 300" — require colon to avoid matching "Headcount 100 songs"
+        (r"[Hh]eadcount\s*:\s*(\d[\d\.,]*)", "de_headcount"),
     ]
     # Italian patterns
     _IT_PATTERNS = [
@@ -5919,7 +6017,12 @@ def _extract_employee_size_regex(text: str, country_code: str = "IT") -> dict:
     }
 
 
-def _classify_hrm_signals(text_corpus: list[str], country_code: str = "IT") -> tuple[int, str, bool]:
+def _classify_hrm_signals(
+    text_corpus: list[str],
+    country_code: str = "IT",
+    official_domain: str = "",
+    evidence_urls: list[str] | None = None,
+) -> tuple[int, str, bool]:
     """
     Score HRM likelihood 0-10 from page text corpus.
     Returns (score, signals_csv, career_page_found).
@@ -5955,12 +6058,22 @@ def _classify_hrm_signals(text_corpus: list[str], country_code: str = "IT") -> t
     found_signals: list[str] = []
     career_found = False
 
+    # career_page only counts if URL is from the official domain or explicitly career-related
+    _evidence_urls_low = [u.lower() for u in (evidence_urls or [])]
+    _career_url_signals = ("karriere", "career", "jobs", "stellenangebote", "ausbildung",
+                           "lavora-con-noi", "posizioni-aperte", "carriere")
+    _career_from_official = (
+        any(official_domain and official_domain in u for u in _evidence_urls_low)
+        or any(sig in u for u in _evidence_urls_low for sig in _career_url_signals)
+    ) if official_domain or _evidence_urls_low else False
+
     for keywords, pts, label in signals_def:
         if any(kw in combined for kw in keywords):
             score += pts
             found_signals.append(label)
             if label == "career_page":
-                career_found = True
+                # career_page only sets career_found if URL is domain-anchored
+                career_found = _career_from_official
 
     score = min(score, 10)
     return score, ",".join(found_signals), career_found
@@ -6031,6 +6144,20 @@ def _infer_company_size(
                 serper_used += 1
                 if _hits:
                     for hit in _hits[:3]:
+                        _hit_domain = _extract_domain(hit.get("link", "") or "")
+                        # Only accept hits from the validated company domain or clearly related pages
+                        _is_official = domain and _hit_domain and (
+                            _hit_domain == domain
+                            or _hit_domain.endswith("." + domain)
+                            or domain.endswith("." + _hit_domain)
+                        )
+                        # For cross-domain hits: only accept if company name appears in snippet/title
+                        _combined = ((hit.get("snippet") or "") + " " + (hit.get("title") or "")).lower()
+                        _name_low = company_name.lower()
+                        _name_words = [w for w in _name_low.split() if len(w) > 3]
+                        _name_in_snippet = any(w in _combined for w in _name_words) if _name_words else False
+                        if not _is_official and not _name_in_snippet:
+                            continue  # skip unrelated result
                         snippet = (hit.get("snippet") or "") + " " + (hit.get("title") or "")
                         if snippet.strip():
                             text_corpus.append(snippet)
@@ -6039,9 +6166,9 @@ def _infer_company_size(
             except Exception:
                 pass
 
-        # Re-check after Serper evidence
+        # Re-check after Serper evidence — require HIGH confidence from Serper alone
         size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
-        if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] in ("high", "medium"):
+        if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] == "high":
             stop_reason = "confirmed_from_serper_snippets"
 
     # Step 3: fetch FC pages (homepage + 1 targeted page) if still no signal
@@ -6085,11 +6212,29 @@ def _infer_company_size(
         stop_reason = "max_pages_reached" if (fc_pages_for_size >= size_fc_budget and size_fc_budget > 0) else "no_evidence_found"
 
     # HRM signals
-    hrm_score, hrm_signals, career_found = _classify_hrm_signals(text_corpus, country_config.country_code)
+    hrm_score, hrm_signals, career_found = _classify_hrm_signals(
+        text_corpus,
+        country_config.country_code,
+        official_domain=domain,
+        evidence_urls=[evidence_url] if evidence_url else [],
+    )
 
-    # Upgrade band based on HRM signals (size unknown but strong HRM signal → likely 100+)
+    # Safety: SIZE_100_PLUS_CONFIRMED from Serper only is allowed only if evidence_url is from the official domain
     band = size_info["band"]
     confidence = size_info["confidence"]
+    if band == SIZE_100_PLUS_CONFIRMED and not result.get("firecrawl_used_for_size_inference"):
+        # Serper-only path: downgrade to LIKELY unless evidence is from official domain
+        _ev_domain = _extract_domain(evidence_url or "")
+        _is_ev_official = domain and _ev_domain and (
+            _ev_domain == domain
+            or _ev_domain.endswith("." + domain)
+            or domain.endswith("." + _ev_domain)
+        )
+        if not _is_ev_official:
+            band = SIZE_100_PLUS_LIKELY
+            confidence = "low"
+
+    # Upgrade band based on HRM signals (size unknown but strong HRM signal → likely 100+)
     if band == SIZE_UNKNOWN and hrm_score >= 5:
         band = SIZE_100_PLUS_LIKELY
         confidence = "low"
@@ -6166,6 +6311,7 @@ def process_dataframe(
 
     Returns (enriched_df_for_all_rows, all_evidence_rows, all_debug_rows, all_jina_debug_rows).
     """
+    _reset_serper_counter()
     new_results:   list[dict] = []
     new_evidence:  list[dict] = []
     new_debug:     list[dict] = []
@@ -6206,7 +6352,13 @@ def process_dataframe(
         postcode = _sv(postcode_col)
 
         # ── Organization eligibility pre-filter ──────────────────────────────
-        org_type, eligibility, pf_decision, pf_reason = classify_organization(name)
+        _legal_form_col = (country_config.name_col_primary if country_config else "") or ""
+        _legal_form_detected = str(row.get("legal_form_detected", "") or "").strip()
+        org_type, eligibility, pf_decision, pf_reason = classify_organization(
+            name,
+            legal_form_hint=_legal_form_detected,
+            country_code=country_config.country_code if country_config else "IT",
+        )
         _pf_skip = (
             (eligibility == _ELI_EXCLUDE and eligibility_filter_mode in (_PF_MODE_COMMERCIAL, _PF_MODE_MAYBE))
             or (eligibility == _ELI_MAYBE and eligibility_filter_mode == _PF_MODE_COMMERCIAL)
@@ -6485,6 +6637,13 @@ def process_dataframe(
         elif not infer_size:
             res["size_inference_enabled"] = False
 
+        # Clean NaN strings from output
+        for _k, _v in res.items():
+            if isinstance(_v, float) and (_v != _v):  # NaN check
+                res[_k] = ""
+            elif isinstance(_v, str) and _v.lower() in ("nan", "none", "null"):
+                res[_k] = ""
+
         new_results.append(res)
 
         # ── Firecrawl runtime health update + fail-fast check ─────────────────
@@ -6676,6 +6835,7 @@ def process_dataframe(
     result_df = pd.DataFrame(all_results, index=df.index)
     enriched  = pd.concat([df.copy(), result_df], axis=1)
     enriched  = enriched.loc[:, ~enriched.columns.duplicated()]
+    process_dataframe._last_serper_count = _get_serper_count()
     return enriched, all_evidence, all_debug, all_jina_debug
 
 
@@ -7922,6 +8082,7 @@ def _build_run_meta(
     verifier_mode: str = _VM_UNCERTAIN,
     firecrawl_keys_loaded: int = 0,
     fc_health: dict | None = None,
+    serper_queries_total: int = 0,
 ) -> dict:
     """Build the ordered dict that populates the Run Summary Excel sheet."""
     actions  = enriched_df.get("domain_action",  pd.Series(dtype=str)).astype(str)
@@ -8017,14 +8178,8 @@ def _build_run_meta(
             .str.contains("timeout_fallback", na=False).sum()
         ),
         # ── Serper usage ──────────────────────────────────────────────────────
-        "serper_queries_total":                int(
-            pd.to_numeric(enriched_df.get("serper_queries_used",
-                pd.Series(dtype=int)), errors="coerce").fillna(0).sum()
-        ),
-        "serper_avg_queries_per_processed_row": round(
-            pd.to_numeric(enriched_df.get("serper_queries_used",
-                pd.Series(dtype=int)), errors="coerce").fillna(0).mean(), 2
-        ) if batch_n else 0.0,
+        "serper_queries_total":                serper_queries_total,
+        "serper_avg_queries_per_processed_row": round(serper_queries_total / batch_n, 2) if batch_n else 0.0,
         # ── Haiku usage ───────────────────────────────────────────────────────
         "haiku_calls_total":                   n_haiku,
         "haiku_avg_calls_per_processed_row":   round(n_haiku / batch_n, 3) if batch_n else 0.0,
@@ -8362,6 +8517,46 @@ def _smoke_test_country_config() -> None:
     print("[SMOKE TEST] _smoke_test_country_config: all 11 cases passed.", flush=True)
 
 
+def _smoke_test_size_inference() -> None:
+    """
+    Regression test: unrelated Apple Music / Headcount snippet must not produce
+    SIZE_100_PLUS_CONFIRMED for 'Global Holding GmbH & Co. KG'.
+    """
+    # Simulate what the old code did wrong: Serper returned Apple Music snippets
+    _bad_snippets = [
+        "Apple Music / Headcount / 100 Miles",
+        "Headcount 100 songs on Apple Music",
+        "Listen to Headcount on music.apple.com",
+    ]
+    _bad_url = "https://music.apple.com/headcount"
+    _domain  = "global-holding.de"
+    _company = "Global Holding GmbH & Co. KG"
+
+    # Test regex extraction — should NOT match any of these as employee count
+    _combined = " ".join(_bad_snippets)
+    result = _extract_employee_size_regex(_combined, "DE")
+    assert result["band"] != SIZE_100_PLUS_CONFIRMED, \
+        f"Apple Music snippets must not produce SIZE_100_PLUS_CONFIRMED: {result}"
+
+    # Test name-in-snippet filter
+    _name_words = [w for w in _company.lower().split() if len(w) > 3]
+    for snippet in _bad_snippets:
+        _in_snippet = any(w in snippet.lower() for w in _name_words)
+        assert not _in_snippet, f"Company name should NOT appear in Apple Music snippet: {snippet!r}"
+
+    # Test career_page domain anchor
+    _, _, career_found = _classify_hrm_signals(
+        _bad_snippets,
+        country_code="DE",
+        official_domain=_domain,
+        evidence_urls=[_bad_url],
+    )
+    assert not career_found, \
+        f"career_page_found must be False for Apple Music URL (domain={_bad_url!r}, official={_domain!r})"
+
+    print("[SMOKE TEST] _smoke_test_size_inference: all cases passed.", flush=True)
+
+
 def cli_batch_run() -> None:
     """
     Non-Streamlit batch entry point.
@@ -8556,6 +8751,7 @@ def cli_batch_run() -> None:
         verifier_mode=_VM_UNCERTAIN,
         firecrawl_keys_loaded=len(fc_keys_cli),
         fc_health=_cli_fc_health,
+        serper_queries_total=getattr(process_dataframe, "_last_serper_count", 0),
     )
 
     # Build fc_audit dict for the Firecrawl Audit sheet
@@ -9282,6 +9478,7 @@ def main():
                 verifier_mode=verifier_mode,
                 firecrawl_keys_loaded=len(_fc_keys),
                 fc_health={},
+                serper_queries_total=getattr(process_dataframe, "_last_serper_count", 0),
             )
 
             st.session_state["reg_enriched"]    = enriched_df
@@ -9639,6 +9836,7 @@ def main():
             verifier_mode=verifier_mode,
             firecrawl_keys_loaded=len(_fc_keys),
             fc_health=_fc_live,
+            serper_queries_total=getattr(process_dataframe, "_last_serper_count", 0),
         )
 
         # Build Firecrawl Audit dict
