@@ -6553,8 +6553,8 @@ def run_cli() -> None:
 
     # ── Detect key columns ────────────────────────────────────────────────────
     _col_candidates = {
-        "company_name":     ["Company Name", "company_name", "company", "name", "Company"],
-        "domain":           ["validated_domain", "final_selected_domain", "domain", "website", "Website"],
+        "company_name":     ["company_name", "cleaned_company_name", "canonical_company_name", "Company Name", "company", "name", "Company"],
+        "domain":           ["final_selected_domain", "validated_domain", "recommended_domain", "canonical_company_domain", "domain", "website", "Website"],
         "city":             ["lusha_city", "city", "City", "lusha_api_city"],
         "country":          ["lusha_country", "country", "Country", "lusha_api_country"],
         "industry":         ["lusha_industry", "industry", "Industry", "lusha_api_industry"],
@@ -6571,6 +6571,10 @@ def run_cli() -> None:
     domain_col  = _find_col("domain")
     print(f"[enricher] Company col: {company_col}, Domain col: {domain_col}", flush=True)
 
+    if not domain_col:
+        print(f"[enricher] WARNING: no domain column found. Available columns: {list(df_in.columns)}", flush=True)
+        print("[enricher] Proceeding with empty domains.", flush=True)
+
     # ── Process rows ──────────────────────────────────────────────────────────
     results      = []
     debug_records = []
@@ -6583,14 +6587,14 @@ def run_cli() -> None:
         domain       = str(row_dict.get(domain_col, "") or "").strip() if domain_col else ""
 
         try:
-            result = enrich_one_row(
-                row_dict=row_dict,
+            result, _debug_rec = enrich_one_row(
                 company_name=company_name,
-                domain=domain,
-                anthropic_key=anthropic_key or None,
-                serper_key=serper_key or None,
-                debug_records=debug_records,
+                raw_url=domain,
+                api_key=anthropic_key or "",
+                delay=0,
+                serper_key=serper_key or "",
             )
+            debug_records.append(_debug_rec)
         except Exception as exc:
             result = dict(row_dict)
             result["enrichment_error"] = f"{type(exc).__name__}: {exc}"
@@ -6662,9 +6666,8 @@ def run_cli() -> None:
         print(f"[enricher] ICP override skipped: {_ov_exc}", flush=True)
 
     # ── Write output ──────────────────────────────────────────────────────────
-    stamp    = ts()
-    out_stem = input_path.stem
-    xl_path  = out_dir / f"{out_stem}_lead_prioritized_{stamp}.xlsx"
+    stamp   = ts()
+    xl_path = out_dir / f"enrichedResults_{stamp}.xlsx"
 
     try:
         xl_bytes = build_rich_excel_bytes(
@@ -6677,8 +6680,16 @@ def run_cli() -> None:
         print(f"[enricher] Saved: {xl_path}", flush=True)
     except Exception as exc:
         print(f"[enricher] Rich Excel failed ({exc}), falling back to flat Excel.", flush=True)
-        df_to_excel_bytes_write(df_out, str(xl_path))
-        print(f"[enricher] Saved (flat): {xl_path}", flush=True)
+        try:
+            df_to_excel_bytes_write(df_out, str(xl_path))
+            print(f"[enricher] Saved (flat): {xl_path}", flush=True)
+        except Exception as exc2:
+            print(f"[enricher] ERROR: could not write output file: {exc2}", file=sys.stderr)
+            sys.exit(2)
+
+    if not xl_path.exists():
+        print(f"[enricher] ERROR: output file was not created: {xl_path}", file=sys.stderr)
+        sys.exit(2)
 
 
 
@@ -8687,9 +8698,9 @@ def run_streamlit_app() -> None:
 
 
 if __name__ == "__main__":
-    if cli_args_present():
+    if "--input" in sys.argv or cli_args_present():
         run_cli()
     elif running_under_streamlit():
         run_streamlit_app()
     else:
-        run_cli()
+        run_streamlit_app()
