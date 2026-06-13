@@ -608,15 +608,258 @@ _FC_SPEED_OPTIONS   = [_FC_SPEED_FAST, _FC_SPEED_BALANCED, _FC_SPEED_THOROUGH]
 
 # Firecrawl location constants
 _FC_LOC_ITALY   = "Italy (default)"
+_FC_LOC_GERMANY = "Germany"
 _FC_LOC_USA     = "United States"
 _FC_LOC_DEFAULT = "Default Firecrawl"
-_FC_LOC_OPTIONS = [_FC_LOC_ITALY, _FC_LOC_USA, _FC_LOC_DEFAULT]
+_FC_LOC_OPTIONS = [_FC_LOC_ITALY, _FC_LOC_GERMANY, _FC_LOC_USA, _FC_LOC_DEFAULT]
 
 _FC_LOC_PAYLOADS = {
     _FC_LOC_ITALY:   {"country": "IT", "languages": ["it", "en"]},
+    _FC_LOC_GERMANY: {"country": "DE", "languages": ["de", "en"]},
     _FC_LOC_USA:     {"country": "US", "languages": ["en"]},
     _FC_LOC_DEFAULT: {},
 }
+
+# =============================================================================
+# COUNTRY CONFIG
+# =============================================================================
+
+from dataclasses import dataclass, field as _dc_field
+
+@dataclass
+class CountryConfig:
+    """All country-specific settings for the input cleaner pipeline."""
+    country_code:          str          # "IT" or "DE"
+    country_name:          str          # "Italy" or "Germany"
+    serper_gl:             str          # Serper geolocation code
+    serper_hl:             str          # Serper interface language
+    country_search_name:   str          # How to name the country in queries
+    official_search_terms: list         # e.g. ["sito ufficiale", "official website"]
+    preferred_tlds:        list         # e.g. [".it"] or [".de"]
+    directory_blacklist_domains: set    # exact domains to reject
+    directory_blacklist_bases:   set    # partial base-domain substrings to reject
+    email_provider_blacklist:    set    # generic email providers (not company)
+    legal_tokens:          list         # legal form tokens for this country
+    descriptor_cleanup_patterns: list   # (regex_str, replacement) tuples
+    firecrawl_location:    dict         # Firecrawl location payload
+    # German-style columns (empty for IT)
+    name_col_primary:      str  = ""    # e.g. "company_name_clean"
+    name_col_fallback:     str  = ""    # e.g. "company_name_raw"
+    city_col_primary:      str  = ""    # e.g. "city_or_registered_office"
+    state_col:             str  = ""    # e.g. "federal_state"
+    address_col:           str  = ""    # e.g. "registered_address"
+    # Negative domain patterns (word-boundary safe)
+    negative_domain_patterns: list = _dc_field(default_factory=list)
+
+
+_DE_DIRECTORY_DOMAINS: set = {
+    "handelsregister.de", "unternehmensregister.de", "bundesanzeiger.de",
+    "northdata.de", "firmenwissen.de", "companyhouse.de", "implisense.com",
+    "wer-zu-wem.de", "die-deutsche-wirtschaft.de", "gelbeseiten.de",
+    "dasoertliche.de", "meinestadt.de", "cylex.de", "kompany.com",
+    "opencorporates.com", "firmenabc.de", "europages.de", "europages.com",
+    "kompass.com", "kompass.de", "indeed.com", "stepstone.de",
+    "kununu.com", "xing.com", "linkedin.com", "facebook.com",
+    "instagram.com",
+}
+
+_DE_DIRECTORY_BASES: set = {
+    "handelsregister", "unternehmensregister", "bundesanzeiger",
+    "northdata", "firmenwissen", "companyhouse", "implisense",
+    "wer-zu-wem", "gelbeseiten", "dasoertliche", "meinestadt",
+    "cylex", "firmenabc", "europages", "kompass", "kununu",
+    "stepstone", "opencorporates",
+}
+
+_DE_EMAIL_GENERICS: set = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
+    "web.de", "gmx.de", "gmx.net", "t-online.de", "protonmail.com",
+    "icloud.com", "me.com", "live.com", "msn.com",
+}
+
+# German public/non-commercial domain patterns — checked with word-boundary regex
+# so names like "Schulenburg", "Kammerer", "Neustadt", "Speicherstadt" are not rejected.
+_DE_NEGATIVE_DOMAIN_WORDS: list = [
+    "stadt", "gemeinde", "landkreis", "kreisverwaltung", "rathaus",
+    "ihk", "handwerkskammer", "universitaet", "universitä",
+    "hochschule", "schule", "kita", "kindergarten",
+    "verein", "kirche", "pfarr", "behoerde", "behoerd",
+]
+# Compiled as whole-token pattern: domain split on [-_.] must contain exact token
+_DE_NEGATIVE_DOMAIN_RE = re.compile(
+    r"(?<![a-z])(?:"
+    + "|".join(re.escape(w) for w in _DE_NEGATIVE_DOMAIN_WORDS)
+    + r")(?![a-z])",
+    re.IGNORECASE,
+)
+
+_DE_LEGAL_TOKENS: list = [
+    "gmbh", "ag", "kg", "ohg", "gbr", "kgaa", "se", "ug",
+    "gmbh & co. kg", "gmbh & co.kg", "gmbh&co.kg",
+    "eingetragener kaufmann", "e.k.", "e. k.", "e.kfm.",
+]
+
+_DE_DESCRIPTOR_PATTERNS: list = [
+    (r"\bUnternehmen\b", ""),
+    (r"\bGesellschaft\b", ""),
+    (r"\bBetrieb\b", ""),
+    (r"\bWerkstatt\b", ""),
+    (r"\bHandel\b", ""),
+    (r"\bBau\b", ""),
+]
+
+
+IT_CONFIG = CountryConfig(
+    country_code          = "IT",
+    country_name          = "Italy",
+    serper_gl             = "it",
+    serper_hl             = "it",
+    country_search_name   = "Italy",
+    official_search_terms = ["sito ufficiale", "official website"],
+    preferred_tlds        = [".it"],
+    directory_blacklist_domains = set(),   # existing _GENERIC_DOMAINS already handles IT
+    directory_blacklist_bases   = set(),
+    email_provider_blacklist    = set(),   # existing _PEC_DOMAIN_PATTERNS handles IT
+    legal_tokens          = [],            # existing Italy logic handles legal forms
+    descriptor_cleanup_patterns = [],
+    firecrawl_location    = {"country": "IT", "languages": ["it", "en"]},
+    name_col_primary      = "",
+    name_col_fallback     = "",
+    city_col_primary      = "",
+    state_col             = "",
+    address_col           = "",
+    negative_domain_patterns = [],
+)
+
+DE_CONFIG = CountryConfig(
+    country_code          = "DE",
+    country_name          = "Germany",
+    serper_gl             = "de",
+    serper_hl             = "de",
+    country_search_name   = "Deutschland",
+    official_search_terms = ["offizielle Website", "official website", "Impressum", "Kontakt"],
+    preferred_tlds        = [".de", ".com", ".eu"],
+    directory_blacklist_domains = _DE_DIRECTORY_DOMAINS,
+    directory_blacklist_bases   = _DE_DIRECTORY_BASES,
+    email_provider_blacklist    = _DE_EMAIL_GENERICS,
+    legal_tokens          = _DE_LEGAL_TOKENS,
+    descriptor_cleanup_patterns = _DE_DESCRIPTOR_PATTERNS,
+    firecrawl_location    = {"country": "DE", "languages": ["de", "en"]},
+    name_col_primary      = "company_name_clean",
+    name_col_fallback     = "company_name_raw",
+    city_col_primary      = "city_or_registered_office",
+    state_col             = "federal_state",
+    address_col           = "registered_address",
+    negative_domain_patterns = _DE_NEGATIVE_DOMAIN_WORDS,
+)
+
+COUNTRY_CONFIGS: dict[str, CountryConfig] = {
+    "IT": IT_CONFIG,
+    "DE": DE_CONFIG,
+}
+
+
+def detect_country_from_path(input_path: str) -> str | None:
+    """Infer country code from pipeline folder structure in the input path."""
+    p = input_path.replace("\\", "/").lower()
+    if "/germany/" in p or "/germany\\" in input_path.lower():
+        return "DE"
+    if "/italy" in p:
+        return "IT"
+    return None
+
+
+def detect_country_from_columns(df: "pd.DataFrame") -> str | None:
+    """Infer country code by checking for known country-specific column names."""
+    cols_lc = {str(c).lower().strip() for c in df.columns}
+    de_cols = {"company_name_clean", "company_name_raw", "city_or_registered_office",
+               "federal_state", "company_number", "register_nummer"}
+    it_cols = {"company name", "national statistical institute province",
+               "email address", "postal code"}
+    if cols_lc & de_cols:
+        return "DE"
+    if cols_lc & it_cols:
+        return "IT"
+    return None
+
+
+def resolve_country(cli_country: str, input_path: str, df: "pd.DataFrame") -> str:
+    """Return the resolved country code ("IT" or "DE") from CLI arg, path, or columns."""
+    if cli_country and cli_country.upper() in COUNTRY_CONFIGS:
+        return cli_country.upper()
+    from_path = detect_country_from_path(input_path)
+    if from_path:
+        return from_path
+    from_cols = detect_country_from_columns(df)
+    if from_cols:
+        return from_cols
+    return "IT"   # backward-compatible default
+
+
+def detect_columns_generic(df: "pd.DataFrame", config: "CountryConfig") -> dict:
+    """
+    Detect column roles for both Italian and German inputs.
+
+    For Germany: tries config-specific primary/fallback columns first,
+    then falls back to the standard detect_columns() for anything not found.
+    For Italy: delegates entirely to existing detect_columns().
+    """
+    if config.country_code == "IT":
+        return detect_columns(df)
+
+    # Germany: map canonical roles from known DE column names
+    cols_avail = set(df.columns)
+
+    def _first(*candidates):
+        for c in candidates:
+            if c and c in cols_avail:
+                return c
+        return None
+
+    col_map = {
+        "company": _first(
+            config.name_col_primary, config.name_col_fallback,
+            "company_name", "name",
+        ),
+        "website": _first(
+            "website", "domain", "url", "homepage",
+            "canonical_company_url", "validated_domain",
+        ),
+        "email": _first(
+            "email", "email address", "email_address",
+            "kontakt_email", "contact_email",
+        ),
+        "city": _first(
+            config.city_col_primary,
+            "registered_office", "city", "ort",
+        ),
+        "province": _first(
+            config.state_col,
+            "state", "bundesland", "province",
+        ),
+        "postcode": _first(
+            "postcode", "postal_code", "plz",
+        ),
+        "phone": _first(
+            "phone", "phone_number", "telefon", "tel",
+        ),
+    }
+    return col_map
+
+
+def _is_de_negative_domain(domain: str) -> tuple[bool, str]:
+    """
+    Return (True, reason) when domain contains a German public/non-commercial token
+    as a whole word (split on -, _, .), so names like Schulenburg are safe.
+    """
+    d = (domain or "").lower()
+    parts = set(re.split(r"[-._/]", d))
+    for word in _DE_NEGATIVE_DOMAIN_WORDS:
+        if word in parts:
+            return True, f"German public/non-commercial token in domain: {word}"
+    return False, ""
+
+
 
 # Per-speed-mode defaults: (max_cands, max_pages, timeout_secs)
 _FC_SPEED_DEFAULTS  = {
@@ -1075,7 +1318,7 @@ def brand_overlap_variants(name_variants: dict, domain: str) -> float:
     return bo
 
 
-def is_generic(domain: str) -> bool:
+def is_generic(domain: str, country_config: "CountryConfig | None" = None) -> bool:
     """Return True if domain is in the generic/directory blacklist (incl. subdomains)."""
     if not domain:
         return False
@@ -1086,6 +1329,13 @@ def is_generic(domain: str) -> bool:
     for base in _GENERIC_DOMAIN_BASES:
         if dl == base or dl.endswith("." + base):
             return True
+    # Country-specific additional blacklists
+    if country_config:
+        if dl in country_config.directory_blacklist_domains:
+            return True
+        for base in country_config.directory_blacklist_bases:
+            if dl == base or dl.endswith("." + base):
+                return True
     return False
 
 
@@ -1204,12 +1454,18 @@ def detect_columns(df: pd.DataFrame) -> dict:
 # =============================================================================
 
 
-def _call_serper(query: str, serper_key: str, timeout: int = 12) -> tuple:
+def _call_serper(
+    query: str,
+    serper_key: str,
+    timeout: int = 12,
+    gl: str = "it",
+    hl: str = "it",
+) -> tuple:
     try:
         resp = requests.post(
             SERPER_URL,
             headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-            json={"q": query, "gl": "it", "hl": "it", "num": 5},
+            json={"q": query, "gl": gl, "hl": hl, "num": 5},
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -1307,6 +1563,7 @@ def _build_search_queries(
     province: str,
     postcode: str,
     max_queries: int = 5,
+    country_config: "CountryConfig | None" = None,
 ) -> list[str]:
     """
     Build up to max_queries Serper search queries.
@@ -1314,78 +1571,111 @@ def _build_search_queries(
     For ambiguous/generic brands, location queries are prioritised early to
     reduce false positives from foreign or unrelated companies.
     For dotted acronyms (I.M.E.S.A.), the nodot form (IMESA) is also used.
+    country_config drives country-specific terminology and TLD preferences.
     """
+    cfg = country_config or IT_CONFIG
+
     clean_name  = name_variants.get("no_desc") or name_variants.get("no_legal") or name_variants["full"]
     brand       = name_variants.get("brand") or clean_name
     brand_nodot = name_variants.get("brand_nodot") or brand
     is_acronym  = name_variants.get("is_acronym", False)
     ambiguous   = _brand_is_ambiguous(brand)
 
-    # Use brand queries only when the brand meaningfully differs from clean_name
     use_brand_queries = (brand.lower() != clean_name.lower() and len(brand) >= 3)
     use_nodot_queries = is_acronym and brand_nodot.lower() != brand.lower()
 
-    loc = city or province  # best available location string
+    loc      = city or province
+    country  = cfg.country_search_name
+    tld      = cfg.preferred_tlds[0] if cfg.preferred_tlds else ".com"
+    off_term = cfg.official_search_terms[0] if cfg.official_search_terms else "official website"
 
     queries: list[str] = []
 
-    if ambiguous and loc:
-        # For ambiguous brands: lead with location to anchor to Italy
-        queries.append(f'"{clean_name}" {loc} Italy sito ufficiale')
-        queries.append(f'"{clean_name}" Italy official website')
-        queries.append(f'"{clean_name}" sito ufficiale')
-        if city and province:
-            queries.append(f'"{clean_name}" "{city}" "{province}" Italy')
-        elif city:
-            queries.append(f'"{clean_name}" "{city}" Italy')
-        elif province:
-            queries.append(f'"{clean_name}" "{province}" Italy')
-        queries.append(f'site:.it "{clean_name}"')
+    if cfg.country_code == "DE":
+        # ── German query set ──────────────────────────────────────────────────
+        if ambiguous and loc:
+            queries.append(f'"{clean_name}" {loc} offizielle Website')
+            queries.append(f'"{clean_name}" Unternehmen Deutschland')
+            queries.append(f'"{clean_name}" Impressum')
+            if city and province:
+                queries.append(f'"{clean_name}" "{city}" "{province}" Deutschland')
+            elif city:
+                queries.append(f'"{clean_name}" "{city}" Deutschland')
+            elif province:
+                queries.append(f'"{clean_name}" "{province}" Deutschland')
+            queries.append(f'site:.de "{clean_name}"')
+        else:
+            queries.append(f'"{clean_name}" offizielle Website')
+            queries.append(f'"{clean_name}" Impressum')
+            queries.append(f'"{clean_name}" Kontakt')
+            if city:
+                queries.append(f'"{clean_name}" "{city}" Deutschland')
+            elif province:
+                queries.append(f'"{clean_name}" "{province}" Deutschland')
+            queries.append(f'"{clean_name}" Unternehmen Deutschland')
+            queries.append(f'site:.de "{clean_name}"')
+            if use_brand_queries:
+                queries.append(f'"{brand}" Deutschland offizielle Website')
+                queries.append(f'site:.de "{brand}"')
+        if use_nodot_queries:
+            queries.append(f'"{brand_nodot}" offizielle Website Deutschland')
+            queries.append(f'site:.de "{brand_nodot}"')
+
     else:
-        # Standard order for well-identified brands
-        queries.append(f'"{clean_name}" official website')
-        queries.append(f'"{clean_name}" sito ufficiale')
-        if city:
-            queries.append(f'"{clean_name}" "{city}" Italy')
-        elif province:
-            queries.append(f'"{clean_name}" "{province}" Italy')
-        queries.append(f'"{clean_name}" Italy')
-        if province and city:
-            queries.append(f'"{clean_name}" "{province}" Italy')
-        queries.append(f'site:.it "{clean_name}"')
-        if use_brand_queries:
-            queries.append(f'"{brand}" Italy official website')
-            queries.append(f'site:.it "{brand}"')
+        # ── Italian query set (original behavior) ─────────────────────────────
+        if ambiguous and loc:
+            queries.append(f'"{clean_name}" {loc} Italy sito ufficiale')
+            queries.append(f'"{clean_name}" Italy official website')
+            queries.append(f'"{clean_name}" sito ufficiale')
+            if city and province:
+                queries.append(f'"{clean_name}" "{city}" "{province}" Italy')
+            elif city:
+                queries.append(f'"{clean_name}" "{city}" Italy')
+            elif province:
+                queries.append(f'"{clean_name}" "{province}" Italy')
+            queries.append(f'site:.it "{clean_name}"')
+        else:
+            queries.append(f'"{clean_name}" official website')
+            queries.append(f'"{clean_name}" sito ufficiale')
+            if city:
+                queries.append(f'"{clean_name}" "{city}" Italy')
+            elif province:
+                queries.append(f'"{clean_name}" "{province}" Italy')
+            queries.append(f'"{clean_name}" Italy')
+            if province and city:
+                queries.append(f'"{clean_name}" "{province}" Italy')
+            queries.append(f'site:.it "{clean_name}"')
+            if use_brand_queries:
+                queries.append(f'"{brand}" Italy official website')
+                queries.append(f'site:.it "{brand}"')
+        if use_nodot_queries:
+            queries.append(f'"{brand_nodot}" Italy sito ufficiale')
+            queries.append(f'site:.it "{brand_nodot}"')
 
-    # Acronym nodot queries — use as additional fallback
-    if use_nodot_queries:
-        queries.append(f'"{brand_nodot}" Italy sito ufficiale')
-        queries.append(f'site:.it "{brand_nodot}"')
+        # ── SIGLABILE brand queries (Italy-only, high priority) ───────────────
+        siglabile_brand   = name_variants.get("siglabile_brand", "")
+        siglabile_compact = name_variants.get("siglabile_compact", "")
+        if siglabile_brand and siglabile_brand.lower() != clean_name.lower():
+            queries.insert(0, f'"{siglabile_brand}" sito ufficiale')
+            queries.insert(1, f'"{siglabile_brand}" official website')
+            if siglabile_compact and siglabile_compact != siglabile_brand.lower():
+                queries.append(f'"{siglabile_compact}"')
 
-    # ── SIGLABILE brand queries (high priority — insert near front) ───────────
-    siglabile_brand   = name_variants.get("siglabile_brand", "")
-    siglabile_compact = name_variants.get("siglabile_compact", "")
-    if siglabile_brand and siglabile_brand.lower() != clean_name.lower():
-        queries.insert(0, f'"{siglabile_brand}" sito ufficiale')
-        queries.insert(1, f'"{siglabile_brand}" official website')
-        if siglabile_compact and siglabile_compact != siglabile_brand.lower():
-            queries.append(f'"{siglabile_compact}"')
-
-    # ── First-token brand queries ─────────────────────────────────────────────
-    first_token_brand = name_variants.get("first_token_brand", "")
-    if first_token_brand and first_token_brand.lower() != brand.lower():
-        queries.insert(0, f'"{first_token_brand}" "{clean_name}" sito ufficiale')
-        if loc:
-            queries.append(f'"{first_token_brand}" "{loc}" Italy official website')
-        queries.append(f'site:.it "{first_token_brand}"')
-
-    # ── Descriptor variant queries ────────────────────────────────────────────
-    for _dv_label, _dv_val in name_variants.get("descriptor_variants", []):
-        if _dv_val and _dv_val.lower() != clean_name.lower():
-            queries.append(f'"{_dv_val}" official website')
-            queries.append(f'"{_dv_val}" sito ufficiale')
+        # ── First-token brand queries (Italy-only) ────────────────────────────
+        first_token_brand = name_variants.get("first_token_brand", "")
+        if first_token_brand and first_token_brand.lower() != brand.lower():
+            queries.insert(0, f'"{first_token_brand}" "{clean_name}" sito ufficiale')
             if loc:
-                queries.append(f'"{_dv_val}" {loc}')
+                queries.append(f'"{first_token_brand}" "{loc}" Italy official website')
+            queries.append(f'site:.it "{first_token_brand}"')
+
+        # ── Descriptor variant queries (Italy-only) ───────────────────────────
+        for _dv_label, _dv_val in name_variants.get("descriptor_variants", []):
+            if _dv_val and _dv_val.lower() != clean_name.lower():
+                queries.append(f'"{_dv_val}" official website')
+                queries.append(f'"{_dv_val}" sito ufficiale')
+                if loc:
+                    queries.append(f'"{_dv_val}" {loc}')
 
     # Deduplicate while preserving order
     seen: set = set()
@@ -1407,11 +1697,14 @@ def _score_candidate(
     email_domain: str,
     city: str,
     province: str,
+    country_config: "CountryConfig | None" = None,
 ) -> float:
     """
     Score a candidate domain on a 0–3+ scale.
     Higher is better.
+    country_config controls TLD bonus and country-specific penalties.
     """
+    cfg = country_config or IT_CONFIG
     score = 0.0
 
     # 1. Position weight (rank 0 = 1.0, rank 4 = 0.2)
@@ -1429,11 +1722,8 @@ def _score_candidate(
     if brand_ov >= 0.8:
         score += 0.4
 
-    # Brand similarity gate — penalise domains that have very little to do with
-    # the company name. This prevents high-ranking directory pages or unrelated
-    # sites from winning purely on search position.
     if best_name_overlap < _MIN_BRAND_SIM_TO_SCORE:
-        score *= 0.10   # near-rejection: keeps domain in evidence but won't win
+        score *= 0.10
     elif best_name_overlap < _WEAK_BRAND_SIM_THRESHOLD:
         score *= _WEAK_BRAND_SIM_MULTIPLIER
 
@@ -1455,17 +1745,39 @@ def _score_candidate(
     if email_domain and domain == email_domain:
         score += 0.5
 
-    # 8. .it TLD bonus (official company domain for Italian businesses)
-    if domain.endswith(".it"):
-        score += 0.15
+    # 8. TLD bonus — config-driven (primary TLD = full bonus; secondary = partial)
+    if cfg.preferred_tlds:
+        primary_tld = cfg.preferred_tlds[0]
+        if domain.endswith(primary_tld):
+            score += 0.15
+        elif len(cfg.preferred_tlds) > 1:
+            # Secondary TLDs get a smaller bonus (Germany: .com/.eu acceptable)
+            for _tld in cfg.preferred_tlds[1:]:
+                if domain.endswith(_tld):
+                    score += 0.07
+                    break
 
-    # 9. Hard penalties for non-commercial domain signals
-    if _EDU_IT_RE.search(domain):
-        score -= 0.6   # public school TLD — almost never correct for SPA/SRL
-    elif re.search(r"\b(forum|foro|archive|archivio)\b", domain, re.I):
-        score -= 0.3
-    elif re.search(r"\b(associazione|fondazione|onlus|odv|aps)\b", domain, re.I):
-        score -= 0.3
+    # 9. Italy-specific hard penalties
+    if cfg.country_code == "IT":
+        if _EDU_IT_RE.search(domain):
+            score -= 0.6
+        elif re.search(r"\b(forum|foro|archive|archivio)\b", domain, re.I):
+            score -= 0.3
+        elif re.search(r"\b(associazione|fondazione|onlus|odv|aps)\b", domain, re.I):
+            score -= 0.3
+
+    # 10. Germany-specific penalties (whole-token, word-boundary safe)
+    if cfg.country_code == "DE":
+        _neg, _neg_reason = _is_de_negative_domain(domain)
+        if _neg:
+            score -= 0.5
+        elif re.search(r"\b(forum|archive)\b", domain, re.I):
+            score -= 0.3
+        # Germany directory blacklist penalty
+        _domain_base = domain.split(".")[0] if domain else ""
+        if _domain_base in cfg.directory_blacklist_bases:
+            score -= 1.0
+
     if score < 0:
         score = 0.0
 
@@ -1480,6 +1792,7 @@ def search_official_domain_register(
     email_domain: str,
     serper_key: str,
     max_queries: int = 5,
+    country_config: "CountryConfig | None" = None,
 ) -> tuple[str, float, str, list, str, str, list, dict]:
     """
     Run up to max_queries Serper queries with multi-variant brand scoring.
@@ -1490,8 +1803,12 @@ def search_official_domain_register(
 
     rejection_counts: dict with keys directory/government/religious/academic/low_similarity
     """
+    cfg = country_config or IT_CONFIG
     name_variants = extract_name_variants(company_name)
-    queries = _build_search_queries(name_variants, city, province, postcode, max_queries)
+    queries = _build_search_queries(
+        name_variants, city, province, postcode, max_queries,
+        country_config=cfg,
+    )
 
     candidates: dict[str, float] = {}    # domain → best score seen
     domain_variant: dict[str, str] = {}  # domain → which name variant matched best
@@ -1504,7 +1821,9 @@ def search_official_domain_register(
     }
 
     for query in queries:
-        results, err = _call_serper(query, serper_key)
+        results, err = _call_serper(
+            query, serper_key, gl=cfg.serper_gl, hl=cfg.serper_hl,
+        )
         if err:
             rejection_notes.append(f"Serper error: {err}")
             evidence.append({
@@ -1542,7 +1861,7 @@ def search_official_domain_register(
                 })
                 continue
 
-            if is_generic(domain):
+            if is_generic(domain, country_config=cfg):
                 evidence.append({
                     "query": query, "title": title[:80], "url": url,
                     "snippet": snippet[:200],
@@ -1570,6 +1889,7 @@ def search_official_domain_register(
             score = _score_candidate(
                 domain, rank, title, snippet,
                 name_variants, email_domain, city, province,
+                country_config=cfg,
             )
 
             # Very low score after brand gate — note it but don't include in candidates
@@ -1623,6 +1943,7 @@ def search_official_domain_register(
                     _su_score = _score_candidate(
                         _su_domain, rank, title, snippet,
                         name_variants, email_domain, city, province,
+                        country_config=cfg,
                     )
                     if _su_score >= 0.08:
                         if _su_domain not in candidates or _su_score > candidates[_su_domain]:
@@ -1781,6 +2102,7 @@ def validate_register_row(
     postcode: str,
     serper_key: str | None,
     max_queries: int = 5,
+    country_config: "CountryConfig | None" = None,
 ) -> tuple[dict, list]:
     """
     Validate one register row. Returns result fields dict.
@@ -1861,6 +2183,7 @@ def validate_register_row(
             name, city, province, postcode,
             existing_email_domain or email_domain,
             serper_key, max_queries,
+            country_config=country_config,
         )
         _fill_serper_top(result, ev, query)
         result["name_variant_used"] = variant
@@ -2200,6 +2523,7 @@ def _haiku_review_domain(
     raw_evidence: list[dict],
     api_key: str,
     model: str = _DEFAULT_HAIKU_MODEL,
+    country_config: "CountryConfig | None" = None,
 ) -> dict:
     """
     Call Claude Haiku to validate the Python-suggested domain.
@@ -2231,11 +2555,31 @@ def _haiku_review_domain(
         out["haiku_error"] = "anthropic SDK not installed or API key missing"
         return out
 
+    cfg = country_config or IT_CONFIG
     python_domain     = str(python_result.get("validated_domain", "") or "")
     python_confidence = str(python_result.get("domain_confidence", "") or "")
     results_block     = _build_haiku_results_block(raw_evidence)
 
-    user_msg = _HAIKU_USER_TEMPLATE.format(
+    # Build country-aware location line and system/user prompt
+    _country_name = cfg.country_name
+    _state_label  = "federal state" if cfg.country_code == "DE" else "province"
+    _loc_line = f"{city}, {province} ({_country_name})"
+    _system_prompt = _HAIKU_SYSTEM_PROMPT.replace(
+        "for Italian companies", f"for {_country_name} companies"
+    )
+    _user_template_country = (
+        f"Company: {{company_name}}\n"
+        f"Location: {{city}}, {{province}} ({_country_name})\n"
+        f"Email domain: {{email_domain}}\n"
+        f"Original website in register: {{original_website}}\n"
+        f"Python-suggested domain: {{python_domain}} (confidence: {{python_confidence}})\n\n"
+        f"Search results (pay attention to full URLs and path segments):\n{{results_block}}\n\n"
+        f"Decide whether the Python-suggested domain is the correct official website for this "
+        f"{_country_name} company. If a group/subsidiary page URL exists, evaluate it carefully. "
+        f"Reply with JSON only."
+    )
+
+    user_msg = _user_template_country.format(
         company_name=company_name,
         city=city,
         province=province,
@@ -2251,7 +2595,7 @@ def _haiku_review_domain(
         resp = client.messages.create(
             model=model,
             max_tokens=256,
-            system=_HAIKU_SYSTEM_PROMPT,
+            system=_system_prompt,
             messages=[{"role": "user", "content": user_msg}],
         )
         raw_text = resp.content[0].text.strip()
@@ -5439,6 +5783,8 @@ def process_dataframe(
     fc_fail_fast: bool = True,
     # Debug
     debug_mode: bool = False,
+    # Country config
+    country_config: "CountryConfig | None" = None,
 ) -> tuple[pd.DataFrame, list[dict], list[dict], list[dict]]:
     """
     Process rows resume_from..len(df)-1, prepending prior_results for already-done rows.
@@ -5515,7 +5861,8 @@ def process_dataframe(
             continue
 
         res, raw_ev = validate_register_row(
-            name, website, email, city, province, postcode, serper_key, max_queries
+            name, website, email, city, province, postcode, serper_key, max_queries,
+            country_config=country_config,
         )
         res["organization_type"] = org_type
         res["myngle_target_eligibility"] = eligibility
@@ -5558,6 +5905,7 @@ def process_dataframe(
             haiku_res = _haiku_review_domain(
                 name, city, province, email_domain_h, orig_website_h,
                 res, raw_ev, haiku_api_key, haiku_model,
+                country_config=country_config,
             )
             res.update(haiku_res)
         else:
@@ -7392,6 +7740,97 @@ def _smoke_test_firecrawl_health() -> None:
     print("[SMOKE TEST] _smoke_test_firecrawl_health: all 8 cases passed.", flush=True)
 
 
+def _smoke_test_country_config() -> None:
+    """
+    Smoke test for country detection, column mapping, Serper params, and path routing.
+    Run with:
+        python -c "from input_cleaner_register_edition import _smoke_test_country_config; _smoke_test_country_config()"
+    """
+    import pandas as _pd
+
+    # ── 1. Column detection: Italy-style dataframe ────────────────────────────
+    it_df = _pd.DataFrame(columns=[
+        "Company Name", "Website", "Email address",
+        "City", "National statistical institute Province", "Postal Code", "Phone number",
+    ])
+    it_cols = detect_columns_generic(it_df, IT_CONFIG)
+    assert it_cols["company"] == "Company Name",  f"IT company col: {it_cols['company']}"
+    assert it_cols["email"]   == "Email address", f"IT email col: {it_cols['email']}"
+    assert it_cols["province"] == "National statistical institute Province", \
+        f"IT province col: {it_cols['province']}"
+
+    # ── 2. Column detection: Germany-style dataframe ──────────────────────────
+    de_df = _pd.DataFrame(columns=[
+        "company_name_clean", "company_name_raw", "city_or_registered_office",
+        "federal_state", "registered_address", "company_number", "register_nummer",
+    ])
+    de_cols = detect_columns_generic(de_df, DE_CONFIG)
+    assert de_cols["company"] == "company_name_clean",       f"DE company col: {de_cols['company']}"
+    assert de_cols["city"]    == "city_or_registered_office", f"DE city col: {de_cols['city']}"
+    assert de_cols["province"] == "federal_state",            f"DE province col: {de_cols['province']}"
+
+    # ── 3. Country auto-detection from file path ──────────────────────────────
+    assert detect_country_from_path(r"C:\Users\gertm\Nextcloud\Myngle\Germany\00_raw\Germany_1_R0001_0500.xlsx") == "DE"
+    assert detect_country_from_path("/Users/gertm/Nextcloud/Myngle/Italy100/00_raw/Italy100_1_R0001_0500.xlsx") == "IT"
+    assert detect_country_from_path("/tmp/unknown_file.xlsx") is None
+
+    # ── 4. Country auto-detection from columns ────────────────────────────────
+    assert detect_country_from_columns(de_df) == "DE"
+    assert detect_country_from_columns(it_df) == "IT"
+
+    # ── 5. Serper payload uses gl/hl from country config ─────────────────────
+    assert IT_CONFIG.serper_gl == "it" and IT_CONFIG.serper_hl == "it", "IT Serper locale"
+    assert DE_CONFIG.serper_gl == "de" and DE_CONFIG.serper_hl == "de", "DE Serper locale"
+
+    # ── 6. Dry-run paths resolve correctly ────────────────────────────────────
+    it_paths = resolve_pipeline_output_paths(
+        r"C:\Users\gertm\Nextcloud\Myngle\Italy100\00_raw\Italy100_1_R0001_0500.xlsx",
+        project_root=r"C:\Users\gertm\Nextcloud\Myngle",
+        ts="20260613_1200",
+    )
+    assert "01_cleaned_domains" in it_paths["output_xlsx"].replace("\\", "/"), \
+        f"IT output_xlsx: {it_paths['output_xlsx']}"
+    assert "Italy100" in it_paths["cohort"], f"IT cohort: {it_paths['cohort']}"
+
+    de_paths = resolve_pipeline_output_paths(
+        r"C:\Users\gertm\Nextcloud\Myngle\Germany\00_raw\Germany_1_R0001_0500.xlsx",
+        project_root=r"C:\Users\gertm\Nextcloud\Myngle",
+        ts="20260613_1200",
+    )
+    assert "01_cleaned_domains" in de_paths["output_xlsx"].replace("\\", "/"), \
+        f"DE output_xlsx: {de_paths['output_xlsx']}"
+    assert "Germany" in de_paths["cohort"], f"DE cohort: {de_paths['cohort']}"
+
+    # ── 7. German negative domain checker (word-boundary safe) ────────────────
+    assert _is_de_negative_domain("gemeinde-musterhausen.de")[0],     "gemeinde should be rejected"
+    assert _is_de_negative_domain("rathaus.de")[0],                    "rathaus should be rejected"
+    assert not _is_de_negative_domain("schulenburg.de")[0],            "schulenburg should be safe"
+    assert not _is_de_negative_domain("neustadt-gmbh.de")[0],          "neustadt-gmbh should be safe (not a city token)"
+    assert not _is_de_negative_domain("kammerer.de")[0],               "kammerer should be safe"
+
+    # ── 8. DE blacklist in is_generic ─────────────────────────────────────────
+    assert is_generic("handelsregister.de", country_config=DE_CONFIG), "handelsregister.de should be generic"
+    assert is_generic("northdata.de",       country_config=DE_CONFIG), "northdata.de should be generic"
+    assert not is_generic("acme-gmbh.de",   country_config=DE_CONFIG), "acme-gmbh.de should not be generic"
+
+    # ── 9. Search queries are country-aware ───────────────────────────────────
+    _it_qs = _build_search_queries(
+        {"full": "ACME SRL", "brand": "ACME", "no_desc": "ACME SRL", "is_acronym": False},
+        city="Milano", province="MI", postcode="", max_queries=3, country_config=IT_CONFIG,
+    )
+    assert any("sito ufficiale" in q or "official website" in q for q in _it_qs), \
+        f"IT queries missing Italian terms: {_it_qs}"
+
+    _de_qs = _build_search_queries(
+        {"full": "Mustermann GmbH", "brand": "Mustermann", "no_desc": "Mustermann GmbH", "is_acronym": False},
+        city="Berlin", province="Berlin", postcode="", max_queries=3, country_config=DE_CONFIG,
+    )
+    assert any("Deutschland" in q or "offizielle" in q or "Impressum" in q for q in _de_qs), \
+        f"DE queries missing German terms: {_de_qs}"
+
+    print("[SMOKE TEST] _smoke_test_country_config: all 9 cases passed.", flush=True)
+
+
 def cli_batch_run() -> None:
     """
     Non-Streamlit batch entry point.
@@ -7436,6 +7875,8 @@ def cli_batch_run() -> None:
                         help="Skip the per-key Firecrawl preflight health check before processing")
     parser.add_argument("--no-firecrawl-fail-fast", action="store_true",
                         help="Disable the runtime Firecrawl fail-fast safety check")
+    parser.add_argument("--country", default="auto", choices=["auto", "IT", "DE"],
+                        help="Country pipeline: auto (default), IT (Italy), DE (Germany)")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -7448,6 +7889,13 @@ def cli_batch_run() -> None:
 
     if args.dry_run_paths:
         import json as _json
+        # Determine country from path for dry-run (no df loaded yet)
+        _dry_country = (
+            args.country.upper()
+            if args.country.upper() in COUNTRY_CONFIGS
+            else (detect_country_from_path(str(input_path)) or "IT")
+        )
+        pl_paths["country"] = _dry_country
         print(_json.dumps(pl_paths, indent=2))
         sys.exit(0)
 
@@ -7513,12 +7961,17 @@ def cli_batch_run() -> None:
 
     batch_n = len(df) if args.max_rows <= 0 else min(args.max_rows, len(df))
     run_df  = df.head(batch_n).copy()
-    cols    = detect_columns(run_df)
+
+    # ── Country resolution + column detection ────────────────────────────────
+    country_code = resolve_country(args.country, str(input_path), run_df)
+    cfg          = COUNTRY_CONFIGS.get(country_code, IT_CONFIG)
+    cols         = detect_columns_generic(run_df, cfg)
 
     run_label    = _make_run_label(args.haiku_mode, batch_n, args.max_queries, args.debug, ts=ts)
     run_filename = _make_filename(run_label, file_hash)
 
     print(f"[cleaner] Input:      {input_path}")
+    print(f"[cleaner] Country:    {cfg.country_name} ({cfg.country_code})")
     print(f"[cleaner] Rows:       {batch_n} / {len(df)}")
     print(f"[cleaner] Output:     {pl_paths['output_xlsx']}")
     print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}")
@@ -7550,6 +8003,7 @@ def cli_batch_run() -> None:
         eligibility_filter_mode=_PF_MODE_MAYBE,
         debug_mode=args.debug,
         fc_fail_fast=_fc_fail_fast,
+        country_config=cfg,
     )
     print()  # newline after progress
 
