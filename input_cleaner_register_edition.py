@@ -1091,6 +1091,7 @@ def _cols_from_normalized(run_df: "pd.DataFrame", cfg: "CountryConfig") -> dict:
     """
     Build a cols dict that always points to canonical column names.
     Falls back to detect_columns_generic if a canonical column is entirely blank.
+    The fallback itself is validated: blank fallback columns are never returned.
     """
     canonical_map = {
         "company":  "company_name",
@@ -1103,12 +1104,18 @@ def _cols_from_normalized(run_df: "pd.DataFrame", cfg: "CountryConfig") -> dict:
     }
     cols: dict = {}
     fallback = detect_columns_generic(run_df, cfg)
+
+    def _col_has_data(col_name: str) -> bool:
+        if not col_name or col_name not in run_df.columns:
+            return False
+        return run_df[col_name].astype(str).str.strip().ne("").any()
+
     for role, canon in canonical_map.items():
-        if canon in run_df.columns:
-            has_data = run_df[canon].astype(str).str.strip().ne("").any()
-            cols[role] = canon if has_data else fallback.get(role)
+        if _col_has_data(canon):
+            cols[role] = canon
         else:
-            cols[role] = fallback.get(role)
+            fb = fallback.get(role)
+            cols[role] = fb if _col_has_data(fb) else None
     return cols
 
 
@@ -7346,10 +7353,26 @@ def _build_best_guess_df(
     province_col = cols.get("province") or ""
     phone_col    = cols.get("phone") or ""
 
+    # Priority fallback chains for Best Guess columns — handle both IT and DE output
+    _company_fallbacks = [
+        company_col, "company_name", "cleaned_company_name",
+        "company_name_clean", "company_name_raw",
+    ]
+    _city_fallbacks    = [city_col, "city", "city_or_registered_office"]
+    _province_fallbacks = [province_col, "province", "federal_state"]
+
     rows = []
     for _, r in enriched_df.iterrows():
         def _sv(col):
             return str(r.get(col, "") or "").strip() if col else ""
+
+        def _sv_first(*cols_chain):
+            for c in cols_chain:
+                if c:
+                    v = str(r.get(c, "") or "").strip()
+                    if v:
+                        return v
+            return ""
 
         action       = str(r.get("domain_action", "") or "")
         norm         = str(r.get("normalized_input_website", "") or "").strip()
@@ -7425,11 +7448,11 @@ def _build_best_guess_df(
 
         rows.append({
             # ── Business-facing (lead prioritiser input) ──────────────────────
-            "company_name":                      _sv(company_col),
+            "company_name":                      _sv_first(*_company_fallbacks),
             "website_url":                       url,
             "email":                             _sv(email_col),
-            "city":                              _sv(city_col),
-            "province":                          _sv(province_col),
+            "city":                              _sv_first(*_city_fallbacks),
+            "province":                          _sv_first(*_province_fallbacks),
             "phone":                             _sv(phone_col),
             "final_selected_domain":             final,
             "final_domain_is_business_output":   _final_is_output,
@@ -9105,6 +9128,101 @@ def _smoke_test_country_config() -> None:
     )
 
     print("[SMOKE TEST] _smoke_test_country_config: all 18 cases passed.", flush=True)
+
+
+def _smoke_test_german_pipeline() -> None:
+    """
+    Regression tests for the German batch pipeline.
+    Covers: normalize columns, _cols_from_normalized, _build_best_guess_df fallbacks.
+    """
+    import pandas as _pd
+
+    # ── T1. normalize_register_columns_for_cleaner produces canonical DE columns ─
+    _de_raw = _pd.DataFrame([{
+        "company_name_clean": "Mustermann GmbH",
+        "homepage_url": "mustermann.de",
+        "email": "info@mustermann.de",
+        "city_or_registered_office": "Berlin",
+        "federal_state": "Berlin",
+        "postcode": "10115",
+    }])
+    _de_norm, _ = normalize_register_columns_for_cleaner(_de_raw, DE_CONFIG)
+    assert "company_name" in _de_norm.columns, "T1: company_name canonical col missing after norm"
+    assert _de_norm["company_name"].iloc[0] == "Mustermann GmbH", \
+        f"T1: company_name value wrong: {_de_norm['company_name'].iloc[0]}"
+    assert "city" in _de_norm.columns, "T1: city canonical col missing after norm"
+    assert _de_norm["city"].iloc[0] == "Berlin", \
+        f"T1: city value wrong: {_de_norm['city'].iloc[0]}"
+
+    # ── T2. _cols_from_normalized returns populated canonical columns ──────────
+    _de_cols = _cols_from_normalized(_de_norm, DE_CONFIG)
+    assert _de_cols.get("company") == "company_name", \
+        f"T2: company col should be 'company_name', got: {_de_cols.get('company')}"
+    assert _de_cols.get("city") == "city", \
+        f"T2: city col should be 'city', got: {_de_cols.get('city')}"
+
+    # ── T3. _cols_from_normalized does NOT return a blank canonical column ─────
+    _de_blank = _pd.DataFrame([{
+        "company_name": "",   # canonical exists but is blank
+        "company_name_clean": "Blank Test GmbH",
+        "city": "Hamburg",
+    }])
+    _de_blank_cols = _cols_from_normalized(_de_blank, DE_CONFIG)
+    # company_name col is blank → should fall back to None or fallback with data
+    assert _de_blank_cols.get("company") != "company_name" or \
+        _de_blank["company_name"].astype(str).str.strip().ne("").any(), \
+        "T3: _cols_from_normalized must not return blank canonical col as company col"
+
+    # ── T4. _build_best_guess_df produces non-blank company_name via fallback ──
+    _de_multi = _pd.DataFrame([{
+        "company_name": "",
+        "company_name_clean": "Fallback GmbH",
+        "website": "fallback.de",
+        "city": "München",
+        "federal_state": "Bavaria",
+    }])
+    _de_multi_norm, _ = normalize_register_columns_for_cleaner(_de_multi, DE_CONFIG)
+    _de_multi_cols = _cols_from_normalized(_de_multi_norm, DE_CONFIG)
+    _bg_df = _build_best_guess_df(_de_multi_norm, _de_multi_cols)
+    assert len(_bg_df) > 0, "T4: _build_best_guess_df returned empty DataFrame"
+    _bg_name = str(_bg_df.iloc[0].get("company_name", "")).strip()
+    assert _bg_name, f"T4: company_name is blank in Best Guess output; cols={_de_multi_cols}"
+
+    # ── T5. detect_columns_generic handles German cleaned output file ─────────
+    _de_cleaned = _pd.DataFrame([{
+        "company_name": "Mustermann GmbH",
+        "website": "mustermann.de",
+        "city": "Berlin",
+        "organization_type": "GmbH",
+        "federal_state": "Berlin",
+    }])
+    _de_gc = detect_columns_generic(_de_cleaned, DE_CONFIG)
+    assert _de_gc.get("company") == "company_name", \
+        f"T5: detect_columns_generic should find 'company_name', got: {_de_gc.get('company')}"
+    assert _de_gc.get("website") == "website", \
+        f"T5: detect_columns_generic should find 'website', got: {_de_gc.get('website')}"
+
+    # ── T6. brand_is_de_generic: single-word generic brand detected ───────────
+    for _generic_name in ["Global GmbH", "Solutions GmbH & Co. KG", "Digital GmbH"]:
+        _v = extract_name_variants(_generic_name)
+        assert _v.get("brand_is_de_generic"), \
+            f"T6: '{_generic_name}' must set brand_is_de_generic (brand='{_v.get('brand')}')"
+
+    # ── T7. url_shortener guard: t.co must not survive as validated domain ─────
+    _tco_domain = best_website_domain("https://t.co/xyz123")
+    assert is_url_shortener(_tco_domain) if _tco_domain else True, \
+        f"T7: t.co must be flagged as url shortener; got domain='{_tco_domain}'"
+
+    # ── T8. resolve_country + COUNTRY_CONFIGS round-trip for DE ──────────────
+    _country = resolve_country("auto", "Germany_2_R0001_0500.xlsx", _pd.DataFrame())
+    assert _country == "DE", f"T8: resolve_country for German file must return 'DE', got '{_country}'"
+    _cfg = COUNTRY_CONFIGS.get(_country)
+    assert _cfg is not None, "T8: COUNTRY_CONFIGS must contain 'DE' key"
+    assert _cfg.country_code == "DE", f"T8: DE config country_code must be 'DE': {_cfg.country_code}"
+    assert _cfg.firecrawl_location.get("country") == "DE", \
+        f"T8: DE firecrawl_location must have country=DE: {_cfg.firecrawl_location}"
+
+    print("[SMOKE TEST] _smoke_test_german_pipeline: all 8 cases passed.", flush=True)
 
 
 def _smoke_test_size_inference() -> None:

@@ -6556,28 +6556,81 @@ def run_cli() -> None:
     print(f"[enricher] Rows to process: {len(df_in)}", flush=True)
 
     # ── Detect key columns ────────────────────────────────────────────────────
-    _col_candidates = {
-        "company_name":     ["company_name", "cleaned_company_name", "canonical_company_name", "Company Name", "company", "name", "Company"],
-        "domain":           ["final_selected_domain", "validated_domain", "recommended_domain", "canonical_company_domain", "domain", "website", "Website"],
-        "city":             ["lusha_city", "city", "City", "lusha_api_city"],
-        "country":          ["lusha_country", "country", "Country", "lusha_api_country"],
-        "industry":         ["lusha_industry", "industry", "Industry", "lusha_api_industry"],
-        "employee_range":   ["employee_range_for_scoring", "employee_range_resolved", "lusha_employee_range",
-                             "lusha_api_employee_range", "employee_range"],
+    # Columns that must never be selected as the company-name column
+    _META_COLS_EXCLUDE: set[str] = {
+        "organization_type", "myngle_target_eligibility", "pre_filter_decision",
+        "pre_filter_reason", "pre_score", "pre_label", "domain_action",
+        "domain_confidence", "domain_reason", "final_confidence",
+        "final_decision_source", "verifier_decision", "website_discovery_method",
+        "professional_site_level", "source", "source_row_id", "current_status",
+        "jurisdiction_code", "legal_form_detected", "registered_address",
+        "city_or_registered_office", "federal_state", "registrar",
+        "register_art", "register_nummer", "retrieved_at",
+        "positive_reasons", "exclude_reasons", "low_priority_reasons",
     }
+    _META_SUFFIX_EXCLUDE = (
+        "_status", "_source", "_reason", "_signal", "_score",
+        "_confidence", "_type", "_decision", "_action", "_label",
+        "_notes", "_evidence",
+    )
+
+    def _is_meta_col(col_name: str) -> bool:
+        if col_name in _META_COLS_EXCLUDE:
+            return True
+        cl = col_name.lower()
+        return any(cl.endswith(sfx) for sfx in _META_SUFFIX_EXCLUDE)
+
+    _col_candidates = {
+        # Priority order: cleaned output canonical → German raw → Italian raw → generic
+        "company_name": [
+            "company_name", "canonical_company_name", "cleaned_company_name",
+            "Company Name", "company_name_clean", "company_name_raw",
+            "name", "company", "organisation_name", "organization_name",
+        ],
+        "domain": [
+            "website_url", "final_selected_domain", "canonical_company_domain",
+            "validated_domain", "recommended_domain",
+            "python_validated_domain", "python_recommended_domain",
+            "Company Domain", "Company Website", "Website",
+            "website", "domain", "url", "homepage",
+        ],
+        "city":           ["lusha_city", "city", "City", "lusha_api_city", "city_or_registered_office"],
+        "country":        ["lusha_country", "country", "Country", "lusha_api_country"],
+        "industry":       ["lusha_industry", "industry", "Industry", "lusha_api_industry"],
+        "employee_range": [
+            "employee_range_for_scoring", "employee_range_resolved",
+            "lusha_employee_range", "lusha_api_employee_range", "employee_range",
+        ],
+    }
+
     def _find_col(role):
         for cand in _col_candidates.get(role, []):
             if cand in df_in.columns:
+                # For company_name role, never select metadata columns
+                if role == "company_name" and _is_meta_col(cand):
+                    continue
                 return cand
+        # For company_name: fuzzy fallback — first non-metadata column that has unique values
+        if role == "company_name":
+            for col in df_in.columns:
+                if not _is_meta_col(col):
+                    n_unique = df_in[col].astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+                    if n_unique >= max(3, len(df_in) // 4):
+                        return col
         return None
 
     company_col = _find_col("company_name") or df_in.columns[0]
-    domain_col  = _find_col("domain")
-    print(f"[enricher] Company col: {company_col}, Domain col: {domain_col}", flush=True)
+    domain_col  = _find_col("domain")  # may be None for German raw files
+
+    # Guard: never use a metadata column as company_name
+    if _is_meta_col(company_col):
+        # Explicit fallback to first non-meta column
+        company_col = next((c for c in df_in.columns if not _is_meta_col(c)), df_in.columns[0])
+
+    print(f"[enricher] Company col: {company_col}, Domain col: {domain_col or '(none)'}", flush=True)
 
     if not domain_col:
-        print(f"[enricher] WARNING: no domain column found. Available columns: {list(df_in.columns)}", flush=True)
-        print("[enricher] Proceeding with empty domains.", flush=True)
+        print("[enricher] No domain column found — proceeding with company-name-only enrichment.", flush=True)
 
     # ── Process rows ──────────────────────────────────────────────────────────
     results      = []
@@ -7029,7 +7082,7 @@ def run_streamlit_app() -> None:
             )
         else:
             # Type 1 simple company list: count unique non-empty company names
-            _t1_name_col, _ = detect_columns(df_raw)
+            _t1_name_col, _t1_dom_col = detect_columns(df_raw)
             if _t1_name_col and _t1_name_col in df_raw.columns:
                 _t1_count = int(
                     df_raw[_t1_name_col]
@@ -7042,10 +7095,25 @@ def run_streamlit_app() -> None:
                 )
             else:
                 _t1_count = len(df_raw)
+            _t1_row_count = len(df_raw)
+            _col_info_parts = []
+            if _t1_name_col:
+                _col_info_parts.append(f"name: `{_t1_name_col}`")
+            if _t1_dom_col:
+                _col_info_parts.append(f"domain: `{_t1_dom_col}`")
+            else:
+                _col_info_parts.append("domain: *not detected — will search*")
+            _col_info = " · ".join(_col_info_parts)
             _st.success(
                 f"✓ **{ss('file_name')}** loaded · "
                 f"{_t1_count:,} {'company' if _t1_count == 1 else 'companies'} ready"
+                + (f"  \n{_col_info}" if _col_info else "")
             )
+            if _t1_row_count >= 50 and _t1_count <= 10:
+                _st.warning(
+                    f"Only {_t1_count} unique company names found in {_t1_row_count:,} rows. "
+                    "Check that the correct name column was detected above."
+                )
     # ── Column detection and processing scope ─────────────────────────────────────
 
     name_col     = _sc_name_col if _app_mode == "Single Company" else None
