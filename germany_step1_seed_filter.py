@@ -151,15 +151,29 @@ PUBLIC_KEYWORDS: list[tuple[str, str]] = [
 
 # Low-priority keywords (reduce score, no hard exclusion)
 LOW_PRIORITY_KEYWORDS: list[tuple[str, str]] = [
-    ("grundstück",       r"\b(?:Grundstück|Grundstueck)\b"),
-    ("immobilien",       r"\bImmobilien\b"),
-    ("vermögensverwaltung", r"\b(?:Vermögensverwaltung|Vermoegensverwaltung)\b"),
+    ("grundstück",              r"\b(?:Grundstück|Grundstueck)\b"),
+    ("grundbesitz",             r"\bGrundbesitz\b"),
+    ("immobilien",              r"\bImmobilien\b"),
+    ("real_estate",             r"\bReal\s*Estate\b"),
+    ("property",                r"\bProperty\b"),
+    ("objektgesellschaft",      r"\bObjektgesellschaft\b"),
+    ("besitzgesellschaft",      r"\bBesitzgesellschaft\b"),
+    ("verwaltungsgesellschaft", r"\bVerwaltungsgesellschaft\b"),
+    ("vermögensverwaltung",     r"\b(?:Vermögensverwaltung|Vermoegensverwaltung)\b"),
     ("beteiligungsgesellschaft", r"\bBeteiligungsgesellschaft\b"),
-    ("verwaltungs",      r"\bVerwaltungs\b"),
-    ("residence",        r"\bResidence\b"),
-    ("fonds",            r"\bFonds\b"),
-    ("asset_management", r"\bAsset\s*Management\b"),
+    ("verwaltungs",             r"\bVerwaltungs\b"),
+    ("residence",               r"\bResidence\b"),
+    ("fonds",                   r"\bFonds\b"),
+    ("asset_management",        r"\bAsset\s*Management\b"),
 ]
+
+# Strong operational sector keywords — these override low-priority signals for PRE_KEEP
+STRONG_OPERATIONAL_SECTOR_KEYWORDS = {
+    "maschinenbau", "industrie", "logistik", "automotive", "technik",
+    "technologie", "systems", "solutions", "software", "pharma", "chemie",
+    "medtech", "engineering", "automation", "elektronik", "kunststoff",
+    "verpackung", "metall", "medical", "energie",
+}
 
 # Compile all regex patterns once
 def _compile(pairs: list[tuple[str, str]]) -> list[tuple[str, re.Pattern]]:
@@ -201,7 +215,15 @@ def detect_legal_form(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def score_row(name: str, legal_form: str) -> tuple[int, str, list[str], list[str], list[str]]:
-    """Return (score, pre_label, positive_reasons, exclude_reasons, low_priority_reasons)."""
+    """Return (score, pre_label, positive_reasons, exclude_reasons, low_priority_reasons).
+
+    PRE_KEEP rules (all must hold):
+      - Strong legal form (AG/SE/KGaA/GmbH&Co.KG/GmbH&Co.KGaA) requires at least one
+        sector or scale signal.
+      - GmbH alone requires at least one sector or scale signal.
+      - Low-priority signals block PRE_KEEP unless a strong operational sector keyword
+        is present.
+    """
     score = 0
     positive: list[str] = []
     excluded: list[str] = []
@@ -236,25 +258,42 @@ def score_row(name: str, legal_form: str) -> tuple[int, str, list[str], list[str
             return score, "PRE_EXCLUDE", positive, excluded, low_pri
 
     # --- Scale keywords ---
+    has_scale_signal = False
     for key, pat in _SCALE_COMPILED:
         if pat.search(name):
             score += 2
+            has_scale_signal = True
             positive.append(f"positive_scale_keyword:{key}")
 
     # --- Sector keywords ---
+    has_sector_signal = False
+    has_strong_operational_signal = False
     for key, pat in _SECTOR_COMPILED:
         if pat.search(name):
             score += 1
+            has_sector_signal = True
+            if key in STRONG_OPERATIONAL_SECTOR_KEYWORDS:
+                has_strong_operational_signal = True
             positive.append(f"positive_sector_keyword:{key}")
 
     # --- Low-priority keywords ---
+    has_low_priority_signal = False
     for key, pat in _LOW_PRI_COMPILED:
         if pat.search(name):
             score -= 1
+            has_low_priority_signal = True
             low_pri.append(f"low_priority_keyword:{key}")
 
-    # --- Pre-label ---
-    if score >= PRE_KEEP_THRESHOLD:
+    # --- PRE_KEEP qualification ---
+    # A company qualifies for PRE_KEEP only when:
+    #   1. Score is above threshold.
+    #   2. There is at least one sector or scale signal (legal form alone is not enough).
+    #   3. Low-priority signals do not block it, unless a strong operational sector
+    #      keyword is present.
+    has_positive_signal = has_sector_signal or has_scale_signal
+    low_pri_blocks_keep = has_low_priority_signal and not has_strong_operational_signal
+
+    if score >= PRE_KEEP_THRESHOLD and has_positive_signal and not low_pri_blocks_keep:
         label = "PRE_KEEP"
     elif score >= PRE_MAYBE_THRESHOLD:
         label = "PRE_MAYBE"
