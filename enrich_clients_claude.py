@@ -69,8 +69,8 @@ def running_under_streamlit() -> bool:
     if "streamlit" not in sys.modules:
         return False
     try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx() is not None
+        import streamlit.runtime as _sr
+        return _sr.exists()
     except Exception:
         return False
 
@@ -6549,6 +6549,10 @@ def run_cli() -> None:
     if args.max_rows and args.max_rows > 0:
         df_in = df_in.head(args.max_rows)
 
+    if len(df_in) == 0:
+        print("[enricher] ERROR: input file has zero rows.", file=sys.stderr)
+        sys.exit(2)
+
     print(f"[enricher] Rows to process: {len(df_in)}", flush=True)
 
     # ── Detect key columns ────────────────────────────────────────────────────
@@ -6690,6 +6694,8 @@ def run_cli() -> None:
     if not xl_path.exists():
         print(f"[enricher] ERROR: output file was not created: {xl_path}", file=sys.stderr)
         sys.exit(2)
+
+    print(f"[enricher] Output file: {xl_path}", flush=True)
 
 
 
@@ -8703,4 +8709,10 @@ if __name__ == "__main__":
     elif running_under_streamlit():
         run_streamlit_app()
     else:
-        run_streamlit_app()
+        print(
+            "mYngle Lead Prioritizer\n"
+            "  Batch mode:  python enrich_clients_claude.py --input FILE [--output-dir DIR] [--max-rows N]\n"
+            "  Streamlit UI: streamlit run enrich_clients_claude.py",
+            file=sys.stderr,
+        )
+        sys.exit(0)
