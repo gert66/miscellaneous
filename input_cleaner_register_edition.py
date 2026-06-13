@@ -5743,7 +5743,372 @@ _OUTPUT_COLS = [
     "pre_safety_final_confidence",
     "pre_safety_manual_review_needed",
     "pre_safety_final_decision_source",
+    # size inference fields
+    "size_inference_enabled",
+    "employee_size_band",
+    "employee_size_confidence",
+    "employee_count_estimate",
+    "employee_count_min",
+    "employee_count_max",
+    "employee_size_evidence_text",
+    "employee_size_evidence_url",
+    "employee_size_source",
+    "hrm_likelihood_score",
+    "hrm_signals",
+    "career_page_found",
+    "size_manual_review_needed",
+    "size_inference_stop_reason",
+    "firecrawl_used_for_domain_verification",
+    "firecrawl_used_for_size_inference",
+    "firecrawl_pages_used_for_size",
+    "firecrawl_pages_used_total",
+    "firecrawl_purpose",
 ]
+
+# ── Size inference constants ──────────────────────────────────────────────────
+SIZE_100_PLUS_CONFIRMED = "SIZE_100_PLUS_CONFIRMED"
+SIZE_100_PLUS_LIKELY    = "SIZE_100_PLUS_LIKELY"
+SIZE_50_99_LIKELY       = "SIZE_50_99_LIKELY"
+SIZE_BELOW_50_LIKELY    = "SIZE_BELOW_50_LIKELY"
+SIZE_UNKNOWN            = "SIZE_UNKNOWN"
+
+SIZE_INFERENCE_FIELDS: list[str] = [
+    "size_inference_enabled",
+    "employee_size_band",
+    "employee_size_confidence",
+    "employee_count_estimate",
+    "employee_count_min",
+    "employee_count_max",
+    "employee_size_evidence_text",
+    "employee_size_evidence_url",
+    "employee_size_source",
+    "hrm_likelihood_score",
+    "hrm_signals",
+    "career_page_found",
+    "size_manual_review_needed",
+    "size_inference_stop_reason",
+    # FC tracking by purpose
+    "firecrawl_used_for_domain_verification",
+    "firecrawl_used_for_size_inference",
+    "firecrawl_pages_used_for_size",
+    "firecrawl_pages_used_total",
+    "firecrawl_purpose",
+]
+
+
+def _size_inference_empty() -> dict:
+    """Return a blank size-inference result dict."""
+    return {
+        "size_inference_enabled": False,
+        "employee_size_band": SIZE_UNKNOWN,
+        "employee_size_confidence": "none",
+        "employee_count_estimate": "",
+        "employee_count_min": "",
+        "employee_count_max": "",
+        "employee_size_evidence_text": "",
+        "employee_size_evidence_url": "",
+        "employee_size_source": "",
+        "hrm_likelihood_score": 0,
+        "hrm_signals": "",
+        "career_page_found": False,
+        "size_manual_review_needed": False,
+        "size_inference_stop_reason": "",
+        "firecrawl_used_for_domain_verification": False,
+        "firecrawl_used_for_size_inference": False,
+        "firecrawl_pages_used_for_size": 0,
+        "firecrawl_pages_used_total": 0,
+        "firecrawl_purpose": "",
+    }
+
+
+def _extract_employee_size_regex(text: str, country_code: str = "IT") -> dict:
+    """
+    Extract employee count from page text using language-specific regex patterns.
+    Returns dict with keys: count_min, count_max, estimate, band, confidence, evidence_text.
+    """
+    import re as _re
+
+    text = (text or "")[:20_000]  # cap to avoid slow regex on huge pages
+
+    # German patterns
+    _DE_PATTERNS = [
+        # "über 500 Mitarbeiter", "mehr als 200 Beschäftigte"
+        (r"(?:über|mehr als|ca\.?|rund|etwa)\s+(\d[\d\.,]*)\s*(?:Mitarbeiter|Beschäftigte|Angestellte|Mitarbeitende)", "de_ueber"),
+        # "500 Mitarbeiter", "1.200 Beschäftigte"
+        (r"(\d[\d\.,]*)\s*(?:Mitarbeiter(?:innen)?|Beschäftigte|Angestellte|Mitarbeitende)", "de_plain"),
+        # "Team von 50", "Team mit 120 Personen"
+        (r"Team\s+(?:von|mit)\s+(\d[\d\.,]*)\s*(?:Personen|Mitarbeiter|Menschen)?", "de_team"),
+        # "150 employees" (English on DE sites)
+        (r"(\d[\d\.,]*)\s+employees?", "de_en_empl"),
+        # "Headcount: 300"
+        (r"[Hh]eadcount[:\s]+(\d[\d\.,]*)", "de_headcount"),
+    ]
+    # Italian patterns
+    _IT_PATTERNS = [
+        # "oltre 500 dipendenti", "più di 200 collaboratori"
+        (r"(?:oltre|più di|circa|ca\.?|quasi)\s+(\d[\d\.,]*)\s*(?:dipendenti|collaboratori|lavoratori|persone)", "it_oltre"),
+        # "500 dipendenti", "1.200 collaboratori"
+        (r"(\d[\d\.,]*)\s*(?:dipendenti|collaboratori|lavoratori|risorse umane)", "it_plain"),
+        # "team di 50 persone"
+        (r"team\s+di\s+(\d[\d\.,]*)\s*(?:persone|dipendenti)?", "it_team"),
+        # "150 employees" (English on IT sites)
+        (r"(\d[\d\.,]*)\s+employees?", "it_en_empl"),
+    ]
+
+    patterns = _DE_PATTERNS if country_code == "DE" else _IT_PATTERNS
+
+    def _parse_num(s: str) -> int | None:
+        s = s.replace(".", "").replace(",", "")
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    best_count: int | None = None
+    best_evidence = ""
+
+    for pattern, label in patterns:
+        for m in _re.finditer(pattern, text, _re.IGNORECASE):
+            n = _parse_num(m.group(1))
+            if n is None or n < 2 or n > 500_000:
+                continue
+            span_start = max(0, m.start() - 40)
+            span_end   = min(len(text), m.end() + 40)
+            snippet    = text[span_start:span_end].replace("\n", " ").strip()
+            if best_count is None or n > best_count:
+                best_count    = n
+                best_evidence = snippet
+
+    if best_count is None:
+        return {"count_min": "", "count_max": "", "estimate": "", "band": SIZE_UNKNOWN,
+                "confidence": "none", "evidence_text": ""}
+
+    # Classify band
+    if best_count >= 200:
+        band = SIZE_100_PLUS_CONFIRMED
+        conf = "high"
+        cmin, cmax = best_count, ""
+    elif best_count >= 100:
+        band = SIZE_100_PLUS_CONFIRMED
+        conf = "medium"
+        cmin, cmax = best_count, ""
+    elif best_count >= 50:
+        band = SIZE_50_99_LIKELY
+        conf = "medium"
+        cmin, cmax = 50, 99
+    else:
+        band = SIZE_BELOW_50_LIKELY
+        conf = "low"
+        cmin, cmax = "", best_count
+
+    return {
+        "count_min": cmin,
+        "count_max": cmax,
+        "estimate":  best_count,
+        "band":      band,
+        "confidence": conf,
+        "evidence_text": best_evidence,
+    }
+
+
+def _classify_hrm_signals(text_corpus: list[str], country_code: str = "IT") -> tuple[int, str, bool]:
+    """
+    Score HRM likelihood 0-10 from page text corpus.
+    Returns (score, signals_csv, career_page_found).
+    """
+    combined = " ".join((t or "") for t in text_corpus)[:40_000].lower()
+
+    # Signal definitions: (keyword_list, points, label)
+    _DE_SIGNALS = [
+        (["karriere", "karriereseite", "jobs", "stellenangebote"], 2, "career_page"),
+        (["ausbildung", "ausbildungsplatz", "azubi"], 1, "ausbildung"),
+        (["personalentwicklung", "weiterbildung", "l&d", "learning & development"], 1, "personalentwicklung"),
+        (["hr-abteilung", "human resources", "personalwesen"], 1, "hr_dept"),
+        (["onboarding", "einarbeitung"], 1, "onboarding"),
+        (["benefits", "mitarbeitervorteile", "corporate benefits"], 1, "benefits"),
+        (["mehrere standorte", "niederlassungen", "international"], 1, "multi_location"),
+        (["academy", "akademie", "lernpfad"], 1, "academy"),
+        (["sprachen", "fremdsprachen", "sprachkenntnisse"], 1, "languages"),
+    ]
+    _IT_SIGNALS = [
+        (["lavora con noi", "posizioni aperte", "carriere", "careers"], 2, "career_page"),
+        (["formazione", "sviluppo professionale", "l&d"], 1, "formazione"),
+        (["risorse umane", "hr", "human resources"], 1, "hr_dept"),
+        (["onboarding", "inserimento"], 1, "onboarding"),
+        (["benefit", "welfare aziendale", "fringe benefit"], 1, "benefits"),
+        (["più sedi", "sedi", "internazionale"], 1, "multi_location"),
+        (["academy", "accademia", "percorso formativo"], 1, "academy"),
+        (["lingue", "lingua straniera", "corsi di lingua"], 1, "languages"),
+        (["stage", "tirocinio", "apprendistato"], 1, "apprenticeship"),
+    ]
+
+    signals_def = _DE_SIGNALS if country_code == "DE" else _IT_SIGNALS
+    score = 0
+    found_signals: list[str] = []
+    career_found = False
+
+    for keywords, pts, label in signals_def:
+        if any(kw in combined for kw in keywords):
+            score += pts
+            found_signals.append(label)
+            if label == "career_page":
+                career_found = True
+
+    score = min(score, 10)
+    return score, ",".join(found_signals), career_found
+
+
+def _build_size_serper_queries(domain: str, country_config: "CountryConfig") -> list[str]:
+    """Build up to 2 targeted Serper queries for size inference."""
+    cc = country_config.country_code
+    queries: list[str] = []
+    if cc == "DE":
+        queries.append(f"site:{domain} Mitarbeiter OR Beschäftigte OR Headcount")
+        queries.append(f"site:{domain} Karriere OR Stellenangebote OR Jobs")
+    else:  # IT default
+        queries.append(f"site:{domain} dipendenti OR collaboratori OR team")
+        queries.append(f"site:{domain} lavora con noi OR posizioni aperte OR careers")
+    return queries[:2]
+
+
+def _infer_company_size(
+    domain: str,
+    company_name: str,
+    serper_key: str | None,
+    fc_keys,
+    country_config: "CountryConfig",
+    fc_location: dict | None,
+    max_size_serper_queries: int = 2,
+    max_size_fc_pages: int = 2,
+    fc_pages_already_used: int = 0,
+    max_total_fc_pages: int = 3,
+    existing_texts: list[str] | None = None,
+    existing_evidence_url: str = "",
+    fc_speed_mode: str = "fast",
+    page_timeout: int = 15,
+) -> dict:
+    """
+    Orchestrate size + HRM inference for one company.
+    Returns a dict compatible with SIZE_INFERENCE_FIELDS.
+    """
+    result = _size_inference_empty()
+    result["size_inference_enabled"] = True
+    result["firecrawl_used_for_domain_verification"] = fc_pages_already_used > 0
+
+    if not domain:
+        result["size_inference_stop_reason"] = "no_domain"
+        return result
+
+    text_corpus: list[str] = list(existing_texts or [])
+    evidence_url = existing_evidence_url
+    fc_pages_for_size = 0
+    stop_reason = ""
+
+    # Step 1: mine existing Serper/FC evidence already in corpus
+    size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
+    if size_info["band"] in (SIZE_100_PLUS_CONFIRMED,) and size_info["confidence"] == "high":
+        stop_reason = "exact_count_from_existing_evidence"
+
+    # Step 2: fetch homepage if no strong signal yet and we have budget
+    if not stop_reason and serper_key:
+        queries = _build_size_serper_queries(domain, country_config)
+        gl = country_config.serper_gl
+        hl = country_config.serper_hl
+        serper_used = 0
+        for q in queries[:max_size_serper_queries]:
+            if serper_used >= max_size_serper_queries:
+                break
+            try:
+                _hits, _err = _call_serper(q, serper_key, gl=gl, hl=hl)
+                serper_used += 1
+                if _hits:
+                    for hit in _hits[:3]:
+                        snippet = (hit.get("snippet") or "") + " " + (hit.get("title") or "")
+                        if snippet.strip():
+                            text_corpus.append(snippet)
+                            if not evidence_url and hit.get("link"):
+                                evidence_url = hit["link"]
+            except Exception:
+                pass
+
+        # Re-check after Serper evidence
+        size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
+        if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] in ("high", "medium"):
+            stop_reason = "confirmed_from_serper_snippets"
+
+    # Step 3: fetch FC pages (homepage + 1 targeted page) if still no signal
+    fc_budget_remaining = max_total_fc_pages - fc_pages_already_used
+    size_fc_budget = min(max_size_fc_pages, fc_budget_remaining)
+
+    if not stop_reason and size_fc_budget > 0 and fc_keys:
+        fc_urls_to_try = [f"https://{domain}"]
+        # add career page URL guess
+        cc = country_config.country_code
+        career_path = "/karriere" if cc == "DE" else "/lavora-con-noi"
+        fc_urls_to_try.append(f"https://{domain}{career_path}")
+
+        fc_key_list = fc_keys if isinstance(fc_keys, list) else [fc_keys]
+        for fc_url in fc_urls_to_try[:size_fc_budget]:
+            if fc_pages_for_size >= size_fc_budget:
+                break
+            try:
+                fc_result = _fetch_one_page_firecrawl(
+                    fc_url,
+                    fc_key_list,
+                    speed_mode=fc_speed_mode,
+                    location=fc_location,
+                    timeout=page_timeout,
+                )
+                fc_pages_for_size += 1
+                page_text = fc_result.get("markdown") or fc_result.get("text") or ""
+                if page_text:
+                    text_corpus.append(page_text)
+                    if not evidence_url:
+                        evidence_url = fc_url
+            except Exception:
+                fc_pages_for_size += 1  # count attempt
+
+        result["firecrawl_used_for_size_inference"] = fc_pages_for_size > 0
+        # Re-check after FC
+        size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
+        if size_info["band"] in (SIZE_100_PLUS_CONFIRMED, SIZE_100_PLUS_LIKELY) and size_info["confidence"] != "none":
+            stop_reason = "confirmed_from_firecrawl"
+
+    if not stop_reason:
+        stop_reason = "max_pages_reached" if (fc_pages_for_size >= size_fc_budget and size_fc_budget > 0) else "no_evidence_found"
+
+    # HRM signals
+    hrm_score, hrm_signals, career_found = _classify_hrm_signals(text_corpus, country_config.country_code)
+
+    # Upgrade band based on HRM signals (size unknown but strong HRM signal → likely 100+)
+    band = size_info["band"]
+    confidence = size_info["confidence"]
+    if band == SIZE_UNKNOWN and hrm_score >= 5:
+        band = SIZE_100_PLUS_LIKELY
+        confidence = "low"
+
+    result.update({
+        "employee_size_band":       band,
+        "employee_size_confidence": confidence,
+        "employee_count_estimate":  size_info.get("estimate", ""),
+        "employee_count_min":       size_info.get("count_min", ""),
+        "employee_count_max":       size_info.get("count_max", ""),
+        "employee_size_evidence_text": size_info.get("evidence_text", "")[:300],
+        "employee_size_evidence_url":  evidence_url,
+        "employee_size_source":     "serper+firecrawl" if result["firecrawl_used_for_size_inference"] else "serper",
+        "hrm_likelihood_score":     hrm_score,
+        "hrm_signals":              hrm_signals,
+        "career_page_found":        career_found,
+        "size_manual_review_needed": band == SIZE_UNKNOWN,
+        "size_inference_stop_reason": stop_reason,
+        "firecrawl_pages_used_for_size": fc_pages_for_size,
+        "firecrawl_pages_used_total": fc_pages_already_used + fc_pages_for_size,
+        "firecrawl_purpose": "domain_verification+size_inference" if (fc_pages_already_used > 0 and fc_pages_for_size > 0)
+                             else "size_inference" if fc_pages_for_size > 0
+                             else "domain_verification" if fc_pages_already_used > 0
+                             else "",
+    })
+    return result
 
 
 def process_dataframe(
