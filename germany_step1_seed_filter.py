@@ -149,31 +149,43 @@ PUBLIC_KEYWORDS: list[tuple[str, str]] = [
     ("amt",             r"\bAmt\b"),
 ]
 
-# Low-priority keywords (reduce score, no hard exclusion)
+# Low-priority keywords (reduce score, block PRE_KEEP unless strong operational signal).
+# Patterns use prefix/stem matching for German compound words so that
+# e.g. "Grundstücksgesellschaft" is caught by the grundstück stem pattern.
 LOW_PRIORITY_KEYWORDS: list[tuple[str, str]] = [
-    ("grundstück",              r"\b(?:Grundstück|Grundstueck)\b"),
-    ("grundbesitz",             r"\bGrundbesitz\b"),
-    ("immobilien",              r"\bImmobilien\b"),
+    # real-estate / property stems (catch compounds)
+    ("grundstück",              r"Grundst(?:ück|uck)"),
+    ("liegenschaft",            r"Liegenschaft"),
+    ("grundbesitz",             r"Grundbesitz"),
+    ("objekt",                  r"Objekt(?:gesellschaft|verwaltung|fonds)?"),
+    ("besitz",                  r"Besitz(?:gesellschaft|verwaltung|ges\.)?"),
+    ("immobilien",              r"Immobilien"),
     ("real_estate",             r"\bReal\s*Estate\b"),
     ("property",                r"\bProperty\b"),
-    ("objektgesellschaft",      r"\bObjektgesellschaft\b"),
-    ("besitzgesellschaft",      r"\bBesitzgesellschaft\b"),
-    ("verwaltungsgesellschaft", r"\bVerwaltungsgesellschaft\b"),
-    ("vermögensverwaltung",     r"\b(?:Vermögensverwaltung|Vermoegensverwaltung)\b"),
-    ("beteiligungsgesellschaft", r"\bBeteiligungsgesellschaft\b"),
-    ("verwaltungs",             r"\bVerwaltungs\b"),
+    ("verpachtung",             r"Verpachtung"),
+    ("vermietung",              r"Vermietung"),
+    # financial / holding vehicles
+    ("vermögensverwaltung",     r"Verm(?:ö|oe)gensverwaltung"),
+    ("beteiligungsgesellschaft", r"Beteiligungsgesellschaft"),
+    ("verwaltungsgesellschaft", r"Verwaltungsgesellschaft"),
+    ("verwaltungs",             r"Verwaltungs"),
     ("residence",               r"\bResidence\b"),
     ("fonds",                   r"\bFonds\b"),
     ("asset_management",        r"\bAsset\s*Management\b"),
 ]
 
-# Strong operational sector keywords — these override low-priority signals for PRE_KEEP
+# Strong operational sector keywords — override low-priority block for PRE_KEEP
 STRONG_OPERATIONAL_SECTOR_KEYWORDS = {
     "maschinenbau", "industrie", "logistik", "automotive", "technik",
     "technologie", "systems", "solutions", "software", "pharma", "chemie",
     "medtech", "engineering", "automation", "elektronik", "kunststoff",
     "verpackung", "metall", "medical", "energie",
 }
+
+# Scale keywords that are "strong" operational signals (group/global/international/werke)
+# vs "weak" financial signals (holding alone).  Holding boosts score but is NOT
+# sufficient on its own to satisfy the operational-signal gate for PRE_KEEP.
+WEAK_SCALE_KEYWORDS = {"holding"}
 
 # Compile all regex patterns once
 def _compile(pairs: list[tuple[str, str]]) -> list[tuple[str, re.Pattern]]:
@@ -218,11 +230,11 @@ def score_row(name: str, legal_form: str) -> tuple[int, str, list[str], list[str
     """Return (score, pre_label, positive_reasons, exclude_reasons, low_priority_reasons).
 
     PRE_KEEP rules (all must hold):
-      - Strong legal form (AG/SE/KGaA/GmbH&Co.KG/GmbH&Co.KGaA) requires at least one
-        sector or scale signal.
-      - GmbH alone requires at least one sector or scale signal.
-      - Low-priority signals block PRE_KEEP unless a strong operational sector keyword
-        is present.
+      - Score >= PRE_KEEP_THRESHOLD.
+      - Operational signal: sector keyword OR strong scale keyword (Gruppe/Werke/
+        International/Europa). Legal form alone or Holding alone is not enough.
+      - Low-priority signals (real-estate, financial vehicles) block PRE_KEEP unless
+        a strong operational sector keyword (Maschinenbau, Software, …) is also present.
     """
     score = 0
     positive: list[str] = []
@@ -258,11 +270,17 @@ def score_row(name: str, legal_form: str) -> tuple[int, str, list[str], list[str
             return score, "PRE_EXCLUDE", positive, excluded, low_pri
 
     # --- Scale keywords ---
-    has_scale_signal = False
+    # "Strong" scale: Gruppe/Group, Werke, International, Global, Europe/Europa
+    # "Weak" scale: Holding alone — boosts score but cannot satisfy the operational gate
+    has_strong_scale_signal = False
+    has_weak_scale_only = False
     for key, pat in _SCALE_COMPILED:
         if pat.search(name):
             score += 2
-            has_scale_signal = True
+            if key in WEAK_SCALE_KEYWORDS:
+                has_weak_scale_only = True
+            else:
+                has_strong_scale_signal = True
             positive.append(f"positive_scale_keyword:{key}")
 
     # --- Sector keywords ---
@@ -285,15 +303,16 @@ def score_row(name: str, legal_form: str) -> tuple[int, str, list[str], list[str
             low_pri.append(f"low_priority_keyword:{key}")
 
     # --- PRE_KEEP qualification ---
-    # A company qualifies for PRE_KEEP only when:
-    #   1. Score is above threshold.
-    #   2. There is at least one sector or scale signal (legal form alone is not enough).
-    #   3. Low-priority signals do not block it, unless a strong operational sector
-    #      keyword is present.
-    has_positive_signal = has_sector_signal or has_scale_signal
+    # All three conditions must hold:
+    #   1. Score >= PRE_KEEP_THRESHOLD.
+    #   2. Operational signal present: sector keyword OR strong scale keyword
+    #      (Gruppe/Werke/International/Europa). Holding alone is not enough.
+    #   3. Low-priority signal does not block, unless a strong operational
+    #      sector keyword (Maschinenbau, Software, etc.) is also present.
+    has_operational_signal = has_sector_signal or has_strong_scale_signal
     low_pri_blocks_keep = has_low_priority_signal and not has_strong_operational_signal
 
-    if score >= PRE_KEEP_THRESHOLD and has_positive_signal and not low_pri_blocks_keep:
+    if score >= PRE_KEEP_THRESHOLD and has_operational_signal and not low_pri_blocks_keep:
         label = "PRE_KEEP"
     elif score >= PRE_MAYBE_THRESHOLD:
         label = "PRE_MAYBE"
