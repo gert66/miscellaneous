@@ -4,9 +4,11 @@ Step 1: Offline seed-filter for the German OffeneRegister SQLite database.
 Reads active German commercial company records, scores and labels them,
 and exports filtered seed files for the mYngle B2B pipeline.
 
-Output folder: Germany/01_seed/
+Output folder: C:/Users/gertm/Nextcloud/Myngle/Germany/01_seed/
+(override with env var GERMANY_OUT_DIR; DB path via GERMANY_DB_PATH)
 """
 
+import os
 import re
 import sqlite3
 import random
@@ -18,9 +20,23 @@ import pandas as pd
 # Configuration — easy to adjust
 # ---------------------------------------------------------------------------
 
-BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "Germany" / "handelsregister.db"
-OUTPUT_DIR = BASE_DIR / "Germany" / "01_seed"
+_DEFAULT_DB  = Path(r"C:\Users\gertm\Nextcloud\Myngle\Germany\handelsregister.db")
+_DEFAULT_OUT = Path(r"C:\Users\gertm\Nextcloud\Myngle\Germany\01_seed")
+
+def _resolve_db_path() -> Path:
+    env = os.environ.get("GERMANY_DB_PATH")
+    if env:
+        return Path(env)
+    return _DEFAULT_DB
+
+def _resolve_output_dir() -> Path:
+    env = os.environ.get("GERMANY_OUT_DIR")
+    if env:
+        return Path(env)
+    return _DEFAULT_OUT
+
+DB_PATH    = _resolve_db_path()
+OUTPUT_DIR = _resolve_output_dir()
 
 SQL_LIMIT = 150_000      # rows to pull from the database
 FINAL_LIMIT = 50_000     # rows to include in the main output after filtering
@@ -291,6 +307,9 @@ def build_sql(limit: int) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    print(f"Resolved DB path : {DB_PATH}")
+    print(f"Resolved out dir : {OUTPUT_DIR}")
+
     if not DB_PATH.exists():
         print(f"ERROR: Database not found at {DB_PATH}")
         return

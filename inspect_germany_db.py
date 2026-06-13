@@ -4,11 +4,19 @@ Prints tables, columns, row counts and 5-row samples.
 FTS shadow tables (large blob tables) are listed but not sampled.
 """
 
+import os
 import sqlite3
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "Germany" / "handelsregister.db"
+_DEFAULT_DB = Path(r"C:\Users\gertm\Nextcloud\Myngle\Germany\handelsregister.db")
+
+def _resolve_db_path() -> Path:
+    env = os.environ.get("GERMANY_DB_PATH")
+    if env:
+        return Path(env)
+    return _DEFAULT_DB
+
+DB_PATH = _resolve_db_path()
 
 FTS_SHADOW_SUFFIXES = (
     "_content", "_segments", "_segdir", "_docsize", "_stat",
@@ -26,6 +34,7 @@ def is_fts_shadow(table_name: str, all_tables: list[str]) -> bool:
 
 
 def main() -> None:
+    print(f"Resolved DB path: {DB_PATH}")
     if not DB_PATH.exists():
         print(f"Database not found: {DB_PATH}")
         return
