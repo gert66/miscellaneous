@@ -6148,7 +6148,7 @@ def _build_size_serper_queries(domain: str, country_config: "CountryConfig") -> 
     cc = country_config.country_code
     queries: list[str] = []
     if cc == "DE":
-        queries.append(f"site:{domain} Mitarbeiter OR Beschäftigte OR Headcount")
+        queries.append(f"site:{domain} Mitarbeiter OR Beschäftigte OR Mitarbeitende")
         queries.append(f"site:{domain} Karriere OR Stellenangebote OR Jobs")
     else:  # IT default
         queries.append(f"site:{domain} dipendenti OR collaboratori OR team")
@@ -6171,6 +6171,7 @@ def _infer_company_size(
     existing_evidence_url: str = "",
     fc_speed_mode: str = "fast",
     page_timeout: int = 15,
+    live_counters: dict | None = None,  # updated in-place with SI FC calls
 ) -> dict:
     """
     Orchestrate size + HRM inference for one company.
@@ -6184,15 +6185,23 @@ def _infer_company_size(
         result["size_inference_stop_reason"] = "no_domain"
         return result
 
-    text_corpus: list[str] = list(existing_texts or [])
-    evidence_url = existing_evidence_url
+    # text_corpus: safe Serper snippets + safe existing texts (never raw Apple Music / blocked domains)
+    # _fc_texts: only FC-fetched page content from the official company domain (always trusted)
+    text_corpus: list[str] = []
+    _fc_texts: list[str] = []
+    evidence_url = ""
     fc_pages_for_size = 0
     stop_reason = ""
 
-    # Step 1: mine existing Serper/FC evidence already in corpus
-    # Only use existing_evidence_url if it comes from the validated domain
-    if evidence_url and not _is_allowed_size_source(evidence_url, company_name, domain):
-        evidence_url = ""  # discard unsafe pre-existing evidence URL
+    # Step 1: mine existing Serper/FC evidence already in the row — only if URL is safe
+    if (existing_evidence_url
+            and _is_allowed_size_source(existing_evidence_url, company_name, domain)):
+        for _t in (existing_texts or []):
+            if str(_t).strip():
+                text_corpus.append(str(_t))
+        evidence_url = existing_evidence_url
+    # (if existing_evidence_url is blocked / unsafe → discard both URL and texts entirely)
+
     size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
     if size_info["band"] == SIZE_100_PLUS_CONFIRMED and size_info["confidence"] == "high":
         stop_reason = "exact_count_from_existing_evidence"
@@ -6212,7 +6221,7 @@ def _infer_company_size(
                 if _hits:
                     for hit in _hits[:3]:
                         _link = hit.get("link", "") or ""
-                        # Source-domain safety check
+                        # Source-domain safety check — hard-block media/store/social results
                         if not _is_allowed_size_source(_link, company_name, domain):
                             continue
                         snippet = (hit.get("snippet") or "") + " " + (hit.get("title") or "")
@@ -6256,20 +6265,29 @@ def _infer_company_size(
                     fc_location=fc_location,
                 )
                 fc_pages_for_size += 1
+                if live_counters is not None:
+                    live_counters["fc_requests_attempted"] = live_counters.get("fc_requests_attempted", 0) + 1
                 page_text = _md or ""
                 if page_text:
+                    _fc_texts.append(page_text)   # FC-only list (always from official domain)
                     text_corpus.append(page_text)
                     if not _fc_evidence_url:
                         _fc_evidence_url = fc_url  # FC URLs are always from validated domain
+                    if live_counters is not None:
+                        live_counters["fc_pages_successful"] = live_counters.get("fc_pages_successful", 0) + 1
             except Exception:
                 fc_pages_for_size += 1  # count attempt
+                if live_counters is not None:
+                    live_counters["fc_requests_attempted"] = live_counters.get("fc_requests_attempted", 0) + 1
 
         result["firecrawl_used_for_size_inference"] = fc_pages_for_size > 0
-        # Update evidence_url to FC source if FC found something (FC URLs are always trusted)
         if _fc_evidence_url:
             evidence_url = _fc_evidence_url
-        # Re-check after FC — FC pages are from official domain, so trust them
-        size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
+        # Size regex on FC texts only — they come exclusively from the official domain
+        if _fc_texts:
+            size_info = _extract_employee_size_regex(" ".join(_fc_texts), country_config.country_code)
+        else:
+            size_info = _extract_employee_size_regex(" ".join(text_corpus), country_config.country_code)
         if size_info["band"] in (SIZE_100_PLUS_CONFIRMED, SIZE_100_PLUS_LIKELY) and size_info["confidence"] != "none":
             stop_reason = "confirmed_from_firecrawl"
 
@@ -6283,10 +6301,9 @@ def _infer_company_size(
         evidence_url = ""
         stop_reason = "unsafe_or_unrelated_source"
 
-    # HRM signals — only score using text from trusted sources (FC pages from official domain)
-    # Use only the FC page text if available; otherwise skip HRM scoring to avoid false signals
-    _hrm_corpus = [_fc_evidence_url] if _fc_evidence_url else []
-    _hrm_texts = text_corpus if _fc_evidence_url else []
+    # HRM signals — use ONLY FC-fetched texts from the official domain to avoid false positives
+    # from Serper snippets (which may include music bands, app stores, etc.)
+    _hrm_texts = _fc_texts  # never use Serper snippets or unvalidated existing_texts for HRM
     hrm_score, hrm_signals, career_found = _classify_hrm_signals(
         _hrm_texts,
         country_config.country_code,
@@ -6695,6 +6712,7 @@ def process_dataframe(
                 existing_evidence_url=_ev_url,
                 fc_speed_mode=fc_speed_mode,
                 page_timeout=page_timeout,
+                live_counters=_live_fc_counters,
             )
             res.update(_size_result)
         elif not infer_size:
@@ -7129,7 +7147,11 @@ def _build_best_guess_df(
             "professional_site_level":           str(r.get("professional_site_level", "") or ""),
             "professional_site_signals":         str(r.get("professional_site_signals", "") or ""),
         })
-    return pd.DataFrame(rows)
+    bg = pd.DataFrame(rows)
+    # Scrub any NaN values that leak from rows without FC / size-inference data
+    for _c in bg.select_dtypes(include="object").columns:
+        bg[_c] = bg[_c].fillna("").replace("nan", "")
+    return bg
 
 
 def _write_best_guess_sheet(ws, bg_df: pd.DataFrame, enriched_df: pd.DataFrame) -> None:
@@ -9737,6 +9759,12 @@ def main():
         _resolved_country = resolve_country("auto", uploaded.name, df)
         _country_source = "auto"
     _country_cfg = COUNTRY_CONFIGS.get(_resolved_country, IT_CONFIG)
+
+    # Bug fix: if country was auto-detected (not manually set), override FC location payload
+    # to match the resolved country — sidebar default was computed before the file was uploaded
+    if _country_source == "auto":
+        _auto_fc_loc = _FC_LOC_GERMANY if _resolved_country == "DE" else _FC_LOC_ITALY
+        fc_location_payload = _FC_LOC_PAYLOADS.get(_auto_fc_loc, _FC_LOC_PAYLOADS[_FC_LOC_ITALY])
 
     _country_flag = {"IT": "🇮🇹", "DE": "🇩🇪"}.get(_resolved_country, "🌍")
     st.title(f"{_country_flag} Input Cleaner · Register Edition")
