@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# German pipeline — data files (never commit)
+Germany/handelsregister.db
+Germany/01_seed/
+
+# Data file types
+*.xlsx
+*.csv
+*.db
+*.sqlite
+*.gz
+*.bz2
