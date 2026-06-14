@@ -447,6 +447,13 @@ META_FIELDS = [
     "anthropic_web_search_used",
     "anthropic_tools_used",
     "serper_search_used",
+    # Serper evidence handoff (compact aggregated for Opportunity Radar / caller brief)
+    "serper_query_summary",
+    "serper_source_urls",
+    "serper_result_titles",
+    "serper_snippets",
+    "raw_evidence_summary",
+    "evidence_source_urls",
 ]
 
 # Real Lusha API enrichment fields (prefix "lusha_api_")
@@ -3021,6 +3028,29 @@ def run_step2_serper(
     total_hits = sum(len(h) for _, h in query_groups)
     _dlog(f"Total Serper results for {company_name}: {total_hits} across {len(query_groups)} queries")
 
+    # ── Build compact Serper evidence handoff for Opportunity Radar / caller brief ──
+    _s_labels:   list[str] = []
+    _s_urls:     list[str] = []
+    _s_titles:   list[str] = []
+    _s_snippets: list[str] = []
+    for _lbl, _hits in query_groups:
+        _s_labels.append(_lbl)
+        for _h in _hits[:2]:  # top 2 results per query
+            if _h.get("link"):
+                _s_urls.append(str(_h["link"])[:200])
+            if _h.get("title"):
+                _s_titles.append(str(_h["title"])[:120])
+            if _h.get("snippet"):
+                _s_snippets.append(str(_h["snippet"])[:160])
+    _serper_evidence_handoff: dict = {
+        "serper_query_summary":   " | ".join(_s_labels),
+        "serper_source_urls":     " | ".join(_s_urls[:8]),
+        "serper_result_titles":   " | ".join(_s_titles[:8]),
+        "serper_snippets":        " | ".join(_s_snippets[:6]),
+        "raw_evidence_summary":   f"{total_hits} Serper results across {len(query_groups)} queries",
+        "evidence_source_urls":   " | ".join(_s_urls[:8]),
+    }
+
     # ── Build Claude prompt ────────────────────────────────────────────────────
     results_text = _format_serper_results(query_groups)
     search_instruction = (
@@ -3124,10 +3154,13 @@ def run_step2_serper(
             except Exception:
                 pass
 
-        payload = {"icp_data": _icp_raw, "tokens_in": in_t, "tokens_out": out_t}
+        payload = {"icp_data": _icp_raw, "tokens_in": in_t, "tokens_out": out_t,
+                   "serper_evidence": _serper_evidence_handoff}
         save_cache(ck, payload)
         _dlog(f"Finished Step 2 (Serper) for {company_name}")
-        return (_extract_icp_fields(_icp_raw), payload, in_t, out_t, "ok", "", 0, 0)
+        _icp_out = _extract_icp_fields(_icp_raw)
+        _icp_out.update(_serper_evidence_handoff)
+        return (_icp_out, payload, in_t, out_t, "ok", "", 0, 0)
 
     except (json.JSONDecodeError, ValueError) as e:
         _dlog(f"Step 2 Serper parse error for {company_name}: {e}")
@@ -3700,13 +3733,38 @@ _DOMESTIC_HQ_INDICATORS: tuple = (
     "head office in", "head office at",
 )
 
-# Phrases that indicate foreign parent / foreign ownership
+# Phrases that indicate foreign parent / foreign ownership.
+# IMPORTANT: keep these SPECIFIC to foreign ownership — do NOT include generic words like
+# "part of", "group", "multinational", "subsidiaries", "global", "international"
+# which describe legitimate Italian companies with international operations.
 _FOREIGN_PARENT_INDICATORS: tuple = (
-    "subsidiary of", "owned by", "part of", "acquired by", "controlled by",
-    "reporting to", "member of the", "branch of", "affiliate of",
+    "subsidiary of", "owned by", "acquired by", "controlled by",
+    "branch of", "affiliate of",
     "wholly owned", "majority owned", "joint venture with",
-    "gruppo", "group based in", "group headquartered in",
-    "parent company", "parent group", "holding company",
+    "parent company outside", "parent group outside", "holding company outside",
+    "parent company in germany", "parent company in france", "parent company in us",
+    "parent company in the us", "parent company in united states",
+    "parent company in uk", "parent company in china", "parent company in japan",
+    "owned by a foreign", "owned by foreign", "controlled by foreign",
+    "external operating hq", "reporting line outside italy",
+    "foreign parent", "foreign holding", "foreign ownership",
+)
+
+# Phrases indicating a domestic Italian company with international footprint.
+# These FORCE sanitization to 0 when found, even before the city check.
+_DOMESTIC_INTL_FOOTPRINT_INDICATORS: tuple = (
+    "italy with international subsidiaries",
+    "italy with usa operations",
+    "italy with operations abroad",
+    "italia con filiali",
+    "italia con sussidiarie",
+    "italy and international subsidiaries",
+    "headquartered in italy",
+    "based in italy",
+    "sede in italy",
+    "sede legale in italy",
+    "italian company with",
+    "italian group with",
 )
 
 
@@ -3768,7 +3826,23 @@ def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
         str(row.get("sig_intl_footprint_evidence", "") or ""),
     ])).lower()
 
-    # Rule A/B: check for foreign parent / ownership first (do NOT sanitize)
+    # Rule 0: explicit domestic-Italy-with-intl-footprint phrases → always sanitize for IT input
+    if input_country == "IT":
+        has_domestic_intl = any(ind in evidence_text for ind in _DOMESTIC_INTL_FOOTPRINT_INDICATORS)
+        if has_domestic_intl:
+            row["foreign_hq_original_score"]    = score_int
+            row["foreign_hq_original_evidence"] = str(row.get("sig_foreign_hq_evidence", ""))
+            row["sig_foreign_hq_score"]         = 0
+            row["foreign_hq_sanitized"]         = True
+            row["foreign_hq_sanitizer_reason"]  = (
+                "Sanitized: evidence shows domestic HQ in Italy with international footprint "
+                "(explicit domestic-intl phrase detected) — not a foreign HQ signal."
+            )
+            return row
+
+    # Rule A/B: check for foreign parent / ownership (do NOT sanitize).
+    # Only triggers on SPECIFIC foreign-ownership phrases — NOT on "group", "multinational",
+    # "subsidiaries", "part of", "international operations", "global operations", etc.
     has_foreign_parent = any(ind in evidence_text for ind in _FOREIGN_PARENT_INDICATORS)
     if has_foreign_parent:
         # Evidence suggests actual foreign ownership — keep the score
@@ -3778,11 +3852,11 @@ def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
     if input_country == "IT":
         has_domestic_hq = any(ind in evidence_text for ind in _DOMESTIC_HQ_INDICATORS)
         if has_domestic_hq:
-            # Check if a domestic city is mentioned after the HQ indicator
+            # Check if a domestic city or "italy" is mentioned within 100 chars of the HQ indicator
             for ind in _DOMESTIC_HQ_INDICATORS:
                 idx = evidence_text.find(ind)
                 if idx >= 0:
-                    after = evidence_text[idx:idx + 80]
+                    after = evidence_text[idx:idx + 100]
                     if any(city in after for city in _ITALY_DOMESTIC_CITY_NAMES):
                         row["foreign_hq_original_score"]    = score_int
                         row["foreign_hq_original_evidence"] = str(row.get("sig_foreign_hq_evidence", ""))
@@ -4581,6 +4655,7 @@ def enrich_one_row(
     run_step2_enrichment: bool = True,
     existing_lusha_data: dict | None = None,
     _cli_verbose: bool = False,
+    scoring_profile: str = "default",
 ) -> tuple:
     """
     Run optional Lusha API enrichment, then Step 1 (Jina + Claude extraction),
@@ -4591,6 +4666,8 @@ def enrich_one_row(
     company_name = company_name.strip() if company_name else ""
 
     # ── Domain validation (fast local check + optional Serper) ────────────────
+    if is_cli_mode():
+        print("[enricher]   Step 0: domain validation", flush=True)
     _dv = validate_company_domain(
         company_name, url,
         serper_key=serper_key,
@@ -4602,6 +4679,12 @@ def enrich_one_row(
 
     row = {f: "" for f in ALL_ENRICHMENT_FIELDS}
     row.update(_dv)
+
+    # Populate canonical identity fields from input parameters
+    row["canonical_company_name"]   = company_name
+    row["canonical_company_domain"] = clean_domain(url) if url else ""
+    row["canonical_company_url"]    = normalize_url(url) if url else ""
+    row["scoring_profile"]          = scoring_profile
 
     # Populate row with any pre-existing Lusha/Lucia data from the input file
     # so downstream steps (Step 2, Step 3) can use it as context.
@@ -4639,8 +4722,8 @@ def enrich_one_row(
         row.update(la_fields)
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
-    if _cli_verbose:
-        print("[enricher]   Step 1: firmographics (Jina/Claude)...", flush=True)
+    if is_cli_mode():
+        print("[enricher]   Step 1: Jina/Claude firmographics", flush=True)
     if run_step1_enrichment:
         s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
             url, company_name, api_key, delay,
@@ -4676,8 +4759,8 @@ def enrich_one_row(
             row["lucia_data_status"] = "missing_not_requested"
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
-    if _cli_verbose:
-        print("[enricher]   Step 2: ICP/Serper search...", flush=True)
+    if is_cli_mode():
+        print("[enricher]   Step 2: Serper ICP search", flush=True)
     if run_step2_enrichment:
         s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
             url, company_name, api_key, delay, model_step2=model_step2,
@@ -4693,6 +4776,8 @@ def enrich_one_row(
         row["serper_search_used"]         = (search_provider == STEP2_PROVIDER_SERPER)
         row["step2_tokens_in"]            = str(s2_in)
         row["step2_tokens_out"]           = str(s2_out)
+        if is_cli_mode() and s2_status == "cached":
+            print("[enricher]   Step 2: cached Serper result used", flush=True)
         row["step2_cost_usd"]      = f"{calc_cost(s2_in, s2_out):.6f}"
     else:
         s2_fields = _ICP_EMPTY.copy()
@@ -4728,8 +4813,8 @@ def enrich_one_row(
     flag_review(row, company_name)
 
     # ── Step 3 — Model-signal extraction ─────────────────────────────────────
-    if _cli_verbose:
-        print("[enricher]   Step 3: model signal extraction...", flush=True)
+    if is_cli_mode():
+        print("[enricher]   Step 3: model signal extraction", flush=True)
     if extract_model_signals and api_key and not dry_run:
         try:
             ms_fields = run_model_signal_extraction(
@@ -4758,17 +4843,17 @@ def enrich_one_row(
     # ── Step 3b — Foreign HQ hygiene sanitizer ───────────────────────────────
     # Runs unconditionally (even on dry-run or when Step 3 is disabled) so that
     # any pre-existing or zero-value foreign HQ fields are properly initialised.
-    if _cli_verbose:
-        print("[enricher]   Step 3b: foreign HQ hygiene...", flush=True)
-    _fhq_country = _get_input_country(row)
+    if is_cli_mode():
+        print("[enricher]   Step 3b: foreign HQ hygiene", flush=True)
+    _fhq_country = _get_input_country(row, scoring_profile)
     sanitize_foreign_hq_signal(row, _fhq_country)
 
     # ── Step 4 — Competitor customer search ──────────────────────────────────
     # Runs a targeted Serper query to find evidence that the company is already
     # a customer/user of a direct mYngle competitor.  Only runs when a Serper
     # key is available and not in dry-run mode.
-    if _cli_verbose:
-        print("[enricher]   Step 4: competitor customer search...", flush=True)
+    if is_cli_mode():
+        print("[enricher]   Step 4: competitor customer search", flush=True)
     _comp_fields = _build_competitor_customer_empty()
     if serper_key and not dry_run:
         try:
@@ -4820,6 +4905,8 @@ def enrich_one_row(
         "needs_manual_review":      row["needs_manual_review"],
         "match_notes":              row["match_notes"],
     }
+    if is_cli_mode():
+        print("[enricher]   Row completed", flush=True)
     return row, dbg
 
 
@@ -6022,6 +6109,19 @@ def _xl_write_opportunity_input(
         ("foreign_hq_sanitized",           ["foreign_hq_sanitized"]),
         ("foreign_hq_sanitizer_reason",    ["foreign_hq_sanitizer_reason"]),
         ("foreign_hq_original_score",      ["foreign_hq_original_score"]),
+        # ── Raw Serper evidence handoff (for Opportunity Radar / caller brief) ──
+        ("serper_query_summary",           ["serper_query_summary"]),
+        ("serper_source_urls",             ["serper_source_urls"]),
+        ("serper_result_titles",           ["serper_result_titles"]),
+        ("serper_snippets",                ["serper_snippets"]),
+        ("raw_evidence_summary",           ["raw_evidence_summary"]),
+        ("evidence_source_urls",           ["evidence_source_urls"]),
+        # ── Canonical identity handoff ────────────────────────────────────────
+        ("canonical_company_name",         ["canonical_company_name"]),
+        ("canonical_company_domain",       ["canonical_company_domain"]),
+        ("input_type",                     ["input_type"]),
+        ("company_number_canonical",       ["company_number", "native_company_number",
+                                            "register_nummer", "source_row_id"]),
     ]
 
     # Columns that should be written as real numeric values (float/int).
@@ -6045,6 +6145,12 @@ def _xl_write_opportunity_input(
         "domain_match_confidence", "possible_domain_mismatch",
         "suggested_domain", "domain_check_reason", "domain_source",
         "needs_domain_review",
+        # Serper evidence handoff
+        "serper_query_summary", "serper_source_urls", "serper_result_titles",
+        "serper_snippets", "raw_evidence_summary", "evidence_source_urls",
+        # Canonical identity
+        "canonical_company_name", "canonical_company_domain", "input_type",
+        "company_number_canonical",
     }
 
     def _is_numeric_col(col_name: str) -> bool:
@@ -7590,6 +7696,7 @@ def run_cli() -> None:
     parser.add_argument("--max-rows",       type=int, default=0, help="Process first N rows (0 = all)")
     parser.add_argument("--debug",          action="store_true", help="Enable debug output")
     parser.add_argument("--dry-run-paths",  action="store_true", help="Print paths and exit, no processing")
+    parser.add_argument("--output-name",    default=None, help="Override output filename (without .xlsx)")
     args = parser.parse_args()
 
     # ── Resolve input path ────────────────────────────────────────────────────
@@ -7823,6 +7930,7 @@ def run_cli() -> None:
                 delay=0,
                 serper_key=serper_key or "",
                 _cli_verbose=True,
+                scoring_profile=_cli_scoring_profile,
             )
             debug_records.append(_debug_rec)
             _claude_calls += int(result.get("claude_api_calls", 0) or 0)
@@ -7850,6 +7958,28 @@ def run_cli() -> None:
 
     print(f"[enricher] Done — {total} rows processed, {_error_count} errors.", flush=True)
 
+    # ── Buzzi runtime assertion (Italy profile) ──────────────────────────────
+    if _cli_scoring_profile == "italy_register_icp_only":
+        for _r in results:
+            _rname = str(_r.get("company_name") or _r.get("canonical_company_name") or "").upper()
+            _r_ev  = str(_r.get("sig_foreign_hq_evidence") or "").lower()
+            if "BUZZI" in _rname and "casale monferrato" in _r_ev:
+                _r_score = _r.get("sig_foreign_hq_score", "")
+                try:
+                    _r_score_int = int(float(_r_score))
+                except (TypeError, ValueError):
+                    _r_score_int = -1
+                if _r_score_int != 0:
+                    print(
+                        f"[enricher] ASSERTION FAILED: {_rname} sig_foreign_hq_score={_r_score_int} "
+                        f"(expected 0). Evidence: {str(_r.get('sig_foreign_hq_evidence', ''))[:200]}",
+                        flush=True,
+                    )
+                    print("[enricher] ERROR: Buzzi foreign HQ sanitization did not work. Aborting.", file=__import__('sys').stderr)
+                    __import__('sys').exit(3)
+                else:
+                    print(f"[enricher] ASSERTION OK: {_rname} sig_foreign_hq_score=0 (correctly sanitized)", flush=True)
+
     # ── Foreign HQ hygiene summary ────────────────────────────────────────────
     _fhq_sanitized   = sum(1 for r in results if r.get("foreign_hq_sanitized"))
     _fhq_review      = sum(1 for r in results
@@ -7868,6 +7998,25 @@ def run_cli() -> None:
     enriched_df_raw = pd.DataFrame(results)
     for col in _active_fields:
         df_out[col] = enriched_df_raw[col].values if col in enriched_df_raw.columns else ""
+
+    # ── Patch canonical identity + scoring_profile from enrichment results ────
+    # These fields are NOT in ALL_ENRICHMENT_FIELDS (they come from input normalization)
+    # but enrich_one_row now writes them. Backfill blanks from enrichment.
+    _CANONICAL_PATCH_COLS = (
+        "canonical_company_name", "canonical_company_domain",
+        "canonical_company_url", "scoring_profile",
+    )
+    for _cp_col in _CANONICAL_PATCH_COLS:
+        if _cp_col in enriched_df_raw.columns:
+            _enr_vals = list(enriched_df_raw[_cp_col])
+            if _cp_col not in df_out.columns:
+                df_out[_cp_col] = _enr_vals
+            else:
+                _cur = df_out[_cp_col].astype(str).str.strip()
+                _blank_mask = _cur.isin(["", "nan", "None"])
+                df_out.loc[_blank_mask, _cp_col] = [
+                    _enr_vals[j] for j in df_out.index[_blank_mask]
+                ]
 
     # ── Employee range resolver ───────────────────────────────────────────────
     def _is_blank_val(v) -> bool:
@@ -7928,7 +8077,10 @@ def run_cli() -> None:
 
     # ── Write output ──────────────────────────────────────────────────────────
     stamp   = ts()
-    xl_path = out_dir / f"enrichedResults_{stamp}.xlsx"
+    if args.output_name:
+        xl_path = out_dir / f"{args.output_name}.xlsx"
+    else:
+        xl_path = out_dir / f"enrichedResults_{stamp}.xlsx"
 
     try:
         xl_bytes = build_rich_excel_bytes(
