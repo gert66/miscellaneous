@@ -129,6 +129,36 @@ TIER_THRESHOLDS: list[tuple[float, str]] = [
     (0.0,  "❄️ Pass"),
 ]
 
+# Tier thresholds for italy_register_icp_only (K=1, size_weight=0).
+# With K=1 the sigmoid barely moves so icp_sim ≈ 3.0–7.5; final = icp_sim × 1.0.
+# Recalibrated from empirical distribution of Italian register batch scores.
+_TIER_THRESHOLDS_ITALY: list[tuple[float, str]] = [
+    (6.50, "🥇 Hot"),
+    (5.00, "🥈 Warm"),
+    (3.00, "🥉 Cool"),
+    (0.0,  "❄️ Pass"),
+]
+
+# ── Scoring profiles ──────────────────────────────────────────────────────────
+# Each profile overrides the module-level defaults inside score_company().
+# Pass via params["scoring_profile"] or params["_profile_override"].
+SCORING_PROFILES: dict = {
+    "default": {
+        "model_weight": ICP_SIMILARITY_WEIGHT,  # 0.90
+        "size_weight":  COMPANY_SIZE_WEIGHT,     # 0.10
+        "sigmoid_k":    SIGMOID_K,               # 10.0
+        "tier_thresholds": TIER_THRESHOLDS,
+        "label": "Default (ICP 90% + size 10%)",
+    },
+    "italy_register_icp_only": {
+        "model_weight": 1.0,
+        "size_weight":  0.0,
+        "sigmoid_k":    1.0,
+        "tier_thresholds": _TIER_THRESHOLDS_ITALY,
+        "label": "Italy register, ICP only (K=1, size excluded)",
+    },
+}
+
 # Composite profile score groupings (display-only — not part of LR)
 GLOBAL_COMPLEXITY_FIELDS: list[str] = [
     "sig_intl_footprint_score",
@@ -226,6 +256,7 @@ SCORE_OUTPUT_COLS: list[str] = [
     "weak_score_drivers",
     "scoring_notes",
     "missing_scoring_fields",
+    "scoring_profile",
 ]
 
 # =============================================================================
@@ -397,9 +428,17 @@ def score_company(
     all audit fields so callers can write them to a model_features sheet.
     """
     p = params or {}
-    intercept = float(p.get("intercept", INTERCEPT))
-    coeffs    = {**LEAN_COEFFICIENTS, **p.get("coefficients", {})}
-    tiers     = p.get("tier_thresholds", TIER_THRESHOLDS)
+
+    # Resolve scoring profile — profile name → profile dict → override individual params
+    _profile_name = p.get("scoring_profile", "default")
+    _profile = SCORING_PROFILES.get(_profile_name, SCORING_PROFILES["default"])
+
+    intercept    = float(p.get("intercept", INTERCEPT))
+    coeffs       = {**LEAN_COEFFICIENTS, **p.get("coefficients", {})}
+    tiers        = p.get("tier_thresholds", _profile["tier_thresholds"])
+    _model_w     = float(p.get("model_weight", _profile["model_weight"]))
+    _size_w      = float(p.get("size_weight",  _profile["size_weight"]))
+    _sig_k       = float(p.get("sigmoid_k",    _profile["sigmoid_k"]))
 
     if isinstance(row, pd.Series):
         row = row.to_dict()
@@ -440,9 +479,12 @@ def score_company(
     lean_model_prob = 1.0 / (1.0 + math.exp(-lr_z))
 
     # ── 3. Sigmoid stretch → ICP Similarity Score ────────────────────────────
-    sigmoid_raw_s = 1.0 / (1.0 + math.exp(-SIGMOID_K * (lean_model_prob - 0.5)))
-    denom = SIGMOID_S_MAX - SIGMOID_S_MIN
-    icp_sim = _clamp(1.0 + 9.0 * (sigmoid_raw_s - SIGMOID_S_MIN) / denom, 1.0, 10.0)
+    # Use profile-specific K; recompute S_MIN/S_MAX so normalisation stays valid.
+    _s_min = 1.0 / (1.0 + math.exp(-_sig_k * (_SIGMOID_P_LO - 0.5)))
+    _s_max = 1.0 / (1.0 + math.exp(-_sig_k * (_SIGMOID_P_HI - 0.5)))
+    sigmoid_raw_s = 1.0 / (1.0 + math.exp(-_sig_k * (lean_model_prob - 0.5)))
+    _denom = _s_max - _s_min if abs(_s_max - _s_min) > 1e-9 else 1.0
+    icp_sim = _clamp(1.0 + 9.0 * (sigmoid_raw_s - _s_min) / _denom, 1.0, 10.0)
 
     # ── 4. Size score ─────────────────────────────────────────────────────────
     size_score, size_missing, range_key = _resolve_size_score(row)
@@ -472,11 +514,11 @@ def score_company(
             f"{_src_label}: {range_key} → company_size_score {round(size_score, 2)}/10."
         )
 
-    # ── 5. Blend — 90% ICP signal similarity + 10% company size ─────────────
-    w_model = ICP_SIMILARITY_WEIGHT * icp_sim
-    w_size  = COMPANY_SIZE_WEIGHT   * size_score
+    # ── 5. Blend — profile-controlled weights ────────────────────────────────
+    w_model = _model_w * icp_sim
+    w_size  = _size_w  * size_score
     final   = _clamp(w_model + w_size, 1.0, 10.0)
-    # Legacy 75/25 formula — kept temporarily for ranking-impact audit.
+    # Legacy 75/25 formula — kept for ranking-impact audit (default profile only).
     _legacy_final = _clamp(
         _LEGACY_MODEL_WEIGHT * icp_sim + _LEGACY_SIZE_WEIGHT * size_score,
         1.0, 10.0,
@@ -528,10 +570,19 @@ def score_company(
     elif manual_rev:
         notes.append("Flagged for manual review; score reliability is reduced.")
 
-    notes.append(
-        f"Final score = 90% ICP signal similarity + 10% company size "
-        f"({round(icp_sim, 2)} × 0.90 + {round(size_score, 2)} × 0.10 = {round(final, 2)}/10)."
-    )
+    if _profile_name == "italy_register_icp_only":
+        notes.append(
+            f"Final score = ICP signal only (Italy register profile, size excluded). "
+            f"icp_similarity={round(icp_sim, 2)}/10, K={_sig_k} → final={round(final, 2)}/10. "
+            "Company size is audit/context data only; input list is register-filtered for 100+ employees."
+        )
+    else:
+        notes.append(
+            f"Final score = {round(_model_w*100):.0f}% ICP signal similarity + "
+            f"{round(_size_w*100):.0f}% company size "
+            f"({round(icp_sim, 2)} × {_model_w} + {round(size_score, 2)} × {_size_w}"
+            f" = {round(final, 2)}/10)."
+        )
 
     # ── Assemble result ───────────────────────────────────────────────────────
     out.update({
@@ -548,16 +599,17 @@ def score_company(
         "lean_model_logit":            round(lr_z, 6),
         "model_probability":           round(lean_model_prob, 7),
         # Sigmoid audit
-        "sigmoid_k":           SIGMOID_K,
-        "sigmoid_s_min":       SIGMOID_S_MIN,
-        "sigmoid_s_max":       SIGMOID_S_MAX,
+        "sigmoid_k":           _sig_k,
+        "sigmoid_s_min":       _s_min,
+        "sigmoid_s_max":       _s_max,
         "sigmoid_input_value": round(lean_model_prob, 7),
         "sigmoid_raw_s":       round(sigmoid_raw_s, 7),
         # Blend audit
-        "model_weight":              MODEL_WEIGHT,
-        "size_weight":               SIZE_WEIGHT,
+        "model_weight":              _model_w,
+        "size_weight":               _size_w,
         "weighted_model_component":  round(w_model, 4),
         "weighted_size_component":   round(w_size, 4),
+        "scoring_profile":           _profile_name,
         # Composite
         "global_complexity_score":     global_complexity,
         "people_development_score":    people_development,
@@ -581,10 +633,17 @@ def score_company(
 def score_dataframe(
     df: pd.DataFrame,
     params: dict | None = None,
+    scoring_profile: str = "default",
 ) -> pd.DataFrame:
-    """Apply score_company to every row and append SCORE_OUTPUT_COLS."""
+    """Apply score_company to every row and append SCORE_OUTPUT_COLS.
+
+    scoring_profile: "default" or "italy_register_icp_only"
+    """
+    _params = dict(params or {})
+    if "scoring_profile" not in _params:
+        _params["scoring_profile"] = scoring_profile
     records = df.to_dict("records")
-    scored  = [score_company(r, params) for r in records]
+    scored  = [score_company(r, _params) for r in records]
     for col in SCORE_OUTPUT_COLS:
         df[col] = [r.get(col) for r in scored]
     return df

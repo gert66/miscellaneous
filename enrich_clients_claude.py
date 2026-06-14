@@ -4976,19 +4976,25 @@ def _xl_write_df(ws, df: pd.DataFrame) -> None:
             pass
 
 
-def _xl_write_scoring_settings(ws) -> None:
+def _xl_write_scoring_settings(ws, scoring_profile: str = "default") -> None:
     """Write scoring constants to the Scoring Settings sheet."""
     from openpyxl.styles import Font, PatternFill, Alignment
     try:
         from commercial_fit_scoring import (
             INTERCEPT as _INT, LEAN_COEFFICIENTS as _LC,
-            SIZE_BAND_LOOKUP as _SB, TIER_THRESHOLDS as _TT,
-            SIGMOID_K as _SIGMOID_K,
-            ICP_SIMILARITY_WEIGHT as _ICW, COMPANY_SIZE_WEIGHT as _CSW,
+            SIZE_BAND_LOOKUP as _SB,
+            SCORING_PROFILES as _SPROFS,
         )
     except ImportError:
         ws.cell(row=1, column=1, value="Scoring module not available")
         return
+
+    _sprof = _SPROFS.get(scoring_profile, _SPROFS["default"])
+    _is_italy = (scoring_profile == "italy_register_icp_only")
+    _TT   = _sprof["tier_thresholds"]
+    _ICW  = _sprof["model_weight"]
+    _CSW  = _sprof["size_weight"]
+    _SIGMOID_K = _sprof["sigmoid_k"]
 
     hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
     hdr_font = Font(bold=True, color="FFFFFF", size=10)
@@ -4999,21 +5005,31 @@ def _xl_write_scoring_settings(ws) -> None:
     ws.cell(row=r, column=1, value="Scoring Settings").font = Font(bold=True, size=13)
     r += 2
 
+    ws.cell(row=r, column=1, value="Scoring profile").font = bold
+    ws.cell(row=r, column=2, value=_sprof["label"]).font = norm
+    r += 1
     ws.cell(row=r, column=1, value="Intercept").font = bold
     ws.cell(row=r, column=2, value=_INT).font = norm
     r += 1
-    ws.cell(row=r, column=1, value="Sigmoid steepness k").font = bold
+    ws.cell(row=r, column=1, value="Sigmoid steepness (k)").font = bold
     ws.cell(row=r, column=2, value=_SIGMOID_K).font = norm
     r += 1
-    ws.cell(row=r, column=1, value="ICP similarity weight").font = bold
-    ws.cell(row=r, column=2, value=_ICW).font = norm
+    ws.cell(row=r, column=1, value="Model weight").font = bold
+    ws.cell(row=r, column=2, value=f"{round(_ICW*100):.0f}%").font = norm
     r += 1
-    ws.cell(row=r, column=1, value="Company size weight").font = bold
-    ws.cell(row=r, column=2, value=_CSW).font = norm
+    ws.cell(row=r, column=1, value="Size weight").font = bold
+    ws.cell(row=r, column=2, value=f"{round(_CSW*100):.0f}%").font = norm
     r += 1
-    ws.cell(row=r, column=1,
-            value="Legacy 75/25 comparison score: final_commercial_fit_score_75_25_legacy "
-                  "(temporary audit column — will be removed once distribution is stable)").font = norm
+    if _is_italy:
+        ws.cell(row=r, column=1,
+                value="Final score is based on ICP/model signals only. "
+                      "Company size is excluded from scoring because the Italian register input "
+                      "is already pre-filtered for 100+ employees. "
+                      "Company size remains available as audit/context data only.").font = norm
+    else:
+        ws.cell(row=r, column=1,
+                value="Legacy 75/25 comparison score: final_commercial_fit_score_75_25_legacy "
+                      "(temporary audit column — will be removed once distribution is stable)").font = norm
     r += 2
 
     ws.cell(row=r, column=1, value="Lean Model Coefficients").font = bold
@@ -5932,6 +5948,7 @@ def build_rich_excel_bytes(
     name_col: str | None = None,
     domain_col: str | None = None,
     df_input_original: pd.DataFrame | None = None,
+    scoring_profile: str = "default",
 ) -> bytes:
     """
     Build a fully formatted multi-sheet Excel workbook.
@@ -6078,7 +6095,7 @@ def build_rich_excel_bytes(
     # ── Scoring Settings (hidden) ─────────────────────────────────────────────
     try:
         ws_sc = wb.create_sheet("Scoring Settings")
-        _xl_write_scoring_settings(ws_sc)
+        _xl_write_scoring_settings(ws_sc, scoring_profile=scoring_profile)
         ws_sc.sheet_state = "hidden"
     except Exception:
         pass
@@ -6393,10 +6410,40 @@ def reset_processing(clear_autosave: bool = False):
     )
 
 
-def apply_results_compatible_scoring(df: pd.DataFrame) -> pd.DataFrame:
-    """Single source of truth for scoring — always routes through Results(8).xlsx formula."""
+def _detect_italy_register_profile(fname: str, df: "pd.DataFrame | None" = None) -> bool:
+    """Return True when strong indicators suggest this is an Italian register batch.
+
+    Conservative: only matches clear Italy-register filename patterns or cleaner output
+    with Italian country context.  Never triggers on Lucia/Lusha exports or generic lists.
+    """
+    fl = (fname or "").lower()
+    # Filename patterns that indicate Italian register input
+    _italy_patterns = (
+        "italy100", "italy200", "italy200plus",
+    )
+    if any(p in fl for p in _italy_patterns):
+        return True
+    # Italy + cleaned suffix (e.g. Italy100_1_R0001_0500_cleaned_20260613.xlsx)
+    if "italy" in fl and "cleaned" in fl:
+        return True
+    # Cleaner output with Italian country_code column populated with IT
+    if df is not None and "country_code" in df.columns:
+        _codes = df["country_code"].dropna().astype(str).str.strip().str.upper()
+        if (_codes == "IT").any() and not (_codes == "DE").any():
+            return True
+    return False
+
+
+def apply_results_compatible_scoring(
+    df: pd.DataFrame,
+    scoring_profile: str = "default",
+) -> pd.DataFrame:
+    """Single source of truth for scoring — always routes through Results(8).xlsx formula.
+
+    scoring_profile: "default" | "italy_register_icp_only"
+    """
     from commercial_fit_scoring import score_dataframe as _cfs_score_df
-    return _cfs_score_df(df)
+    return _cfs_score_df(df, scoring_profile=scoring_profile)
 
 
 def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
@@ -6465,8 +6512,9 @@ def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
     ]
 
     if not ss("_elm_mode", False):
+        _baf_scoring_profile = ss("_scoring_profile", "default")
         try:
-            df_out = apply_results_compatible_scoring(df_out)
+            df_out = apply_results_compatible_scoring(df_out, _baf_scoring_profile)
         except Exception:
             pass
         try:
@@ -6824,6 +6872,66 @@ def _validate_type1_type2_pipeline() -> None:
         _detect_company_number_col(_h_no_cn_df) is None,
         repr(_detect_company_number_col(_h_no_cn_df)))
 
+    # ── Italy register scoring profile ────────────────────────────────────────
+    print("\nItaly register scoring profile")
+    from commercial_fit_scoring import score_company as _sc, SCORING_PROFILES as _SPROFS
+
+    # Detection: Italy filename
+    chk("ITP-1 Italy100 filename → italy_register_icp_only",
+        _detect_italy_register_profile("Italy100_1_R0001_0500.xlsx"))
+    chk("ITP-2 Italy200 filename → italy_register_icp_only",
+        _detect_italy_register_profile("Italy200_1_R0001_0500.xlsx"))
+    chk("ITP-3 Italy+cleaned filename → italy_register_icp_only",
+        _detect_italy_register_profile("Italy100_1_R0001_0500_cleaned_20260614.xlsx"))
+    chk("ITP-4 Germany filename → NOT italy_register",
+        not _detect_italy_register_profile("Germany_1_R0001_0500.xlsx"))
+    chk("ITP-5 generic cleaner → NOT italy_register",
+        not _detect_italy_register_profile("register_cleaned_20260613.xlsx"))
+
+    # Italy profile country_code column detection
+    _h_it_df = pd.DataFrame([{"company_name": "Test SRL", "country_code": "IT"}])
+    _h_de_df2 = pd.DataFrame([{"company_name": "Test GmbH", "country_code": "DE"}])
+    chk("ITP-6 country_code=IT df → italy_register_icp_only",
+        _detect_italy_register_profile("register_cleaned.xlsx", _h_it_df))
+    chk("ITP-7 country_code=DE df → NOT italy_register",
+        not _detect_italy_register_profile("register_cleaned.xlsx", _h_de_df2))
+
+    # Scoring: Italy profile uses K=1, model_weight=1.0, size_weight=0.0
+    _italy_prof = _SPROFS["italy_register_icp_only"]
+    chk("ITP-8 italy profile model_weight = 1.0",  _italy_prof["model_weight"] == 1.0)
+    chk("ITP-9 italy profile size_weight = 0.0",   _italy_prof["size_weight"]  == 0.0)
+    chk("ITP-10 italy profile sigmoid_k = 1.0",    _italy_prof["sigmoid_k"]    == 1.0)
+
+    # Score same row with default vs Italy — size must not affect Italy score
+    _ref_row = {
+        "sig_foreign_hq_score": 3, "sig_explicit_lnd_score": 3,
+        "sig_intl_footprint_score": 3, "sig_employer_branding_score": 2,
+        "sig_lnd_onboarding_score": 2, "ti_onboarding_score": 2,
+        "sig_rapid_growth_score": 1,
+        "lusha_api_employee_range": "1 - 10",   # tiny size → low size_score
+    }
+    _s_default = _sc(_ref_row, {"scoring_profile": "default"})
+    _s_italy   = _sc(_ref_row, {"scoring_profile": "italy_register_icp_only"})
+    chk("ITP-11 Italy final_score != default when size differs",
+        abs(_s_italy["final_commercial_fit_score"] - _s_default["final_commercial_fit_score"]) > 0.01,
+        f"italy={_s_italy['final_commercial_fit_score']} default={_s_default['final_commercial_fit_score']}")
+    chk("ITP-12 Italy weighted_size_component = 0.0",
+        _s_italy["weighted_size_component"] == 0.0,
+        repr(_s_italy["weighted_size_component"]))
+    chk("ITP-13 Italy scoring_profile field = italy_register_icp_only",
+        _s_italy["scoring_profile"] == "italy_register_icp_only")
+    chk("ITP-14 Italy sigmoid_k in output = 1.0",
+        _s_italy["sigmoid_k"] == 1.0, repr(_s_italy["sigmoid_k"]))
+    chk("ITP-15 Italy model_weight in output = 1.0",
+        _s_italy["model_weight"] == 1.0, repr(_s_italy["model_weight"]))
+    # Scores with large vs small size MUST be identical for Italy profile
+    _ref_big  = dict(_ref_row, **{"lusha_api_employee_range": "100001 - 10000000"})
+    _s_it_big = _sc(_ref_big,  {"scoring_profile": "italy_register_icp_only"})
+    _s_it_sml = _sc(_ref_row,  {"scoring_profile": "italy_register_icp_only"})
+    chk("ITP-16 Italy score invariant to company size",
+        abs(_s_it_big["final_commercial_fit_score"] - _s_it_sml["final_commercial_fit_score"]) < 1e-6,
+        f"big={_s_it_big['final_commercial_fit_score']} small={_s_it_sml['final_commercial_fit_score']}")
+
     print(f"\n{'═'*60}")
     if failures:
         print(f"  FAILURES ({len(failures)}):")
@@ -7002,6 +7110,26 @@ def run_cli() -> None:
     _cnum_col = _detect_company_number_col(df_in)
     print(f"[enricher] Company number column: {_cnum_col or 'none'}", flush=True)
 
+    # ── Scoring profile detection ─────────────────────────────────────────────
+    _cli_fname = str(input_path.name)
+    _cli_scoring_profile = (
+        "italy_register_icp_only"
+        if _detect_italy_register_profile(_cli_fname, df_in)
+        else "default"
+    )
+    from commercial_fit_scoring import SCORING_PROFILES as _SP
+    _sp_info = _SP.get(_cli_scoring_profile, _SP["default"])
+    print("", flush=True)
+    print(f"[enricher] SCORING PROFILE: {_cli_scoring_profile}", flush=True)
+    print(f"[enricher] MODEL WEIGHT:    {_sp_info['model_weight']}", flush=True)
+    print(f"[enricher] SIZE WEIGHT:     {_sp_info['size_weight']}", flush=True)
+    print(f"[enricher] SIGMOID_K:       {_sp_info['sigmoid_k']}", flush=True)
+    if _cli_scoring_profile == "italy_register_icp_only":
+        print("[enricher] COMPANY SIZE:    excluded from score, audit only", flush=True)
+    else:
+        print("[enricher] COMPANY SIZE:    included in score (10% weight)", flush=True)
+    print("", flush=True)
+
     if not domain_col:
         print("[enricher] No domain column found — proceeding with company-name-only enrichment.", flush=True)
 
@@ -7129,8 +7257,9 @@ def run_cli() -> None:
     ]
 
     # ── Commercial scoring ────────────────────────────────────────────────────
+    print(f"[enricher] Applying scoring profile: {_cli_scoring_profile}", flush=True)
     try:
-        df_out = apply_results_compatible_scoring(df_out)
+        df_out = apply_results_compatible_scoring(df_out, _cli_scoring_profile)
     except Exception as _score_exc:
         print(f"[enricher] Scoring skipped: {_score_exc}", flush=True)
 
@@ -7149,6 +7278,7 @@ def run_cli() -> None:
             name_col=company_col,
             domain_col=domain_col or None,
             df_input_original=df_in,
+            scoring_profile=_cli_scoring_profile,
         )
         xl_path.write_bytes(xl_bytes)
         print(f"[enricher] Saved: {xl_path}", flush=True)
@@ -7481,8 +7611,14 @@ def run_streamlit_app() -> None:
                             else "simple_company_list"
                         )
 
+                _det_scoring_profile = (
+                    "italy_register_icp_only"
+                    if _detect_italy_register_profile(fname, df_loaded)
+                    else "default"
+                )
                 ss_set(df_raw=df_loaded, file_name=fname,
-                       _selected_sheet=_sel_sheet, _detected_input_type_ui=_det_itype)
+                       _selected_sheet=_sel_sheet, _detected_input_type_ui=_det_itype,
+                       _scoring_profile=_det_scoring_profile)
                 _is_lucia_loaded = (_det_itype == "pre_enriched_lucia_export")
                 _detected_lusha  = detect_lusha_columns(df_loaded)
                 ss_set(
@@ -7496,6 +7632,7 @@ def run_streamlit_app() -> None:
                     file_error=str(exc),
                     _lusha_cols_in_input=[], _has_lusha_input=False,
                     _is_lucia_export=False, _is_cleaner_output=False,
+                    _scoring_profile="default",
                 )
 
     df_raw: pd.DataFrame | None = ss("df_raw")
@@ -8817,6 +8954,7 @@ def run_streamlit_app() -> None:
                 name_col=ss("_name_col"),
                 domain_col=ss("_domain_col"),
                 df_input_original=ss("_df_raw_original"),
+                scoring_profile=ss("_scoring_profile", "default"),
             )
             if not _elm_done else df_to_excel_bytes(df_enriched)
         )
@@ -9127,6 +9265,7 @@ def run_streamlit_app() -> None:
                 name_col=ss("_name_col"),
                 domain_col=ss("_domain_col"),
                 df_input_original=ss("_df_raw_original"),
+                scoring_profile=ss("_scoring_profile", "default"),
             )
         _st.download_button(
             label="⬇ Download lead scores",
