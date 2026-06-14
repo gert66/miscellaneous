@@ -6853,6 +6853,7 @@ def _xl_autosave_write(
     filename: str,
     name_col: str | None = None,
     domain_col: str | None = None,
+    scoring_profile: str = "default",
 ) -> tuple[bool, str]:
     """
     Atomically write df to Excel using the full rich workbook format
@@ -6864,7 +6865,7 @@ def _xl_autosave_write(
     try:
         dst = _xl_autosave_path(filename)
         tmp = dst.with_suffix(".tmp.xlsx")
-        xl_bytes = build_rich_excel_bytes(df, name_col=name_col, domain_col=domain_col)
+        xl_bytes = build_rich_excel_bytes(df, name_col=name_col, domain_col=domain_col, scoring_profile=scoring_profile)
         tmp.write_bytes(xl_bytes)
         tmp.replace(dst)
         from datetime import datetime as _dt
@@ -6961,6 +6962,7 @@ def save_partial_outputs_to_run_folder(
     row_count: int = 0,
     name_col: str | None = None,
     domain_col: str | None = None,
+    scoring_profile: str = "default",
 ) -> tuple:
     """
     Write cumulative files to run_dir:
@@ -6978,7 +6980,7 @@ def save_partial_outputs_to_run_folder(
         partial_df.to_csv(rdir / "latest_results.csv", index=False, encoding="utf-8-sig")
         log_df.to_csv(rdir / "processing_log.csv",     index=False, encoding="utf-8-sig")
 
-        xl_bytes = build_rich_excel_bytes(partial_df, name_col=name_col, domain_col=domain_col)
+        xl_bytes = build_rich_excel_bytes(partial_df, name_col=name_col, domain_col=domain_col, scoring_profile=scoring_profile)
         (rdir / "latest_results.xlsx").write_bytes(xl_bytes)
 
         if row_count > 0 and row_count % CHECKPOINT_EVERY == 0:
@@ -6988,6 +6990,71 @@ def save_partial_outputs_to_run_folder(
         return True, f"{len(results)} rows written to {run_dir}"
     except Exception as exc:
         return False, f"Partial output save failed: {exc}"
+
+
+def cleanup_old_streamlit_runs(
+    base_dir: str = "enrichment_outputs/runs",
+    keep_last_runs: int = 5,
+    keep_days: int = 7,
+    dry_run: bool = True,
+    current_run_dir: str = "",
+) -> tuple[list[str], list[str]]:
+    """List (and optionally delete) old Streamlit run folders.
+
+    Safety rules:
+    - Never deletes current_run_dir
+    - Never deletes outside base_dir
+    - Keeps the most recent keep_last_runs folders
+    - Only considers folders older than keep_days days for deletion
+    - dry_run=True (default): returns what would be deleted without deleting
+
+    Returns (would_delete: list[str], kept: list[str]).
+    """
+    import time as _time
+    base = Path(__file__).parent / base_dir
+    if not base.exists():
+        return [], []
+
+    # List only immediate subdirectories of base_dir
+    all_runs = sorted(
+        [d for d in base.iterdir() if d.is_dir()],
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,  # newest first
+    )
+
+    cutoff_time = _time.time() - keep_days * 86400
+    to_delete: list[str] = []
+    to_keep: list[str] = []
+
+    for i, run_dir in enumerate(all_runs):
+        run_str = str(run_dir.resolve())
+        cur_str = str(Path(current_run_dir).resolve()) if current_run_dir else ""
+
+        # Never delete the current run
+        if cur_str and run_str == cur_str:
+            to_keep.append(run_str)
+            continue
+
+        # Keep the most recent keep_last_runs
+        if i < keep_last_runs:
+            to_keep.append(run_str)
+            continue
+
+        # Only delete if older than keep_days
+        if run_dir.stat().st_mtime < cutoff_time:
+            to_delete.append(run_str)
+        else:
+            to_keep.append(run_str)
+
+    if not dry_run:
+        import shutil as _shutil
+        for run_str in to_delete:
+            try:
+                _shutil.rmtree(run_str)
+            except Exception:
+                pass
+
+    return to_delete, to_keep
 
 
 def autosave_already_done(df_saved: pd.DataFrame, name_col: str, domain_col: str | None,
@@ -7073,6 +7140,27 @@ def _detect_italy_register_profile(fname: str, df: "pd.DataFrame | None" = None)
         if (_codes == "IT").any() and not (_codes == "DE").any():
             return True
     return False
+
+
+def resolve_active_scoring_profile(
+    input_filename: str = "",
+    df: "pd.DataFrame | None" = None,
+    selected_sheet: str = "",
+    detected_input_type: str = "",
+    user_override: str = "auto",
+) -> str:
+    """Single source of truth for scoring profile selection.
+
+    Priority:
+    1. user_override != "auto"  → return it directly
+    2. Italy register detected   → "italy_register_icp_only"
+    3. Otherwise                 → "default"
+    """
+    if user_override and user_override != "auto":
+        return user_override
+    if _detect_italy_register_profile(input_filename, df):
+        return "italy_register_icp_only"
+    return "default"
 
 
 def apply_results_compatible_scoring(
@@ -8085,10 +8173,9 @@ def run_cli() -> None:
 
     # ── Scoring profile detection ─────────────────────────────────────────────
     _cli_fname = str(input_path.name)
-    _cli_scoring_profile = (
-        "italy_register_icp_only"
-        if _detect_italy_register_profile(_cli_fname, df_in)
-        else "default"
+    _cli_scoring_profile = resolve_active_scoring_profile(
+        input_filename=_cli_fname,
+        df=df_in,
     )
     from commercial_fit_scoring import SCORING_PROFILES as _SP
     _sp_info = _SP.get(_cli_scoring_profile, _SP["default"])
@@ -8658,10 +8745,11 @@ def run_streamlit_app() -> None:
                             else "simple_company_list"
                         )
 
-                _det_scoring_profile = (
-                    "italy_register_icp_only"
-                    if _detect_italy_register_profile(fname, df_loaded)
-                    else "default"
+                _det_scoring_profile = resolve_active_scoring_profile(
+                    input_filename=fname,
+                    df=df_loaded,
+                    selected_sheet=_sel_sheet or "",
+                    detected_input_type=_det_itype,
                 )
                 ss_set(df_raw=df_loaded, file_name=fname,
                        _selected_sheet=_sel_sheet, _detected_input_type_ui=_det_itype,
@@ -8755,6 +8843,21 @@ def run_streamlit_app() -> None:
                     "Detected company column has very few unique values. "
                     "Please check column mapping."
                 )
+            # Show resolved scoring profile so user sees it before starting
+            _resolved_sp = ss("_scoring_profile", "default")
+            from commercial_fit_scoring import SCORING_PROFILES as _SP
+            _sp_display = _SP.get(_resolved_sp, _SP["default"])
+            _sp_label = (
+                "Italy register ICP only"
+                if _resolved_sp == "italy_register_icp_only"
+                else "Default (ICP 90% + size 10%)"
+            )
+            _st.info(
+                f"**Resolved scoring profile:** {_sp_label}  \n"
+                f"K = {_sp_display.get('sigmoid_k', 10)} · "
+                f"Model weight = {int(_sp_display.get('model_weight', 0.9)*100)}% · "
+                f"Size weight = {int(_sp_display.get('size_weight', 0.1)*100)}%"
+            )
     # ── Column detection and processing scope ─────────────────────────────────────
 
     name_col     = _sc_name_col if _app_mode == "Single Company" else None
@@ -9091,11 +9194,15 @@ def run_streamlit_app() -> None:
                 _cur_company = str(df_work.iloc[idx].get("canonical_company_name", "")).strip()
             except Exception:
                 pass
-        _progress_text = (
-            f"Processing {idx + 1} of {_n}"
-            + (f" · Current company: {_cur_company}" if _cur_company else "")
-        )
-        _st.progress(idx / _n if _n else 1.0, text=_progress_text)
+        if idx >= _n:
+            _progress_text = f"Completed {_n} of {_n}"
+            _st.progress(1.0, text=_progress_text)
+        else:
+            _progress_text = (
+                f"Processing {idx + 1} of {_n}"
+                + (f" · Current company: {_cur_company}" if _cur_company else "")
+            )
+            _st.progress(idx / _n if _n else 1.0, text=_progress_text)
 
         # ── ETA display ───────────────────────────────────────────────────────────
         _completed  = len(results)
@@ -9492,6 +9599,7 @@ def run_streamlit_app() -> None:
                             include_signal_evidence=_include_signal_evidence_run,
                             run_step1_enrichment=_run_step1_enrichment_run,
                             run_step2_enrichment=_run_step2_enrichment_run,
+                            scoring_profile=_scoring_profile,
                             existing_lusha_data=_existing_lusha or None,
                         )
                     if not (_zero_cost_run and _dry_run_run):
@@ -9557,6 +9665,7 @@ def run_streamlit_app() -> None:
                     elm_mode=_elm_mode_run,
                     row_count=_new_idx,
                     name_col=name_col,
+                    scoring_profile=_scoring_profile,
                     domain_col=domain_col,
                 )
                 if _pca_ok2:
@@ -9581,7 +9690,7 @@ def run_streamlit_app() -> None:
                 )
                 _xl_ok, _xl_msg = _xl_autosave_write(
                     _xl_snap, _xl_partial_fname,
-                    name_col=name_col, domain_col=domain_col,
+                    name_col=name_col, scoring_profile=_scoring_profile, domain_col=domain_col,
                 )
                 ss_set(_xl_autosave_last_msg=(
                     f"Autosaved {_new_idx} rows → {_xl_partial_fname}: {_xl_msg}"
@@ -10246,6 +10355,7 @@ def run_streamlit_app() -> None:
             _xl_fin_ok, _xl_fin_msg = _xl_autosave_write(
                 df_enriched, _xl_fin_fname_cfg,
                 name_col=name_col, domain_col=domain_col,
+                scoring_profile=ss("_scoring_profile", "default"),
             )
             if _xl_fin_ok:
                 ss_set(
