@@ -6159,6 +6159,54 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             pass
 
 
+def _xl_write_run_settings(ws, run_config: dict, run_mode: str = "streamlit") -> None:
+    """Write run configuration to the Run Settings sheet (hidden).
+
+    Allows CLI vs Streamlit output comparison without guessing run parameters.
+    """
+    from openpyxl.styles import Font, Alignment
+
+    bold     = Font(bold=True,  size=10)
+    norm     = Font(bold=False, size=10)
+    hdr_font = Font(bold=True,  size=13)
+    lft      = Alignment(horizontal="left", vertical="center")
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 55
+
+    rows = [
+        ("Run Settings",             None),
+        (None,                       None),
+        ("run_mode",                 run_mode),
+        ("input_filename",           run_config.get("input_filename", "")),
+        ("selected_sheet",           run_config.get("selected_sheet", "")),
+        ("input_type",               run_config.get("input_type", "")),
+        ("scoring_profile",          run_config.get("scoring_profile", "")),
+        ("scoring_profile_source",   run_config.get("scoring_profile_source", "")),
+        ("run_step1_enrichment",     str(run_config.get("run_step1_enrichment", ""))),
+        ("run_step2_enrichment",     str(run_config.get("run_step2_enrichment", ""))),
+        ("extract_model_signals",    str(run_config.get("extract_model_signals", ""))),
+        ("include_signal_evidence",  str(run_config.get("include_signal_evidence", ""))),
+        ("search_provider",          run_config.get("search_provider", "")),
+        ("use_playwright",           str(run_config.get("use_playwright", ""))),
+        ("model_step1",              run_config.get("model_step1", "")),
+        ("model_step2",              run_config.get("model_step2", "")),
+    ]
+
+    for r, (label, value) in enumerate(rows, 1):
+        if label == "Run Settings":
+            ws.cell(row=r, column=1, value=label).font = hdr_font
+        elif label is None:
+            pass
+        else:
+            lc = ws.cell(row=r, column=1, value=label)
+            lc.font = bold
+            lc.alignment = lft
+            vc = ws.cell(row=r, column=2, value=value)
+            vc.font = norm
+            vc.alignment = lft
+
+
 def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
     """Write the Advanced Evidence sheet in long format: one row per company per signal.
 
@@ -6685,6 +6733,8 @@ def build_rich_excel_bytes(
     domain_col: str | None = None,
     df_input_original: pd.DataFrame | None = None,
     scoring_profile: str = "default",
+    run_config: dict | None = None,
+    run_mode: str = "streamlit",
 ) -> bytes:
     """
     Build a fully formatted multi-sheet Excel workbook.
@@ -6841,6 +6891,15 @@ def build_rich_excel_bytes(
         ws_sc.sheet_state = "hidden"
     except Exception:
         pass
+
+    # ── Run Settings (hidden) ─────────────────────────────────────────────────
+    if run_config:
+        try:
+            ws_rs = wb.create_sheet("Run Settings")
+            _xl_write_run_settings(ws_rs, run_config=run_config, run_mode=run_mode)
+            ws_rs.sheet_state = "hidden"
+        except Exception:
+            pass
 
     # ── Enriched (hidden) ─────────────────────────────────────────────────────
     try:
@@ -7262,6 +7321,62 @@ def resolve_active_scoring_profile(
     if _detect_italy_register_profile(input_filename, df):
         return "italy_register_icp_only"
     return "default"
+
+
+def resolve_active_run_config(
+    input_filename: str = "",
+    df: "pd.DataFrame | None" = None,
+    selected_sheet: str = "",
+    detected_input_type: str = "",
+    has_existing_lusha_data: bool = False,
+    user_overrides: dict | None = None,
+) -> dict:
+    """Single source of truth for all per-run enrichment parameters.
+
+    Call once at run start; store the result in session_state._active_run_config.
+    Use it unchanged for every enrich_one_row() call in that run.
+
+    Step 1 (Jina/Firecrawl firmographic scrape) is skipped ONLY for true
+    pre-enriched Lucia/Lusha exports where company-level data is already present.
+    Input cleaner output must always run Step 1 regardless of what columns it has.
+    """
+    overrides = user_overrides or {}
+
+    scoring_profile = resolve_active_scoring_profile(
+        input_filename=input_filename,
+        df=df,
+        selected_sheet=selected_sheet,
+        detected_input_type=detected_input_type,
+        user_override=overrides.get("scoring_profile", "auto"),
+    )
+    sp_source = (
+        "manual_override"
+        if (overrides.get("scoring_profile") and overrides.get("scoring_profile") != "auto")
+        else "auto_detected"
+    )
+
+    # Step 1 skipped ONLY for true pre-enriched Lucia/Lusha exports.
+    # Cleaner output (detected_input_type == "input_cleaner_output") must always
+    # run Step 1 — never treat it as pre-enriched even if it has Lusha-like cols.
+    _is_lucia = (detected_input_type == "pre_enriched_lucia_export")
+    _skip_s1_default = _is_lucia and has_existing_lusha_data
+    run_step1 = bool(overrides.get("run_step1_enrichment", not _skip_s1_default))
+
+    return {
+        "scoring_profile":          scoring_profile,
+        "scoring_profile_source":   sp_source,
+        "run_step1_enrichment":     run_step1,
+        "run_step2_enrichment":     bool(overrides.get("run_step2_enrichment", True)),
+        "extract_model_signals":    bool(overrides.get("extract_model_signals", True)),
+        "include_signal_evidence":  bool(overrides.get("include_signal_evidence", True)),
+        "search_provider":          overrides.get("search_provider", STEP2_PROVIDER_SERPER),
+        "use_playwright":           bool(overrides.get("use_playwright", _PLAYWRIGHT_AVAILABLE)),
+        "model_step1":              overrides.get("model_step1", MODEL_STEP1),
+        "model_step2":              overrides.get("model_step2", MODEL_STEP2),
+        "input_type":               detected_input_type,
+        "selected_sheet":           selected_sheet,
+        "input_filename":           input_filename,
+    }
 
 
 def apply_results_compatible_scoring(
@@ -8278,23 +8393,45 @@ def run_cli() -> None:
     _cnum_col = _detect_company_number_col(df_in)
     print(f"[enricher] Company number column: {_cnum_col or 'none'}", flush=True)
 
-    # ── Scoring profile detection ─────────────────────────────────────────────
+    # ── Input type + unified run config ──────────────────────────────────────
     _cli_fname = str(input_path.name)
-    _cli_scoring_profile = resolve_active_scoring_profile(
+    _cli_det_itype = (
+        "pre_enriched_lucia_export" if is_lucia_contact_export(df_in)
+        else "input_cleaner_output"  if is_input_cleaner_output(df_in, _cli_fname)
+        else "simple_company_list"
+    )
+    # For Lusha detection: cleaner output is never treated as pre-enriched Lusha
+    _cli_has_lusha = (
+        bool(detect_lusha_columns(df_in))
+        and _cli_det_itype == "pre_enriched_lucia_export"
+    )
+    _run_config = resolve_active_run_config(
         input_filename=_cli_fname,
         df=df_in,
+        detected_input_type=_cli_det_itype,
+        has_existing_lusha_data=_cli_has_lusha,
     )
+    _cli_scoring_profile = _run_config["scoring_profile"]
+
     from commercial_fit_scoring import SCORING_PROFILES as _SP
     _sp_info = _SP.get(_cli_scoring_profile, _SP["default"])
     print("", flush=True)
-    print(f"[enricher] SCORING PROFILE: {_cli_scoring_profile}", flush=True)
-    print(f"[enricher] MODEL WEIGHT:    {_sp_info['model_weight']}", flush=True)
-    print(f"[enricher] SIZE WEIGHT:     {_sp_info['size_weight']}", flush=True)
-    print(f"[enricher] SIGMOID_K:       {_sp_info['sigmoid_k']}", flush=True)
+    print(f"[enricher] INPUT TYPE:          {_cli_det_itype}", flush=True)
+    print(f"[enricher] SCORING PROFILE:     {_cli_scoring_profile} ({_run_config['scoring_profile_source']})", flush=True)
+    print(f"[enricher] MODEL WEIGHT:        {_sp_info['model_weight']}", flush=True)
+    print(f"[enricher] SIZE WEIGHT:         {_sp_info['size_weight']}", flush=True)
+    print(f"[enricher] SIGMOID_K:           {_sp_info['sigmoid_k']}", flush=True)
+    print(f"[enricher] run_step1:           {_run_config['run_step1_enrichment']}", flush=True)
+    print(f"[enricher] run_step2:           {_run_config['run_step2_enrichment']}", flush=True)
+    print(f"[enricher] extract_signals:     {_run_config['extract_model_signals']}", flush=True)
+    print(f"[enricher] search_provider:     {_run_config['search_provider']}", flush=True)
+    print(f"[enricher] use_playwright:      {_run_config['use_playwright']}", flush=True)
+    print(f"[enricher] model_step1:         {_run_config['model_step1']}", flush=True)
+    print(f"[enricher] model_step2:         {_run_config['model_step2']}", flush=True)
     if _cli_scoring_profile == "italy_register_icp_only":
-        print("[enricher] COMPANY SIZE:    excluded from score, audit only", flush=True)
+        print("[enricher] COMPANY SIZE:        excluded from score, audit only", flush=True)
     else:
-        print("[enricher] COMPANY SIZE:    included in score (10% weight)", flush=True)
+        print("[enricher] COMPANY SIZE:        included in score (10% weight)", flush=True)
     print("", flush=True)
 
     if not domain_col:
@@ -8361,7 +8498,15 @@ def run_cli() -> None:
                 delay=0,
                 serper_key=serper_key or "",
                 _cli_verbose=True,
-                scoring_profile=_cli_scoring_profile,
+                scoring_profile=_run_config["scoring_profile"],
+                run_step1_enrichment=_run_config["run_step1_enrichment"],
+                run_step2_enrichment=_run_config["run_step2_enrichment"],
+                extract_model_signals=_run_config["extract_model_signals"],
+                include_signal_evidence=_run_config["include_signal_evidence"],
+                search_provider=_run_config["search_provider"],
+                use_playwright=_run_config["use_playwright"],
+                model_step1=_run_config["model_step1"],
+                model_step2=_run_config["model_step2"],
             )
             debug_records.append(_debug_rec)
             _claude_calls += int(result.get("claude_api_calls", 0) or 0)
@@ -8520,6 +8665,8 @@ def run_cli() -> None:
             domain_col=domain_col or None,
             df_input_original=df_in,
             scoring_profile=_cli_scoring_profile,
+            run_config=_run_config,
+            run_mode="cli",
         )
         xl_path.write_bytes(xl_bytes)
         print(f"[enricher] Saved: {xl_path}", flush=True)
@@ -8863,9 +9010,12 @@ def run_streamlit_app() -> None:
                        _scoring_profile=_det_scoring_profile)
                 _is_lucia_loaded = (_det_itype == "pre_enriched_lucia_export")
                 _detected_lusha  = detect_lusha_columns(df_loaded)
+                # _has_lusha_input = True ONLY for true Lucia/Lusha exports, never
+                # for cleaner output (even if it happens to contain Lusha-like cols).
+                _has_lusha = bool(_detected_lusha) and _is_lucia_loaded
                 ss_set(
                     _lusha_cols_in_input=_detected_lusha,
-                    _has_lusha_input=bool(_detected_lusha),
+                    _has_lusha_input=_has_lusha,
                     _is_lucia_export=_is_lucia_loaded,
                     _is_cleaner_output=(_det_itype == "input_cleaner_output"),
                 )
@@ -8950,7 +9100,7 @@ def run_streamlit_app() -> None:
                     "Detected company column has very few unique values. "
                     "Please check column mapping."
                 )
-            # Show resolved scoring profile so user sees it before starting
+            # Show resolved run config so user sees it before starting
             _resolved_sp = ss("_scoring_profile", "default")
             from commercial_fit_scoring import SCORING_PROFILES as _SP
             _sp_display = _SP.get(_resolved_sp, _SP["default"])
@@ -8959,11 +9109,30 @@ def run_streamlit_app() -> None:
                 if _resolved_sp == "italy_register_icp_only"
                 else "Default (ICP 90% + size 10%)"
             )
+            _ui_rc = resolve_active_run_config(
+                input_filename=ss("file_name", ""),
+                df=df_raw,
+                selected_sheet=ss("_selected_sheet", ""),
+                detected_input_type=ss("_detected_input_type_ui", ""),
+                has_existing_lusha_data=bool(ss("_has_lusha_input", False)),
+                user_overrides={
+                    "model_step1": ss("_model_step1", MODEL_STEP1),
+                    "model_step2": ss("_model_step2", MODEL_STEP2),
+                },
+            )
             _st.info(
                 f"**Resolved scoring profile:** {_sp_label}  \n"
                 f"K = {_sp_display.get('sigmoid_k', 10)} · "
                 f"Model weight = {int(_sp_display.get('model_weight', 0.9)*100)}% · "
-                f"Size weight = {int(_sp_display.get('size_weight', 0.1)*100)}%"
+                f"Size weight = {int(_sp_display.get('size_weight', 0.1)*100)}%  \n"
+                f"**Step 1 (firmographics):** "
+                f"{'enabled' if _ui_rc['run_step1_enrichment'] else 'skipped - Lusha data present'}  \n"
+                f"**Step 2 (ICP search):** "
+                f"{'enabled' if _ui_rc['run_step2_enrichment'] else 'disabled'}  \n"
+                f"**Model signals:** "
+                f"{'enabled' if _ui_rc['extract_model_signals'] else 'disabled'}  \n"
+                f"**Search provider:** {_ui_rc['search_provider']}  \n"
+                f"**Input type:** {ss('_detected_input_type_ui', 'unknown')}"
             )
     # ── Column detection and processing scope ─────────────────────────────────────
 
@@ -9214,6 +9383,19 @@ def run_streamlit_app() -> None:
                 _st.warning(f"⚠ Could not create autosave run folder: {_pca_err}")
                 _pca_run_dir_new = ""
 
+        # ── Build and lock run config for this run ────────────────────────────
+        _arc = resolve_active_run_config(
+            input_filename=ss("file_name", ""),
+            df=ss("df_raw"),
+            selected_sheet=ss("_selected_sheet", ""),
+            detected_input_type=ss("_detected_input_type_ui", ""),
+            has_existing_lusha_data=bool(ss("_has_lusha_input", False)),
+            user_overrides={
+                "model_step1": ss("_model_step1", MODEL_STEP1),
+                "model_step2": ss("_model_step2", MODEL_STEP2),
+            },
+        )
+
         ss_set(
             processing=True, stop_requested=False,
             process_index=0, results=[], debug_records=[],
@@ -9228,19 +9410,11 @@ def run_streamlit_app() -> None:
             _active_fields=ELM_ALL_FIELDS if _elm_mode else ALL_ENRICHMENT_FIELDS,
             _local_save_enabled=ss("_local_save_enabled", True),
             _final_auto_saved=False, _last_local_save="",
-            _use_playwright=ss("_use_playwright", True),
-            _model_step1=ss("_model_step1", MODEL_STEP1),
-            _model_step2=ss("_model_step2", MODEL_STEP2),
-            _step2_provider=ss("_step2_provider", STEP2_PROVIDER_SERPER),
             _serper_key=serper_key,
             _step2_dry_run=ss("_step2_dry_run", False),
             _zero_cost_preview=ss("_zero_cost_preview", False),
             _enable_lusha_api=False,  # Lusha live API disabled in Layer 1
             _lusha_api_key=lusha_api_key,
-            _extract_model_signals=ss("_extract_model_signals", True),
-            _include_signal_evidence=ss("_include_signal_evidence", True),
-            _run_step1_enrichment=ss("_run_step1_enrichment", True),
-            _run_step2_enrichment=ss("_run_step2_enrichment", True),
             _dry_run_records=[], _search_output_records=[], _step2_debug_files=[],
             _dry_run_preview_count=0,
             # Lucia export: original (contact-level) df for the Input sheet
@@ -9250,8 +9424,18 @@ def run_streamlit_app() -> None:
             _per_company_autosave_last_saved="",
             _per_company_autosave_last_error="",
             _final_save_path="", _final_save_error="",
-            # Scoring profile locked at run-start; stable across per-row reruns
-            _active_scoring_profile=ss("_scoring_profile", "default"),
+            # Active run config — single source of truth, locked at run start
+            _active_run_config=_arc,
+            _active_scoring_profile=_arc["scoring_profile"],
+            # Keep legacy individual keys in sync for any residual reads
+            _use_playwright=_arc["use_playwright"],
+            _model_step1=_arc["model_step1"],
+            _model_step2=_arc["model_step2"],
+            _step2_provider=_arc["search_provider"],
+            _extract_model_signals=_arc["extract_model_signals"],
+            _include_signal_evidence=_arc["include_signal_evidence"],
+            _run_step1_enrichment=_arc["run_step1_enrichment"],
+            _run_step2_enrichment=_arc["run_step2_enrichment"],
         )
         _st.rerun()
 
@@ -9271,22 +9455,24 @@ def run_streamlit_app() -> None:
         _delay        = ss("_delay", 1.0)
         _elm_mode_run  = ss("_elm_mode", False)
         _active_fields = ss("_active_fields", ALL_ENRICHMENT_FIELDS)
-        _use_playwright_run  = ss("_use_playwright", True)
-        _model_step1_run     = ss("_model_step1", MODEL_STEP1)
-        _model_step2_run     = ss("_model_step2", MODEL_STEP2)
-        _step2_provider_run  = ss("_step2_provider", STEP2_PROVIDER_SERPER)
-        _serper_key_run      = ss("_serper_key", "")
-        _dry_run_run         = ss("_step2_dry_run", False)
-        _zero_cost_run       = ss("_zero_cost_preview", False)
-        _enable_lusha_api_run      = ss("_enable_lusha_api", False)
-        _lusha_api_key_run         = ss("_lusha_api_key", "")
-        _extract_model_signals_run = ss("_extract_model_signals", True)
-        _include_signal_evidence_run = ss("_include_signal_evidence", True)
-        _run_step1_enrichment_run  = ss("_run_step1_enrichment", True)
-        _run_step2_enrichment_run  = ss("_run_step2_enrichment", True)
+        # Read from locked run config — never recompute mid-run
+        _arc_run = ss("_active_run_config") or {}
+        _use_playwright_run          = _arc_run.get("use_playwright",        ss("_use_playwright", True))
+        _model_step1_run             = _arc_run.get("model_step1",           ss("_model_step1", MODEL_STEP1))
+        _model_step2_run             = _arc_run.get("model_step2",           ss("_model_step2", MODEL_STEP2))
+        _step2_provider_run          = _arc_run.get("search_provider",       ss("_step2_provider", STEP2_PROVIDER_SERPER))
+        _serper_key_run              = ss("_serper_key", "")
+        _dry_run_run                 = ss("_step2_dry_run", False)
+        _zero_cost_run               = ss("_zero_cost_preview", False)
+        _enable_lusha_api_run        = ss("_enable_lusha_api", False)
+        _lusha_api_key_run           = ss("_lusha_api_key", "")
+        _extract_model_signals_run   = _arc_run.get("extract_model_signals",   ss("_extract_model_signals", True))
+        _include_signal_evidence_run = _arc_run.get("include_signal_evidence", ss("_include_signal_evidence", True))
+        _run_step1_enrichment_run    = _arc_run.get("run_step1_enrichment",    ss("_run_step1_enrichment", True))
+        _run_step2_enrichment_run    = _arc_run.get("run_step2_enrichment",    ss("_run_step2_enrichment", True))
+        _scoring_profile             = _arc_run.get("scoring_profile",         ss("_active_scoring_profile", "default"))
         _pca_enabled_run  = ss("_per_company_autosave_enabled", False)
         _pca_run_dir_run  = ss("_per_company_autosave_run_dir", "")
-        _scoring_profile  = ss("_active_scoring_profile", "default")
         total_in          = ss("total_tokens_in", 0)
         total_out         = ss("total_tokens_out", 0)
         total_cost        = ss("total_cost_usd", 0.0)
@@ -10245,6 +10431,8 @@ def run_streamlit_app() -> None:
                 domain_col=ss("_domain_col"),
                 df_input_original=ss("_df_raw_original"),
                 scoring_profile=ss("_scoring_profile", "default"),
+                run_config=ss("_active_run_config"),
+                run_mode="streamlit",
             )
             if not _elm_done else df_to_excel_bytes(df_enriched)
         )
@@ -10557,6 +10745,8 @@ def run_streamlit_app() -> None:
                 domain_col=ss("_domain_col"),
                 df_input_original=ss("_df_raw_original"),
                 scoring_profile=ss("_scoring_profile", "default"),
+                run_config=ss("_active_run_config"),
+                run_mode="streamlit",
             )
         _st.download_button(
             label="⬇ Download lead scores",
