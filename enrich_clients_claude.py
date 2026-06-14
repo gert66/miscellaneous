@@ -989,6 +989,30 @@ def _is_meta_col(col_name: str) -> bool:
     return any(cl.endswith(sfx) for sfx in _META_SUFFIX_EXCLUDE)
 
 
+# Priority list for resolving a human-readable company / register number from a row
+_COMPANY_NUMBER_COLS: tuple = (
+    "company_number", "Company Number", "native_company_number",
+    "register_nummer", "source_row_id", "id",
+)
+
+
+def _get_company_number(row: dict) -> str:
+    """Return the first non-blank company/register number found in *row*, or 'n/a'."""
+    for col in _COMPANY_NUMBER_COLS:
+        v = str(row.get(col, "") or "").strip()
+        if v and v.lower() not in ("nan", "none", ""):
+            return v
+    return "n/a"
+
+
+def _detect_company_number_col(df: "pd.DataFrame") -> str | None:
+    """Return the first _COMPANY_NUMBER_COLS column that exists in df, or None."""
+    for col in _COMPANY_NUMBER_COLS:
+        if col in df.columns:
+            return col
+    return None
+
+
 # Filename patterns that hint at cleaner output (case-insensitive)
 _CLEANER_FNAME_PATTERNS: tuple = (
     "register_cleaned_",
@@ -6770,6 +6794,36 @@ def _validate_type1_type2_pipeline() -> None:
     else:
         print("  [skip] H-T6: Example_Cold_Caller.csv not found, skipping Lucia test")
 
+    # ── Company-number resolution (CLI progress) ──────────────────────────────
+    print("\nCompany number resolution")
+    _h_cn_row = {
+        "company_number": "DE-HRB-12345", "company_name": "EUROPE Hotels GmbH",
+        "website_url": "europehotels.de",
+    }
+    chk("H-CN1 resolves company_number", _get_company_number(_h_cn_row) == "DE-HRB-12345",
+        repr(_get_company_number(_h_cn_row)))
+
+    _h_rn_row = {
+        "register_nummer": "HRB 99999", "company_name": "Test GmbH",
+    }
+    chk("H-CN2 resolves register_nummer", _get_company_number(_h_rn_row) == "HRB 99999",
+        repr(_get_company_number(_h_rn_row)))
+
+    _h_no_cn_row = {"company_name": "NoCN AG", "website": "nocn.de"}
+    chk("H-CN3 missing company_number returns n/a",
+        _get_company_number(_h_no_cn_row) == "n/a",
+        repr(_get_company_number(_h_no_cn_row)))
+
+    _h_cn_df = pd.DataFrame([_h_cn_row])
+    chk("H-CN4 _detect_company_number_col finds company_number",
+        _detect_company_number_col(_h_cn_df) == "company_number",
+        repr(_detect_company_number_col(_h_cn_df)))
+
+    _h_no_cn_df = pd.DataFrame([_h_no_cn_row])
+    chk("H-CN5 _detect_company_number_col returns None when absent",
+        _detect_company_number_col(_h_no_cn_df) is None,
+        repr(_detect_company_number_col(_h_no_cn_df)))
+
     print(f"\n{'═'*60}")
     if failures:
         print(f"  FAILURES ({len(failures)}):")
@@ -6945,19 +6999,63 @@ def run_cli() -> None:
 
     print(f"[enricher] Company col: {company_col}, Domain col: {domain_col or '(none)'}", flush=True)
 
+    _cnum_col = _detect_company_number_col(df_in)
+    print(f"[enricher] Company number column: {_cnum_col or 'none'}", flush=True)
+
     if not domain_col:
         print("[enricher] No domain column found — proceeding with company-name-only enrichment.", flush=True)
 
+    # ── Progress helper ───────────────────────────────────────────────────────
+    import time as _time
+
+    def _fmt_elapsed(secs: float) -> str:
+        s = int(secs)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _print_cli_progress(
+        i: int, total: int, company_name: str, company_number: str,
+        start_ts: float, claude_calls: int, serper_calls: int, error_count: int,
+    ) -> None:
+        elapsed  = _time.monotonic() - start_ts
+        pct      = i / total * 100
+        eta_secs = (elapsed / i) * (total - i) if i > 0 else 0
+        print(
+            f"[enricher] {i}/{total} ({pct:.1f}%) | "
+            f"company_number: {company_number} | "
+            f"current: {company_name[:60]} | "
+            f"elapsed {_fmt_elapsed(elapsed)} | "
+            f"ETA {_fmt_elapsed(eta_secs)} | "
+            f"Claude: {claude_calls} | Serper: {serper_calls} | errors: {error_count}",
+            flush=True,
+        )
+
     # ── Process rows ──────────────────────────────────────────────────────────
-    results      = []
+    results       = []
     debug_records = []
-    total = len(df_in)
+    total         = len(df_in)
+    _claude_calls = 0
+    _serper_calls = 0
+    _error_count  = 0
+    _start_ts     = _time.monotonic()
 
     for i, (_, row) in enumerate(df_in.iterrows(), 1):
-        print(f"\r[enricher] {i}/{total}", end="", flush=True)
-        row_dict = row.to_dict()
+        row_dict     = row.to_dict()
         company_name = str(row_dict.get(company_col, "") or "").strip()
         domain       = str(row_dict.get(domain_col, "") or "").strip() if domain_col else ""
+        _cnum        = _get_company_number(row_dict)
+
+        _should_print = (
+            i == 1
+            or i == total
+            or total <= 5
+            or (total <= 50 and i % 5 == 0)
+            or (total > 50  and i % 10 == 0)
+        )
+        if _should_print:
+            _print_cli_progress(
+                i, total, company_name, _cnum,
+                _start_ts, _claude_calls, _serper_calls, _error_count,
+            )
 
         try:
             result, _debug_rec = enrich_one_row(
@@ -6968,12 +7066,15 @@ def run_cli() -> None:
                 serper_key=serper_key or "",
             )
             debug_records.append(_debug_rec)
+            _claude_calls += int(result.get("claude_api_calls", 0) or 0)
+            _serper_calls += int(result.get("serper_calls", 0) or 0)
         except Exception as exc:
             result = dict(row_dict)
             result["enrichment_error"] = f"{type(exc).__name__}: {exc}"
+            _error_count += 1
         results.append(result)
 
-    print(f"\n[enricher] Done — {total} rows processed.", flush=True)
+    print(f"[enricher] Done — {total} rows processed, {_error_count} errors.", flush=True)
 
     # ── Build output dataframe ────────────────────────────────────────────────
     _active_fields = ALL_ENRICHMENT_FIELDS + EMPLOYEE_RANGE_RESOLVER_FIELDS
