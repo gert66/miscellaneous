@@ -134,6 +134,18 @@ if "%MODE_RAW%"=="" (
     goto :show_usage
 )
 
+:: Validate max_rows if supplied
+set "_MAX_ROWS_SOURCE="
+if not "%MAX_ROWS_OVERRIDE%"=="" (
+    :: Check it is a positive integer using PowerShell
+    for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "if ('%MAX_ROWS_OVERRIDE%' -match '^[1-9][0-9]*$') { 'ok' } else { 'bad' }"`) do set "_MR_VALID=%%V"
+    if "!_MR_VALID!"=="bad" (
+        echo ERROR: max_rows must be a positive integer. Got: %MAX_ROWS_OVERRIDE%
+        exit /b 1
+    )
+    set "_MAX_ROWS_SOURCE=user supplied"
+)
+
 :: -- Resolve PROJECT_ROOT (MYNGLE_DATA_ROOT override or auto-detect) --
 call :resolve_project_root
 
@@ -149,8 +161,19 @@ echo [runner] Parsed:
 echo   queue:           %QUEUE_NAME%
 echo   batch numbers:   %BATCH_NUMBERS%
 echo   mode:            %MODE%
-if not "%MAX_ROWS_OVERRIDE%"=="" echo   max rows:        %MAX_ROWS_OVERRIDE% ^(override^)
-if     "%MAX_ROWS_OVERRIDE%"=="" if "%MODE%"=="test" echo   max rows:        %MAX_ROWS_TEST% ^(default test limit^)
+if not "%MAX_ROWS_OVERRIDE%"=="" (
+    if "%MODE%"=="dry" (
+        echo   max rows:        %MAX_ROWS_OVERRIDE% ^(supplied but ignored in dry mode^)
+    ) else if "%MODE%"=="full" (
+        echo   max rows:        %MAX_ROWS_OVERRIDE% ^(safety cap on full mode^)
+    ) else (
+        echo   max rows:        %MAX_ROWS_OVERRIDE% ^(user supplied^)
+    )
+) else (
+    if "%MODE%"=="test" echo   max rows:        %MAX_ROWS_TEST% ^(default test limit^)
+    if "%MODE%"=="full" echo   max rows:        all rows
+    if "%MODE%"=="dry"  echo   max rows:        n/a ^(dry mode^)
+)
 echo.
 echo [runner] PROJECT_ROOT:   %PROJECT_ROOT%
 echo [runner] FLAT_INPUT_DIR: %FLAT_INPUT_DIR%
@@ -311,14 +334,22 @@ set "_RUN_MAXROWS="
 
 if "%MODE%"=="dry" (
     set "_RUN_DRY=1"
+    if not "%MAX_ROWS_OVERRIDE%"=="" (
+        echo [runner] Dry mode -- max_rows %MAX_ROWS_OVERRIDE% noted but Python is not invoked.
+    )
 ) else if "%MODE%"=="test" (
     if not "%MAX_ROWS_OVERRIDE%"=="" (
         set "_RUN_MAXROWS=%MAX_ROWS_OVERRIDE%"
+        echo [runner] Test mode -- row limit: %MAX_ROWS_OVERRIDE% ^(user supplied^)
     ) else (
         set "_RUN_MAXROWS=%MAX_ROWS_TEST%"
+        echo [runner] Test mode -- row limit: %MAX_ROWS_TEST% ^(default^)
     )
 ) else (
-    if not "%MAX_ROWS_OVERRIDE%"=="" set "_RUN_MAXROWS=%MAX_ROWS_OVERRIDE%"
+    if not "%MAX_ROWS_OVERRIDE%"=="" (
+        set "_RUN_MAXROWS=%MAX_ROWS_OVERRIDE%"
+        echo [runner] Full mode with max rows safety cap: %MAX_ROWS_OVERRIDE%
+    )
 )
 
 call :write_and_run_ps1
@@ -538,13 +569,20 @@ echo.
 echo  QUEUE:    Italy100 ^| Italy200 ^| Germany ^| 1 ^| 2
 echo  BATCHES:  "1" ^| "1 2 3" ^| "11 12 13"   (in quotes^)
 echo  MODE:     dry  = path check only, no API calls
-echo            test = first %MAX_ROWS_TEST% rows only
+echo            test = first N rows (default: %MAX_ROWS_TEST%^)
 echo            full = all rows
+echo  MAX_ROWS: optional positive integer
+echo            test: overrides the default %MAX_ROWS_TEST%-row limit
+echo            full: applies a safety cap on row count
+echo            dry:  noted but ignored (Python is not invoked^)
 echo.
 echo  EXAMPLES:
 echo    run_enricher_queue_generic.bat Italy100 "1" dry
 echo    run_enricher_queue_generic.bat Italy100 "1" test
+echo    run_enricher_queue_generic.bat Italy100 "1" test 20
+echo    run_enricher_queue_generic.bat Italy100 "1 2 3" test 10
 echo    run_enricher_queue_generic.bat Italy100 "1 2 3" full
+echo    run_enricher_queue_generic.bat Italy100 "1" full 50
 echo    run_enricher_queue_generic.bat 1 "1" test
 echo.
 echo  INPUT FILE DISCOVERY:
