@@ -9143,6 +9143,8 @@ def run_streamlit_app() -> None:
             _per_company_autosave_last_saved="",
             _per_company_autosave_last_error="",
             _final_save_path="", _final_save_error="",
+            # Scoring profile locked at run-start; stable across per-row reruns
+            _active_scoring_profile=ss("_scoring_profile", "default"),
         )
         _st.rerun()
 
@@ -9177,6 +9179,7 @@ def run_streamlit_app() -> None:
         _run_step2_enrichment_run  = ss("_run_step2_enrichment", True)
         _pca_enabled_run  = ss("_per_company_autosave_enabled", False)
         _pca_run_dir_run  = ss("_per_company_autosave_run_dir", "")
+        _scoring_profile  = ss("_active_scoring_profile", "default")
         total_in          = ss("total_tokens_in", 0)
         total_out         = ss("total_tokens_out", 0)
         total_cost        = ss("total_cost_usd", 0.0)
