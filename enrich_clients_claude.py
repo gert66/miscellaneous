@@ -5262,7 +5262,7 @@ def _xl_write_scoring_settings(ws, scoring_profile: str = "default") -> None:
 # Human-readable labels for model signal field names.
 _SIGNAL_READABLE: dict[str, str] = {
     # Global complexity
-    "sig_foreign_hq_score":                  "Foreign HQ / foreign parent or ownership",
+    "sig_foreign_hq_score":                  "Foreign parent / external HQ decision structure",
     "sig_intl_footprint_score":              "International footprint",
     "sig_multicultural_score":               "Multicultural workforce",
     # People development
@@ -5352,6 +5352,158 @@ def _signal_strength_label(score: float) -> str:
     if score >= 1:
         return "Weak"
     return "Missing"
+
+
+def _build_caller_angle(rd: dict) -> str:
+    """Build a 2-3 sentence caller-facing angle for a scored company row.
+
+    Replaces generic scoring disclaimers (size weight, K-factor, audit notes)
+    with tier-specific, signal-anchored guidance for the sales or calling team.
+    The scoring_profile is read from rd["scoring_profile"] so the function is
+    self-contained and requires no extra arguments.
+    """
+    tier = str(rd.get("commercial_tier", "") or "").strip()
+    _profile = str(rd.get("scoring_profile", "default") or "default")
+    _is_italy = (_profile == "italy_register_icp_only")
+
+    def _f(field: str) -> float:
+        try:
+            return float(rd.get(field, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Signal scores
+    _intl    = _f("sig_intl_footprint_score")
+    _lnd     = _f("sig_explicit_lnd_score")
+    _onboard = _f("sig_lnd_onboarding_score")
+    _multi   = _f("sig_multicultural_score")
+    _growth  = _f("sig_rapid_growth_score")
+    _merger  = _f("sig_merger_acq_score")
+    _employer= _f("sig_employer_branding_score")
+    _fhq     = _f("sig_foreign_hq_score")
+    _fhq_san = bool(rd.get("foreign_hq_sanitized"))
+    _ti_eng  = _f("ti_language_english_score")
+    _ti_lead = _f("ti_leadership_score")
+    _ti_onb  = _f("ti_onboarding_score")
+    _ti_inter= _f("ti_intercultural_score")
+    _ti_neg  = _f("ti_negotiation_sales_score")
+
+    buyer_fn = str(rd.get("icp_potential_buyer_function", "") or "").strip()
+    comp_opp = str(rd.get("competitive_switch_opportunity", "") or "").strip()
+
+    # Infer most relevant buyer entry function
+    def _buyer_hint() -> str:
+        if buyer_fn:
+            return buyer_fn
+        if _lnd >= 2 or _onboard >= 2:
+            return "HR, L&D or People leadership"
+        if _ti_lead >= 2:
+            return "L&D, HR or Senior leadership"
+        if _multi >= 2 or _ti_inter >= 2:
+            return "HR, Operations or People leadership"
+        if _ti_onb >= 2:
+            return "HR, Talent or Operations"
+        if _ti_eng >= 2:
+            return "HR or L&D leadership"
+        if _intl >= 2:
+            return "HR, Operations or People leadership"
+        return "HR or People leadership"
+
+    # Describe the single strongest structural signal
+    def _anchor() -> str:
+        if _lnd >= 2:
+            return "The company shows explicit learning and development focus"
+        if _ti_lead >= 2:
+            return "Leadership development interest is evident"
+        if _onboard >= 2:
+            return "The company shows onboarding and employee development activity"
+        if _multi >= 2 or _ti_inter >= 2:
+            return "The company has a multicultural or cross-cultural workforce"
+        if _ti_eng >= 2:
+            return "English language training interest is evident"
+        if _intl >= 2:
+            return "The company has significant international operations"
+        # Only use foreign HQ signal when it was NOT sanitized away
+        if _fhq >= 2 and not _fhq_san:
+            return "The company operates under a foreign parent or external group structure"
+        if _ti_neg >= 2:
+            return "Sales or negotiation training interest is evident"
+        if _growth >= 2:
+            return "The company is in a rapid growth phase"
+        if _merger >= 2:
+            return "The company has recent merger or acquisition activity"
+        if _employer >= 2:
+            return "The company has visible employer branding and employee-experience focus"
+        return "Some mYngle-relevant signals exist but are not yet strong"
+
+    # Second sentence that adds a verifiable hypothesis
+    def _second_sentence(hot: bool) -> str:
+        if comp_opp == "Strong":
+            return (
+                "Competitor evidence suggests a possible switch opportunity — "
+                "investigate the current provider before leading with a full pitch."
+            )
+        # True foreign parent (not sanitized)
+        if _fhq >= 2 and not _fhq_san:
+            return (
+                "The foreign parent or external HQ structure may mean HR/L&D or "
+                "procurement decisions are made centrally — verify whether this is "
+                "the right entry point or whether the Italian entity has autonomy."
+            )
+        if _intl >= 2:
+            return (
+                "In the first call, test whether cross-country communication, "
+                "onboarding, English, leadership or client-facing communication "
+                "is handled centrally or locally."
+            )
+        if _lnd >= 2 or _ti_lead >= 2:
+            return (
+                "In the first call, test whether language training or leadership "
+                "development is managed centrally by HR/L&D or delegated to individual teams."
+            )
+        if hot:
+            return (
+                "In the first call, test whether training needs are coordinated "
+                "centrally or handled team by team."
+            )
+        return (
+            "Use Opportunity Radar to look for hiring, expansion, new leadership, "
+            "or training initiatives before prioritising a call."
+        )
+
+    bh = _buyer_hint()
+    anchor = _anchor()
+
+    if "Hot" in tier:
+        p1 = f"Strong Layer 1 fit. {anchor}, making {bh} a relevant entry point."
+        p2 = _second_sentence(hot=True)
+        return f"{p1} {p2}"
+
+    if "Warm" in tier:
+        p1 = f"Promising but incomplete fit. {anchor}"
+        p2 = (
+            _second_sentence(hot=False)
+            if (comp_opp == "Strong" or (_fhq >= 2 and not _fhq_san))
+            else (
+                "Use Opportunity Radar to look for hiring, expansion, new leadership, "
+                "integration, or training initiatives before prioritising a call."
+            )
+        )
+        return f"{p1}, but the training need is not yet explicit. {p2}"
+
+    if "Cool" in tier:
+        return (
+            f"Some mYngle-relevant context exists ({anchor.lower()}), "
+            "but the current evidence is still thin. Do not prioritise a cold call yet "
+            "unless Opportunity Radar finds a concrete trigger such as expansion, hiring, "
+            "acquisition, leadership change, or a new training initiative."
+        )
+
+    # Pass (or unknown tier)
+    return (
+        "Low Layer 1 priority. No strong mYngle-relevant signal was found yet. "
+        "Only move forward if Opportunity Radar finds a clear current trigger."
+    )
 
 
 def _build_profile_signals_gaps(rd: dict) -> tuple[str, str]:
@@ -5468,7 +5620,7 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         # Build signals/gaps from actual sig_*/ti_* scores — single consistent source.
         signals, gaps = _build_profile_signals_gaps(rd)
         evidence  = _xl_get(rd, "icp_evidence")
-        interp    = _xl_get(rd, "scoring_notes")
+        interp    = rd.get("caller_angle") or _build_caller_angle(rd)
 
         hdr_text = company
         if tier:
@@ -5526,7 +5678,7 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
             ("Top Positive Signals",     signals,  55),
             ("Gaps / Missing Signals",   gaps,     45),
             ("Evidence",                 evidence, 70),
-            ("Commercial Interpretation", interp,  50),
+            ("Caller Angle",              interp,  55),
         ]
         for label, content, height in long_rows:
             lc = ws.cell(row=cur, column=1, value=label)
@@ -5657,7 +5809,7 @@ def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
 
     Columns: Company Name | Company Domain/URL | Final Score | Commercial Tier |
              Signal Category | Signal Name | Signal Score | Signal Strength |
-             Evidence | Commercial Interpretation
+             Evidence | Caller Angle
     Uses canonical company identity only — no contact-level fields.
     """
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -5673,7 +5825,7 @@ def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
         "Signal Score",
         "Signal Strength",
         "Evidence",
-        "Commercial Interpretation",
+        "Caller Angle",
     ]
     col_widths = [30, 32, 12, 14, 20, 38, 12, 14, 60, 50]
 
@@ -5703,7 +5855,7 @@ def _xl_write_advanced_evidence(ws, df: pd.DataFrame) -> None:
         except (ValueError, TypeError):
             score_str = ""
         tier    = str(rd.get("commercial_tier", "") or "").strip()
-        interp  = str(rd.get("scoring_notes", "") or "").strip()
+        interp  = str(rd.get("caller_angle", "") or "").strip() or _build_caller_angle(rd)
 
         for field in _SIGNAL_FIELDS_ORDERED:
             try:
@@ -5796,6 +5948,7 @@ def _xl_write_opportunity_input(
         ("model_probability",    ["model_probability", "lean_model_prob"]),
         ("lean_model_prob",      ["lean_model_prob"]),
         ("scoring_notes",        ["scoring_notes"]),
+        ("caller_angle",         ["caller_angle"]),
         ("needs_manual_review",  ["needs_manual_review"]),
         ("match_notes",          ["match_notes"]),
         # ── ICP context ───────────────────────────────────────────────────────
@@ -5849,7 +6002,7 @@ def _xl_write_opportunity_input(
     # Text columns that must never be coerced to numbers even if they look numeric.
     _TEXT_COLS = {
         "company_name", "domain", "country", "city", "industry",
-        "employee_range", "commercial_tier", "scoring_notes", "match_notes",
+        "employee_range", "commercial_tier", "scoring_notes", "caller_angle", "match_notes",
         "icp_buying_signals", "icp_evidence", "icp_why_relevant",
         "icp_likely_training_interest", "icp_potential_buyer_function",
         "top_positive_signals", "gaps_missing_signals",
@@ -5905,7 +6058,7 @@ def _xl_write_opportunity_input(
 
     # Long text columns that should wrap
     _WRAP_COLS = {
-        "scoring_notes", "match_notes", "icp_buying_signals", "icp_evidence",
+        "scoring_notes", "caller_angle", "match_notes", "icp_buying_signals", "icp_evidence",
         "icp_why_relevant", "icp_likely_training_interest",
         "top_positive_signals", "gaps_missing_signals",
         "domain_check_reason",
@@ -6240,6 +6393,12 @@ def build_rich_excel_bytes(
     else:
         _xl_write_df(ws_input, df[input_cols_list] if input_cols_list else df)
     ws_input.sheet_state = "hidden"
+
+    # ── Compute caller_angle once for all rows ────────────────────────────────
+    # _build_caller_angle reads scoring_profile from rd["scoring_profile"].
+    if "caller_angle" not in df.columns or df["caller_angle"].astype(str).str.strip().eq("").all():
+        df = df.copy()
+        df["caller_angle"] = [_build_caller_angle(r) for r in df.to_dict("records")]
 
     # ── Lead Scores (visible) ─────────────────────────────────────────────────
     ws_lead_scores = wb.create_sheet("Lead Scores")
@@ -7264,6 +7423,110 @@ def _validate_type1_type2_pipeline() -> None:
     chk("FHQ-J foreign_hq_sanitized = False",
         not _fhq_r_j["foreign_hq_sanitized"],
         repr(_fhq_r_j["foreign_hq_sanitized"]))
+
+    # ── Caller Angle tests ────────────────────────────────────────────────────
+    print("\nCaller Angle builder")
+
+    # CA-1: Hot company with international footprint + explicit L&D
+    _ca1 = {
+        "commercial_tier": "🥇 Hot",
+        "scoring_profile": "italy_register_icp_only",
+        "sig_intl_footprint_score": 3,
+        "sig_explicit_lnd_score": 3,
+        "sig_foreign_hq_score": 0,
+        "foreign_hq_sanitized": False,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca1_text = _build_caller_angle(_ca1)
+    chk("CA-1 Hot: starts with 'Strong Layer 1'", _ca1_text.startswith("Strong Layer 1"),
+        repr(_ca1_text[:60]))
+    chk("CA-1 Hot: no size disclaimer", "size" not in _ca1_text.lower() and
+        "100+ employees" not in _ca1_text, repr(_ca1_text[:80]))
+    chk("CA-1 Hot: mentions L&D or HR",
+        any(w in _ca1_text for w in ("L&D", "HR", "learning", "leadership")),
+        repr(_ca1_text[:80]))
+
+    # CA-2: Warm company with international footprint but no explicit L&D
+    _ca2 = {
+        "commercial_tier": "🥈 Warm",
+        "scoring_profile": "italy_register_icp_only",
+        "sig_intl_footprint_score": 2,
+        "sig_explicit_lnd_score": 0,
+        "sig_foreign_hq_score": 0,
+        "foreign_hq_sanitized": False,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca2_text = _build_caller_angle(_ca2)
+    chk("CA-2 Warm: mentions 'Promising' or incomplete",
+        "romising" in _ca2_text or "incomplete" in _ca2_text, repr(_ca2_text[:80]))
+    chk("CA-2 Warm: recommends Opportunity Radar or verification",
+        "Opportunity Radar" in _ca2_text or "verif" in _ca2_text.lower(),
+        repr(_ca2_text[:120]))
+
+    # CA-3: Cool company with thin evidence
+    _ca3 = {
+        "commercial_tier": "🥉 Cool",
+        "scoring_profile": "default",
+        "sig_intl_footprint_score": 1,
+        "sig_explicit_lnd_score": 0,
+        "sig_foreign_hq_score": 0,
+        "foreign_hq_sanitized": False,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca3_text = _build_caller_angle(_ca3)
+    chk("CA-3 Cool: mentions thin evidence or Opportunity Radar",
+        "thin" in _ca3_text or "Opportunity Radar" in _ca3_text, repr(_ca3_text[:80]))
+
+    # CA-4: Pass company
+    _ca4 = {
+        "commercial_tier": "❄️ Pass",
+        "scoring_profile": "default",
+        "sig_intl_footprint_score": 0,
+        "sig_explicit_lnd_score": 0,
+        "sig_foreign_hq_score": 0,
+        "foreign_hq_sanitized": False,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca4_text = _build_caller_angle(_ca4)
+    chk("CA-4 Pass: says 'Low Layer 1 priority'",
+        "Low Layer 1 priority" in _ca4_text, repr(_ca4_text[:80]))
+
+    # CA-5: Ferrari-like domestic global — no foreign HQ language
+    _ca5 = {
+        "commercial_tier": "🥉 Cool",
+        "scoring_profile": "italy_register_icp_only",
+        "sig_intl_footprint_score": 3,
+        "sig_foreign_hq_score": 0,      # sanitized
+        "foreign_hq_sanitized": True,
+        "sig_explicit_lnd_score": 0,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca5_text = _build_caller_angle(_ca5)
+    _fhq_words = ("foreign HQ", "international headquarters", "foreign headquarters",
+                  "Foreign HQ", "International headquarters")
+    chk("CA-5 Ferrari: no foreign-HQ language in Caller Angle",
+        not any(w in _ca5_text for w in _fhq_words), repr(_ca5_text[:120]))
+
+    # CA-6: True Italian subsidiary of foreign parent — foreign parent language allowed
+    _ca6 = {
+        "commercial_tier": "🥇 Hot",
+        "scoring_profile": "italy_register_icp_only",
+        "sig_intl_footprint_score": 3,
+        "sig_foreign_hq_score": 3,      # real foreign parent, NOT sanitized
+        "foreign_hq_sanitized": False,
+        "sig_explicit_lnd_score": 0,
+        "icp_potential_buyer_function": "",
+        "competitive_switch_opportunity": "",
+    }
+    _ca6_text = _build_caller_angle(_ca6)
+    chk("CA-6 Foreign parent: mentions parent or external structure",
+        any(w in _ca6_text for w in ("foreign parent", "external", "centrally")),
+        repr(_ca6_text[:120]))
 
     print(f"\n{'═'*60}")
     if failures:
