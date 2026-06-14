@@ -279,6 +279,21 @@ Scoring rubric (0–3):
   2 = clear evidence
   3 = strong or explicit evidence
 
+International footprint vs foreign HQ — CRITICAL distinction:
+  sig_intl_footprint_score: Score 1–3 when the company has international operations,
+    subsidiaries, offices, production sites, clients, export activity, multilingual teams,
+    or cross-border business. This applies even when the company is headquartered in the
+    input country. A domestic company with international subsidiaries scores high here.
+  sig_foreign_hq_score: Score 1–3 ONLY when the company's headquarters, parent company,
+    group ownership, regional HQ, or reporting line is OUTSIDE the input country.
+    Examples that justify a positive score: "part of a German group", "owned by a US parent",
+    "subsidiary of a French group", "reports to the Swedish parent company".
+    Do NOT score foreign HQ based on words like: global, international, multinational,
+    worldwide, export, subsidiaries, countries, offices abroad, plants in other countries.
+    If the company is headquartered in the input country and has international subsidiaries
+    or global operations, set sig_foreign_hq_score = 0 and score sig_intl_footprint instead.
+    If evidence says "headquartered in [input country city]", set sig_foreign_hq_score = 0.
+
 Provider category rules:
   Category 1 direct language-training competitors (goes into has_language_competitor):
     goFLUENT, Learnlight, Speexx, Voxy, Learnship, Berlitz, EF Corporate Solutions,
@@ -539,6 +554,12 @@ MODEL_SIGNAL_QA_FIELDS = [
     "model_signal_manual_review_reason",
     "model_signal_sources_used",
     "model_signal_search_quality",
+    # Foreign HQ hygiene audit fields (populated by sanitize_foreign_hq_signal)
+    "foreign_hq_sanitized",
+    "foreign_hq_sanitizer_reason",
+    "foreign_hq_original_score",
+    "foreign_hq_original_evidence",
+    "inferred_input_country",
 ]
 
 MODEL_SIGNAL_FIELDS = (
@@ -3661,6 +3682,150 @@ def _sanitize_icp_provider_fields(fields: dict) -> dict:
     return fields
 
 
+# ── Foreign HQ hygiene ────────────────────────────────────────────────────────
+
+# Italian city names used to detect domestic HQ evidence
+_ITALY_DOMESTIC_CITY_NAMES: frozenset = frozenset({
+    "italy", "italia", "milan", "milano", "rome", "roma", "turin", "torino",
+    "bologna", "florence", "firenze", "naples", "napoli", "venice", "venezia",
+    "genoa", "genova", "bari", "catania", "palermo", "verona", "padova",
+    "padua", "brescia", "modena", "parma", "bergamo", "reggio", "perugia",
+    "trieste", "vicenza", "trento", "bolzano", "ancona", "ferrara",
+})
+
+# Phrases in evidence that indicate the company IS the domestic entity
+_DOMESTIC_HQ_INDICATORS: tuple = (
+    "headquartered in", "headquarters in", "sede in", "sede a",
+    "based in", "fondata a", "fondata in",
+    "head office in", "head office at",
+)
+
+# Phrases that indicate foreign parent / foreign ownership
+_FOREIGN_PARENT_INDICATORS: tuple = (
+    "subsidiary of", "owned by", "part of", "acquired by", "controlled by",
+    "reporting to", "member of the", "branch of", "affiliate of",
+    "wholly owned", "majority owned", "joint venture with",
+    "gruppo", "group based in", "group headquartered in",
+    "parent company", "parent group", "holding company",
+)
+
+
+def _get_input_country(row: dict, scoring_profile: str = "default") -> str:
+    """Infer the input country for a row from available fields.
+
+    Returns an ISO2 code ("IT", "DE", etc.) or empty string if unknown.
+    Priority: explicit canonical fields → scoring profile → unknown.
+    """
+    for field in ("input_country", "country_code", "canonical_country",
+                  "lusha_api_country", "lusha_country", "country", "Company Country"):
+        v = str(row.get(field, "") or "").strip().upper()
+        if len(v) == 2 and v.isalpha():
+            return v
+        # Resolve "Italy" → "IT", "Germany" → "DE"
+        vl = v.lower()
+        if vl in ("italy", "italia"):
+            return "IT"
+        if vl in ("germany", "deutschland"):
+            return "DE"
+    # Fall back to scoring profile
+    if scoring_profile == "italy_register_icp_only":
+        return "IT"
+    return ""
+
+
+def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
+    """Post-processing sanitizer: correct sig_foreign_hq_score when evidence
+    shows a domestic multinational rather than a foreign-owned company.
+
+    Modifies row in-place and returns it.
+    Adds audit fields: foreign_hq_sanitized, foreign_hq_sanitizer_reason,
+    foreign_hq_original_score, foreign_hq_original_evidence, inferred_input_country.
+    """
+    row.setdefault("foreign_hq_sanitized", False)
+    row.setdefault("foreign_hq_sanitizer_reason", "")
+    row.setdefault("foreign_hq_original_score", "")
+    row.setdefault("foreign_hq_original_evidence", "")
+    row.setdefault("inferred_input_country", input_country)
+
+    orig_score = row.get("sig_foreign_hq_score", 0)
+    try:
+        score_int = int(orig_score)
+    except (TypeError, ValueError):
+        score_int = 0
+
+    if score_int == 0:
+        return row  # nothing to sanitize
+
+    # Gather all evidence text
+    evidence_text = " ".join(filter(None, [
+        str(row.get("sig_foreign_hq_evidence", "") or ""),
+        str(row.get("icp_evidence", "") or ""),
+        str(row.get("icp_why_relevant", "") or ""),
+        str(row.get("sig_intl_footprint_evidence", "") or ""),
+    ])).lower()
+
+    # Rule A/B: check for foreign parent / ownership first (do NOT sanitize)
+    has_foreign_parent = any(ind in evidence_text for ind in _FOREIGN_PARENT_INDICATORS)
+    if has_foreign_parent:
+        # Evidence suggests actual foreign ownership — keep the score
+        return row
+
+    # Rule A: domestic HQ evidence for Italy input
+    if input_country == "IT":
+        has_domestic_hq = any(ind in evidence_text for ind in _DOMESTIC_HQ_INDICATORS)
+        if has_domestic_hq:
+            # Check if a domestic city is mentioned after the HQ indicator
+            for ind in _DOMESTIC_HQ_INDICATORS:
+                idx = evidence_text.find(ind)
+                if idx >= 0:
+                    after = evidence_text[idx:idx + 80]
+                    if any(city in after for city in _ITALY_DOMESTIC_CITY_NAMES):
+                        row["foreign_hq_original_score"]    = score_int
+                        row["foreign_hq_original_evidence"] = str(row.get("sig_foreign_hq_evidence", ""))
+                        row["sig_foreign_hq_score"]         = 0
+                        row["foreign_hq_sanitized"]         = True
+                        row["foreign_hq_sanitizer_reason"]  = (
+                            "Sanitized: evidence shows domestic HQ in Italy with international "
+                            "footprint — not a foreign HQ signal."
+                        )
+                        return row
+
+    # Rule B: no domestic city found but still no foreign parent — check for
+    # pure export/international operations language (no HQ signal)
+    _export_only_words = (
+        "export", "subsidiaries abroad", "offices abroad", "operations abroad",
+        "international clients", "global clients", "worldwide", "multinational",
+        "internationally", "foreign markets", "overseas",
+    )
+    has_export_only = any(w in evidence_text for w in _export_only_words)
+    has_any_hq_ref  = any(w in evidence_text for w in ("headquartered", "headquarters",
+                                                         "sede", "parent", "owned by"))
+    if has_export_only and not has_any_hq_ref:
+        row["foreign_hq_original_score"]    = score_int
+        row["foreign_hq_original_evidence"] = str(row.get("sig_foreign_hq_evidence", ""))
+        row["sig_foreign_hq_score"]         = 0
+        row["foreign_hq_sanitized"]         = True
+        row["foreign_hq_sanitizer_reason"]  = (
+            "Sanitized: evidence shows export/international operations only — "
+            "no foreign parent or foreign HQ evidence found."
+        )
+        return row
+
+    # Rule D: ambiguous — flag for manual review but keep the score
+    if input_country and not has_foreign_parent and not has_export_only:
+        existing_review = int(row.get("model_signal_needs_manual_review", 0) or 0)
+        if not existing_review:
+            row["model_signal_needs_manual_review"] = 1
+            existing_reason = str(row.get("model_signal_manual_review_reason", "") or "")
+            row["model_signal_manual_review_reason"] = (
+                (existing_reason + " | " if existing_reason else "")
+                + "Ambiguous foreign HQ evidence — verify whether this is a foreign parent/HQ "
+                  "or domestic multinational footprint."
+            )
+
+    return row
+
+
 def _extract_icp_fields(raw: dict) -> dict:
     fields = {
         "icp_lead_score":                          str(raw.get("lead_score")                          or "").strip(),
@@ -4579,6 +4744,12 @@ def enrich_one_row(
         # Fill defaults when signal extraction is disabled or dry-run
         row.update(_build_model_signal_empty())
 
+    # ── Step 3b — Foreign HQ hygiene sanitizer ───────────────────────────────
+    # Runs unconditionally (even on dry-run or when Step 3 is disabled) so that
+    # any pre-existing or zero-value foreign HQ fields are properly initialised.
+    _fhq_country = _get_input_country(row)
+    sanitize_foreign_hq_signal(row, _fhq_country)
+
     # ── Step 4 — Competitor customer search ──────────────────────────────────
     # Runs a targeted Serper query to find evidence that the company is already
     # a customer/user of a direct mYngle competitor.  Only runs when a Serper
@@ -5087,7 +5258,7 @@ def _xl_write_scoring_settings(ws, scoring_profile: str = "default") -> None:
 # Human-readable labels for model signal field names.
 _SIGNAL_READABLE: dict[str, str] = {
     # Global complexity
-    "sig_foreign_hq_score":                  "Foreign headquarters or group structure",
+    "sig_foreign_hq_score":                  "Foreign HQ / foreign parent or ownership",
     "sig_intl_footprint_score":              "International footprint",
     "sig_multicultural_score":               "Multicultural workforce",
     # People development
@@ -6932,6 +7103,89 @@ def _validate_type1_type2_pipeline() -> None:
         abs(_s_it_big["final_commercial_fit_score"] - _s_it_sml["final_commercial_fit_score"]) < 1e-6,
         f"big={_s_it_big['final_commercial_fit_score']} small={_s_it_sml['final_commercial_fit_score']}")
 
+    # ── Foreign HQ hygiene sanitizer tests ───────────────────────────────────
+    print("\nForeign HQ hygiene sanitizer")
+
+    # FHQ-A: Italian domestic multinational — must be sanitized to 0
+    _fhq_row_a = {
+        "sig_foreign_hq_score": 2,
+        "sig_foreign_hq_evidence": "The company is headquartered in Milan, Italy, and operates subsidiaries in the United States, Germany, and France.",
+        "sig_intl_footprint_score": 3,
+        "icp_evidence": "",
+        "country_code": "IT",
+    }
+    _fhq_r_a = dict(_fhq_row_a)
+    sanitize_foreign_hq_signal(_fhq_r_a, "IT")
+    chk("FHQ-A sig_intl_footprint_score preserved", _fhq_r_a["sig_intl_footprint_score"] == 3)
+    chk("FHQ-A sig_foreign_hq_score → 0",           int(_fhq_r_a["sig_foreign_hq_score"]) == 0,
+        repr(_fhq_r_a["sig_foreign_hq_score"]))
+    chk("FHQ-A foreign_hq_sanitized = True",         _fhq_r_a["foreign_hq_sanitized"] is True,
+        repr(_fhq_r_a["foreign_hq_sanitized"]))
+
+    # FHQ-B: Italian company owned by German parent — must NOT be sanitized
+    _fhq_row_b = {
+        "sig_foreign_hq_score": 3,
+        "sig_foreign_hq_evidence": "The company is the Italian subsidiary of a German group headquartered in Munich.",
+        "icp_evidence": "Part of a large German industrial group.",
+        "country_code": "IT",
+    }
+    _fhq_r_b = dict(_fhq_row_b)
+    sanitize_foreign_hq_signal(_fhq_r_b, "IT")
+    chk("FHQ-B sig_foreign_hq_score stays 3",
+        int(_fhq_r_b["sig_foreign_hq_score"]) == 3,
+        repr(_fhq_r_b["sig_foreign_hq_score"]))
+    chk("FHQ-B foreign_hq_sanitized = False",
+        not _fhq_r_b["foreign_hq_sanitized"],
+        repr(_fhq_r_b["foreign_hq_sanitized"]))
+
+    # FHQ-C: Italian company with export activity only — no HQ reference
+    _fhq_row_c = {
+        "sig_foreign_hq_score": 1,
+        "sig_foreign_hq_evidence": "The company exports to more than 40 countries worldwide.",
+        "icp_evidence": "Strong export activity internationally.",
+        "country_code": "IT",
+    }
+    _fhq_r_c = dict(_fhq_row_c)
+    sanitize_foreign_hq_signal(_fhq_r_c, "IT")
+    chk("FHQ-C sig_foreign_hq_score → 0 (export only)",
+        int(_fhq_r_c["sig_foreign_hq_score"]) == 0,
+        repr(_fhq_r_c["sig_foreign_hq_score"]))
+    chk("FHQ-C foreign_hq_sanitized = True",
+        _fhq_r_c["foreign_hq_sanitized"] is True)
+
+    # FHQ-D: Unknown country — score 0 already, no-op
+    _fhq_row_d = {
+        "sig_foreign_hq_score": 0,
+        "sig_foreign_hq_evidence": "",
+        "icp_evidence": "The company is headquartered in Milan and has offices abroad.",
+    }
+    _fhq_r_d = dict(_fhq_row_d)
+    sanitize_foreign_hq_signal(_fhq_r_d, "")
+    chk("FHQ-D zero score remains 0 (no-op)", int(_fhq_r_d["sig_foreign_hq_score"]) == 0)
+    chk("FHQ-D foreign_hq_sanitized = False", not _fhq_r_d["foreign_hq_sanitized"])
+
+    # FHQ-E: _get_input_country resolves Italy scoring profile
+    _row_e = {"company_name": "Test SRL"}
+    chk("FHQ-E italy_register_icp_only profile → IT",
+        _get_input_country(_row_e, "italy_register_icp_only") == "IT")
+
+    # FHQ-F: country_code field takes priority
+    _row_f = {"country_code": "DE", "company_name": "Test GmbH"}
+    chk("FHQ-F country_code=DE → DE",
+        _get_input_country(_row_f, "default") == "DE")
+
+    # FHQ-G: foreign_hq_original_score preserved on sanitization
+    _fhq_row_g = {
+        "sig_foreign_hq_score": 2,
+        "sig_foreign_hq_evidence": "Headquartered in Rome, Italy, and exports globally.",
+        "icp_evidence": "",
+    }
+    _fhq_r_g = dict(_fhq_row_g)
+    sanitize_foreign_hq_signal(_fhq_r_g, "IT")
+    chk("FHQ-G foreign_hq_original_score = 2",
+        str(_fhq_r_g["foreign_hq_original_score"]) == "2",
+        repr(_fhq_r_g["foreign_hq_original_score"]))
+
     print(f"\n{'═'*60}")
     if failures:
         print(f"  FAILURES ({len(failures)}):")
@@ -7203,6 +7457,18 @@ def run_cli() -> None:
         results.append(result)
 
     print(f"[enricher] Done — {total} rows processed, {_error_count} errors.", flush=True)
+
+    # ── Foreign HQ hygiene summary ────────────────────────────────────────────
+    _fhq_sanitized   = sum(1 for r in results if r.get("foreign_hq_sanitized"))
+    _fhq_review      = sum(1 for r in results
+                           if "Ambiguous foreign HQ" in str(r.get("model_signal_manual_review_reason", "")))
+    _inferred_ctry   = results[0].get("inferred_input_country", "") if results else ""
+    print("", flush=True)
+    print("[enricher] FOREIGN HQ HYGIENE:", flush=True)
+    print(f"[enricher]   inferred input country:              {_inferred_ctry or 'unknown'}", flush=True)
+    print(f"[enricher]   sanitized domestic intl footprints:  {_fhq_sanitized}", flush=True)
+    print(f"[enricher]   ambiguous foreign HQ rows for review:{_fhq_review}", flush=True)
+    print("", flush=True)
 
     # ── Build output dataframe ────────────────────────────────────────────────
     _active_fields = ALL_ENRICHMENT_FIELDS + EMPLOYEE_RANGE_RESOLVER_FIELDS
