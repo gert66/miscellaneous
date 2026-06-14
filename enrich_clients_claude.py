@@ -54,6 +54,7 @@ def get_streamlit():
 _CLI_FLAGS = {
     "--input", "--dry-run-paths", "--output-dir", "--project-root",
     "--max-rows", "--debug", "--anthropic-key", "--serper-key",
+    "--self-test-competitor-override", "--self-test-output",
 }
 
 
@@ -3670,6 +3671,192 @@ def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
             df.at[idx, "sales_action_hint"]             = ""
 
     return df
+
+
+def run_competitor_override_selftest() -> dict:
+    """Zero-cost self-test for the competitor-customer ICP override logic.
+
+    Creates synthetic DataFrames and synthetic Serper-like hits.
+    Makes NO calls to Serper, Claude, Jina, Firecrawl, or any external service.
+
+    Returns a dict:
+        {
+            "results": [{"name": str, "passed": bool, "details": str}, ...],
+            "passed":  int,
+            "failed":  int,
+            "total":   int,
+        }
+    """
+    import pandas as _pd
+
+    results: list[dict] = []
+
+    def _check(name: str, assertions: list[tuple[bool, str]]) -> dict:
+        failures = [msg for ok, msg in assertions if not ok]
+        passed   = not failures
+        detail   = "OK" if passed else "; ".join(failures)
+        return {"name": name, "passed": passed, "details": detail}
+
+    # ── Test Case 1: High-confidence override from pre-filled fields ─────────
+    tc1_row = {
+        "canonical_company_name":    "ACME TEST S.P.A.",
+        "final_commercial_fit_score": 4.2,
+        "commercial_tier":           "🧊 Cool",
+        "competitor_customer_signal": "Yes",
+        "competitor_signal_strength": "High",
+        "competitor_provider_detected": "Preply Business",
+        "competitor_signal_type":    "case_study",
+        "competitor_evidence":       "ACME selected Preply Business as language training partner.",
+        "competitor_evidence_url":   "https://preply.com/business/case-study/acme",
+    }
+    tc1_df  = _pd.DataFrame([tc1_row])
+    tc1_out = apply_competitor_icp_override(tc1_df).iloc[0]
+    results.append(_check("TC1: High-confidence override from pre-filled fields", [
+        (float(tc1_out.get("base_commercial_fit_score", 0)) == 4.2,
+            f"base_commercial_fit_score should be 4.2, got {tc1_out.get('base_commercial_fit_score')}"),
+        (float(tc1_out.get("final_commercial_fit_score", 0)) == 10.0,
+            f"final_commercial_fit_score should be 10.0, got {tc1_out.get('final_commercial_fit_score')}"),
+        (str(tc1_out.get("commercial_tier", "")) == "🥇 Hot",
+            f"commercial_tier should be '🥇 Hot', got '{tc1_out.get('commercial_tier')}'"),
+        (str(tc1_out.get("icp_override_applied", "")) == "Yes",
+            f"icp_override_applied should be 'Yes', got '{tc1_out.get('icp_override_applied')}'"),
+        (str(tc1_out.get("competitive_switch_opportunity", "")) == "Strong",
+            f"competitive_switch_opportunity should be 'Strong', got '{tc1_out.get('competitive_switch_opportunity')}'"),
+        ("ATTACK" in str(tc1_out.get("sales_action_hint", "")),
+            f"sales_action_hint should contain 'ATTACK', got '{tc1_out.get('sales_action_hint')}'"),
+        ("Preply Business" in str(tc1_out.get("icp_override_reason", "")),
+            f"icp_override_reason should mention 'Preply Business', got '{tc1_out.get('icp_override_reason')}'"),
+    ]))
+
+    # ── Test Case 2: Medium signal should not override ───────────────────────
+    tc2_row = {
+        "final_commercial_fit_score": 5.1,
+        "commercial_tier":           "🔥 Warm",
+        "competitor_customer_signal": "Unclear",
+        "competitor_signal_strength": "Medium",
+        "competitor_provider_detected": "Speexx",
+    }
+    tc2_df  = _pd.DataFrame([tc2_row])
+    tc2_out = apply_competitor_icp_override(tc2_df).iloc[0]
+    results.append(_check("TC2: Medium signal should not override", [
+        (float(tc2_out.get("final_commercial_fit_score", 0)) == 5.1,
+            f"final_commercial_fit_score should remain 5.1, got {tc2_out.get('final_commercial_fit_score')}"),
+        (str(tc2_out.get("commercial_tier", "")) == "🔥 Warm",
+            f"commercial_tier should remain '🔥 Warm', got '{tc2_out.get('commercial_tier')}'"),
+        (str(tc2_out.get("icp_override_applied", "")) == "No",
+            f"icp_override_applied should be 'No', got '{tc2_out.get('icp_override_applied')}'"),
+        (str(tc2_out.get("competitive_switch_opportunity", "")) == "Possible",
+            f"competitive_switch_opportunity should be 'Possible', got '{tc2_out.get('competitive_switch_opportunity')}'"),
+        (str(tc2_out.get("sales_action_hint", "")) == "Investigate current language training provider",
+            f"sales_action_hint wrong: '{tc2_out.get('sales_action_hint')}'"),
+    ]))
+
+    # ── Test Case 3: No competitor signal should not override ────────────────
+    tc3_row = {
+        "final_commercial_fit_score": 6.2,
+        "commercial_tier":           "🔥 Warm",
+        "competitor_customer_signal": "No",
+        "competitor_signal_strength": "",
+        "competitor_provider_detected": "",
+    }
+    tc3_df  = _pd.DataFrame([tc3_row])
+    tc3_out = apply_competitor_icp_override(tc3_df).iloc[0]
+    results.append(_check("TC3: No competitor signal should not override", [
+        (float(tc3_out.get("final_commercial_fit_score", 0)) == 6.2,
+            f"final_commercial_fit_score should remain 6.2, got {tc3_out.get('final_commercial_fit_score')}"),
+        (str(tc3_out.get("commercial_tier", "")) == "🔥 Warm",
+            f"commercial_tier should remain '🔥 Warm', got '{tc3_out.get('commercial_tier')}'"),
+        (str(tc3_out.get("icp_override_applied", "")) == "No",
+            f"icp_override_applied should be 'No', got '{tc3_out.get('icp_override_applied')}'"),
+        (str(tc3_out.get("competitive_switch_opportunity", "")) == "No clear signal",
+            f"competitive_switch_opportunity should be 'No clear signal', got '{tc3_out.get('competitive_switch_opportunity')}'"),
+    ]))
+
+    # ── Test Case 4: High-confidence case-study hit from classifier ──────────
+    tc4_hits = [{
+        "title":   "ACME TEST selected Preply Business for employee language training",
+        "snippet": "ACME TEST selected Preply Business as its language training partner for international teams.",
+        "link":    "https://preply.com/business/case-study/acme-test",
+    }]
+    tc4_cls = _classify_competitor_customer_evidence(tc4_hits, "ACME TEST")
+    results.append(_check("TC4: High-confidence case-study hit", [
+        (tc4_cls.get("competitor_customer_signal") == "Yes",
+            f"competitor_customer_signal should be 'Yes', got '{tc4_cls.get('competitor_customer_signal')}'"),
+        (tc4_cls.get("competitor_provider_detected") == "Preply Business",
+            f"competitor_provider_detected should be 'Preply Business', got '{tc4_cls.get('competitor_provider_detected')}'"),
+        (tc4_cls.get("competitor_signal_strength") == "High",
+            f"competitor_signal_strength should be 'High', got '{tc4_cls.get('competitor_signal_strength')}'"),
+        (tc4_cls.get("competitor_signal_type") in ("case_study", "customer_story", "company_website_mention"),
+            f"competitor_signal_type unexpected: '{tc4_cls.get('competitor_signal_type')}'"),
+        (bool(tc4_cls.get("competitor_evidence_url")),
+            "competitor_evidence_url should be populated"),
+    ]))
+
+    # ── Test Case 5: False positive generic article should not trigger ────────
+    tc5_hits = [{
+        "title":   "Best language learning platforms: Preply, Duolingo and others",
+        "snippet": "A general market article comparing online language learning tools.",
+        "link":    "https://example.com/best-language-learning-platforms",
+    }]
+    tc5_cls = _classify_competitor_customer_evidence(tc5_hits, "ACME TEST")
+    results.append(_check("TC5: False positive generic article should not trigger", [
+        (tc5_cls.get("competitor_customer_signal") == "No",
+            f"competitor_customer_signal should be 'No', got '{tc5_cls.get('competitor_customer_signal')}'"),
+        (tc5_cls.get("competitor_provider_detected", "") == "",
+            f"competitor_provider_detected should be empty, got '{tc5_cls.get('competitor_provider_detected')}'"),
+        (tc5_cls.get("competitor_signal_strength", "") == "",
+            f"competitor_signal_strength should be empty, got '{tc5_cls.get('competitor_signal_strength')}'"),
+    ]))
+
+    # ── Test Case 6: Weak context mention should not trigger override ─────────
+    tc6_hits = [{
+        "title":   "ACME TEST and Preply mentioned in industry overview",
+        "snippet": "The article mentions ACME TEST and Preply in a broad overview of education technology.",
+        "link":    "https://example.com/industry-overview",
+    }]
+    tc6_cls = _classify_competitor_customer_evidence(tc6_hits, "ACME TEST")
+    # Classifier may return Low or No — either is acceptable
+    tc6_signal   = tc6_cls.get("competitor_customer_signal", "No")
+    tc6_strength = tc6_cls.get("competitor_signal_strength", "")
+    # Build a row with whatever the classifier returned and check override does NOT fire
+    tc6_row = {
+        "final_commercial_fit_score": 5.5,
+        "commercial_tier":           "🔥 Warm",
+        "competitor_customer_signal": tc6_signal,
+        "competitor_signal_strength": tc6_strength,
+        "competitor_provider_detected": tc6_cls.get("competitor_provider_detected", ""),
+    }
+    tc6_df  = _pd.DataFrame([tc6_row])
+    tc6_out = apply_competitor_icp_override(tc6_df).iloc[0]
+    results.append(_check("TC6: Weak context mention should not trigger override", [
+        (tc6_signal in ("No", "Low", "Unclear") and tc6_strength != "High",
+            f"classifier should not return High for weak mention, got signal='{tc6_signal}' strength='{tc6_strength}'"),
+        (float(tc6_out.get("final_commercial_fit_score", 0)) != 10.0,
+            f"final_commercial_fit_score should NOT be 10.0, got {tc6_out.get('final_commercial_fit_score')}"),
+        (str(tc6_out.get("icp_override_applied", "")) == "No",
+            f"icp_override_applied should be 'No', got '{tc6_out.get('icp_override_applied')}'"),
+    ]))
+
+    # ── Guardrail: mYngle must never be detected as competitor ───────────────
+    tc_myngle_hits = [{
+        "title":   "ACME TEST uses mYngle for corporate language training",
+        "snippet": "ACME TEST selected mYngle as their official language training partner.",
+        "link":    "https://myngle.com/case-study/acme-test",
+    }]
+    tc_myngle_cls = _classify_competitor_customer_evidence(tc_myngle_hits, "ACME TEST")
+    results.append(_check("TC-Guard: mYngle must never be detected as competitor/provider", [
+        ("myngle" not in str(tc_myngle_cls.get("competitor_provider_detected", "")).lower(),
+            f"mYngle appeared in competitor_provider_detected: '{tc_myngle_cls.get('competitor_provider_detected')}'"),
+    ]))
+
+    passed = sum(1 for r in results if r["passed"])
+    failed = len(results) - passed
+    return {
+        "results": results,
+        "passed":  passed,
+        "failed":  failed,
+        "total":   len(results),
+    }
 
 
 def _sanitize_provider_list(raw_value: str, allowed: frozenset) -> str:
@@ -8235,7 +8422,7 @@ def run_cli() -> None:
         description="mYngle Lead Prioritizer — CLI batch mode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input",          required=True,  help="Path to cleaned .xlsx or .csv input file")
+    parser.add_argument("--input",          required=False, default=None, help="Path to cleaned .xlsx or .csv input file")
     parser.add_argument("--project-root",   default=None,   help="Pipeline project root (for folder convention)")
     parser.add_argument("--output-dir",     default=None,   help="Output directory for enriched Excel")
     parser.add_argument("--anthropic-key",  default=None,   help="Anthropic API key")
@@ -8243,8 +8430,55 @@ def run_cli() -> None:
     parser.add_argument("--max-rows",       type=int, default=0, help="Process first N rows (0 = all)")
     parser.add_argument("--debug",          action="store_true", help="Enable debug output")
     parser.add_argument("--dry-run-paths",  action="store_true", help="Print paths and exit, no processing")
-    parser.add_argument("--output-name",    default=None, help="Override output filename (without .xlsx)")
+    parser.add_argument("--output-name",    default=None,   help="Override output filename (without .xlsx)")
+    parser.add_argument("--self-test-competitor-override", action="store_true",
+                        help="Run zero-cost competitor override self-test and exit")
+    parser.add_argument("--self-test-output", default=None,
+                        help="Optional path for self-test results Excel (.xlsx)")
     args = parser.parse_args()
+
+    # ── Self-test mode: run and exit immediately, no API calls ────────────────
+    if args.self_test_competitor_override:
+        _selftest_results = run_competitor_override_selftest()
+        print("\n" + "=" * 64)
+        print("  mYngle Competitor Override Self-Test")
+        print("=" * 64)
+        for r in _selftest_results["results"]:
+            status = "PASS" if r["passed"] else "FAIL"
+            print(f"  [{status}] {r['name']}")
+            if not r["passed"]:
+                print(f"         → {r['details']}")
+        print("=" * 64)
+        print(
+            f"  Summary: {_selftest_results['passed']} passed / "
+            f"{_selftest_results['failed']} failed / "
+            f"{_selftest_results['total']} total"
+        )
+        print("=" * 64)
+        if args.self_test_output:
+            try:
+                import pandas as _pd_st
+                _rows = []
+                for r in _selftest_results["results"]:
+                    _rows.append({
+                        "test_name":   r["name"],
+                        "result":      "PASS" if r["passed"] else "FAIL",
+                        "details":     r["details"],
+                    })
+                _st_df = _pd_st.DataFrame(_rows)
+                _out_path = Path(args.self_test_output)
+                _st_df.to_excel(_out_path, index=False)
+                print(f"  Self-test output written to: {_out_path}")
+            except Exception as _ste:
+                print(f"  WARNING: could not write self-test output: {_ste}", file=sys.stderr)
+        if _selftest_results["failed"] > 0:
+            sys.exit(1)
+        sys.exit(0)
+
+    # ── Normal mode requires --input ──────────────────────────────────────────
+    if not args.input:
+        print("ERROR: --input is required (or use --self-test-competitor-override)", file=sys.stderr)
+        sys.exit(1)
 
     # ── Resolve input path ────────────────────────────────────────────────────
     input_path = Path(args.input).resolve()
@@ -10852,16 +11086,46 @@ def run_streamlit_app() -> None:
                 except Exception as _sa_exc:
                     _st.error(f"Could not process file: {_sa_exc}")
 
+    # ── Debug: competitor override self-test ──────────────────────────────────
+    if _adv_main and not ss("processing", False):
+        _st.divider()
+        with _st.expander("🧪 Debug: Competitor override self-test", expanded=False):
+            _st.caption(
+                "Runs a zero-cost self-test of the competitor-customer ICP override logic. "
+                "No API calls are made (no Serper, no Claude, no external web)."
+            )
+            if _st.button("Run competitor override self-test", key="btn_competitor_selftest"):
+                with _st.spinner("Running self-test…"):
+                    _st_res = run_competitor_override_selftest()
+                _st.markdown(
+                    f"**{_st_res['passed']} / {_st_res['total']} passed** "
+                    + ("✅" if _st_res["failed"] == 0 else f"— ⚠️ {_st_res['failed']} failed")
+                )
+                _st_rows = []
+                for _r in _st_res["results"]:
+                    _st_rows.append({
+                        "Test":    _r["name"],
+                        "Result":  "✅ PASS" if _r["passed"] else "❌ FAIL",
+                        "Details": _r["details"],
+                    })
+                import pandas as _pd_selftest
+                _st.dataframe(
+                    _pd_selftest.DataFrame(_st_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
 
 if __name__ == "__main__":
-    if "--input" in sys.argv or cli_args_present():
+    if "--self-test-competitor-override" in sys.argv or "--input" in sys.argv or cli_args_present():
         run_cli()
     elif running_under_streamlit():
         run_streamlit_app()
     else:
         print(
             "mYngle Lead Prioritizer\n"
-            "  Batch mode:  python enrich_clients_claude.py --input FILE [--output-dir DIR] [--max-rows N]\n"
+            "  Batch mode:   python enrich_clients_claude.py --input FILE [--output-dir DIR] [--max-rows N]\n"
+            "  Self-test:    python enrich_clients_claude.py --self-test-competitor-override\n"
             "  Streamlit UI: streamlit run enrich_clients_claude.py",
             file=sys.stderr,
         )
