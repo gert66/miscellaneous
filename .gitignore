@@ -16,3 +16,4 @@ company_enrichment_runs/
 .venv/
 venv/
 autosave/
+.claude/
