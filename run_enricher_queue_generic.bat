@@ -241,16 +241,15 @@ if "!RESOLVED_INPUT!"=="" (
     echo     Batch:            %BATCH_NUM%
     echo.
     echo   Patterns searched ^(in order^):
-    echo     1.  %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_%BATCH_NUM%_*_cleaned_*.xlsx
-    echo     2.  %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
-    echo     3.  %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_0%BATCH_NUM%_*.xlsx
-    echo     4.  %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
-    echo     5.  %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_0%BATCH_NUM%_*.xlsx
-    echo     6.  %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_batch_%BATCH_NUM%_*.xlsx
-    echo     7.  %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%*R[zero-padded batch]*.xlsx
-    echo     8.  %FLAT_INPUT_DIR%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
-    echo     9.  %FLAT_INPUT_DIR%\%QUEUE_NAME%_0%BATCH_NUM%_*.xlsx
-    echo     10. %BAT_DIR%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
+    echo     1. %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_%BATCH_NUM%_*_cleaned_*.xlsx
+    echo     2. %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
+    echo     3. %PROJECT_ROOT%\%QUEUE_NAME%\01_cleaned_domains\%QUEUE_NAME%_0%BATCH_NUM%_*.xlsx
+    echo     4. %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_%BATCH_NUM%_*_cleaned_*.xlsx
+    echo     5. %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
+    echo     6. %PROJECT_ROOT%\%QUEUE_NAME%\%QUEUE_NAME%_batch_%BATCH_NUM%_*.xlsx
+    echo     7. %FLAT_INPUT_DIR%\%QUEUE_NAME%_%BATCH_NUM%_*_cleaned_*.xlsx
+    echo     8. %FLAT_INPUT_DIR%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
+    echo     9. %BAT_DIR%\%QUEUE_NAME%_%BATCH_NUM%_*.xlsx
     echo.
     echo   .xlsx files found under PROJECT_ROOT ^(max 50^):
     powershell -NoProfile -Command "$r='%PROJECT_ROOT%'; $hits = Get-ChildItem $r -Filter '*.xlsx' -Recurse -EA 0 | Select-Object -First 50; if ($hits) { $hits | ForEach { Write-Host \"    $_\" } } else { Write-Host '    (none found)' }"
@@ -321,7 +320,10 @@ exit /b %ERRORLEVEL%
 :: =======================================================================
 :find_input
 :: Find the most-recently-modified input file for a given queue + batch.
-:: Uses PowerShell with regex matching so batch 1 never matches batch 10/11.
+:: Uses per-pattern PowerShell one-liners (NO generated temp PS1).
+:: The search dir and pattern are passed via env vars to handle spaces.
+:: Batch isolation: patterns always include a trailing _ after the number
+:: so batch 1 never matches batch 10, 11, 12, etc.
 :: Sets RESOLVED_INPUT to the full path, or empty string if not found.
 :: Args: %1=queue name, %2=batch number
 :: =======================================================================
@@ -329,59 +331,76 @@ set "RESOLVED_INPUT="
 set "_FI_QUEUE=%~1"
 set "_FI_BATCH=%~2"
 
-:: Build zero-padded batch variants: 1->01, 1->0001  (used in R-number patterns)
-for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$b=[int]'%_FI_BATCH%'; '{0:D2}' -f $b"`) do set "_FI_BATCH_2D=%%P"
-for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$b=[int]'%_FI_BATCH%'; 'R{0:D4}' -f $b"`) do set "_FI_RNUM=%%P"
+:: -----------------------------------------------------------------------
+:: Helper macro: search _FI_SD (dir) for pattern _FI_SP (filter).
+:: Sets RESOLVED_INPUT and exits sub if a file is found.
+:: Uses a PowerShell one-liner -- dir+pattern passed via env vars,
+:: no quoting issues with spaces, no generated PS1.
+:: -----------------------------------------------------------------------
+:: NOTE: do NOT call this inside a parenthesised block; call sequentially.
 
-:: All search roots (in priority order)
-set "_FI_ROOT1=%PROJECT_ROOT%\%_FI_QUEUE%\01_cleaned_domains"
-set "_FI_ROOT2=%PROJECT_ROOT%\%_FI_QUEUE%"
-set "_FI_ROOT3=%PROJECT_ROOT%"
-set "_FI_ROOT4=%FLAT_INPUT_DIR%"
-set "_FI_ROOT5=%BAT_DIR%"
+:: --- Priority 1: pipeline cleaned dir -----------------------------------
+set "_FI_SD=%PROJECT_ROOT%\%_FI_QUEUE%\01_cleaned_domains"
 
-:: Patterns (all underscore-bounded so batch 1 does not match batch 10/11)
-:: Pattern group A: exact batch number with underscore separator
-::   {Q}_{N}_*.xlsx   -- e.g. Italy100_1_...xlsx
-::   {Q}_0{N}_*.xlsx  -- zero-padded   Italy100_01_...xlsx
-:: Pattern group B: "batch" keyword
-::   {Q}_batch_{N}_*.xlsx
-:: Pattern group C: R-number (range-start notation)
-::   {Q}*{R0001}*.xlsx  -- e.g. Italy100_R0001_0500_cleaned.xlsx
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*_cleaned_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
 
-:: Write a temp PS1 so we avoid all CMD/PS quoting issues with paths containing spaces.
-set "_FIND_PS1=%TEMP%\enricher_find_%RANDOM%.ps1"
-echo $q  = $env:_FI_QUEUE>>"%_FIND_PS1%"
-echo $n  = $env:_FI_BATCH>>"%_FIND_PS1%"
-echo $rn = $env:_FI_RNUM>>"%_FIND_PS1%"
-echo $roots = @($env:_FI_ROOT1,$env:_FI_ROOT2,$env:_FI_ROOT3,$env:_FI_ROOT4,$env:_FI_ROOT5)>>"%_FIND_PS1%"
-echo $regex  = '^' + [regex]::Escape($q) + '[_-]0*' + [regex]::Escape($n) + '[_.]'>>"%_FIND_PS1%"
-echo $rregex = [regex]::Escape($rn)>>"%_FIND_PS1%"
-echo $cands = @()>>"%_FIND_PS1%"
-echo foreach ($root in $roots) {>>"%_FIND_PS1%"
-echo   if (-not $root -or -not (Test-Path $root)) { continue }>>"%_FIND_PS1%"
-echo   $files = Get-ChildItem $root -Filter '*.xlsx' -EA 0>>"%_FIND_PS1%"
-echo   foreach ($f in $files) {>>"%_FIND_PS1%"
-echo     if ($f.Name -match $regex -or $f.Name -match $rregex) { $cands += $f }>>"%_FIND_PS1%"
-echo   }>>"%_FIND_PS1%"
-echo }>>"%_FIND_PS1%"
-echo if ($cands.Count -eq 0) { exit 0 }>>"%_FIND_PS1%"
-echo $unique = $cands ^| Sort-Object FullName -Unique>>"%_FIND_PS1%"
-echo if ($unique.Count -eq 1) { Write-Output $unique[0].FullName; exit 0 }>>"%_FIND_PS1%"
-echo $stems = $unique ^| ForEach { $_.BaseName -replace '_[0-9]{8}.*$','' } ^| Sort-Object -Unique>>"%_FIND_PS1%"
-echo if ($stems.Count -eq 1) {>>"%_FIND_PS1%"
-echo   $best = $unique ^| Sort-Object LastWriteTime -Descending ^| Select-Object -First 1>>"%_FIND_PS1%"
-echo   Write-Output $best.FullName; exit 0>>"%_FIND_PS1%"
-echo }>>"%_FIND_PS1%"
-echo Write-Host '[runner] WARNING: Multiple distinct input candidates -- cannot auto-select:'>>"%_FIND_PS1%"
-echo foreach ($f in $unique) { Write-Host "  $($f.FullName)  [modified $($f.LastWriteTime)]" }>>"%_FIND_PS1%"
-echo Write-Host '[runner] Set MYNGLE_DATA_ROOT or move files to disambiguate.'>>"%_FIND_PS1%"
-echo exit 2>>"%_FIND_PS1%"
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
 
-for /f "usebackq delims=" %%F in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%_FIND_PS1%"`) do (
+set "_FI_SP=%_FI_QUEUE%_0%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+:: --- Priority 2: queue folder (no 01_cleaned_domains subfolder) ---------
+set "_FI_SD=%PROJECT_ROOT%\%_FI_QUEUE%"
+
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*_cleaned_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+set "_FI_SP=%_FI_QUEUE%_batch_%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+:: --- Priority 3: flat input dir -----------------------------------------
+set "_FI_SD=%FLAT_INPUT_DIR%"
+
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*_cleaned_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+:: --- Priority 4: bat dir itself -----------------------------------------
+set "_FI_SD=%BAT_DIR%"
+
+set "_FI_SP=%_FI_QUEUE%_%_FI_BATCH%_*.xlsx"
+call :_fi_try
+if not "!RESOLVED_INPUT!"=="" exit /b 0
+
+:: Nothing found
+exit /b 0
+
+
+:: =======================================================================
+:_fi_try
+:: Check _FI_SD for files matching _FI_SP.
+:: If exactly one match: set RESOLVED_INPUT.
+:: If multiple:          pick the newest (same batch, different timestamps).
+:: Both dir and pattern are read from env vars to safely handle spaces.
+:: =======================================================================
+for /f "usebackq delims=" %%F in (`powershell -NoProfile -Command "(Get-ChildItem $env:_FI_SD -Filter $env:_FI_SP -EA 0 | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName"`) do (
     set "RESOLVED_INPUT=%%F"
 )
-del "%_FIND_PS1%" 2>nul
 exit /b 0
 
 
