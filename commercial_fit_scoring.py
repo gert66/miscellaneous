@@ -233,6 +233,7 @@ SCORE_OUTPUT_COLS: list[str] = [
     "score_employee_range_source",
     "score_employee_range_confidence",
     "size_needs_manual_review",
+    "size_scoring_note",
     # ── Audit: sigmoid ───────────────────────────────────────────────────────
     "sigmoid_k",
     "sigmoid_s_min",
@@ -630,9 +631,22 @@ def score_company(
         "scoring_notes":          " | ".join(notes),
         "missing_scoring_fields": ", ".join(missing) if missing else "",
         # ── Employee range provenance as seen by scoring (separate from resolver fields) ───
-        "score_employee_range_source":      er_source,
-        "score_employee_range_confidence":  er_confidence,
+        # For Italy register profile, size is excluded — override source label accordingly.
+        "score_employee_range_source":      (
+            "excluded_from_scoring_italy_register_profile"
+            if _profile_name == "italy_register_icp_only" else er_source
+        ),
+        "score_employee_range_confidence":  (
+            "N/A — size excluded from scoring"
+            if _profile_name == "italy_register_icp_only" else er_confidence
+        ),
         "size_needs_manual_review":         er_needs_review,
+        "size_scoring_note":                (
+            "Company size excluded from Layer 1 scoring. "
+            "Italian register input is prefiltered for 100+ employees. "
+            "Employee estimates are audit-only."
+            if _profile_name == "italy_register_icp_only" else ""
+        ),
     })
     return out
 

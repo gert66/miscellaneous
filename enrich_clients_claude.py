@@ -4580,6 +4580,7 @@ def enrich_one_row(
     run_step1_enrichment: bool = True,
     run_step2_enrichment: bool = True,
     existing_lusha_data: dict | None = None,
+    _cli_verbose: bool = False,
 ) -> tuple:
     """
     Run optional Lusha API enrichment, then Step 1 (Jina + Claude extraction),
@@ -4638,6 +4639,8 @@ def enrich_one_row(
         row.update(la_fields)
 
     # ── Step 1 (three-tier: Jina → Playwright → web_search → no_data) ──────────
+    if _cli_verbose:
+        print("[enricher]   Step 1: firmographics (Jina/Claude)...", flush=True)
     if run_step1_enrichment:
         s1_fields, s1_raw, s1_in, s1_out, s1_status, s1_err, s1_pw_dbg = run_step1(
             url, company_name, api_key, delay,
@@ -4673,6 +4676,8 @@ def enrich_one_row(
             row["lucia_data_status"] = "missing_not_requested"
 
     # ── Step 2 ────────────────────────────────────────────────────────────────
+    if _cli_verbose:
+        print("[enricher]   Step 2: ICP/Serper search...", flush=True)
     if run_step2_enrichment:
         s2_fields, s2_raw, s2_in, s2_out, s2_status, s2_err, s2_cache_create, s2_cache_read = run_step2(
             url, company_name, api_key, delay, model_step2=model_step2,
@@ -4723,6 +4728,8 @@ def enrich_one_row(
     flag_review(row, company_name)
 
     # ── Step 3 — Model-signal extraction ─────────────────────────────────────
+    if _cli_verbose:
+        print("[enricher]   Step 3: model signal extraction...", flush=True)
     if extract_model_signals and api_key and not dry_run:
         try:
             ms_fields = run_model_signal_extraction(
@@ -4751,6 +4758,8 @@ def enrich_one_row(
     # ── Step 3b — Foreign HQ hygiene sanitizer ───────────────────────────────
     # Runs unconditionally (even on dry-run or when Step 3 is disabled) so that
     # any pre-existing or zero-value foreign HQ fields are properly initialised.
+    if _cli_verbose:
+        print("[enricher]   Step 3b: foreign HQ hygiene...", flush=True)
     _fhq_country = _get_input_country(row)
     sanitize_foreign_hq_signal(row, _fhq_country)
 
@@ -4758,6 +4767,8 @@ def enrich_one_row(
     # Runs a targeted Serper query to find evidence that the company is already
     # a customer/user of a direct mYngle competitor.  Only runs when a Serper
     # key is available and not in dry-run mode.
+    if _cli_verbose:
+        print("[enricher]   Step 4: competitor customer search...", flush=True)
     _comp_fields = _build_competitor_customer_empty()
     if serper_key and not dry_run:
         try:
@@ -5615,7 +5626,12 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
             score_str = ""
         industry  = _xl_get(rd, "lusha_industry",       "lusha_api_industry")
         country   = _xl_get(rd, "lusha_country",        "lusha_api_country")
-        employees = _xl_get(rd, "lusha_employee_range", "lusha_api_employee_range")
+        _is_italy_profile = str(rd.get("scoring_profile", "")) == "italy_register_icp_only"
+        employees = (
+            "Register filter: 100+ employees"
+            if _is_italy_profile
+            else _xl_get(rd, "lusha_employee_range", "lusha_api_employee_range")
+        )
         why       = _xl_get(rd, "icp_why_relevant")
         # Build signals/gaps from actual sig_*/ti_* scores — single consistent source.
         signals, gaps = _build_profile_signals_gaps(rd)
@@ -5991,6 +6007,21 @@ def _xl_write_opportunity_input(
         ("ti_leadership_evidence",         ["ti_leadership_evidence"]),
         ("ti_intercultural_evidence",      ["ti_intercultural_evidence"]),
         ("ti_negotiation_sales_evidence",  ["ti_negotiation_sales_evidence"]),
+        # ── Competitor and sales action ───────────────────────────────────────
+        ("competitor_evidence_url",        ["competitor_evidence_url"]),
+        ("competitor_provider_detected",   ["competitor_provider_detected"]),
+        ("sales_action_hint",              ["sales_action_hint"]),
+        # ── Canonical identity + handoff fields ───────────────────────────────
+        ("canonical_company_url",          ["canonical_company_url"]),
+        ("company_number",                 ["company_number", "native_company_number",
+                                            "register_nummer", "source_row_id"]),
+        ("scoring_profile",                ["scoring_profile"]),
+        ("inferred_input_country",         ["inferred_input_country"]),
+        ("size_scoring_note",              ["size_scoring_note"]),
+        # ── Foreign HQ audit ─────────────────────────────────────────────────
+        ("foreign_hq_sanitized",           ["foreign_hq_sanitized"]),
+        ("foreign_hq_sanitizer_reason",    ["foreign_hq_sanitizer_reason"]),
+        ("foreign_hq_original_score",      ["foreign_hq_original_score"]),
     ]
 
     # Columns that should be written as real numeric values (float/int).
@@ -6003,6 +6034,8 @@ def _xl_write_opportunity_input(
     _TEXT_COLS = {
         "company_name", "domain", "country", "city", "industry",
         "employee_range", "commercial_tier", "scoring_notes", "caller_angle", "match_notes",
+        "sales_action_hint", "canonical_company_url", "scoring_profile", "inferred_input_country",
+        "size_scoring_note", "competitor_evidence_url", "competitor_provider_detected",
         "icp_buying_signals", "icp_evidence", "icp_why_relevant",
         "icp_likely_training_interest", "icp_potential_buyer_function",
         "top_positive_signals", "gaps_missing_signals",
@@ -7768,19 +7801,20 @@ def run_cli() -> None:
         domain       = str(row_dict.get(domain_col, "") or "").strip() if domain_col else ""
         _cnum        = _get_company_number(row_dict)
 
-        _should_print = (
-            i == 1
-            or i == total
-            or total <= 5
-            or (total <= 50 and i % 5 == 0)
-            or (total > 50  and i % 10 == 0)
+        # Print START line for every row — always, not throttled
+        elapsed_pre = _time.monotonic() - _start_ts
+        eta_pre = (elapsed_pre / (i - 1)) * (total - (i - 1)) if i > 1 else 0
+        print(
+            f"[enricher] START {i}/{total} | "
+            f"company_number: {_cnum} | "
+            f"company: {company_name[:60]} | "
+            f"elapsed {_fmt_elapsed(elapsed_pre)} | "
+            f"ETA {_fmt_elapsed(eta_pre)} | "
+            f"Claude: {_claude_calls} | Serper: {_serper_calls} | errors: {_error_count}",
+            flush=True,
         )
-        if _should_print:
-            _print_cli_progress(
-                i, total, company_name, _cnum,
-                _start_ts, _claude_calls, _serper_calls, _error_count,
-            )
 
+        _row_status = "ok"
         try:
             result, _debug_rec = enrich_one_row(
                 company_name=company_name,
@@ -7788,6 +7822,7 @@ def run_cli() -> None:
                 api_key=anthropic_key or "",
                 delay=0,
                 serper_key=serper_key or "",
+                _cli_verbose=True,
             )
             debug_records.append(_debug_rec)
             _claude_calls += int(result.get("claude_api_calls", 0) or 0)
@@ -7796,7 +7831,22 @@ def run_cli() -> None:
             result = dict(row_dict)
             result["enrichment_error"] = f"{type(exc).__name__}: {exc}"
             _error_count += 1
+            _row_status = f"error: {type(exc).__name__}"
         results.append(result)
+
+        # Print DONE line for every row
+        elapsed_post = _time.monotonic() - _start_ts
+        eta_post = (elapsed_post / i) * (total - i) if i < total else 0
+        print(
+            f"[enricher] DONE  {i}/{total} | "
+            f"company_number: {_cnum} | "
+            f"company: {company_name[:60]} | "
+            f"status: {_row_status} | "
+            f"elapsed {_fmt_elapsed(elapsed_post)} | "
+            f"ETA {_fmt_elapsed(eta_post)} | "
+            f"errors: {_error_count}",
+            flush=True,
+        )
 
     print(f"[enricher] Done — {total} rows processed, {_error_count} errors.", flush=True)
 
@@ -9452,24 +9502,48 @@ def run_streamlit_app() -> None:
                 else:
                     # ── Batch: filtered + sorted score table ──────────────────────
                     _st.subheader("🎯 Commercial Fit Scoring")
-                    _st.caption(
-                        "The score combines ICP similarity and company size. "
-                        "ICP similarity is based on enriched buying signals. "
-                        "Company size is used as a commercial weighting factor. "
-                        "Final Commercial Fit Score = 0.75 × ICP Similarity + 0.25 × Company Size."
-                    )
+                    _active_profile = ss("_scoring_profile", "default")
+                    if _active_profile == "italy_register_icp_only":
+                        _st.caption(
+                            "Final score is based on ICP/model signals only. "
+                            "Company size is excluded from Layer 1 scoring because the Italian register "
+                            "input is already filtered for 100+ employees. "
+                            "Employee estimates are audit-only and should be validated in Layer 2.5 "
+                            "with Lucia/Lusha/contact enrichment."
+                        )
+                    else:
+                        _st.caption(
+                            "The score combines ICP similarity and company size. "
+                            "ICP similarity is based on enriched buying signals. "
+                            "Company size is used as a commercial weighting factor. "
+                            "Final Commercial Fit Score = 0.75 × ICP Similarity + 0.25 × Company Size."
+                        )
 
                     with _st.expander("ℹ️ About these scores", expanded=False):
-                        _st.markdown(
-                            "1. **Model probability** — lean logistic regression on 7 key model-signal fields "
-                            "(normalised 0–3 → 0–1).\n"
-                            "2. **ICP Similarity Score [1–10]** — sigmoid-stretched model probability.\n"
-                            "3. **Company Size Score [1–10]** — 9-band employee-count mapping.\n"
-                            "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + 0.25 × Company Size.\n"
-                            "5. **Tier** — 🥇 Hot ≥ 8.66 · 🥈 Warm ≥ 7.19 · 🥉 Cool ≥ 4.23 · ❄️ Pass < 4.23.\n"
-                            "6. **Composite scores** — global complexity, people development, commercial complexity "
-                            "(each 0–10, from signal groupings).\n"
-                        )
+                        if _active_profile == "italy_register_icp_only":
+                            _st.markdown(
+                                "1. **Model probability** — lean logistic regression on 7 key model-signal fields "
+                                "(normalised 0–3 → 0–1).\n"
+                                "2. **ICP Similarity Score [1–10]** — sigmoid-stretched model probability "
+                                "(K=1 for Italy register profile).\n"
+                                "3. **Company Size Score** — excluded from scoring for Italy register profile. "
+                                "Input list is pre-filtered for 100+ employees; estimates are audit-only.\n"
+                                "4. **Final Commercial Fit Score** = ICP Similarity only (100% model weight).\n"
+                                "5. **Tier** — 🥇 Hot ≥ 6.50 · 🥈 Warm ≥ 5.00 · 🥉 Cool ≥ 3.00 · ❄️ Pass < 3.00.\n"
+                                "6. **Composite scores** — global complexity, people development, commercial complexity "
+                                "(each 0–10, from signal groupings).\n"
+                            )
+                        else:
+                            _st.markdown(
+                                "1. **Model probability** — lean logistic regression on 7 key model-signal fields "
+                                "(normalised 0–3 → 0–1).\n"
+                                "2. **ICP Similarity Score [1–10]** — sigmoid-stretched model probability.\n"
+                                "3. **Company Size Score [1–10]** — 9-band employee-count mapping.\n"
+                                "4. **Final Commercial Fit Score** = 0.75 × ICP Similarity + 0.25 × Company Size.\n"
+                                "5. **Tier** — 🥇 Hot ≥ 8.66 · 🥈 Warm ≥ 7.19 · 🥉 Cool ≥ 4.23 · ❄️ Pass < 4.23.\n"
+                                "6. **Composite scores** — global complexity, people development, commercial complexity "
+                                "(each 0–10, from signal groupings).\n"
+                            )
 
                     _tier_order  = ["🥇 Hot", "🥈 Warm", "🥉 Cool", "❄️ Pass"]
                     _tier_counts = df_enriched["commercial_tier"].value_counts()
