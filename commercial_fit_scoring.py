@@ -42,6 +42,9 @@ import re
 from typing import Any
 
 import pandas as pd
+import warnings as _warnings
+from pandas.errors import PerformanceWarning as _PerformanceWarning
+_warnings.simplefilter("ignore", _PerformanceWarning)
 
 # =============================================================================
 # CONSTANTS — Results(8).xlsx-compatible

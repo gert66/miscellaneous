@@ -31,6 +31,9 @@ from urllib.parse import quote
 
 import anthropic
 import pandas as pd
+import warnings as _warnings
+from pandas.errors import PerformanceWarning as _PerformanceWarning
+_warnings.simplefilter("ignore", _PerformanceWarning)
 import requests
 st = None          # lazy — populated by get_streamlit() in UI mode only
 components = None  # lazy — populated by get_streamlit() in UI mode only
@@ -2193,7 +2196,7 @@ def _jina_get_with_retry(url: str, company_hint: str = "") -> str:
             return _jina_get(url, company_hint)
         except JinaRateLimitRetry as exc:
             if is_cli_mode():
-                print(f"[enricher] Jina rate limit — waiting {exc.wait}s for {company_hint or url}", flush=True)
+                print(f"[enricher] Jina rate limit - waiting {exc.wait}s for {company_hint or url}", flush=True)
             else:
                 _st, _ = get_streamlit()
                 _st.session_state["_jina_retry_count"] = (
@@ -7276,7 +7279,7 @@ def _smoke_test_employee_range_resolver() -> None:
 
     print()
     if failures:
-        print(f"FAILED: {len(failures)} check(s) — {failures}")
+        print(f"FAILED: {len(failures)} check(s) - {failures}")
     else:
         print("All checks passed.")
     print()
@@ -7901,15 +7904,15 @@ def _validate_type1_type2_pipeline() -> None:
         any(w in _ca6_text for w in ("foreign parent", "external", "centrally")),
         repr(_ca6_text[:120]))
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     if failures:
         print(f"  FAILURES ({len(failures)}):")
         for f in failures:
-            print(f"    • {f}")
+            print(f"    - {f}")
         sys.exit(1)
     else:
-        print("  ✅ All pipeline validation checks passed.")
-    print("═" * 60)
+        print("  OK: All pipeline validation checks passed.")
+    print("=" * 60)
 
 
 
@@ -8101,7 +8104,7 @@ def run_cli() -> None:
     print("", flush=True)
 
     if not domain_col:
-        print("[enricher] No domain column found — proceeding with company-name-only enrichment.", flush=True)
+        print("[enricher] No domain column found - proceeding with company-name-only enrichment.", flush=True)
 
     # ── Progress helper ───────────────────────────────────────────────────────
     import time as _time
@@ -8190,7 +8193,7 @@ def run_cli() -> None:
             flush=True,
         )
 
-    print(f"[enricher] Done — {total} rows processed, {_error_count} errors.", flush=True)
+    print(f"[enricher] Done - {total} rows processed, {_error_count} errors.", flush=True)
 
     # ── Buzzi runtime assertion (Italy profile) ──────────────────────────────
     if _cli_scoring_profile == "italy_register_icp_only":
