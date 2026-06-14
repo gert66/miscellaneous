@@ -24,7 +24,8 @@ setlocal EnableDelayedExpansion
 ::   run_enricher_queue_generic.bat 1 "1" test    (alias: 1=Italy100)
 ::
 :: PROJECT_ROOT resolution (in priority order):
-::   1. MYNGLE_DATA_ROOT environment variable (if set)
+::   1. MYNGLE_DATA_ROOT environment variable (default: C:\Users\gmeijer4\Nextcloud\Myngle)
+::      Override by setting MYNGLE_DATA_ROOT before calling this bat.
 ::   2. Parent of this repo folder  (%~dp0..)
 ::   3. This repo folder            (%~dp0)
 ::   4. %~dp0data subfolder
@@ -53,6 +54,13 @@ setlocal EnableDelayedExpansion
 ::   powershell -File  to avoid all CMD/PS quote-nesting issues.
 ::   Tee-Object streams live Python output to console + log.
 :: ============================================================
+
+:: -- DEFAULT DATA ROOT --------------------------------------------------
+:: Set a sensible default so the runner works without a manual set command.
+:: The user can override by setting MYNGLE_DATA_ROOT before calling this bat.
+if not defined MYNGLE_DATA_ROOT (
+    set "MYNGLE_DATA_ROOT=C:\Users\gmeijer4\Nextcloud\Myngle"
+)
 
 :: -- CONFIG -----------------------------------------------------------
 
