@@ -8538,13 +8538,13 @@ def _fc_usage_console_summary(run_meta: dict) -> str:
     _si_rows  = run_meta.get("firecrawl_size_inference_rows", 0)
     _fc_rows  = run_meta.get("firecrawl_rows_attempted", 0)
     lines = [
-        "── Usage summary ──────────────────────────────────────",
+        "-- Usage summary -----------------------------------------------",
         f"  Rows processed:             {run_meta.get('processed_rows', 0)}",
         f"  Serper queries total:       {run_meta.get('serper_queries_total', 'n/a')}",
         f"  Serper avg / processed row: {run_meta.get('serper_avg_queries_per_processed_row', 'n/a')}",
         f"  Haiku calls total:          {run_meta.get('haiku_calls_total', 0)}",
         f"  Haiku avg / processed row:  {run_meta.get('haiku_avg_calls_per_processed_row', 0.0):.3f}",
-        "  ─────────────────────────────────────────────────────",
+        "  -------------------------------------------------------------",
         f"  FC estimated credits total: {_fc_cred}",
         f"  FC pages total:             {_fc_pages}",
         f"  FC avg pages / processed:   {run_meta.get('firecrawl_avg_pages_per_processed_row', 0.0):.2f}",
@@ -8557,7 +8557,7 @@ def _fc_usage_console_summary(run_meta: dict) -> str:
         f"  FC key failovers:           {run_meta.get('firecrawl_key_failovers_total', 0)}",
         f"  FC keys loaded:             {run_meta.get('firecrawl_keys_loaded', 0)}",
         f"  Note: Estimated credits = fetched pages. Exact billing not returned by FC API.",
-        "──────────────────────────────────────────────────────",
+        "----------------------------------------------------------------",
     ]
     return "\n".join(lines)
 
@@ -9406,7 +9406,7 @@ def cli_batch_run() -> None:
             print("[FC PREFLIGHT] Skipped (--skip-firecrawl-preflight).", flush=True)
             _fc_preflight = {"preflight_status": "SKIPPED"}
         else:
-            print(f"[FC PREFLIGHT] Testing {len(fc_keys_cli)} key(s)…", flush=True)
+            print(f"[FC PREFLIGHT] Testing {len(fc_keys_cli)} key(s)...", flush=True)
             _fc_preflight = firecrawl_preflight_check(fc_keys_cli)
             _pst = _fc_preflight.get("preflight_status", "UNKNOWN")
             _pok  = _fc_preflight.get("keys_ok", 0)
@@ -9631,7 +9631,7 @@ def cli_batch_run() -> None:
                 evidence_rows   = []
                 debug_rows      = []
                 jina_debug_rows = []
-                print("[cleaner] No checkpoint found — output will be empty.", flush=True)
+                print("[cleaner] No checkpoint found - output will be empty.", flush=True)
         except Exception as _cp_exc:
             print(f"[cleaner] Checkpoint load failed: {_cp_exc}. Output may be empty.", flush=True)
             enriched_df     = pd.DataFrame()
@@ -9736,7 +9736,11 @@ def cli_batch_run() -> None:
     _elapsed_total = _time_mod2.time() - _cli_started_at
 
     print(f"[cleaner] Run log:    {pl_paths['run_log_csv']}", flush=True)
-    print(f"\n{_fc_usage_console_summary(run_meta)}", flush=True)
+    _summary_text = f"\n{_fc_usage_console_summary(run_meta)}"
+    try:
+        print(_summary_text, flush=True)
+    except UnicodeEncodeError:
+        print(_summary_text.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
     # ── End-of-run summary ────────────────────────────────────────────────────
     _rows_with_domain = int(
@@ -9757,9 +9761,9 @@ def cli_batch_run() -> None:
     _fc_dv    = run_meta.get("firecrawl_domain_verification_pages", 0)
     _fc_si    = run_meta.get("firecrawl_size_inference_pages_new", 0)
     _avg_cred = round(_tot_cred / _proc_n, 2) if _tot_cred else 0.0
-    print(f"  firecrawl_speed_mode:              {_cli_fc_speed} · max_cands={_cli_fc_max_cands} · max_pages={_cli_fc_max_pages} · timeout={_cli_fc_page_timeout}s", flush=True)
+    print(f"  firecrawl_speed_mode:              {_cli_fc_speed} / max_cands={_cli_fc_max_cands} / max_pages={_cli_fc_max_pages} / timeout={_cli_fc_page_timeout}s", flush=True)
     if _cli_fc_budget:
-        print(f"  firecrawl_budget:                  {_cli_fc_budget} pages ({'LIMIT HIT — partial output' if _budget_hit else 'not reached'})", flush=True)
+        print(f"  firecrawl_budget:                  {_cli_fc_budget} pages ({'LIMIT HIT - partial output' if _budget_hit else 'not reached'})", flush=True)
     print(f"  firecrawl_total_requests_attempted:{_tot_att}", flush=True)
     print(f"  firecrawl_total_pages_successful:  {_tot_succ}", flush=True)
     print(f"  firecrawl_domain_verification_pages:{_fc_dv}", flush=True)
