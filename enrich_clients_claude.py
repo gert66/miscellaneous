@@ -3745,7 +3745,11 @@ def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
     row.setdefault("foreign_hq_sanitizer_reason", "")
     row.setdefault("foreign_hq_original_score", "")
     row.setdefault("foreign_hq_original_evidence", "")
-    row.setdefault("inferred_input_country", input_country)
+    # Always overwrite blank inferred_input_country with the resolved value so that
+    # a prior pass that wrote "" (because scoring_profile wasn't known yet) is corrected.
+    _existing_ctry = str(row.get("inferred_input_country", "") or "").strip()
+    if input_country or not _existing_ctry:
+        row["inferred_input_country"] = input_country
 
     orig_score = row.get("sig_foreign_hq_score", 0)
     try:
@@ -6612,8 +6616,28 @@ def apply_results_compatible_scoring(
     """Single source of truth for scoring — always routes through Results(8).xlsx formula.
 
     scoring_profile: "default" | "italy_register_icp_only"
+
+    Runs a dataframe-level foreign HQ hygiene pass (with the correct scoring profile)
+    before scoring, so sanitized sig_foreign_hq_score values feed into the final score,
+    top_score_drivers, and scoring_notes.
     """
     from commercial_fit_scoring import score_dataframe as _cfs_score_df
+
+    # ── Foreign HQ hygiene — df-level pass with correct scoring profile ───────
+    # enrich_one_row calls sanitize_foreign_hq_signal with _get_input_country(row)
+    # (no scoring_profile arg), so Italy register rows get input_country="" and Rule A
+    # never fires.  Re-run here where the active scoring_profile is known.
+    _fhq_sanitize_cols = (
+        "sig_foreign_hq_score", "foreign_hq_sanitized", "foreign_hq_sanitizer_reason",
+        "foreign_hq_original_score", "foreign_hq_original_evidence", "inferred_input_country",
+    )
+    _records = df.to_dict("records")
+    for _row in _records:
+        _ctry = _get_input_country(_row, scoring_profile)
+        sanitize_foreign_hq_signal(_row, _ctry)
+    for _col in _fhq_sanitize_cols:
+        df[_col] = [_r.get(_col, "") for _r in _records]
+
     return _cfs_score_df(df, scoring_profile=scoring_profile)
 
 
@@ -7185,6 +7209,61 @@ def _validate_type1_type2_pipeline() -> None:
     chk("FHQ-G foreign_hq_original_score = 2",
         str(_fhq_r_g["foreign_hq_original_score"]) == "2",
         repr(_fhq_r_g["foreign_hq_original_score"]))
+
+    # FHQ-H: Ferrari-like — "headquartered in Maranello, Italy" → sanitize to 0
+    # Simulates the df-level pass where scoring_profile drives input_country resolution.
+    _fhq_row_h = {
+        "sig_foreign_hq_score": 3,
+        "sig_foreign_hq_evidence": (
+            "Ferrari S.p.A. is headquartered in Maranello, Italy, "
+            "confirmed in enrichment context."
+        ),
+        "icp_evidence": "",
+    }
+    _fhq_r_h = dict(_fhq_row_h)
+    _ctry_h = _get_input_country(_fhq_r_h, "italy_register_icp_only")
+    sanitize_foreign_hq_signal(_fhq_r_h, _ctry_h)
+    chk("FHQ-H inferred_input_country = IT", _fhq_r_h.get("inferred_input_country") == "IT",
+        repr(_fhq_r_h.get("inferred_input_country")))
+    chk("FHQ-H sig_foreign_hq_score → 0", int(_fhq_r_h["sig_foreign_hq_score"]) == 0,
+        repr(_fhq_r_h["sig_foreign_hq_score"]))
+    chk("FHQ-H foreign_hq_sanitized = True", _fhq_r_h["foreign_hq_sanitized"] is True,
+        repr(_fhq_r_h["foreign_hq_sanitized"]))
+
+    # FHQ-I: Buzzi-like — domestic HQ + international subsidiaries → sanitize to 0
+    _fhq_row_i = {
+        "sig_foreign_hq_score": 3,
+        "sig_foreign_hq_evidence": (
+            "Headquartered in Casale Monferrato, Italy with international subsidiaries "
+            "including USA operations."
+        ),
+        "sig_intl_footprint_score": 3,
+        "icp_evidence": "",
+    }
+    _fhq_r_i = dict(_fhq_row_i)
+    _ctry_i = _get_input_country(_fhq_r_i, "italy_register_icp_only")
+    sanitize_foreign_hq_signal(_fhq_r_i, _ctry_i)
+    chk("FHQ-I sig_foreign_hq_score → 0", int(_fhq_r_i["sig_foreign_hq_score"]) == 0,
+        repr(_fhq_r_i["sig_foreign_hq_score"]))
+    chk("FHQ-I sig_intl_footprint_score preserved", _fhq_r_i["sig_intl_footprint_score"] == 3)
+    chk("FHQ-I foreign_hq_sanitized = True", _fhq_r_i["foreign_hq_sanitized"] is True,
+        repr(_fhq_r_i["foreign_hq_sanitized"]))
+
+    # FHQ-J: Foreign parent — "Italian subsidiary of a German group" → keep score 3
+    _fhq_row_j = {
+        "sig_foreign_hq_score": 3,
+        "sig_foreign_hq_evidence": "Italian subsidiary of a German group headquartered in Munich.",
+        "icp_evidence": "",
+    }
+    _fhq_r_j = dict(_fhq_row_j)
+    _ctry_j = _get_input_country(_fhq_r_j, "italy_register_icp_only")
+    sanitize_foreign_hq_signal(_fhq_r_j, _ctry_j)
+    chk("FHQ-J sig_foreign_hq_score stays 3 (foreign parent)",
+        int(_fhq_r_j["sig_foreign_hq_score"]) == 3,
+        repr(_fhq_r_j["sig_foreign_hq_score"]))
+    chk("FHQ-J foreign_hq_sanitized = False",
+        not _fhq_r_j["foreign_hq_sanitized"],
+        repr(_fhq_r_j["foreign_hq_sanitized"]))
 
     print(f"\n{'═'*60}")
     if failures:

@@ -495,7 +495,14 @@ def score_company(
               if not _is_missing(row.get(f))), "")
     )
     out["employee_range_normalized"] = range_key
-    if size_missing:
+    if _profile_name == "italy_register_icp_only":
+        # Size is excluded from scoring for Italy register inputs; note is deferred to
+        # the profile summary note added below — do not emit a per-row size note here.
+        notes.append(
+            "Company size excluded from Layer 1 scoring. Input list is register-filtered "
+            "for 100+ employees. Employee range fields are audit-only."
+        )
+    elif size_missing:
         notes.append(
             "No employee range data found; company_size_score defaulted to "
             f"{SIZE_SCORE_MISSING}."
