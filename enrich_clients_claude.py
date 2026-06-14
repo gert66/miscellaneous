@@ -3821,13 +3821,25 @@ _EMPLOYEE_RANGE_PATTERNS = [
     re.compile(r'\bstaff\s+of\s+\d{1,6}\b', re.IGNORECASE),
 ]
 
+# Qualitative size descriptors stripped from Italy register profiles
+_QUALITATIVE_SIZE_PHRASES = (
+    "small company", "small specialist", "small-sized company", "small-sized specialist",
+    "mid-sized company", "mid-size company", "medium-sized company", "medium-size company",
+    "large company", "large-sized company",
+    "small business", "small enterprise", "medium enterprise", "large enterprise",
+    "small firm", "medium firm", "large firm",
+)
+
+
 def _strip_employee_range_from_text(text: str) -> str:
-    """Remove employee count/range mentions from visible profile text for Italy register profiles."""
+    """Remove employee count/range and qualitative size mentions from visible profile text."""
     if not text:
         return text
     result = text
     for pat in _EMPLOYEE_RANGE_PATTERNS:
         result = pat.sub("", result)
+    for phrase in _QUALITATIVE_SIZE_PHRASES:
+        result = re.sub(r'\b' + re.escape(phrase) + r'\b', '', result, flags=re.IGNORECASE)
     # Clean up double spaces / dangling commas left by removal
     result = re.sub(r',\s*,', ',', result)
     result = re.sub(r'\s{2,}', ' ', result)
@@ -3868,15 +3880,27 @@ def _check_profile_consistency(rd: dict, text: str) -> str:
 
     # Rule 2: fhq_score = 0 → strip foreign-parent/foreign-HQ text from display
     if fhq_score == 0:
+        # Strip full gap sentences first (before stripping the shorter sub-phrases)
+        for full_phrase in (
+            "No clear foreign parent or external HQ decision structure found",
+            "No clear foreign parent / external HQ decision structure found",
+            "No clear foreign parent/external HQ decision structure found",
+            "No clear Italian-based / external hq decision structure found",
+            "No clear Italian-based or external hq decision structure found",
+            "No foreign parent or external HQ decision structure found",
+            "no clear foreign parent or external hq decision structure found",
+        ):
+            result = result.replace(full_phrase, "")
+            result = result.replace(full_phrase.capitalize(), "")
+        # Strip the shorter phrases by replacing with empty string
         for phrase in (
             "foreign parent", "foreign headquarters", "foreign HQ",
             "foreign holding", "foreign ownership", "foreign owner",
             "non-Italian parent", "non-Italian HQ",
             "external HQ", "external headquarters",
         ):
-            result = result.replace(phrase, "Italian-based")
-            result = result.replace(phrase.capitalize(), "Italian-based")
-        result = result.replace("Italian-based Italian-based", "Italian-based")
+            result = result.replace(phrase, "")
+            result = result.replace(phrase.capitalize(), "")
 
     # Rule 3: lnd_score = 0 → strip strong L&D maturity claims
     if lnd_score == 0:
@@ -4965,6 +4989,9 @@ def enrich_one_row(
         row["enrichment_status"] = "existing_lusha_preserved" if has_s2 else "existing_lusha_only"
     elif has_s1:
         row["enrichment_status"] = s1_status if has_s2 else f"{s1_status}_step1_only"
+    elif has_s2:
+        # Cleaner input with no Lusha step1: Step 2 (model signals) succeeded
+        row["enrichment_status"] = "enriched_step2_only"
     else:
         row["enrichment_status"] = "no_data"
 
@@ -5040,6 +5067,25 @@ def enrich_one_row(
                 existing_evidence=row.get("competitor_signal_strength_evidence", ""),
             )
     row.update(_comp_fields)
+
+    # ── Post-step-3 review flag update ───────────────────────────────────────
+    # flag_review() ran before Step 3, so model signal flags and FHQ uncertainty
+    # were not yet set.  Apply them now without overriding a TRUE already set.
+    _post_review_reasons: list[str] = []
+    if int(row.get("model_signal_needs_manual_review", 0) or 0):
+        _ms_reason = str(row.get("model_signal_manual_review_reason", "") or "")
+        _post_review_reasons.append(
+            f"model signal review: {_ms_reason}" if _ms_reason else "model signal review flagged"
+        )
+    if row.get("foreign_hq_uncertain"):
+        _post_review_reasons.append("foreign HQ uncertain - acquisition without country proof")
+    if str(row.get("needs_domain_review", "")).lower() in ("true", "1"):
+        _post_review_reasons.append("domain review required")
+    if _post_review_reasons:
+        _existing_notes = row.get("match_notes", "")
+        _all_notes = "; ".join([p for p in [_existing_notes] + _post_review_reasons if p])
+        row["needs_manual_review"] = "TRUE"
+        row["match_notes"] = _all_notes
 
     # Debug record
     dbg = {
@@ -5594,7 +5640,7 @@ _SIGNAL_CATEGORY: dict[str, str] = {
 
 # Fields with model coefficients >= 0.10 — meaningful for gap detection.
 _GAP_CANDIDATE_FIELDS: frozenset[str] = frozenset({
-    "sig_foreign_hq_score",
+    # sig_foreign_hq_score intentionally excluded: score=0 is normal (domestic company), not a gap
     "sig_explicit_lnd_score",
     "sig_intl_footprint_score",
     "sig_employer_branding_score",
@@ -5732,11 +5778,13 @@ def _build_caller_angle(rd: dict) -> str:
 
     bh = _buyer_hint()
     anchor = _anchor()
+    _needs_domain = str(rd.get("needs_domain_review", "")).lower() in ("true", "1")
+    _domain_note = " Note: domain flagged for review - verify the website before calling." if _needs_domain else ""
 
     if "Hot" in tier:
         p1 = f"Strong Layer 1 fit. {anchor}, making {bh} a relevant entry point."
         p2 = _second_sentence(hot=True)
-        return f"{p1} {p2}"
+        return f"{p1} {p2}{_domain_note}"
 
     if "Warm" in tier:
         p1 = f"Promising but incomplete fit. {anchor}"
@@ -5748,21 +5796,34 @@ def _build_caller_angle(rd: dict) -> str:
                 "integration, or training initiatives before prioritising a call."
             )
         )
-        return f"{p1}, but the training need is not yet explicit. {p2}"
+        return f"{p1}, but the training need is not yet explicit. {p2}{_domain_note}"
 
     if "Cool" in tier:
         return (
             f"Some mYngle-relevant context exists ({anchor.lower()}), "
             "but the current evidence is still thin. Do not prioritise a cold call yet "
             "unless Opportunity Radar finds a concrete trigger such as expansion, hiring, "
-            "acquisition, leadership change, or a new training initiative."
+            f"acquisition, leadership change, or a new training initiative.{_domain_note}"
         )
 
     # Pass (or unknown tier)
     return (
         "Low Layer 1 priority. No strong mYngle-relevant signal was found yet. "
-        "Only move forward if Opportunity Radar finds a clear current trigger."
+        f"Only move forward if Opportunity Radar finds a clear current trigger.{_domain_note}"
     )
+
+
+def _compute_outreach_readiness(row: dict) -> str:
+    """Return an outreach readiness label based on tier and domain review status."""
+    tier = str(row.get("commercial_tier", "") or "")
+    needs_domain = str(row.get("needs_domain_review", "")).lower() in ("true", "1")
+    if "Hot" in tier or "Warm" in tier:
+        if needs_domain:
+            return "Domain review required"
+        return "Ready for Opportunity Radar"
+    if "Cool" in tier:
+        return "Low priority - use Opportunity Radar"
+    return "Low priority"
 
 
 def _build_profile_signals_gaps(rd: dict) -> tuple[str, str]:
@@ -5936,6 +5997,22 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         ws.row_dimensions[cur].height = 20
         cur += 1
 
+        # ── Outreach readiness row ────────────────────────────────────────────
+        _ors = _xl_get(rd, "outreach_readiness_status") or _compute_outreach_readiness(rd)
+        _needs_dr = str(rd.get("needs_domain_review", "")).lower() in ("true", "1")
+        _ors_style = [
+            (1, "Outreach Status",    label_font, right_align),
+            (2, _ors,                 value_font, left_align),
+            (3, "Domain Review",      label_font, right_align),
+            (4, "Yes" if _needs_dr else "No", value_font, left_align),
+        ]
+        for ci, val, fnt, aln in _ors_style:
+            c = ws.cell(row=cur, column=ci, value=val)
+            c.font = fnt
+            c.alignment = aln
+        ws.row_dimensions[cur].height = 20
+        cur += 1
+
         # ── Long-text rows ────────────────────────────────────────────────────
         if _is_italy_profile:
             why      = _strip_employee_range_from_text(_check_profile_consistency(rd, why))
@@ -5990,9 +6067,10 @@ def _xl_write_summary(ws, df: pd.DataFrame,
         "Mismatch?",
         "Final Commercial Fit Score",
         "Commercial Tier",
+        "Outreach Readiness",
         "Open Profile",
     ]
-    widths = [30, 35, 14, 10, 24, 16, 18]
+    widths = [30, 35, 14, 10, 24, 16, 22, 18]
 
     hdr_fill = PatternFill(start_color="0B4A92", end_color="0B4A92", fill_type="solid")
     hdr_font = Font(bold=True, color="FFFFFF", size=11)
@@ -6035,7 +6113,8 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             fill_type="solid",
         ) if tier else None
 
-        for ci, val in enumerate([company, domain, dom_conf, mismatch, score, tier], 1):
+        _ors = _xl_get(rd, "outreach_readiness_status") or _compute_outreach_readiness(rd)
+        for ci, val in enumerate([company, domain, dom_conf, mismatch, score, tier, _ors], 1):
             c = ws.cell(row=xrow, column=ci, value=val)
             if row_fill:
                 c.fill = row_fill
@@ -6050,11 +6129,16 @@ def _xl_write_summary(ws, df: pd.DataFrame,
             ws.cell(row=xrow, column=4).fill = PatternFill(
                 start_color="FFD700", end_color="FFD700", fill_type="solid"
             )
+        # Highlight "Domain review required" outreach status
+        if _ors == "Domain review required":
+            ws.cell(row=xrow, column=7).fill = PatternFill(
+                start_color="FFD700", end_color="FFD700", fill_type="solid"
+            )
 
-        # Open Profile hyperlink — column 7 now (shifted by 2 new cols)
+        # Open Profile hyperlink — column 8 (shifted by 1 new col)
         prof_start = profile_start_rows.get(df_idx, 1)
         link_target_row = prof_start + 4   # lands near "Why Relevant"
-        lc = ws.cell(row=xrow, column=7, value="Open Profile")
+        lc = ws.cell(row=xrow, column=8, value="Open Profile")
         lc.hyperlink = f"#'Company Profiles'!A{link_target_row}"
         lc.font = link_font
         lc.alignment = Alignment(horizontal="center", vertical="center")
@@ -6216,6 +6300,7 @@ def _xl_write_opportunity_input(
         ("commercial_fit_score",         ["final_commercial_fit_score"]),
         ("commercial_fit_score_75_25_legacy", ["final_commercial_fit_score_75_25_legacy"]),
         ("commercial_tier",              ["commercial_tier"]),
+        ("outreach_readiness_status",    ["outreach_readiness_status"]),
         ("model_probability",    ["model_probability", "lean_model_prob"]),
         ("lean_model_prob",      ["lean_model_prob"]),
         ("scoring_notes",        ["scoring_notes"]),
@@ -6301,7 +6386,8 @@ def _xl_write_opportunity_input(
     # Text columns that must never be coerced to numbers even if they look numeric.
     _TEXT_COLS = {
         "company_name", "domain", "country", "city", "industry",
-        "employee_range", "commercial_tier", "scoring_notes", "caller_angle", "match_notes",
+        "employee_range", "commercial_tier", "outreach_readiness_status",
+        "scoring_notes", "caller_angle", "match_notes",
         "sales_action_hint", "canonical_company_url", "scoring_profile", "inferred_input_country",
         "size_scoring_note", "competitor_evidence_url", "competitor_provider_detected",
         "icp_buying_signals", "icp_evidence", "icp_why_relevant",
@@ -6454,10 +6540,11 @@ def _xl_write_opportunity_input(
             ws.column_dimensions[letter].width = 12
         elif col in ("company_name", "domain"):
             ws.column_dimensions[letter].width = 28
-        elif col in ("commercial_tier", "needs_manual_review", "needs_domain_review",
+        elif col in ("commercial_tier", "outreach_readiness_status",
+                     "needs_manual_review", "needs_domain_review",
                      "domain_match_confidence", "possible_domain_mismatch",
                      "domain_used_for_enrichment", "domain_source"):
-            ws.column_dimensions[letter].width = 18
+            ws.column_dimensions[letter].width = 22
         elif col in ("input_domain", "validated_domain", "suggested_domain"):
             ws.column_dimensions[letter].width = 26
         else:
@@ -6560,6 +6647,20 @@ def _xl_write_opportunity_input(
                 operator="equal",
                 formula=['"False"'],
                 fill=PatternFill(bgColor="E8F5E9", fill_type="solid"),
+            ),
+        )
+
+    # outreach_readiness_status: "Domain review required" → amber
+    ors_col = col_letters.get("outreach_readiness_status")
+    if ors_col:
+        ors_range = f"{ors_col}2:{ors_col}{data_range_end}"
+        ws.conditional_formatting.add(
+            ors_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"Domain review required"'],
+                fill=PatternFill(bgColor="FFD700", fill_type="solid"),
+                font=Font(color="5C3A00", bold=True),
             ),
         )
 
@@ -7192,7 +7293,13 @@ def apply_results_compatible_scoring(
     for _col in _fhq_sanitize_cols:
         df[_col] = [_r.get(_col, "") for _r in _records]
 
-    return _cfs_score_df(df, scoring_profile=scoring_profile)
+    df = _cfs_score_df(df, scoring_profile=scoring_profile)
+
+    # Compute outreach_readiness_status after scoring (needs commercial_tier)
+    _ors_records = df.to_dict("records")
+    df["outreach_readiness_status"] = [_compute_outreach_readiness(r) for r in _ors_records]
+
+    return df
 
 
 def build_and_finish(results: list, debug_records: list, df_work: pd.DataFrame,
