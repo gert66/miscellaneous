@@ -3,12 +3,13 @@
 :: run_enricher_queue_generic_v3.bat
 :: Compatibility wrapper — forwards all arguments to the real runner.
 ::
-:: Usage:
-::   run_enricher_queue_generic_v3.bat [dry|test|full] [max_rows]
+:: Usage (identical to run_enricher_queue_generic.bat):
+::   run_enricher_queue_generic_v3.bat <queue> "<batches>" <mode> [max_rows]
 ::
-:: This wrapper exists so existing shortcuts, scripts, or documentation
-:: that reference v3 continue to work after the runner was consolidated
-:: into run_enricher_queue_generic.bat.
+:: Examples:
+::   run_enricher_queue_generic_v3.bat Italy100 "1" dry
+::   run_enricher_queue_generic_v3.bat Italy100 "1" test
+::   run_enricher_queue_generic_v3.bat Italy100 "1 2 3" full
 :: ============================================================
 call "%~dp0run_enricher_queue_generic.bat" %*
 exit /b %ERRORLEVEL%
