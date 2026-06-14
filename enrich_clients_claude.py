@@ -567,6 +567,7 @@ MODEL_SIGNAL_QA_FIELDS = [
     "foreign_hq_original_score",
     "foreign_hq_original_evidence",
     "inferred_input_country",
+    "foreign_hq_uncertain",
 ]
 
 MODEL_SIGNAL_FIELDS = (
@@ -3750,6 +3751,44 @@ _FOREIGN_PARENT_INDICATORS: tuple = (
     "foreign parent", "foreign holding", "foreign ownership",
 )
 
+# Phrases proving the parent/owner is explicitly outside Italy.
+# REQUIRED in addition to _FOREIGN_PARENT_INDICATORS to keep the FHQ score positive.
+_EXPLICIT_FOREIGN_COUNTRY_INDICATORS: tuple = (
+    # Country adjectives
+    "japanese parent", "japanese group", "japanese company", "japanese owner",
+    "german parent", "german group", "german company", "german owner",
+    "american parent", "us parent", "us group", "us company",
+    "french parent", "french group", "french company",
+    "british parent", "uk parent", "uk group", "uk company",
+    "dutch parent", "dutch group", "dutch owner",
+    "swiss parent", "swiss group",
+    "chinese parent", "chinese group",
+    "swedish parent", "swedish group",
+    "korean parent", "korean group",
+    # Country-in-sentence patterns
+    "headquartered in germany", "headquartered in japan", "headquartered in france",
+    "headquartered in the us", "headquartered in the united states",
+    "headquartered in united states", "headquartered in uk",
+    "headquartered in the uk", "headquartered in united kingdom",
+    "headquartered in china", "headquartered in sweden",
+    "headquartered in netherlands", "headquartered in switzerland",
+    "headquartered outside italy",
+    "parent outside italy", "parent company outside italy",
+    "parent group outside italy",
+    "reports to parent outside", "hr decisions centralized outside",
+    "decision structure outside italy",
+    "owned by a company in germany", "owned by a company in japan",
+    "owned by a company in france", "owned by a company in the us",
+    # Named country patterns for "acquired by X, a [country] company"
+    ", a japanese ", ", a german ", ", a french ", ", an american ",
+    ", a british ", ", a dutch ", ", a swedish ", ", a swiss ",
+    ", a chinese ", ", a korean ",
+    "based in germany", "based in japan", "based in france",
+    "based in the us", "based in united states", "based in uk",
+    "based in netherlands", "based in sweden", "based in switzerland",
+    "sanden corporation",  # known Japanese parent (Sandenvendo)
+)
+
 # Phrases indicating a domestic Italian company with international footprint.
 # These FORCE sanitization to 0 when found, even before the city check.
 _DOMESTIC_INTL_FOOTPRINT_INDICATORS: tuple = (
@@ -3766,6 +3805,101 @@ _DOMESTIC_INTL_FOOTPRINT_INDICATORS: tuple = (
     "italian company with",
     "italian group with",
 )
+
+
+_EMPLOYEE_RANGE_PATTERNS = [
+    re.compile(r'\b\d{1,6}\s*[-–]\s*\d{1,6}\s*employees?\b', re.IGNORECASE),
+    re.compile(r'\bhas\s+(?:approximately\s+|around\s+|about\s+)?\d{1,6}\s*employees?\b', re.IGNORECASE),
+    re.compile(r'\bwith\s+(?:approximately\s+|around\s+|about\s+)?\d{1,6}\s*employees?\b', re.IGNORECASE),
+    re.compile(r'\bemploying\s+(?:approximately\s+|around\s+|about\s+)?\d{1,6}\s+(?:people|staff|employees)\b', re.IGNORECASE),
+    re.compile(r'\b(?:approximately|around|about|over|more than|fewer than)\s+\d{1,6}\s*employees?\b', re.IGNORECASE),
+    re.compile(r'\bheadcount\s+of\s+\d{1,6}\b', re.IGNORECASE),
+    re.compile(r'\b\d{1,6}\+?\s*employees?\b', re.IGNORECASE),
+    re.compile(r'\bstaff\s+of\s+\d{1,6}\b', re.IGNORECASE),
+]
+
+def _strip_employee_range_from_text(text: str) -> str:
+    """Remove employee count/range mentions from visible profile text for Italy register profiles."""
+    if not text:
+        return text
+    result = text
+    for pat in _EMPLOYEE_RANGE_PATTERNS:
+        result = pat.sub("", result)
+    # Clean up double spaces / dangling commas left by removal
+    result = re.sub(r',\s*,', ',', result)
+    result = re.sub(r'\s{2,}', ' ', result)
+    result = re.sub(r',\s*\.', '.', result)
+    return result.strip()
+
+
+def _check_profile_consistency(rd: dict, text: str) -> str:
+    """Remove internally inconsistent phrases from a visible profile text field.
+
+    Rules applied (non-scoring, display-only):
+    1. sig_intl_footprint_score >= 2 → strip "no evidence of international" / "no international" phrases
+    2. sig_foreign_hq_score = 0 → strip foreign-parent / foreign-HQ mentions
+    3. sig_explicit_lnd_score = 0 → strip L&D maturity claims
+    4. sig_explicit_lnd_score >= 2 → strip "no clear L&D evidence" / "no L&D" phrases
+    """
+    if not text:
+        return text
+
+    result = text
+
+    intl_score = int(rd.get("sig_intl_footprint_score", 0) or 0)
+    fhq_score  = int(rd.get("sig_foreign_hq_score", 0) or 0)
+    lnd_score  = int(rd.get("sig_explicit_lnd_score", 0) or 0)
+
+    # Rule 1: has intl footprint but text says "no international presence"
+    if intl_score >= 2:
+        for phrase in (
+            "no evidence of international footprint",
+            "no evidence of international",
+            "no international operations",
+            "no international presence",
+            "no sign of international",
+            "lacks international presence",
+        ):
+            result = result.replace(phrase, "")
+            result = result.replace(phrase.capitalize(), "")
+
+    # Rule 2: fhq_score = 0 → strip foreign-parent/foreign-HQ text from display
+    if fhq_score == 0:
+        for phrase in (
+            "foreign parent", "foreign headquarters", "foreign HQ",
+            "foreign holding", "foreign ownership", "foreign owner",
+            "non-Italian parent", "non-Italian HQ",
+            "external HQ", "external headquarters",
+        ):
+            result = result.replace(phrase, "Italian-based")
+            result = result.replace(phrase.capitalize(), "Italian-based")
+        result = result.replace("Italian-based Italian-based", "Italian-based")
+
+    # Rule 3: lnd_score = 0 → strip strong L&D maturity claims
+    if lnd_score == 0:
+        for phrase in (
+            "strong L&D culture", "mature L&D function", "established L&D program",
+            "dedicated L&D", "strong learning culture", "structured learning program",
+            "strong training culture", "formal training programs",
+        ):
+            result = result.replace(phrase, "")
+            result = result.replace(phrase.capitalize(), "")
+
+    # Rule 4: lnd_score >= 2 → strip "no L&D evidence" negations
+    if lnd_score >= 2:
+        for phrase in (
+            "no clear L&D evidence", "no L&D evidence", "no evidence of L&D",
+            "no learning and development", "no L&D investment",
+            "limited L&D evidence", "no formal L&D",
+        ):
+            result = result.replace(phrase, "")
+            result = result.replace(phrase.capitalize(), "")
+
+    # Cleanup
+    result = re.sub(r'\s{2,}', ' ', result)
+    result = re.sub(r',\s*,', ',', result)
+    result = re.sub(r',\s*\.', '.', result)
+    return result.strip()
 
 
 def _get_input_country(row: dict, scoring_profile: str = "default") -> str:
@@ -3803,6 +3937,7 @@ def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
     row.setdefault("foreign_hq_sanitizer_reason", "")
     row.setdefault("foreign_hq_original_score", "")
     row.setdefault("foreign_hq_original_evidence", "")
+    row.setdefault("foreign_hq_uncertain", False)
     # Always overwrite blank inferred_input_country with the resolved value so that
     # a prior pass that wrote "" (because scoring_profile wasn't known yet) is corrected.
     _existing_ctry = str(row.get("inferred_input_country", "") or "").strip()
@@ -3845,7 +3980,30 @@ def sanitize_foreign_hq_signal(row: dict, input_country: str = "") -> dict:
     # "subsidiaries", "part of", "international operations", "global operations", etc.
     has_foreign_parent = any(ind in evidence_text for ind in _FOREIGN_PARENT_INDICATORS)
     if has_foreign_parent:
-        # Evidence suggests actual foreign ownership — keep the score
+        # Also require explicit outside-Italy country proof before keeping the score
+        has_explicit_country = any(ind in evidence_text for ind in _EXPLICIT_FOREIGN_COUNTRY_INDICATORS)
+        if has_explicit_country:
+            # Proven foreign parent with known country — keep the score
+            return row
+        # Acquisition/group language found but NO explicit country proof
+        # → mark as uncertain, zero the score, flag for manual review
+        row["foreign_hq_original_score"]    = score_int
+        row["foreign_hq_original_evidence"] = str(row.get("sig_foreign_hq_evidence", ""))
+        row["sig_foreign_hq_score"]         = 0
+        row["foreign_hq_sanitized"]         = True
+        row["foreign_hq_uncertain"]         = True
+        row["foreign_hq_sanitizer_reason"]  = (
+            "Acquisition/group evidence found, but no explicit evidence that parent "
+            "or decision structure is outside Italy. Score zeroed pending manual review."
+        )
+        existing_review = int(row.get("model_signal_needs_manual_review", 0) or 0)
+        if not existing_review:
+            row["model_signal_needs_manual_review"] = 1
+            existing_reason = str(row.get("model_signal_manual_review_reason", "") or "")
+            row["model_signal_manual_review_reason"] = (
+                (existing_reason + " | " if existing_reason else "")
+                + "Foreign HQ uncertain: acquisition/group language without explicit country proof."
+            )
         return row
 
     # Rule A: domestic HQ evidence for Italy input
@@ -5776,6 +5934,13 @@ def _xl_write_company_profiles(ws, df: pd.DataFrame,
         cur += 1
 
         # ── Long-text rows ────────────────────────────────────────────────────
+        if _is_italy_profile:
+            why      = _strip_employee_range_from_text(_check_profile_consistency(rd, why))
+            signals  = _strip_employee_range_from_text(_check_profile_consistency(rd, signals))
+            gaps     = _strip_employee_range_from_text(_check_profile_consistency(rd, gaps))
+            evidence = _strip_employee_range_from_text(_check_profile_consistency(rd, evidence))
+            interp   = _strip_employee_range_from_text(_check_profile_consistency(rd, interp))
+
         long_rows = [
             ("Why Relevant",             why,      55),
             ("Top Positive Signals",     signals,  55),
@@ -7562,6 +7727,75 @@ def _validate_type1_type2_pipeline() -> None:
     chk("FHQ-J foreign_hq_sanitized = False",
         not _fhq_r_j["foreign_hq_sanitized"],
         repr(_fhq_r_j["foreign_hq_sanitized"]))
+
+    # FHQ-K: Sandenvendo — "acquired by Sanden Corporation" (Japanese parent) → keep positive
+    _fhq_row_k = {
+        "sig_foreign_hq_score": 3,
+        "sig_foreign_hq_evidence": (
+            "Sandenvendo S.p.A. was acquired by Sanden Corporation, a Japanese company "
+            "headquartered in Isesaki, Japan."
+        ),
+        "icp_evidence": "",
+        "country_code": "IT",
+    }
+    _fhq_r_k = dict(_fhq_row_k)
+    sanitize_foreign_hq_signal(_fhq_r_k, "IT")
+    chk("FHQ-K Sandenvendo: sig_foreign_hq_score stays 3 (explicit Japanese parent)",
+        int(_fhq_r_k["sig_foreign_hq_score"]) == 3,
+        repr(_fhq_r_k["sig_foreign_hq_score"]))
+    chk("FHQ-K Sandenvendo: foreign_hq_sanitized = False",
+        not _fhq_r_k["foreign_hq_sanitized"])
+    chk("FHQ-K Sandenvendo: foreign_hq_uncertain = False",
+        not _fhq_r_k.get("foreign_hq_uncertain", False))
+
+    # FHQ-L: Gestione Ambiente — "acquired by Itelyum Group" (no country proof) → zero + uncertain
+    _fhq_row_l = {
+        "sig_foreign_hq_score": 2,
+        "sig_foreign_hq_evidence": (
+            "Gestione Ambiente S.r.l. was acquired by Itelyum Group in June 2025."
+        ),
+        "icp_evidence": "",
+        "country_code": "IT",
+    }
+    _fhq_r_l = dict(_fhq_row_l)
+    sanitize_foreign_hq_signal(_fhq_r_l, "IT")
+    chk("FHQ-L Gestione: sig_foreign_hq_score → 0 (no country proof)",
+        int(_fhq_r_l["sig_foreign_hq_score"]) == 0,
+        repr(_fhq_r_l["sig_foreign_hq_score"]))
+    chk("FHQ-L Gestione: foreign_hq_uncertain = True",
+        _fhq_r_l.get("foreign_hq_uncertain") is True,
+        repr(_fhq_r_l.get("foreign_hq_uncertain")))
+    chk("FHQ-L Gestione: model_signal_needs_manual_review = 1",
+        int(_fhq_r_l.get("model_signal_needs_manual_review", 0)) == 1,
+        repr(_fhq_r_l.get("model_signal_needs_manual_review")))
+    chk("FHQ-L Gestione: original evidence preserved",
+        "Itelyum" in str(_fhq_r_l.get("foreign_hq_original_evidence", "")),
+        repr(_fhq_r_l.get("foreign_hq_original_evidence", "")[:80]))
+
+    # SIZE-1: _strip_employee_range_from_text removes employee counts
+    _size_text = "The company has 1500 employees and exports globally."
+    _size_stripped = _strip_employee_range_from_text(_size_text)
+    chk("SIZE-1: '1500 employees' removed from text",
+        "1500" not in _size_stripped, repr(_size_stripped))
+
+    _size_text2 = "Employing approximately 800-1200 employees across Italy."
+    _size_stripped2 = _strip_employee_range_from_text(_size_text2)
+    chk("SIZE-2: '800-1200 employees' range removed",
+        "800" not in _size_stripped2 and "1200" not in _size_stripped2, repr(_size_stripped2))
+
+    # CONS-1: profile consistency — intl footprint score >= 2 strips "no international presence"
+    _cons_rd1 = {"sig_intl_footprint_score": 3, "sig_foreign_hq_score": 0, "sig_explicit_lnd_score": 0}
+    _cons_text1 = "Active exporter. No evidence of international footprint. Promising lead."
+    _cons_out1 = _check_profile_consistency(_cons_rd1, _cons_text1)
+    chk("CONS-1: 'no evidence of international footprint' stripped when score>=2",
+        "no evidence of international footprint" not in _cons_out1.lower(), repr(_cons_out1))
+
+    # CONS-2: lnd_score=0 strips "strong L&D culture"
+    _cons_rd2 = {"sig_intl_footprint_score": 0, "sig_foreign_hq_score": 0, "sig_explicit_lnd_score": 0}
+    _cons_text2 = "The company has a strong L&D culture and invests in training."
+    _cons_out2 = _check_profile_consistency(_cons_rd2, _cons_text2)
+    chk("CONS-2: 'strong L&D culture' stripped when lnd_score=0",
+        "strong L&D culture" not in _cons_out2, repr(_cons_out2))
 
     # ── Caller Angle tests ────────────────────────────────────────────────────
     print("\nCaller Angle builder")
