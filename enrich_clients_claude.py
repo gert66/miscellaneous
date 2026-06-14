@@ -609,10 +609,22 @@ ICP_OVERRIDE_FIELDS: list[str] = [
     "sales_action_hint",
 ]
 
+# Low-threshold attention fields — populated alongside ICP_OVERRIDE_FIELDS.
+# These fire on any plausible competitor mention, even when no hard override applies.
+COMPETITOR_ATTENTION_FIELDS: list[str] = [
+    "competitor_attention_signal",
+    "competitor_attention_provider_detected",
+    "competitor_attention_strength",
+    "competitor_attention_type",
+    "competitor_attention_evidence",
+    "competitor_attention_url",
+    "competitor_attention_needs_review",
+]
+
 ALL_ENRICHMENT_FIELDS = (
     LUSHA_API_FIELDS + LUSHA_API_META_FIELDS + STEP1_FIELDS + ICP_FIELDS
     + META_FIELDS + DOMAIN_VALIDATION_FIELDS + MODEL_SIGNAL_FIELDS
-    + ICP_OVERRIDE_FIELDS
+    + ICP_OVERRIDE_FIELDS + COMPETITOR_ATTENTION_FIELDS
 )
 
 # Employee range resolver output fields (populated before scoring)
@@ -3405,19 +3417,54 @@ _CAT3_PROVIDERS: frozenset = frozenset({
 _MYNGLE_VARIANTS: frozenset = frozenset({"myngle", "mYngle"})
 
 # ── mYngle competitor list ─────────────────────────────────────────────────────
-# Edit this list to add/remove competitors. Used for override detection only.
+# Ordered longest-to-shortest so _detect_competitor_in_text returns the most
+# specific match first (e.g. "Preply Business" before "Preply").
+# EF variants require "EF Corporate" / "EF Education First" phrasing — plain "ef"
+# substrings are never matched. Duolingo requires corporate context (see below).
 MYNGLE_COMPETITOR_KEYWORDS: list[str] = [
-    "Speexx", "goFLUENT", "Berlitz", "Babbel for Business",
-    "Busuu for Business", "EF Corporate", "EF Education First",
-    "Learnship", "Learnlight", "Preply Business",
-    "Rosetta Stone", "Wall Street English", "Linguarama",
-    "Cegos", "Altissia", "Gymglish", "Voxy", "Lingoda",
+    # Specific / business variants first (longest match wins)
+    "Preply Business",
+    "Babbel for Business",
+    "Busuu for Business",
+    "EF Corporate Solutions",
+    "EF Education First",
+    "EF Corporate",
+    "Rosetta Stone Enterprise",
+    "Lingoda for Business",
+    # Main brand names
+    "Speexx", "goFLUENT", "Berlitz",
+    "Babbel", "Busuu",
+    "Learnship", "Learnlight",
+    "Preply",
+    "Rosetta Stone",
+    "Wall Street English",
+    "Linguarama", "Cegos", "Altissia",
+    "Gymglish", "Voxy", "Lingoda",
+    "Talaera", "Twenix", "Cambly", "Fluentify",
+    "Duolingo", "Open English",
 ]
 
-# Subset used in the targeted Serper competitor-customer search query
+# Duolingo only counts as a competitor signal in a corporate / L&D / employee context.
+_DUOLINGO_CORPORATE_PHRASES: frozenset = frozenset({
+    "corporate", "employee", "employees", "enterprise", "business",
+    "for business", "workforce", "l&d", "hr", "company",
+    "learning and development", "training", "onboarding", "b2b",
+})
+
+# Subset used in Serper competitor-customer search queries.
+# Covers all main brands; kept to a reasonable length to avoid query-limit issues.
 _COMPETITOR_SEARCH_SUBSET: list[str] = [
-    "Speexx", "goFLUENT", "Berlitz", "Babbel for Business",
-    "Learnship", "Learnlight", "Preply Business",
+    "Preply Business", "Preply",
+    "Speexx", "goFLUENT", "Berlitz",
+    "Babbel for Business", "Babbel",
+    "Busuu for Business", "Busuu",
+    "EF Corporate", "EF Education First",
+    "Learnship", "Learnlight",
+    "Rosetta Stone", "Wall Street English",
+    "Linguarama", "Cegos", "Altissia",
+    "Gymglish", "Voxy", "Lingoda",
+    "Talaera", "Twenix", "Cambly", "Fluentify",
+    "Open English",
 ]
 
 # URL fragments that strongly suggest a case study or customer page
@@ -3446,7 +3493,7 @@ _COMPETITOR_CUSTOMER_SNIPPET_MEDIUM: tuple[str, ...] = (
 
 
 def _build_competitor_customer_empty() -> dict:
-    """Return a zeroed-out ICP override fields dict."""
+    """Return a zeroed-out ICP override + competitor attention fields dict."""
     return {
         "competitor_customer_signal":  "",
         "competitor_provider_detected": "",
@@ -3454,6 +3501,14 @@ def _build_competitor_customer_empty() -> dict:
         "competitor_signal_type":      "",
         "competitor_evidence":         "",
         "competitor_evidence_url":     "",
+        # Low-threshold attention layer
+        "competitor_attention_signal":            "No",
+        "competitor_attention_provider_detected": "",
+        "competitor_attention_strength":          "",
+        "competitor_attention_type":              "",
+        "competitor_attention_evidence":          "",
+        "competitor_attention_url":               "",
+        "competitor_attention_needs_review":      "False",
     }
 
 
@@ -3462,29 +3517,74 @@ def _run_competitor_customer_search(
     domain: str,
     serper_key: str,
 ) -> dict:
-    """Run a targeted Serper search to find competitor-customer evidence.
+    """Run up to two targeted Serper searches for competitor-customer evidence.
 
-    Returns a dict with keys 'hits' (list of result dicts) and 'query_used'.
+    Query 1 (always): "<company_name>" (competitor OR competitor OR ...)
+    Query 2 (when domain available): site:<domain> (competitor OR ...)
+
+    Results are deduplicated by URL.
+    Returns dict with keys 'hits', 'query_used', 'error'.
     Never logs or returns API key values.
     """
     competitors_q = " OR ".join(f'"{c}"' for c in _COMPETITOR_SEARCH_SUBSET)
-    # Prefer a site-scoped query when domain is known; fall back to company name
-    if domain and "." in domain:
-        clean_domain = domain.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
-        query = f'site:{clean_domain} ({competitors_q})'
-    else:
-        query = f'"{company_name}" ({competitors_q})'
+    all_hits: list  = []
+    queries_used: list[str] = []
+    errors: list[str]       = []
+    seen_urls: set[str]     = set()
 
-    hits, _status, _raw, _err = _call_serper(query, serper_key, timeout=12)
-    return {"hits": hits or [], "query_used": query, "error": _err or ""}
+    def _add_hits(hits: list) -> None:
+        for h in (hits or []):
+            url = str(h.get("link", "") or "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_hits.append(h)
+
+    # Query 1: company name + competitors (always run)
+    q1 = f'"{company_name}" ({competitors_q})'
+    hits1, _s1, _r1, err1 = _call_serper(q1, serper_key, timeout=12)
+    _add_hits(hits1)
+    queries_used.append(q1)
+    if err1:
+        errors.append(err1)
+
+    # Query 2: site-scoped when a clean domain is available
+    if domain and "." in domain:
+        clean_domain = (
+            domain.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+        )
+        if clean_domain:
+            q2 = f'site:{clean_domain} ({competitors_q})'
+            hits2, _s2, _r2, err2 = _call_serper(q2, serper_key, timeout=12)
+            _add_hits(hits2)
+            queries_used.append(q2)
+            if err2:
+                errors.append(err2)
+
+    return {
+        "hits":       all_hits,
+        "query_used": " | ".join(queries_used),
+        "error":      "; ".join(errors),
+    }
 
 
 def _detect_competitor_in_text(text: str) -> str:
-    """Return the first competitor name found in text (case-insensitive), or ''."""
+    """Return the first competitor name found in text (case-insensitive), or ''.
+
+    MYNGLE_COMPETITOR_KEYWORDS is ordered longest-first so the most specific
+    variant is returned (e.g. 'Preply Business' before 'Preply').
+    Duolingo requires a corporate/L&D context phrase to avoid consumer-app matches.
+    EF variants already require specific context ('EF Corporate', etc.).
+    mYngle is never in MYNGLE_COMPETITOR_KEYWORDS and is never returned.
+    """
     text_lc = text.lower()
     for comp in MYNGLE_COMPETITOR_KEYWORDS:
-        if comp.lower() in text_lc:
-            return comp
+        comp_lc = comp.lower()
+        if comp_lc not in text_lc:
+            continue
+        if comp_lc == "duolingo":
+            if not any(ph in text_lc for ph in _DUOLINGO_CORPORATE_PHRASES):
+                continue
+        return comp
     return ""
 
 
@@ -3496,23 +3596,30 @@ def _classify_competitor_customer_evidence(
 ) -> dict:
     """Classify competitor-customer evidence from search hits and existing signals.
 
-    Returns a dict with competitor_customer_signal, competitor_provider_detected,
-    competitor_signal_strength, competitor_signal_type, competitor_evidence,
-    competitor_evidence_url.
-
-    High confidence  → signal=Yes, strength=High
-    Medium confidence → signal=Unclear, strength=Medium
-    Low / no signal   → signal=No, strength=Low or blank
+    Populates two layers:
+      1. competitor_customer_* — hard override candidates
+         High  → signal=Yes, strength=High
+         Medium → signal=Unclear, strength=Medium
+         Low   → signal=No, strength=Low
+      2. competitor_attention_* — low-threshold alert for any plausible mention
+         Fires on Low, Medium, or High hits where company name is connected.
+         mYngle is never detected as a competitor.
     """
-    result = _build_competitor_customer_empty()
+    result     = _build_competitor_customer_empty()
     company_lc = company_name.lower()
 
     # ── Walk each search hit ──────────────────────────────────────────────────
-    best_strength  = ""   # "High" > "Medium" > "Low"
+    best_strength  = ""
     best_type      = ""
     best_evidence  = ""
     best_url       = ""
     best_provider  = ""
+
+    attn_strength  = ""
+    attn_type      = ""
+    attn_evidence  = ""
+    attn_url       = ""
+    attn_provider  = ""
 
     strength_rank  = {"High": 3, "Medium": 2, "Low": 1, "": 0}
 
@@ -3524,22 +3631,19 @@ def _classify_competitor_customer_evidence(
 
         provider = _detect_competitor_in_text(text)
         if not provider:
-            continue  # no competitor name found — skip this result
+            continue
 
         # ── Determine signal type and strength ───────────────────────────────
         url_lc   = url.lower()
         strength = "Low"
         sig_type = "search_snippet_only"
 
-        # High-confidence URL patterns (case study, customer story, etc.)
         if any(frag in url_lc for frag in _COMPETITOR_CUSTOMER_URL_SIGNALS):
             strength = "High"
             sig_type = "case_study" if "case" in url_lc else "customer_story"
 
-        # High-confidence snippet phrases combined with company name in text
         elif company_lc in text and any(ph in text for ph in _COMPETITOR_CUSTOMER_SNIPPET_HIGH):
             strength = "High"
-            # Classify by URL context
             if "tender" in url_lc or "procurement" in url_lc or "contract" in url_lc:
                 sig_type = "procurement_or_tender"
             elif "job" in url_lc or "career" in url_lc or "vacature" in url_lc:
@@ -3551,26 +3655,31 @@ def _classify_competitor_customer_evidence(
             else:
                 sig_type = "company_website_mention"
 
-        # Medium-confidence: company name in text with medium phrases
         elif company_lc in text and any(ph in text for ph in _COMPETITOR_CUSTOMER_SNIPPET_MEDIUM):
             strength = "Medium"
             sig_type = "search_snippet_only"
 
-        # Low: competitor found but no company-name match or weak context
         else:
-            # Only count if company name appears anywhere in the hit
             if company_lc not in text:
-                continue  # competitor mention with no company connection — skip
+                continue  # no company connection — skip
             strength = "Low"
-            sig_type = "search_snippet_only"
+            sig_type = "weak_context_mention"
 
-        # Keep the highest-confidence hit
+        # Update best-customer (hard override) hit
         if strength_rank[strength] > strength_rank[best_strength]:
             best_strength = strength
             best_type     = sig_type
             best_evidence = f"{title}: {snippet}"[:300]
             best_url      = url
             best_provider = provider
+
+        # Update attention hit (same ranking — captures Low too)
+        if strength_rank[strength] > strength_rank[attn_strength]:
+            attn_strength = strength
+            attn_type     = sig_type
+            attn_evidence = f"{title}: {snippet}"[:300]
+            attn_url      = url
+            attn_provider = provider
 
     # ── Fall back to existing ICP signal fields ───────────────────────────────
     if not best_provider and existing_icp_signal and existing_icp_signal.strip():
@@ -3581,13 +3690,17 @@ def _classify_competitor_customer_evidence(
             best_type     = "search_snippet_only"
             best_evidence = (existing_evidence or "")[:300]
             best_url      = ""
+            if not attn_provider:
+                attn_provider = first_provider
+                attn_strength = "Medium"
+                attn_type     = "search_snippet_only"
+                attn_evidence = best_evidence
+                attn_url      = ""
 
-    # ── Build output ──────────────────────────────────────────────────────────
+    # ── Build customer (hard override) output ─────────────────────────────────
     if not best_provider:
         result["competitor_customer_signal"] = "No"
-        return result
-
-    if best_strength == "High":
+    elif best_strength == "High":
         result["competitor_customer_signal"] = "Yes"
     elif best_strength == "Medium":
         result["competitor_customer_signal"] = "Unclear"
@@ -3599,6 +3712,20 @@ def _classify_competitor_customer_evidence(
     result["competitor_signal_type"]       = best_type
     result["competitor_evidence"]          = best_evidence.strip()
     result["competitor_evidence_url"]      = best_url
+
+    # ── Build attention output ────────────────────────────────────────────────
+    if attn_provider:
+        result["competitor_attention_signal"]            = "Yes"
+        result["competitor_attention_provider_detected"] = attn_provider
+        result["competitor_attention_strength"]          = attn_strength
+        result["competitor_attention_type"]              = attn_type
+        result["competitor_attention_evidence"]          = attn_evidence.strip()
+        result["competitor_attention_url"]               = attn_url
+        result["competitor_attention_needs_review"]      = "True"
+    else:
+        result["competitor_attention_signal"]       = "No"
+        result["competitor_attention_needs_review"] = "False"
+
     return result
 
 
@@ -3606,14 +3733,19 @@ def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
     """Post-scoring override layer for confirmed competitor-customer evidence.
 
     Must be called AFTER apply_results_compatible_scoring().
-    Adds / updates all ICP_OVERRIDE_FIELDS columns.
+    Adds / updates all ICP_OVERRIDE_FIELDS and COMPETITOR_ATTENTION_FIELDS columns.
     Never destroys the original score — it is saved to base_commercial_fit_score.
+
+    Hard override (score=10 / Hot): only when competitor_customer_signal=Yes,
+    competitor_signal_strength=High, competitor_provider_detected populated.
+
+    Attention-only (no score change): when competitor_attention_signal=Yes but
+    no hard override — sets CHECK COMPETITOR MENTION hint for caller review.
     """
     import pandas as _pd
 
     df = df.copy()
 
-    # Initialise base_commercial_fit_score from the current final score (numeric)
     if "final_commercial_fit_score" in df.columns:
         df["base_commercial_fit_score"] = (
             _pd.to_numeric(df["final_commercial_fit_score"], errors="coerce")
@@ -3621,12 +3753,15 @@ def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
     else:
         df["base_commercial_fit_score"] = _pd.NA
 
-    # Ensure all remaining override columns exist with blank defaults
     for col in ICP_OVERRIDE_FIELDS:
         if col == "base_commercial_fit_score":
             continue
         if col not in df.columns:
             df[col] = ""
+
+    for col in COMPETITOR_ATTENTION_FIELDS:
+        if col not in df.columns:
+            df[col] = "False" if col == "competitor_attention_needs_review" else ""
 
     for idx, row in df.iterrows():
 
@@ -3634,19 +3769,25 @@ def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
         strength = str(row.get("competitor_signal_strength", "") or "").strip()
         provider = str(row.get("competitor_provider_detected", "") or "").strip()
 
+        attn_signal   = str(row.get("competitor_attention_signal", "") or "").strip()
+        attn_provider = str(row.get("competitor_attention_provider_detected", "") or "").strip()
+
         if signal == "Yes" and strength == "High" and provider:
-            # ── High-confidence override ──────────────────────────────────────
+            # ── Hard override ─────────────────────────────────────────────────
             df.at[idx, "final_commercial_fit_score"] = 10.0
             if "commercial_tier" in df.columns:
                 df.at[idx, "commercial_tier"] = "🥇 Hot"
-            df.at[idx, "icp_override_applied"]      = "Yes"
-            df.at[idx, "icp_override_reason"]       = (
+            df.at[idx, "icp_override_applied"]           = "Yes"
+            df.at[idx, "icp_override_reason"]            = (
                 f"Explicit competitor customer evidence: company appears connected to "
                 f"{provider} as language training provider"
             )
-            df.at[idx, "competitive_switch_opportunity"] = "Strong"
-            df.at[idx, "sales_action_hint"]         = "ATTACK: already buys language training category"
-            # Append override note to scoring_notes if that column exists
+            df.at[idx, "competitive_switch_opportunity"]  = "Strong"
+            df.at[idx, "sales_action_hint"]              = "ATTACK: already buys language training category"
+            df.at[idx, "competitor_attention_signal"]     = "Yes"
+            df.at[idx, "competitor_attention_needs_review"] = "True"
+            if not str(df.at[idx, "competitor_attention_provider_detected"] or "").strip():
+                df.at[idx, "competitor_attention_provider_detected"] = provider
             if "scoring_notes" in df.columns:
                 existing_note = str(df.at[idx, "scoring_notes"] or "")
                 override_note = (
@@ -3657,24 +3798,35 @@ def apply_competitor_icp_override(df: "pd.DataFrame") -> "pd.DataFrame":
                 df.at[idx, "scoring_notes"] = (existing_note + " | " + override_note).lstrip(" | ")
 
         elif signal == "Unclear" and strength == "Medium":
-            # ── Medium-confidence — no override, flag for investigation ──────
-            df.at[idx, "icp_override_applied"]          = "No"
-            df.at[idx, "icp_override_reason"]           = ""
-            df.at[idx, "competitive_switch_opportunity"] = "Possible"
-            df.at[idx, "sales_action_hint"]             = "Investigate current language training provider"
+            # ── Medium confidence — no override, flag for investigation ───────
+            df.at[idx, "icp_override_applied"]            = "No"
+            df.at[idx, "icp_override_reason"]             = ""
+            df.at[idx, "competitive_switch_opportunity"]   = "Possible"
+            df.at[idx, "sales_action_hint"]               = "Investigate current language training provider"
+            df.at[idx, "competitor_attention_needs_review"] = "True"
+
+        elif attn_signal == "Yes" and attn_provider and signal != "Yes":
+            # ── Attention only — no score override, flag for caller review ────
+            df.at[idx, "icp_override_applied"]            = "No"
+            df.at[idx, "icp_override_reason"]             = ""
+            df.at[idx, "competitive_switch_opportunity"]   = "Possible"
+            df.at[idx, "sales_action_hint"]               = (
+                "CHECK COMPETITOR MENTION: verify source URL before outreach"
+            )
+            df.at[idx, "competitor_attention_needs_review"] = "True"
 
         else:
             # ── No override ───────────────────────────────────────────────────
-            df.at[idx, "icp_override_applied"]          = "No"
-            df.at[idx, "icp_override_reason"]           = ""
-            df.at[idx, "competitive_switch_opportunity"] = "No clear signal"
-            df.at[idx, "sales_action_hint"]             = ""
+            df.at[idx, "icp_override_applied"]            = "No"
+            df.at[idx, "icp_override_reason"]             = ""
+            df.at[idx, "competitive_switch_opportunity"]   = "No clear signal"
+            df.at[idx, "sales_action_hint"]               = ""
 
     return df
 
 
 def run_competitor_override_selftest() -> dict:
-    """Zero-cost self-test for the competitor-customer ICP override logic.
+    """Zero-cost self-test for the competitor-customer ICP override + attention logic.
 
     Creates synthetic DataFrames and synthetic Serper-like hits.
     Makes NO calls to Serper, Claude, Jina, Firecrawl, or any external service.
@@ -3697,11 +3849,11 @@ def run_competitor_override_selftest() -> dict:
         detail   = "OK" if passed else "; ".join(failures)
         return {"name": name, "passed": passed, "details": detail}
 
-    # ── Test Case 1: High-confidence override from pre-filled fields ─────────
+    # ── TC1: High-confidence override from pre-filled fields ─────────────────
     tc1_row = {
         "canonical_company_name":    "ACME TEST S.P.A.",
         "final_commercial_fit_score": 4.2,
-        "commercial_tier":           "🧊 Cool",
+        "commercial_tier":           "\U0001f9ca Cool",
         "competitor_customer_signal": "Yes",
         "competitor_signal_strength": "High",
         "competitor_provider_detected": "Preply Business",
@@ -3716,22 +3868,22 @@ def run_competitor_override_selftest() -> dict:
             f"base_commercial_fit_score should be 4.2, got {tc1_out.get('base_commercial_fit_score')}"),
         (float(tc1_out.get("final_commercial_fit_score", 0)) == 10.0,
             f"final_commercial_fit_score should be 10.0, got {tc1_out.get('final_commercial_fit_score')}"),
-        (str(tc1_out.get("commercial_tier", "")) == "🥇 Hot",
-            f"commercial_tier should be '🥇 Hot', got '{tc1_out.get('commercial_tier')}'"),
+        ("Hot" in str(tc1_out.get("commercial_tier", "")),
+            f"commercial_tier should contain Hot, got '{tc1_out.get('commercial_tier')}'"),
         (str(tc1_out.get("icp_override_applied", "")) == "Yes",
             f"icp_override_applied should be 'Yes', got '{tc1_out.get('icp_override_applied')}'"),
         (str(tc1_out.get("competitive_switch_opportunity", "")) == "Strong",
             f"competitive_switch_opportunity should be 'Strong', got '{tc1_out.get('competitive_switch_opportunity')}'"),
         ("ATTACK" in str(tc1_out.get("sales_action_hint", "")),
-            f"sales_action_hint should contain 'ATTACK', got '{tc1_out.get('sales_action_hint')}'"),
+            f"sales_action_hint should contain ATTACK, got '{tc1_out.get('sales_action_hint')}'"),
         ("Preply Business" in str(tc1_out.get("icp_override_reason", "")),
-            f"icp_override_reason should mention 'Preply Business', got '{tc1_out.get('icp_override_reason')}'"),
+            f"icp_override_reason should mention Preply Business, got '{tc1_out.get('icp_override_reason')}'"),
     ]))
 
-    # ── Test Case 2: Medium signal should not override ───────────────────────
+    # ── TC2: Medium signal should not override ────────────────────────────────
     tc2_row = {
         "final_commercial_fit_score": 5.1,
-        "commercial_tier":           "🔥 Warm",
+        "commercial_tier":           "\U0001f525 Warm",
         "competitor_customer_signal": "Unclear",
         "competitor_signal_strength": "Medium",
         "competitor_provider_detected": "Speexx",
@@ -3740,9 +3892,9 @@ def run_competitor_override_selftest() -> dict:
     tc2_out = apply_competitor_icp_override(tc2_df).iloc[0]
     results.append(_check("TC2: Medium signal should not override", [
         (float(tc2_out.get("final_commercial_fit_score", 0)) == 5.1,
-            f"final_commercial_fit_score should remain 5.1, got {tc2_out.get('final_commercial_fit_score')}"),
-        (str(tc2_out.get("commercial_tier", "")) == "🔥 Warm",
-            f"commercial_tier should remain '🔥 Warm', got '{tc2_out.get('commercial_tier')}'"),
+            f"score should remain 5.1, got {tc2_out.get('final_commercial_fit_score')}"),
+        ("Warm" in str(tc2_out.get("commercial_tier", "")),
+            f"commercial_tier should stay Warm, got '{tc2_out.get('commercial_tier')}'"),
         (str(tc2_out.get("icp_override_applied", "")) == "No",
             f"icp_override_applied should be 'No', got '{tc2_out.get('icp_override_applied')}'"),
         (str(tc2_out.get("competitive_switch_opportunity", "")) == "Possible",
@@ -3751,10 +3903,10 @@ def run_competitor_override_selftest() -> dict:
             f"sales_action_hint wrong: '{tc2_out.get('sales_action_hint')}'"),
     ]))
 
-    # ── Test Case 3: No competitor signal should not override ────────────────
+    # ── TC3: No competitor signal should not override ─────────────────────────
     tc3_row = {
         "final_commercial_fit_score": 6.2,
-        "commercial_tier":           "🔥 Warm",
+        "commercial_tier":           "\U0001f525 Warm",
         "competitor_customer_signal": "No",
         "competitor_signal_strength": "",
         "competitor_provider_detected": "",
@@ -3763,16 +3915,14 @@ def run_competitor_override_selftest() -> dict:
     tc3_out = apply_competitor_icp_override(tc3_df).iloc[0]
     results.append(_check("TC3: No competitor signal should not override", [
         (float(tc3_out.get("final_commercial_fit_score", 0)) == 6.2,
-            f"final_commercial_fit_score should remain 6.2, got {tc3_out.get('final_commercial_fit_score')}"),
-        (str(tc3_out.get("commercial_tier", "")) == "🔥 Warm",
-            f"commercial_tier should remain '🔥 Warm', got '{tc3_out.get('commercial_tier')}'"),
+            f"score should remain 6.2, got {tc3_out.get('final_commercial_fit_score')}"),
         (str(tc3_out.get("icp_override_applied", "")) == "No",
             f"icp_override_applied should be 'No', got '{tc3_out.get('icp_override_applied')}'"),
         (str(tc3_out.get("competitive_switch_opportunity", "")) == "No clear signal",
-            f"competitive_switch_opportunity should be 'No clear signal', got '{tc3_out.get('competitive_switch_opportunity')}'"),
+            f"competitive_switch_opportunity wrong: '{tc3_out.get('competitive_switch_opportunity')}'"),
     ]))
 
-    # ── Test Case 4: High-confidence case-study hit from classifier ──────────
+    # ── TC4: High-confidence case-study hit from classifier ───────────────────
     tc4_hits = [{
         "title":   "ACME TEST selected Preply Business for employee language training",
         "snippet": "ACME TEST selected Preply Business as its language training partner for international teams.",
@@ -3781,18 +3931,20 @@ def run_competitor_override_selftest() -> dict:
     tc4_cls = _classify_competitor_customer_evidence(tc4_hits, "ACME TEST")
     results.append(_check("TC4: High-confidence case-study hit", [
         (tc4_cls.get("competitor_customer_signal") == "Yes",
-            f"competitor_customer_signal should be 'Yes', got '{tc4_cls.get('competitor_customer_signal')}'"),
+            f"competitor_customer_signal should be Yes, got '{tc4_cls.get('competitor_customer_signal')}'"),
         (tc4_cls.get("competitor_provider_detected") == "Preply Business",
-            f"competitor_provider_detected should be 'Preply Business', got '{tc4_cls.get('competitor_provider_detected')}'"),
+            f"competitor_provider_detected should be Preply Business, got '{tc4_cls.get('competitor_provider_detected')}'"),
         (tc4_cls.get("competitor_signal_strength") == "High",
-            f"competitor_signal_strength should be 'High', got '{tc4_cls.get('competitor_signal_strength')}'"),
+            f"competitor_signal_strength should be High, got '{tc4_cls.get('competitor_signal_strength')}'"),
         (tc4_cls.get("competitor_signal_type") in ("case_study", "customer_story", "company_website_mention"),
             f"competitor_signal_type unexpected: '{tc4_cls.get('competitor_signal_type')}'"),
         (bool(tc4_cls.get("competitor_evidence_url")),
             "competitor_evidence_url should be populated"),
+        (tc4_cls.get("competitor_attention_signal") == "Yes",
+            f"competitor_attention_signal should be Yes, got '{tc4_cls.get('competitor_attention_signal')}'"),
     ]))
 
-    # ── Test Case 5: False positive generic article should not trigger ────────
+    # ── TC5: False positive generic article should not trigger ────────────────
     tc5_hits = [{
         "title":   "Best language learning platforms: Preply, Duolingo and others",
         "snippet": "A general market article comparing online language learning tools.",
@@ -3801,43 +3953,45 @@ def run_competitor_override_selftest() -> dict:
     tc5_cls = _classify_competitor_customer_evidence(tc5_hits, "ACME TEST")
     results.append(_check("TC5: False positive generic article should not trigger", [
         (tc5_cls.get("competitor_customer_signal") == "No",
-            f"competitor_customer_signal should be 'No', got '{tc5_cls.get('competitor_customer_signal')}'"),
+            f"competitor_customer_signal should be No, got '{tc5_cls.get('competitor_customer_signal')}'"),
         (tc5_cls.get("competitor_provider_detected", "") == "",
             f"competitor_provider_detected should be empty, got '{tc5_cls.get('competitor_provider_detected')}'"),
-        (tc5_cls.get("competitor_signal_strength", "") == "",
-            f"competitor_signal_strength should be empty, got '{tc5_cls.get('competitor_signal_strength')}'"),
+        (tc5_cls.get("competitor_attention_signal") == "No",
+            f"competitor_attention_signal should be No for generic article, got '{tc5_cls.get('competitor_attention_signal')}'"),
     ]))
 
-    # ── Test Case 6: Weak context mention should not trigger override ─────────
+    # ── TC6: Weak context mention should not trigger hard override ─────────────
     tc6_hits = [{
         "title":   "ACME TEST and Preply mentioned in industry overview",
         "snippet": "The article mentions ACME TEST and Preply in a broad overview of education technology.",
         "link":    "https://example.com/industry-overview",
     }]
-    tc6_cls = _classify_competitor_customer_evidence(tc6_hits, "ACME TEST")
-    # Classifier may return Low or No — either is acceptable
-    tc6_signal   = tc6_cls.get("competitor_customer_signal", "No")
-    tc6_strength = tc6_cls.get("competitor_signal_strength", "")
-    # Build a row with whatever the classifier returned and check override does NOT fire
+    tc6_cls    = _classify_competitor_customer_evidence(tc6_hits, "ACME TEST")
+    tc6_signal = tc6_cls.get("competitor_customer_signal", "No")
+    tc6_str    = tc6_cls.get("competitor_signal_strength", "")
+    tc6_attn   = tc6_cls.get("competitor_attention_signal", "No")
     tc6_row = {
-        "final_commercial_fit_score": 5.5,
-        "commercial_tier":           "🔥 Warm",
-        "competitor_customer_signal": tc6_signal,
-        "competitor_signal_strength": tc6_strength,
-        "competitor_provider_detected": tc6_cls.get("competitor_provider_detected", ""),
+        "final_commercial_fit_score":             5.5,
+        "commercial_tier":                        "\U0001f525 Warm",
+        "competitor_customer_signal":             tc6_signal,
+        "competitor_signal_strength":             tc6_str,
+        "competitor_provider_detected":           tc6_cls.get("competitor_provider_detected", ""),
+        "competitor_attention_signal":            tc6_attn,
+        "competitor_attention_provider_detected": tc6_cls.get("competitor_attention_provider_detected", ""),
+        "competitor_attention_url":               tc6_cls.get("competitor_attention_url", ""),
     }
     tc6_df  = _pd.DataFrame([tc6_row])
     tc6_out = apply_competitor_icp_override(tc6_df).iloc[0]
-    results.append(_check("TC6: Weak context mention should not trigger override", [
-        (tc6_signal in ("No", "Low", "Unclear") and tc6_strength != "High",
-            f"classifier should not return High for weak mention, got signal='{tc6_signal}' strength='{tc6_strength}'"),
+    results.append(_check("TC6: Weak context mention should not trigger hard override", [
+        (tc6_signal in ("No", "Unclear") and tc6_str != "High",
+            f"customer signal should not be High, got signal='{tc6_signal}' strength='{tc6_str}'"),
         (float(tc6_out.get("final_commercial_fit_score", 0)) != 10.0,
-            f"final_commercial_fit_score should NOT be 10.0, got {tc6_out.get('final_commercial_fit_score')}"),
+            f"score should NOT be 10.0, got {tc6_out.get('final_commercial_fit_score')}"),
         (str(tc6_out.get("icp_override_applied", "")) == "No",
-            f"icp_override_applied should be 'No', got '{tc6_out.get('icp_override_applied')}'"),
+            f"icp_override_applied should be No, got '{tc6_out.get('icp_override_applied')}'"),
     ]))
 
-    # ── Guardrail: mYngle must never be detected as competitor ───────────────
+    # ── TC-Guard: mYngle must never be detected as competitor ─────────────────
     tc_myngle_hits = [{
         "title":   "ACME TEST uses mYngle for corporate language training",
         "snippet": "ACME TEST selected mYngle as their official language training partner.",
@@ -3846,7 +4000,102 @@ def run_competitor_override_selftest() -> dict:
     tc_myngle_cls = _classify_competitor_customer_evidence(tc_myngle_hits, "ACME TEST")
     results.append(_check("TC-Guard: mYngle must never be detected as competitor/provider", [
         ("myngle" not in str(tc_myngle_cls.get("competitor_provider_detected", "")).lower(),
-            f"mYngle appeared in competitor_provider_detected: '{tc_myngle_cls.get('competitor_provider_detected')}'"),
+            f"mYngle in competitor_provider_detected: '{tc_myngle_cls.get('competitor_provider_detected')}'"),
+        ("myngle" not in str(tc_myngle_cls.get("competitor_attention_provider_detected", "")).lower(),
+            f"mYngle in attention_provider_detected: '{tc_myngle_cls.get('competitor_attention_provider_detected')}'"),
+    ]))
+
+    # ── TC-Att1: Preply low-context mention triggers attention signal ──────────
+    tc_att1_hits = [{
+        "title":   "ACME TEST and Preply mentioned in language learning overview",
+        "snippet": "The article mentions ACME TEST and Preply in relation to corporate language learning.",
+        "link":    "https://example.com/overview",
+    }]
+    tc_att1_cls = _classify_competitor_customer_evidence(tc_att1_hits, "ACME TEST")
+    results.append(_check("TC-Att1: Preply low-context mention triggers attention signal", [
+        (tc_att1_cls.get("competitor_attention_signal") == "Yes",
+            f"competitor_attention_signal should be Yes, got '{tc_att1_cls.get('competitor_attention_signal')}'"),
+        ("preply" in str(tc_att1_cls.get("competitor_attention_provider_detected", "")).lower(),
+            f"attention_provider should contain Preply, got '{tc_att1_cls.get('competitor_attention_provider_detected')}'"),
+        (tc_att1_cls.get("competitor_attention_strength") in ("Low", "Medium", "High"),
+            f"attention_strength unexpected: '{tc_att1_cls.get('competitor_attention_strength')}'"),
+        (tc_att1_cls.get("competitor_customer_signal") != "Yes",
+            f"customer_signal should NOT be Yes for weak mention, got '{tc_att1_cls.get('competitor_customer_signal')}'"),
+    ]))
+
+    # ── TC-Att2: Attention-only row triggers CHECK hint, no score override ─────
+    tc_att2_row = {
+        "final_commercial_fit_score":             5.5,
+        "commercial_tier":                        "\U0001f525 Warm",
+        "competitor_customer_signal":             "No",
+        "competitor_signal_strength":             "Low",
+        "competitor_provider_detected":           "",
+        "competitor_attention_signal":            "Yes",
+        "competitor_attention_provider_detected": "Preply",
+        "competitor_attention_url":               "https://example.com/overview",
+    }
+    tc_att2_df  = _pd.DataFrame([tc_att2_row])
+    tc_att2_out = apply_competitor_icp_override(tc_att2_df).iloc[0]
+    results.append(_check("TC-Att2: Attention-only row triggers CHECK hint, no score override", [
+        (float(tc_att2_out.get("final_commercial_fit_score", 0)) == 5.5,
+            f"score should stay 5.5, got {tc_att2_out.get('final_commercial_fit_score')}"),
+        (str(tc_att2_out.get("icp_override_applied", "")) == "No",
+            f"icp_override_applied should be No, got '{tc_att2_out.get('icp_override_applied')}'"),
+        ("CHECK COMPETITOR MENTION" in str(tc_att2_out.get("sales_action_hint", "")),
+            f"sales_action_hint should contain CHECK COMPETITOR MENTION, got '{tc_att2_out.get('sales_action_hint')}'"),
+        (str(tc_att2_out.get("competitive_switch_opportunity", "")) == "Possible",
+            f"competitive_switch_opportunity should be Possible, got '{tc_att2_out.get('competitive_switch_opportunity')}'"),
+    ]))
+
+    # ── TC-Att3: Generic article without company name = no attention ───────────
+    tc_att3_hits = [{
+        "title":   "Preply Business releases new enterprise language training features",
+        "snippet": "Preply Business announced new features for enterprise language training clients.",
+        "link":    "https://preply.com/blog/enterprise-features",
+    }]
+    tc_att3_cls = _classify_competitor_customer_evidence(tc_att3_hits, "ACME TEST")
+    results.append(_check("TC-Att3: Generic article without company name = no attention signal", [
+        (tc_att3_cls.get("competitor_attention_signal") == "No",
+            f"competitor_attention_signal should be No, got '{tc_att3_cls.get('competitor_attention_signal')}'"),
+        (tc_att3_cls.get("competitor_customer_signal") == "No",
+            f"competitor_customer_signal should be No, got '{tc_att3_cls.get('competitor_customer_signal')}'"),
+    ]))
+
+    # ── TC-Att4: EF false-positive guard ─────────────────────────────────────
+    tc_att4_fp = _detect_competitor_in_text(
+        "acme test has an effective and efficient workflow"
+    )
+    tc_att4_ok = _detect_competitor_in_text(
+        "acme test selected ef corporate for international language training"
+    )
+    results.append(_check("TC-Att4: EF false-positive guard", [
+        (tc_att4_fp == "",
+            f"ef substring should not match, got '{tc_att4_fp}'"),
+        (tc_att4_ok.lower().startswith("ef"),
+            f"ef corporate context should match, got '{tc_att4_ok}'"),
+    ]))
+
+    # ── TC-Att5: Duolingo corporate guard ─────────────────────────────────────
+    tc_att5_nocorp = _detect_competitor_in_text(
+        "acme test managers enjoy duolingo on weekends"
+    )
+    tc_att5_corp = _detect_competitor_in_text(
+        "acme test provides duolingo as a corporate language training benefit for employees"
+    )
+    results.append(_check("TC-Att5: Duolingo requires corporate/L&D context", [
+        (tc_att5_nocorp == "",
+            f"Duolingo without corporate context should not match, got '{tc_att5_nocorp}'"),
+        ("duolingo" in tc_att5_corp.lower(),
+            f"Duolingo with corporate context should match, got '{tc_att5_corp}'"),
+    ]))
+
+    # ── TC-Att6: Preply Business matched over plain Preply ────────────────────
+    tc_att6_provider = _detect_competitor_in_text(
+        "acme test has chosen preply business as its official language training partner"
+    )
+    results.append(_check("TC-Att6: Preply Business matched over plain Preply", [
+        (tc_att6_provider == "Preply Business",
+            f"Should match Preply Business, got '{tc_att6_provider}'"),
     ]))
 
     passed = sum(1 for r in results if r["passed"])
@@ -5971,7 +6220,7 @@ def _build_caller_angle(rd: dict) -> str:
     if "Hot" in tier:
         p1 = f"Strong Layer 1 fit. {anchor}, making {bh} a relevant entry point."
         p2 = _second_sentence(hot=True)
-        return f"{p1} {p2}{_domain_note}"
+        return _append_competitor_note(f"{p1} {p2}{_domain_note}", rd)
 
     if "Warm" in tier:
         p1 = f"Promising but incomplete fit. {anchor}"
@@ -5983,21 +6232,50 @@ def _build_caller_angle(rd: dict) -> str:
                 "integration, or training initiatives before prioritising a call."
             )
         )
-        return f"{p1}, but the training need is not yet explicit. {p2}{_domain_note}"
+        return _append_competitor_note(
+            f"{p1}, but the training need is not yet explicit. {p2}{_domain_note}", rd
+        )
 
     if "Cool" in tier:
-        return (
+        return _append_competitor_note(
             f"Some mYngle-relevant context exists ({anchor.lower()}), "
             "but the current evidence is still thin. Do not prioritise a cold call yet "
             "unless Opportunity Radar finds a concrete trigger such as expansion, hiring, "
-            f"acquisition, leadership change, or a new training initiative.{_domain_note}"
+            f"acquisition, leadership change, or a new training initiative.{_domain_note}",
+            rd,
         )
 
     # Pass (or unknown tier)
-    return (
+    return _append_competitor_note(
         "Low Layer 1 priority. No strong mYngle-relevant signal was found yet. "
-        f"Only move forward if Opportunity Radar finds a clear current trigger.{_domain_note}"
+        f"Only move forward if Opportunity Radar finds a clear current trigger.{_domain_note}",
+        rd,
     )
+
+
+def _append_competitor_note(base_text: str, rd: dict) -> str:
+    """Append a competitor signal note to a caller angle string if signals are present."""
+    cust_sig  = str(rd.get("competitor_customer_signal", "") or "").strip()
+    cust_str  = str(rd.get("competitor_signal_strength", "") or "").strip()
+    cust_prov = str(rd.get("competitor_provider_detected", "") or "").strip()
+    attn_sig  = str(rd.get("competitor_attention_signal", "") or "").strip()
+    attn_prov = str(rd.get("competitor_attention_provider_detected", "") or "").strip()
+    attn_url  = str(rd.get("competitor_attention_url", "") or "").strip()
+
+    if cust_sig == "Yes" and cust_str == "High" and cust_prov:
+        return (
+            base_text
+            + f" | COMPETITOR SIGNAL: Strong evidence the company may already use {cust_prov}."
+            " Treat as a competitive switch opportunity."
+        )
+    if attn_sig == "Yes" and attn_prov:
+        url_note = f" Source: {attn_url}" if attn_url else ""
+        return (
+            base_text
+            + f" | COMPETITOR MENTION: {attn_prov} found in search results."
+            f"{url_note} Verify before outreach."
+        )
+    return base_text
 
 
 def _compute_outreach_readiness(row: dict) -> str:
@@ -6582,10 +6860,21 @@ def _xl_write_opportunity_input(
         ("ti_leadership_evidence",         ["ti_leadership_evidence"]),
         ("ti_intercultural_evidence",      ["ti_intercultural_evidence"]),
         ("ti_negotiation_sales_evidence",  ["ti_negotiation_sales_evidence"]),
-        # ── Competitor and sales action ───────────────────────────────────────
-        ("competitor_evidence_url",        ["competitor_evidence_url"]),
+        # ── Competitor hard override (customer signal) ────────────────────────
+        ("competitor_customer_signal",     ["competitor_customer_signal"]),
         ("competitor_provider_detected",   ["competitor_provider_detected"]),
+        ("competitor_signal_strength",     ["competitor_signal_strength"]),
+        ("competitor_evidence_url",        ["competitor_evidence_url"]),
+        ("competitive_switch_opportunity", ["competitive_switch_opportunity"]),
         ("sales_action_hint",              ["sales_action_hint"]),
+        # ── Competitor attention layer (low-threshold) ────────────────────────
+        ("competitor_attention_signal",            ["competitor_attention_signal"]),
+        ("competitor_attention_provider_detected", ["competitor_attention_provider_detected"]),
+        ("competitor_attention_strength",          ["competitor_attention_strength"]),
+        ("competitor_attention_type",              ["competitor_attention_type"]),
+        ("competitor_attention_evidence",          ["competitor_attention_evidence"]),
+        ("competitor_attention_url",               ["competitor_attention_url"]),
+        ("competitor_attention_needs_review",      ["competitor_attention_needs_review"]),
         # ── Canonical identity + handoff fields ───────────────────────────────
         ("canonical_company_url",          ["canonical_company_url"]),
         ("company_number",                 ["company_number", "native_company_number",
@@ -6634,6 +6923,13 @@ def _xl_write_opportunity_input(
         "domain_match_confidence", "possible_domain_mismatch",
         "suggested_domain", "domain_check_reason", "domain_source",
         "needs_domain_review",
+        # competitor attention
+        "competitor_attention_signal", "competitor_attention_provider_detected",
+        "competitor_attention_strength", "competitor_attention_type",
+        "competitor_attention_evidence", "competitor_attention_url",
+        "competitor_attention_needs_review",
+        "competitor_customer_signal", "competitive_switch_opportunity",
+        "competitor_signal_strength",
         # Serper evidence handoff
         "serper_query_summary", "serper_source_urls", "serper_result_titles",
         "serper_snippets", "raw_evidence_summary", "evidence_source_urls",
