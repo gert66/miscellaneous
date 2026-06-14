@@ -264,7 +264,7 @@ if "!RESOLVED_INPUT!"=="" (
 )
 
 :: Resolve output dir and log file (per batch)
-set "BATCH_OUTPUT_DIR=%BASE_OUTPUT_DIR%\%QUEUE_NAME%\batch_%BATCH_NUM%"
+set "BATCH_OUTPUT_DIR=%PROJECT_ROOT%\%QUEUE_NAME%\02_lead_prioritized"
 set "BATCH_LOG_FILE=%LOG_DIR%\enricher_%QUEUE_NAME%_%BATCH_NUM%_%LOG_STAMP%.log"
 if not exist "!BATCH_OUTPUT_DIR!" mkdir "!BATCH_OUTPUT_DIR!"
 
