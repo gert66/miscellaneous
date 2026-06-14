@@ -54,7 +54,7 @@ def get_streamlit():
 _CLI_FLAGS = {
     "--input", "--dry-run-paths", "--output-dir", "--project-root",
     "--max-rows", "--debug", "--anthropic-key", "--serper-key",
-    "--self-test-competitor-override", "--self-test-output",
+    "--self-test-competitor-override", "--self-test-output", "--no-eta",
 }
 
 
@@ -8414,6 +8414,67 @@ def _validate_type1_type2_pipeline() -> None:
 
 
 
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS or MM:SS.
+
+    Examples:
+        45   -> "00:45"
+        125  -> "02:05"
+        3725 -> "01:02:05"
+    """
+    s = max(0, int(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h:
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def estimate_cli_eta(
+    completed: int,
+    total: int,
+    run_start_ts: float,
+    row_durations: list,
+    recent_window: int = 5,
+) -> dict:
+    """Return ETA stats dict for CLI progress reporting.
+
+    Keys returned:
+        elapsed_seconds, last_row_seconds, avg_row_seconds,
+        recent_avg_row_seconds, remaining_seconds, estimated_finish_local
+    """
+    import time as _time_eta
+    import datetime as _dt
+
+    elapsed = _time_eta.monotonic() - run_start_ts
+    last_row = row_durations[-1] if row_durations else 0.0
+
+    if completed > 0 and row_durations:
+        avg_row = sum(row_durations) / len(row_durations)
+        window  = row_durations[-recent_window:] if len(row_durations) >= recent_window else row_durations
+        recent_avg = sum(window) / len(window)
+    else:
+        avg_row    = 0.0
+        recent_avg = 0.0
+
+    remaining_rows = max(0, total - completed)
+    remaining_secs = recent_avg * remaining_rows if recent_avg else avg_row * remaining_rows
+
+    finish_local = (
+        _dt.datetime.now() + _dt.timedelta(seconds=remaining_secs)
+    ).strftime("%Y-%m-%d %H:%M")
+
+    return {
+        "elapsed_seconds":         elapsed,
+        "last_row_seconds":        last_row,
+        "avg_row_seconds":         avg_row,
+        "recent_avg_row_seconds":  recent_avg,
+        "remaining_seconds":       remaining_secs,
+        "estimated_finish_local":  finish_local,
+    }
+
+
 def run_cli() -> None:
     """Non-Streamlit batch entry point."""
     import argparse
@@ -8435,6 +8496,8 @@ def run_cli() -> None:
                         help="Run zero-cost competitor override self-test and exit")
     parser.add_argument("--self-test-output", default=None,
                         help="Optional path for self-test results Excel (.xlsx)")
+    parser.add_argument("--no-eta",           action="store_true",
+                        help="Suppress per-row ETA progress lines")
     args = parser.parse_args()
 
     # ── Self-test mode: run and exit immediately, no API calls ────────────────
@@ -8671,29 +8734,10 @@ def run_cli() -> None:
     if not domain_col:
         print("[enricher] No domain column found - proceeding with company-name-only enrichment.", flush=True)
 
-    # ── Progress helper ───────────────────────────────────────────────────────
+    # ── Progress helpers ──────────────────────────────────────────────────────
     import time as _time
 
-    def _fmt_elapsed(secs: float) -> str:
-        s = int(secs)
-        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-
-    def _print_cli_progress(
-        i: int, total: int, company_name: str, company_number: str,
-        start_ts: float, claude_calls: int, serper_calls: int, error_count: int,
-    ) -> None:
-        elapsed  = _time.monotonic() - start_ts
-        pct      = i / total * 100
-        eta_secs = (elapsed / i) * (total - i) if i > 0 else 0
-        print(
-            f"[enricher] {i}/{total} ({pct:.1f}%) | "
-            f"company_number: {company_number} | "
-            f"current: {company_name[:60]} | "
-            f"elapsed {_fmt_elapsed(elapsed)} | "
-            f"ETA {_fmt_elapsed(eta_secs)} | "
-            f"Claude: {claude_calls} | Serper: {serper_calls} | errors: {error_count}",
-            flush=True,
-        )
+    _show_eta = not getattr(args, "no_eta", False)
 
     # ── Process rows ──────────────────────────────────────────────────────────
     results       = []
@@ -8703,6 +8747,7 @@ def run_cli() -> None:
     _serper_calls = 0
     _error_count  = 0
     _start_ts     = _time.monotonic()
+    _row_durations: list = []
 
     for i, (_, row) in enumerate(df_in.iterrows(), 1):
         row_dict     = row.to_dict()
@@ -8710,19 +8755,18 @@ def run_cli() -> None:
         domain       = str(row_dict.get(domain_col, "") or "").strip() if domain_col else ""
         _cnum        = _get_company_number(row_dict)
 
-        # Print START line for every row — always, not throttled
-        elapsed_pre = _time.monotonic() - _start_ts
-        eta_pre = (elapsed_pre / (i - 1)) * (total - (i - 1)) if i > 1 else 0
+        # Print START line for every row
+        _eta_pre = estimate_cli_eta(i - 1, total, _start_ts, _row_durations)
         print(
             f"[enricher] START {i}/{total} | "
             f"company_number: {_cnum} | "
             f"company: {company_name[:60]} | "
-            f"elapsed {_fmt_elapsed(elapsed_pre)} | "
-            f"ETA {_fmt_elapsed(eta_pre)} | "
+            f"elapsed {format_duration(_eta_pre['elapsed_seconds'])} | "
             f"Claude: {_claude_calls} | Serper: {_serper_calls} | errors: {_error_count}",
             flush=True,
         )
 
+        _row_start = _time.monotonic()
         _row_status = "ok"
         try:
             result, _debug_rec = enrich_one_row(
@@ -8752,21 +8796,38 @@ def run_cli() -> None:
             _row_status = f"error: {type(exc).__name__}"
         results.append(result)
 
+        _row_elapsed = _time.monotonic() - _row_start
+        _row_durations.append(_row_elapsed)
+
         # Print DONE line for every row
-        elapsed_post = _time.monotonic() - _start_ts
-        eta_post = (elapsed_post / i) * (total - i) if i < total else 0
         print(
             f"[enricher] DONE  {i}/{total} | "
             f"company_number: {_cnum} | "
-            f"company: {company_name[:60]} | "
+            f"name: {company_name[:60]} | "
             f"status: {_row_status} | "
-            f"elapsed {_fmt_elapsed(elapsed_post)} | "
-            f"ETA {_fmt_elapsed(eta_post)} | "
-            f"errors: {_error_count}",
+            f"row_time: {format_duration(_row_elapsed)}",
             flush=True,
         )
 
-    print(f"[enricher] Done - {total} rows processed, {_error_count} errors.", flush=True)
+        # Print ETA line (unless --no-eta)
+        if _show_eta:
+            _eta = estimate_cli_eta(i, total, _start_ts, _row_durations)
+            print(
+                f"[enricher] ETA   {i}/{total} | "
+                f"elapsed {format_duration(_eta['elapsed_seconds'])} | "
+                f"avg {format_duration(_eta['avg_row_seconds'])} | "
+                f"recent avg {format_duration(_eta['recent_avg_row_seconds'])} | "
+                f"remaining ~{format_duration(_eta['remaining_seconds'])} | "
+                f"finish around {_eta['estimated_finish_local']}",
+                flush=True,
+            )
+
+    _enrichment_elapsed = _time.monotonic() - _start_ts
+    print(
+        f"[enricher] Enrichment complete | companies={total} | errors={_error_count} | "
+        f"enrichment time {format_duration(_enrichment_elapsed)}",
+        flush=True,
+    )
 
     # ── Buzzi runtime assertion (Italy profile) ──────────────────────────────
     if _cli_scoring_profile == "italy_register_icp_only":
@@ -8892,6 +8953,7 @@ def run_cli() -> None:
     else:
         xl_path = out_dir / f"enrichedResults_{stamp}.xlsx"
 
+    _export_start = _time.monotonic()
     try:
         xl_bytes = build_rich_excel_bytes(
             df_out,
@@ -8912,12 +8974,22 @@ def run_cli() -> None:
         except Exception as exc2:
             print(f"[enricher] ERROR: could not write output file: {exc2}", file=sys.stderr)
             sys.exit(2)
+    _export_elapsed = _time.monotonic() - _export_start
 
     if not xl_path.exists():
         print(f"[enricher] ERROR: output file was not created: {xl_path}", file=sys.stderr)
         sys.exit(2)
 
-    print(f"[enricher] Output file: {xl_path}", flush=True)
+    _total_runtime = _time.monotonic() - _start_ts
+    print(
+        f"[enricher] BATCH COMPLETE | "
+        f"companies={total} | "
+        f"enrichment time {format_duration(_enrichment_elapsed)} | "
+        f"final export time {format_duration(_export_elapsed)} | "
+        f"total runtime {format_duration(_total_runtime)} | "
+        f"output={xl_path}",
+        flush=True,
+    )
 
 
 
