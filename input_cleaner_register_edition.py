@@ -9339,6 +9339,24 @@ def cli_batch_run() -> None:
                         help="Country pipeline: auto (default), IT (Italy), DE (Germany)")
     parser.add_argument("--infer-size", action="store_true",
                         help="Infer company size and HR signals using Serper + Firecrawl evidence")
+    # ── Firecrawl speed / budget controls ────────────────────────────────────
+    parser.add_argument("--fc-speed",
+                        default=_FC_SPEED_FAST, choices=_FC_SPEED_OPTIONS,
+                        help=(
+                            "Firecrawl speed mode (default: Fast). "
+                            "Fast=1 cand/1 page/6s, Balanced=1/2/8s, Thorough=3/3/15s."
+                        ))
+    parser.add_argument("--fc-max-cands", type=int, default=None,
+                        help="Override max candidates per company (default: from --fc-speed).")
+    parser.add_argument("--fc-max-pages", type=int, default=None,
+                        help="Override max pages per candidate (default: from --fc-speed).")
+    parser.add_argument("--fc-page-timeout", type=int, default=None,
+                        help="Override page timeout in seconds (default: from --fc-speed).")
+    parser.add_argument("--fc-budget", type=int, default=0,
+                        help=(
+                            "Hard Firecrawl page budget. Processing stops cleanly when "
+                            "successful pages reach this limit (0 = no limit)."
+                        ))
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -9499,11 +9517,47 @@ def cli_batch_run() -> None:
         )
         sys.exit(3)
 
+    # ── Resolve Firecrawl speed defaults ─────────────────────────────────────
+    _cli_fc_speed = args.fc_speed
+    _spd = _FC_SPEED_DEFAULTS.get(_cli_fc_speed, _FC_SPEED_DEFAULTS[_FC_SPEED_FAST])
+    _cli_fc_max_cands   = args.fc_max_cands   if args.fc_max_cands   is not None else _spd[0]
+    _cli_fc_max_pages   = args.fc_max_pages   if args.fc_max_pages   is not None else _spd[1]
+    _cli_fc_page_timeout= args.fc_page_timeout if args.fc_page_timeout is not None else _spd[2]
+    _cli_fc_budget      = max(0, args.fc_budget)
+
+    if args.infer_size:
+        print(
+            "[cleaner] WARNING: --infer-size is enabled. "
+            "Size inference may add up to 2 Firecrawl pages per company.",
+            flush=True,
+        )
+
+    if args.verifier in (_VP_FIRECRAWL, _VP_FC_JINA):
+        print(
+            f"[cleaner] Firecrawl mode: {_cli_fc_speed} · "
+            f"max_cands={_cli_fc_max_cands} · max_pages={_cli_fc_max_pages} · "
+            f"timeout={_cli_fc_page_timeout}s · "
+            f"infer_size={'on' if args.infer_size else 'off'}"
+            + (f" · budget={_cli_fc_budget} pages" if _cli_fc_budget else " · budget=unlimited"),
+            flush=True,
+        )
+
     _cli_fc_health: dict = _make_fc_health()
     # Current-name box: updated before each row's progress callback via index lookup
     _name_col_for_cb = cols.get("company") or ""
 
+    # Budget-exceeded sentinel — raised from progress callback to stop processing cleanly
+    class _FcBudgetExceeded(Exception):
+        pass
+
     def _cli_progress(i, total):
+        # Hard budget guard: stop when successful pages reach the limit
+        if _cli_fc_budget > 0:
+            _pages_so_far = _cli_fc_health.get("pages_successful", 0)
+            if _pages_so_far >= _cli_fc_budget:
+                raise _FcBudgetExceeded(
+                    f"Firecrawl page budget reached ({_pages_so_far}/{_cli_fc_budget})"
+                )
         # Look up the company name for the row just completed (0-indexed row = i-1)
         _cur = ""
         if _name_col_for_cb and _name_col_for_cb in run_df.columns and i > 0:
@@ -9521,30 +9575,69 @@ def cli_batch_run() -> None:
             counters=_counters,
         )
 
-    enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
-        run_df, cols, serper_key or None, args.max_queries,
-        progress_cb=_cli_progress,
-        live_counters_out=_cli_fc_health,
-        run_id=file_hash,
-        resume_from=0,
-        prior_results=[],
-        prior_evidence=[],
-        run_label=run_label,
-        haiku_mode=args.haiku_mode,
-        haiku_api_key=anthropic_key,
-        haiku_model=_DEFAULT_HAIKU_MODEL,
-        haiku_max_rows=0,
-        jina_mode=_JINA_MODE_OFF,
-        verifier_provider=args.verifier,
-        verifier_mode=_VM_UNCERTAIN,
-        fc_key=fc_key_arg,
-        fc_location=_fc_loc_payload,
-        eligibility_filter_mode=_PF_MODE_MAYBE,
-        debug_mode=args.debug,
-        fc_fail_fast=_fc_fail_fast,
-        country_config=cfg,
-        infer_size=args.infer_size,
-    )
+    _budget_hit = False
+    try:
+        enriched_df, evidence_rows, debug_rows, jina_debug_rows = process_dataframe(
+            run_df, cols, serper_key or None, args.max_queries,
+            progress_cb=_cli_progress,
+            live_counters_out=_cli_fc_health,
+            run_id=file_hash,
+            resume_from=0,
+            prior_results=[],
+            prior_evidence=[],
+            run_label=run_label,
+            haiku_mode=args.haiku_mode,
+            haiku_api_key=anthropic_key,
+            haiku_model=_DEFAULT_HAIKU_MODEL,
+            haiku_max_rows=0,
+            jina_mode=_JINA_MODE_OFF,
+            verifier_provider=args.verifier,
+            verifier_mode=_VM_UNCERTAIN,
+            fc_key=fc_key_arg,
+            fc_location=_fc_loc_payload,
+            eligibility_filter_mode=_PF_MODE_MAYBE,
+            debug_mode=args.debug,
+            fc_fail_fast=_fc_fail_fast,
+            country_config=cfg,
+            infer_size=args.infer_size,
+            max_cands_per_company=_cli_fc_max_cands,
+            max_pages_per_cand=_cli_fc_max_pages,
+            page_timeout=_cli_fc_page_timeout,
+            fc_speed_mode=_cli_fc_speed,
+        )
+    except _FcBudgetExceeded as _bexc:
+        _budget_hit = True
+        print(f"\n[cleaner] WARNING: {_bexc}. Saving partial results.", flush=True)
+        # process_dataframe returns partial results via _cli_fc_health and autosave;
+        # reconstruct what we have from autosave or use an empty fallback.
+        # Attempt to load the latest autosave checkpoint for this run.
+        try:
+            from pathlib import Path as _Path2
+            _as_dir = _AUTOSAVE_DIR / file_hash
+            _cp_files = sorted(_as_dir.glob("checkpoint_*.xlsx")) if _as_dir.exists() else []
+            if _cp_files:
+                import openpyxl as _opx
+                _cp_wb = _opx.load_workbook(_cp_files[-1], read_only=True, data_only=True)
+                _cp_ws = _cp_wb.active
+                _cp_hdr = [c.value for c in next(_cp_ws.iter_rows(min_row=1, max_row=1))]
+                _cp_rows = [[c.value for c in r] for r in _cp_ws.iter_rows(min_row=2)]
+                enriched_df  = pd.DataFrame(_cp_rows, columns=_cp_hdr)
+                evidence_rows = []
+                debug_rows    = []
+                jina_debug_rows = []
+                print(f"[cleaner] Loaded {len(enriched_df)} rows from checkpoint: {_cp_files[-1].name}", flush=True)
+            else:
+                enriched_df     = pd.DataFrame()
+                evidence_rows   = []
+                debug_rows      = []
+                jina_debug_rows = []
+                print("[cleaner] No checkpoint found — output will be empty.", flush=True)
+        except Exception as _cp_exc:
+            print(f"[cleaner] Checkpoint load failed: {_cp_exc}. Output may be empty.", flush=True)
+            enriched_df     = pd.DataFrame()
+            evidence_rows   = []
+            debug_rows      = []
+            jina_debug_rows = []
     print()  # newline after progress
 
     _fc_loc_pl = _fc_loc_payload or {}
@@ -9651,6 +9744,7 @@ def cli_batch_run() -> None:
         .astype(str).str.strip().replace("", pd.NA).notna().sum()
     )
     _rows_failed = _cli_fc_health.get("exceptions", 0)
+    _proc_n      = max(batch_n, 1)
     print(f"\n[cleaner] Summary:", flush=True)
     print(f"  rows_processed:                    {batch_n}", flush=True)
     print(f"  rows_with_final_domain:            {_rows_with_domain}", flush=True)
@@ -9660,9 +9754,18 @@ def cli_batch_run() -> None:
     _tot_att  = run_meta.get("firecrawl_total_requests_attempted", 0)
     _tot_succ = run_meta.get("firecrawl_total_pages_successful_new", 0)
     _tot_cred = run_meta.get("firecrawl_total_estimated_credits", 0)
+    _fc_dv    = run_meta.get("firecrawl_domain_verification_pages", 0)
+    _fc_si    = run_meta.get("firecrawl_size_inference_pages_new", 0)
+    _avg_cred = round(_tot_cred / _proc_n, 2) if _tot_cred else 0.0
+    print(f"  firecrawl_speed_mode:              {_cli_fc_speed} · max_cands={_cli_fc_max_cands} · max_pages={_cli_fc_max_pages} · timeout={_cli_fc_page_timeout}s", flush=True)
+    if _cli_fc_budget:
+        print(f"  firecrawl_budget:                  {_cli_fc_budget} pages ({'LIMIT HIT — partial output' if _budget_hit else 'not reached'})", flush=True)
     print(f"  firecrawl_total_requests_attempted:{_tot_att}", flush=True)
     print(f"  firecrawl_total_pages_successful:  {_tot_succ}", flush=True)
+    print(f"  firecrawl_domain_verification_pages:{_fc_dv}", flush=True)
+    print(f"  firecrawl_size_inference_pages:    {_fc_si}", flush=True)
     print(f"  firecrawl_total_estimated_credits: {_tot_cred}", flush=True)
+    print(f"  firecrawl_avg_credits_per_row:     {_avg_cred}", flush=True)
     print(f"  elapsed:                           {_format_duration(_elapsed_total)}", flush=True)
     print(f"  output_file:                       {out_path}", flush=True)
 
