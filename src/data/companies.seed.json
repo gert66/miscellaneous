@@ -1,1 +1,55 @@
-PLACEHOLDER_DO_NOT_USE
+{
+  "list": [
+    {
+      "company_id": "it_001_callebaut_com",
+      "company_name": "BARRY CALLEBAUT MANUFACTURING ITALIA S.P.A.",
+      "domain": "callebaut.com",
+      "country": "Italy",
+      "city": "",
+      "industry": "Unknown",
+      "employee_range": "51 - 200",
+      "commercial_fit_score": 10.0,
+      "commercial_tier": "A",
+      "commercial_fit_score_app": 10.0,
+      "commercial_tier_app": "A",
+      "outreach_readiness_status": "ready",
+      "has_detail": true,
+      "has_contacts": false,
+      "last_updated": "2026-06-23T00:00:00Z",
+      "last_updated_at": "2026-06-23T00:00:00Z"
+    }
+  ],
+  "detail": {
+    "it_001_callebaut_com": {
+      "company_id": "it_001_callebaut_com",
+      "company_name": "BARRY CALLEBAUT MANUFACTURING ITALIA S.P.A.",
+      "domain": "callebaut.com",
+      "country": "Italy",
+      "city": "",
+      "industry": "Unknown",
+      "employee_range": "51 - 200",
+      "commercial_fit_score": 10.0,
+      "commercial_tier": "A",
+      "commercial_fit_score_app": 10.0,
+      "commercial_tier_app": "A",
+      "outreach_readiness_status": "ready",
+      "last_updated": "2026-06-23T00:00:00Z",
+      "last_updated_at": "2026-06-23T00:00:00Z",
+      "why_relevant": "Barry Callebaut is a high-fit company from the enriched mYngle dataset.",
+      "why_relevant_app": "Barry Callebaut is a high-fit company from the enriched mYngle dataset.",
+      "whats_hot": ["Commercial fit score: 10.0"],
+      "what_is_hot_app": ["Commercial fit score: 10.0"],
+      "whats_not_hot": [],
+      "what_is_not_app": [],
+      "caller_angle": "Use the enriched company profile to prepare a focused first call.",
+      "caller_angle_app": "Use the enriched company profile to prepare a focused first call.",
+      "call_starter_app": "I saw signals that Barry Callebaut may be relevant for mYngle. How are you currently approaching language training for international teams?",
+      "caution_app": "Seed data for frontend testing only.",
+      "evidence_summary": [{"label": "Seed", "detail": "Imported from real mYngle rich Excel sample.", "source": "Excel seed"}],
+      "evidence_summary_app": [{"label": "Seed", "detail": "Imported from real mYngle rich Excel sample.", "source": "Excel seed"}],
+      "key_source_links": [{"label": "Website", "url": "https://callebaut.com"}],
+      "key_source_links_app": [{"label": "Website", "url": "https://callebaut.com"}],
+      "advanced_notes_app": "Temporary real-data seed. Frontend display only."
+    }
+  }
+}
